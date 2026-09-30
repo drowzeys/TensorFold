@@ -325,6 +325,8 @@ class App:
         gate = self._call_gate(prompt, tools) if tools and tool_choice_requires_call(body.get("tool_choice")) else None
 
         options: dict[str, Any] = {} if draft else {"draft": False}
+        if body.get("tf_mtp") and "mtp_mode" in inspect.signature(self.engine.generate).parameters:
+            options["mtp_mode"] = str(body["tf_mtp"])        # engine-specific MTP input variant (A/B)
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
         shaped = prepared.grammar is not None or prepared.think_budget > 0

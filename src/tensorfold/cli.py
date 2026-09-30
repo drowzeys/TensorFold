@@ -108,12 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                       help="auto: MLX on macOS, CUDA elsewhere")
-    cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,
-                      help="GPUs (one per machine) the model is split over; run the same command on each")
-    cuda.add_argument("--rank", type=int, choices=(0, 1), default=0,
-                      help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
-    cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
-    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
+    cuda.add_argument("--tp", type=int, choices=(1, 2, 4), default=1,
+                      help="GPUs (one per machine) the model is split over; run the same command on each "
+                           "(4: full GLM-5.3 over four DGX Sparks)")
+    cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
+                      help="with --tp 2 or 4: this machine's rank; rank 0 serves HTTP, the others follow it")
+    cuda.add_argument("--master", default="", help="with --tp 2 or 4: rank 0's address on the link between the machines")
+    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2 or 4: rank 0's rendezvous port")
     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
@@ -341,10 +342,14 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
 
     from tensorfold import hub
 
-    if args.tp == 2 and not args.master:
-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
-    if args.tp == 1 and args.rank != 0:
-        raise ValueError("--rank 1 needs --tp 2")
+    if args.tp > 1 and not args.master:
+        raise ValueError(f"--tp {args.tp} needs --master: rank 0's address on the link between the machines")
+    if args.rank >= args.tp:
+        raise ValueError(f"--rank {args.rank} needs --tp {args.rank + 1} or more (ranks are 0 to tp - 1)")
+    supported = tuple(getattr(family.package, "CUDA_TP", (1, 2)))
+    if args.tp not in supported:
+        raise ValueError(f"{family.title} runs on CUDA with --tp " + " or ".join(map(str, supported))
+                         + f", not {args.tp}")
     started = time.perf_counter()
     drafter = "" if args.no_drafts else _drafter(family, args.drafter)
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
@@ -364,12 +369,13 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if streams > 1:
         options["parallel"] = streams
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
-    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
+    where = f", rank {args.rank} of {args.tp}" if args.tp > 1 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     engine = family.package.cuda_engine(model_dir, **options)
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
-    if args.tp == 2 and args.rank == 1:
-        print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+    if args.tp > 1 and args.rank > 0:
+        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0",
+              flush=True)
         engine.follow()
         return 0
     from tensorfold.cuda.server import App, serve
