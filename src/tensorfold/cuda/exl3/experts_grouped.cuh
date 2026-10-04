@@ -123,6 +123,16 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
     return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
 }
 
+// 16 bytes of trellis words, read once a window and not kept in L1 (linear.cu's ldg_nc_v4); asm volatile keeps each
+// load where it stands relative to the (volatile) mma, so the depth in flight is what the code says.
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 template <int K2>
 __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const uint32_t* p, int lane) {
     constexpr int TW = Fmt<K2>::TW;
@@ -181,13 +191,77 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
+// warp_tiles with the trellis words as 16-byte non-coherent loads V k steps ahead (TF_EXL3_EXPERTS_LOADS 1..4;
+// after MiaAI-Lab patch 0047 / jayleaton/glm53-tensorfold-spark patch 0580, Apache-2.0). A k step's NT tiles are
+// contiguous (NT * TW words from tile (kt, nt0)), so the warp loads the step as whole 16-byte pieces (lane l: pieces
+// l, l + 32, ..), stages it in its own slice of shared memory (``stage``, at least NT * TW words, 16-byte aligned)
+// and each lane reads back exactly the words load_words gives it. Every decode, mma and sum is warp_tiles' in the
+// same order: the same bits. Needs 16-byte aligned trellises (prepare() checks; routed() falls back to 32-bit loads).
+template <int CB, int K2, int NT, int V>
+__device__ __forceinline__ void warp_tiles_v(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                             const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                             uint32_t* stage, float (&acc)[NT][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int CH = NT * TW / 4;                       // 16-byte pieces of a k step
+    constexpr int NV = (CH + 31) / 32;                    // pieces a lane
+    static_assert(V >= 1 && V <= 4, "1 to 4 k steps ahead");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* sp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+
+    uint4 rv[V][NV];                                      // ring: step it in rv[it % V]
+    auto load_step = [&](int it, uint4 (&v)[NV]) {
+        const uint32_t* p = sp + (size_t)it * kstride;
+#pragma unroll
+        for (int c = 0; c < NV; ++c)
+            if (CH % 32 == 0 || c * 32 + lane < CH) v[c] = ldg_nc_v4(p + 4 * (c * 32 + lane));
+    };
+#pragma unroll
+    for (int d = 0; d < V; ++d)
+        if (d < nkt) load_step(d, rv[d]);
+
+    for (int ib = 0; ib < nkt; ib += V) {
+#pragma unroll
+        for (int d = 0; d < V; ++d) {
+            const int it = ib + d;
+            if (it < nkt) {
+                __syncwarp();                             // every lane has read the previous step back
+#pragma unroll
+                for (int c = 0; c < NV; ++c)
+                    if (CH % 32 == 0 || c * 32 + lane < CH)
+                        *reinterpret_cast<uint4*>(stage + 4 * (c * 32 + lane)) = rv[d][c];
+                if (it + V < nkt) load_step(it + V, rv[d]);   // the slot's registers are free again
+                __syncwarp();
+                uint32_t w[NT][LW];
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+#pragma unroll
+                    for (int l = 0; l < LW; ++l)
+                        w[i][l] = ((TW % 32) == 0 || l * 32 + lane < TW) ? stage[i * TW + l * 32 + lane] : 0u;
+                const int k = (kt0 + it) * 16;
+                uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                                 load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                    mma16816(acc[i][0], a, b0);
+                    mma16816(acc[i][1], a, b1);
+                }
+            }
+        }
+    }
+    __syncwarp();                                         // the staging slice is the warp's red rows again
+}
+
 // The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
 __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
 }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
-template <int CB, int NT, int W, int PF, int LO, int HI>
+// V > 0: warp_tiles_v (16-byte loads V k steps ahead, staged in the warp's slice of red), else warp_tiles (PF tiles).
+template <int CB, int NT, int W, int PF, int V, int LO, int HI>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -231,12 +305,21 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
+    // warps' partial sums (below); V > 0 first stages each warp's k steps in its own slice red[warp]
+    __shared__ __align__(16) float red[W][16][NT * 16];
+    uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
+    static_assert(NT * 4 * 16 <= 16 * NT * 16, "a k step of the widest tiles fits a warp's slice of red");
+
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
-        else                                                                                                    \
+        if constexpr (K2_ >= LO && K2_ <= HI) {                                                                 \
+            if constexpr (V > 0)                                                                                \
+                warp_tiles_v<CB, K2_, NT, V>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane,     \
+                                             stage, acc);                                                       \
+            else                                                                                                \
+                warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+        } else                                                                                                  \
             __trap();                                                                                           \
         break;
         TF_EXL3X_CASE(2)
@@ -260,7 +343,6 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 
     // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -320,23 +402,30 @@ struct GroupedArgs {
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
     int ns = 0;          // trellis row stride in tiles (0 = N/16)
+    int vec = 0;         // 0: 32-bit loads, pf tiles in flight; 1..4: 16-byte loads that many k steps ahead (nt 8,
+                         // 4 warps; other tiles keep the 32-bit walk)
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
-#define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
+#define TF_LAUNCH(NT_, W_, PF_, V_, LO_, HI_)                                                                   \
+    grouped_kernel<CB, NT_, W_, PF_, V_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                               \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
         a.slots, a.ns)
-#define TF_RANGES(NT_, W_, PF_)                                                                                 \
-    if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
-    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
-    else TF_LAUNCH(NT_, W_, PF_, 2, 16);
-    if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1) }
-    else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
-    else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
+#define TF_RANGES(NT_, W_, PF_, V_)                                                                             \
+    if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, V_, 8, 8);                                              \
+    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, V_, 2, 10);                                       \
+    else TF_LAUNCH(NT_, W_, PF_, V_, 2, 16);
+    // 16-byte loads (vec 1..4) for GLM's tiles (8 n tiles, 4 warps; pf has no meaning there), else the 32-bit walk
+    if (a.nt == 8 && a.warps == 4 && a.vec == 1) { TF_RANGES(8, 4, 1, 1) }
+    else if (a.nt == 8 && a.warps == 4 && a.vec == 2) { TF_RANGES(8, 4, 1, 2) }
+    else if (a.nt == 8 && a.warps == 4 && a.vec == 3) { TF_RANGES(8, 4, 1, 3) }
+    else if (a.nt == 8 && a.warps == 4 && a.vec == 4) { TF_RANGES(8, 4, 1, 4) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1, 0) }
+    else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2, 0) }
+    else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2, 0) }
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
 #undef TF_RANGES
 #undef TF_LAUNCH

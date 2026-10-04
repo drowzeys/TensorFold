@@ -253,8 +253,9 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi, int64_t ns) {
+                        int64_t hi, int64_t ns, int64_t vec) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
+    TORCH_CHECK(vec >= 0 && vec <= 4, "vec: 0 (32-bit loads) or 1..4 (16-byte loads that many k steps ahead)");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
     a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
@@ -270,6 +271,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     a.ns = (int)ns;
+    a.vec = (int)vec;
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);

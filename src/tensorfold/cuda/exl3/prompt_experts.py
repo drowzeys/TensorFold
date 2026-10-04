@@ -28,7 +28,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_prompt_experts_v4",
+    return load(name="tensorfold_exl3_prompt_experts_v5",
                 sources=[str(here / "prompt_experts.cpp"), str(here / "prompt_experts.cu")],
                 extra_cuda_cflags=["-O3", "-lineinfo"], extra_include_paths=[str(here)], verbose=False)
 
