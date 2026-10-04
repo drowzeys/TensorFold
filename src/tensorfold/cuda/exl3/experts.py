@@ -42,9 +42,9 @@ LOADS = _knob("TF_EXL3_EXPERTS_LOADS", 1, 0, 4)
 # of an expert's 2 * splits blocks (MiaAI-Lab measured it slower on its shapes: off by default, try 3). 0: the
 # separate kernels. Every value gives the same bits (MiaAI-Lab patch 0016's decode kernel, adapted).
 FUSE = _knob("TF_EXL3_EXPERTS_FUSE", 1, 0, 3)
-# TF_EXL3_EXPERTS_PDL (default 1): the chain's kernels launch with programmatic dependent launch (as linear.cu's);
+# TF_EXL3_EXPERTS_PDL (default 0: the bench at 3-4 rows, the decode windows, ran 2-3 % slower with it): the chain's kernels launch with programmatic dependent launch (as linear.cu's);
 # each waits for the previous kernel before touching memory. 0: plain launches. The same bits either way.
-PDL = _knob("TF_EXL3_EXPERTS_PDL", 1, 0, 1)
+PDL = _knob("TF_EXL3_EXPERTS_PDL", 0, 0, 1)
 
 
 @lru_cache(maxsize=1)
