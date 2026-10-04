@@ -2,9 +2,10 @@
 
 The drafter reads the target's hidden rows after the tap layers (its ``target_layer_ids``, the output of each layer),
 keeps its own sliding-window context from the committed rows' taps, and drafts a block of mask rows after the pending
-token. Only the output head differs from the Flash family: here it is the bf16 lm_head share of each rank (the router
-kernel), and each rank's top-k candidates merge over the ranks exactly as there. Drafts never have to be exact - the
-target verifies every one - so the drafter's 4-bit weights and ring-free projections are fine.
+token. Only the output head differs from the Flash family: here it is each rank's lm_head share - its 4-bit draft copy
+(headq, TF_GLM53_DRAFT_HEAD=q4, the default) or the bf16 share itself (router kernel) - and each rank's top-k
+candidates merge over the ranks exactly as there. Drafts never have to be exact - the target verifies every one - so
+the drafter's 4-bit weights, its 4-bit head and ring-free projections are fine.
 
 Checkpoint: e.g. incoai/GLM-5.3-DFlash2 (6 layers, block 8, taps 5/19/33/47/61/75, trained against BF16 GLM-5.3).
 """
@@ -69,7 +70,7 @@ def _dattn_ring(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.constex
     out = acc / l_i[:, None]
     tl.store(OUT + qr[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
 
-from . import fused
+from . import fused, headq
 
 
 class GlmDrafter(Drafter):
@@ -86,7 +87,7 @@ class GlmDrafter(Drafter):
         self.vc = [torch.zeros((KV, RING, hd), dtype=torch.bfloat16, device=self.dev) for _ in self.layers]
         torch.cuda.empty_cache()
         self.fw = w
-        V = w.lm_head.shape[0]
+        V = w.vocab_part
         self.logits = torch.empty((self.block - 1, V), dtype=torch.float32, device=w.device)
         m = self.block - 1                               # PINNED: every rank's [m, 2 top_k], then [m, selector rank]
         self.cand_n = max(self.world, 1) * m * 2 * self.top_k
@@ -135,8 +136,8 @@ class GlmDrafter(Drafter):
         idx = self.pos_dev + self.ar[:n]
         for i in range(len(self.layers)):
             x = self._layer(i, x, cos, sin, idx)
-        h, _ = self._norm(x[1:], self.norm)
-        glue.router(h, self.fw.lm_head, self.logits)
+        h, hs = self._norm(x[1:], self.norm)
+        headq.logits(h, self.fw.draft_lm_head, self.logits, hs)
         vals, local = torch.topk(self.logits, self.top_k, dim=-1)
         gids = (local + self.fw.vocab_off).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
@@ -291,7 +292,7 @@ class MultiDrafter:
         self.t_meta = torch.zeros((2 * T,), dtype=torch.int64, device=self.dev)         # position | destination
         self.tap_in = torch.zeros((T, d.tap_in.shape[1]), dtype=torch.bfloat16, device=self.dev)
         m = n - 1
-        V = d.fw.lm_head.shape[0]
+        V = d.fw.vocab_part
         self.logits = torch.empty((streams * m, V), dtype=torch.float32, device=self.dev)
         self.cand_n = d.world * streams * m * 2 * d.top_k
         self.cand = torch.zeros((self.cand_n + streams * m * d.hproj.shape[0],), dtype=torch.float32, device=self.dev)
@@ -351,9 +352,9 @@ class MultiDrafter:
         for i in range(len(d.layers)):
             x = self._layer(i, x, cos, sin, idx, S)
         m, k = n - 1, d.top_k
-        h, _ = d._norm(x.view(S, n, d.D)[:, 1:].reshape(S * m, d.D), d.norm)
+        h, hs = d._norm(x.view(S, n, d.D)[:, 1:].reshape(S * m, d.D), d.norm)
         lg = self.logits[:S * m]
-        glue.router(h, d.fw.lm_head, lg)
+        headq.logits(h, d.fw.draft_lm_head, lg, hs)
         vals, local = torch.topk(lg, k, dim=-1)
         gids = (local + d.fw.vocab_off).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()

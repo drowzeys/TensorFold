@@ -221,7 +221,7 @@ class Runner:
         t = 2 * self.topk
         while self.topk < self.capacity and t <= max(fused.bucket(self.capacity, self.topk) or 0, 2 * self.topk):
             buckets.append(t)
-            t *= 2
+            t = fused.bucket(t + 1, self.topk)
         return buckets
 
     @torch.no_grad()
@@ -453,7 +453,7 @@ class Runner:
                 vb.amax[:, 2].fill_(1.0)
                 vote.armed = True
         elif pick == "full":                             # behind the rows: a wider window's logits overwrite it
-            vb.lflat[R * w.lm_head.shape[0]].fill_(1.0 if vote.mine else 0.0)
+            vb.lflat[R * w.vocab_part].fill_(1.0 if vote.mine else 0.0)
 
     def _vote_word(self, R: int, pick: str) -> torch.Tensor | None:
         """After a verify window of R rows: the device word holding rank 0's vote (None: one rank, or head "local",
@@ -463,7 +463,7 @@ class Runner:
             return None
         if pick == "argmax":
             return vb.amax_all[2:3]
-        n = R * w.lm_head.shape[0]
+        n = R * w.vocab_part
         return vb.lgath[n:n + 1]
 
     @staticmethod

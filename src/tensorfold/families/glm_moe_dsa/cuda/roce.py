@@ -1,6 +1,13 @@
 """Decode-window reductions over RoCE (b12x RoCEnante, in the serving image): one launch, every peer's partial
 RDMA-written into pinned host memory, summed in fixed rank order - every rank stores the same bits, as the NCCL
-all-gather + rank-order sum does - and capturable in CUDA graphs. Prompt chunks stay on NCCL (large messages)."""
+all-gather + rank-order sum does - and capturable in CUDA graphs. Prompt chunks stay on NCCL (large messages).
+
+Rails: a DGX Spark's QSFP port reaches the GB10 over two PCIe Gen5 x4 links, so one cabled port is two RoCE devices
+("twins", rocep1s0f1 and roceP2p1s0f1, each ~112 Gb/s; MiaAI-Lab GLM-5.3-Flash v1.3.3 #30). The devices come from
+TF_GLM53_ROCE_HCA, else NCCL_IB_HCA - a comma list, in the same rail order on every rank (rail i = one subnet on every
+node: tools/tp4_run.sh orders them by subnet). Their RoCE v2 GID index: TF_GLM53_ROCE_GIDS (one a device), else
+NCCL_IB_GID_INDEX for all; b12x takes one index for every device, so devices whose GIDs differ fall back to the first
+device. TF_GLM53_RAILS=1: the first device only."""
 
 from __future__ import annotations
 
@@ -9,6 +16,27 @@ import os
 import torch
 
 MAX_BYTES = 1 << 20              # decode windows: up to 32 rows x 6144 fp32 = 768 KB; logits argmax rows: tiny
+
+
+def rails() -> tuple[list[str] | None, int | None]:
+    """(RoCE device names in rail order, or None: b12x discovers them; their one RoCE v2 GID index, or None)."""
+    spec = os.environ.get("TF_GLM53_ROCE_HCA") or os.environ.get("NCCL_IB_HCA") or ""
+    if not spec or spec.startswith("^"):              # unset, or an NCCL exclusion list: b12x's own discovery
+        names = None
+    else:                                             # NCCL syntax: "=" exact-match prefix, ":port" suffixes
+        names = [h.split(":")[0] for h in spec.lstrip("=").split(",") if h.strip()] or None
+    gids = [int(g) for g in os.environ.get("TF_GLM53_ROCE_GIDS", "").split(",") if g.strip()]
+    one = os.environ.get("NCCL_IB_GID_INDEX")
+    if names and gids and len(gids) != len(names):
+        raise ValueError(f"TF_GLM53_ROCE_GIDS={gids}: one GID index for each of {names}")
+    if names and gids and len(set(gids)) > 1:        # b12x takes one GID index for all its devices
+        print(f"[tensorfold] RoCE devices {names} have different GID indices {gids}: using {names[0]} only",
+              flush=True)
+        names, gids = names[:1], gids[:1]
+    if names and os.environ.get("TF_GLM53_RAILS", "2") == "1":
+        names = names[:1]
+    gid = gids[0] if gids else (int(one) if one else None)
+    return names, gid
 
 
 class RoceReduce:
@@ -23,11 +51,10 @@ class RoceReduce:
 
             dist.init_process_group("gloo", init_method=f"tcp://{master}:{port}", rank=rank, world_size=world,
                                     timeout=timedelta(seconds=120))
-        hca = os.environ.get("NCCL_IB_HCA")
-        gid = os.environ.get("NCCL_IB_GID_INDEX")
+        names, gid = rails()
         self.rt = AllReduce(exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=MAX_BYTES,
-                            max_gather_bytes=MAX_BYTES, hca_names=[hca] if hca else None,
-                            gid_index=int(gid) if gid else None)
+                            max_gather_bytes=MAX_BYTES, hca_names=names, gid_index=gid)
+        self.hcas = names
         self.rt.prepare((torch.float32,), padded_gather=True)
         self.rank, self.world = rank, world
         if nccl is not None:
@@ -61,5 +88,6 @@ class RoceReduce:
             order &= torch.equal(allv[0], ref)
         if not same:
             raise RuntimeError("RoCE all-reduce: ranks hold different bits")
-        print(f"[tensorfold] RoCE one-shot reduce ready (ranks bit-equal: {same}; equals the NCCL rank-order sum: "
-              f"{order}; windows of 3 and {DECODE_ROWS} rows)", flush=True)
+        print(f"[tensorfold] RoCE one-shot reduce ready on {','.join(self.hcas or ['(discovered)'])} (ranks "
+              f"bit-equal: {same}; equals the NCCL rank-order sum: {order}; windows of 3 and {DECODE_ROWS} rows)",
+              flush=True)

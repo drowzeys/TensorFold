@@ -34,9 +34,12 @@ def main():
     dist.init_process_group("gloo", init_method=f"tcp://{a.master}:29575", rank=a.rank, world_size=4,
                             timeout=timedelta(seconds=120))
     from b12x.comm.roce import AllReduce
+    from tensorfold.families.glm_moe_dsa.cuda.roce import rails
+
+    names, gid = rails()                    # TF_GLM53_ROCE_HCA / NCCL_IB_HCA (a rail list), TF_GLM53_RAILS=1: one
+    print(f"[roce-big] rank {a.rank}: RoCE devices {names} GID {gid}", flush=True)
     rt = AllReduce(exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=64 << 20,
-                   max_gather_bytes=1 << 20, hca_names=[os.environ["NCCL_IB_HCA"]],
-                   gid_index=int(os.environ["NCCL_IB_GID_INDEX"]))
+                   max_gather_bytes=1 << 20, hca_names=names, gid_index=gid)
     rt.prepare((torch.bfloat16,))
     lines = []
     for rows in (512, 1024, 2048, 4096):

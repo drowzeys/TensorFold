@@ -25,7 +25,7 @@ from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import linear as x3linear
 from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.families.glm5_next.cuda import glue, latent
-from tensorfold.families.glm_moe_dsa.cuda import roce, topk
+from tensorfold.families.glm_moe_dsa.cuda import headq, roce, topk
 
 from ..config import Config
 from .weights import Layer, MtpHead
@@ -64,6 +64,12 @@ FAST_ROWS = 16           # windows up to this many rows reduce over RoCE (when a
 DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurrent DFlash2 rounds, 4 streams x 8 rows
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)
 SPECIALS = 128           # ... plus the vocabulary's last ids (GLM's special tokens)
+# decode index-key buckets (``bucket``): steps an octave past INDEX_FINE_FROM keys (1: powers of two, the old graphs;
+# 4: a 32K context scores 40,960 columns instead of 65,536 - same keys selected, ~2x the decode graphs)
+INDEX_SPLIT = int(os.environ.get("TF_GLM53_INDEX_SPLIT", "4"))
+INDEX_FINE_FROM = 16384
+if INDEX_SPLIT not in (1, 2, 4, 8):
+    raise ValueError(f"TF_GLM53_INDEX_SPLIT={INDEX_SPLIT}: 1, 2, 4 or 8")
 TUNE = os.environ.get("TF_GLM53_TUNE", "1") != "0"
 # small exchanges off the head (sampled verify candidates, DFlash2 block candidates: a few KB) over the RoCE one-shot
 # gather when it is up (``small_gather``); 0: NCCL. Every rank must be given the same setting
@@ -469,8 +475,11 @@ class Weights:
         self.fast = None                 # RoceReduce for decode windows (engine sets it)
         self.tap_slot: dict[int, int] = {}   # DFlash2: target layer -> slot in Buffers.taps (engine sets it)
         self.dcp = 1                     # decode context parallelism: KV positions interleaved over the ranks
-        self.vocab_off = rank * self.lm_head.shape[0]
+        self.vocab_part = self.lm_head.shape[0]  # this rank's vocabulary share
+        self.vocab_off = rank * self.vocab_part
         self.draft_head = self.draft_ids = None
+        self.verify_head = self.lm_head          # verify windows and prompts (headq: TF_GLM53_VERIFY_HEAD)
+        self.draft_lm_head = self.lm_head        # full-share drafts: DFlash2's block, MTP ":full" (headq: q4 copy)
         every = layers + ([mtp.layer] if mtp is not None else [])
         self.tunable = [lin for L in every for lin in linears(L)]   # the same order on every rank
         if TUNE:
@@ -788,7 +797,7 @@ class Buffers:
         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
         self.taps = (torch.zeros((rows, len(w.tap_slot) * D), dtype=bf, device=dev) if w.tap_slot else None)
         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
-        V = w.lm_head.shape[0]
+        V = w.vocab_part
         hr = min(rows, self.small)           # head rows: a window's, or a prompt chunk's last one
         # one word more behind the rows: "full" heads gather it with them (rank 0's stop vote, runner.StopVote)
         self.lflat = torch.zeros((hr * V + 1,), dtype=f32, device=dev)
@@ -1120,24 +1129,26 @@ def layer(w: Weights, L: Layer, b: Buffers, x: torch.Tensor, R: int, cache, icac
 
 
 def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, rows: slice | None = None,
-         mode: str = "full"):
+         mode: str = "full", draft: bool = False):
     """Rows' next-token pick into b.argmax[:n]; "full" also leaves full fp32 logits (every rank alike) in b.logits[:n].
     "argmax": each rank's first maximum over its vocabulary share, exchanged as 16 bytes a row and resolved by lowest
     rank - the full argmax's own choice. "draft": the same over the reduced draft vocabulary. "local": only this
     rank's share of the logits, b.lpart[:n], and no pick (the runner's sharded sample, TF_GLM53_SHARDED_SAMPLE).
     Each exchange carries one spare word a round (a stop vote, runner.StopVote; nothing here reads it): "argmax"
     b.amax[0, 2], gathered at b.amax_all[2] (rank 0's); "full" b.lflat[n * V] right behind the rows, at
-    b.lgath[n * V] (rank 0's)."""
+    b.lgath[n * V] (rank 0's).
+    ``draft`` (MTP steps): the draft copies of the head (headq: 4-bit under TF_GLM53_DRAFT_HEAD=q4); verify windows,
+    prompts and "local" read w.verify_head."""
     c = w.cfg
     x = x if rows is None else x[rows]
     n = x.shape[0]
     glue.rmsnorm(x, norm, c.rms_norm_eps, b.fnormed[:n])
     if mode == "local":                                  # this rank's vocabulary share only, no exchange: the
-        glue.router(b.fnormed[:n], w.lm_head, b.lpart[:n])      # runner's sharded sample gathers its candidates
+        headq.logits(b.fnormed[:n], w.verify_head, b.lpart[:n])  # runner's sharded sample gathers its candidates
         return b.lpart[:n]
     if mode == "full":
-        V = w.lm_head.shape[0]
-        glue.router(b.fnormed[:n], w.lm_head, b.lpart[:n])
+        V = w.vocab_part
+        headq.logits(b.fnormed[:n], w.verify_head, b.lpart[:n])
         if w.world > 1:
             m = n * V + 1                                # the rows, then the spare word
             g = b.lgath[:w.world * m]
@@ -1148,10 +1159,10 @@ def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, ro
             b.logits[:n].copy_(b.lpart[:n])
         torch.argmax(b.logits[:n], dim=-1, out=b.argmax[:n])
         return b.logits[:n]
-    table = w.draft_head if mode == "draft" else w.lm_head
-    V = table.shape[0]
+    table = w.draft_head if mode == "draft" else w.draft_lm_head if draft else w.verify_head
+    V = headq.rows_of(table)
     lg = b.lpart.view(-1)[:n * V].view(n, V)
-    glue.router(b.fnormed[:n], table, lg)
+    headq.logits(b.fnormed[:n], table, lg)
     i = torch.argmax(lg, dim=-1)
     a = b.amax[:n]
     a[:, 0] = lg.gather(1, i[:, None])[:, 0]
@@ -1522,11 +1533,11 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, T: int | None, *, log
         S = last.shape[0]
         sel = b.me[:S]                               # (the embeddings are spent by now)
         torch.index_select(x, 0, last, out=sel)
-        head(w, b, sel, m.head_norm, S, mode=mode)
+        head(w, b, sel, m.head_norm, S, mode=mode, draft=True)
     elif logits == "last":
-        head(w, b, x, m.head_norm, n, slice(n - 1, n), mode=mode)
+        head(w, b, x, m.head_norm, n, slice(n - 1, n), mode=mode, draft=True)
     elif logits == "all":
-        head(w, b, x, m.head_norm, n, mode=mode)
+        head(w, b, x, m.head_norm, n, mode=mode, draft=True)
 
 
 def target_hidden_for_mtp(w: Weights, b: Buffers, rows: slice, out: torch.Tensor, normed: bool) -> None:
@@ -1539,7 +1550,22 @@ def target_hidden_for_mtp(w: Weights, b: Buffers, rows: slice, out: torch.Tensor
 
 
 def bucket(t: int, topk: int) -> int | None:
-    """The indexer's key range for a window whose last row sits at t - 1: None while t <= topk, else a power of two."""
+    """The indexer's key range for a window whose last row sits at t - 1: None while t <= topk, else the power of two
+    p >= t (at least 2 topk) - or, past INDEX_FINE_FROM keys, the first of INDEX_SPLIT equal steps of the octave
+    (p / 2, p] that reaches t (TF_GLM53_INDEX_SPLIT=4: a 32,769-key window scores 40,960 columns, not 65,536).
+
+    Any range T >= t (and >= topk) selects the same keys, so the bucket only changes the work, never the bits: the
+    columns [t, T) hold keys no row of the window can see, which _index_scores packs as the int64 minimum + 1 (and
+    the radix select's 4-byte order words as 0), below every visible key. Visible keys carry their position in the
+    low word, so no two are equal: the K largest values are one set whatever the width, and torch.topk(sorted=False)
+    returns values, which select() decodes and sorts. A row with fewer than K visible keys takes padding values that
+    are all equal, so the multiset is again the same; the radix select breaks its ties by lower column, and every
+    padding column [p + 1, t) of the narrower range comes before [t, T). DCP: the same per rank, then over the
+    gathered candidates."""
     if t <= topk:
         return None
-    return max(2 * topk, 1 << (t - 1).bit_length())
+    p = max(2 * topk, 1 << (t - 1).bit_length())
+    if INDEX_SPLIT <= 1 or p <= INDEX_FINE_FROM:
+        return p
+    step = p // (2 * INDEX_SPLIT)
+    return -(-t // step) * step

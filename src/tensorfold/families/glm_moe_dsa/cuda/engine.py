@@ -23,8 +23,9 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 import os
 
 from ..config import Config
-from . import fused
+from . import fused, headq
 from .model import RankModel
+from .multi import unwatch, watch
 from .runner import SHARDED, Runner
 from .weights import RankReader, load_layer, load_mtp
 
@@ -106,6 +107,8 @@ class Glm53Engine:
                 spans = [(rank * q, (rank + 1) * q)] + ([(V - fused.SPECIALS, V)] if rank == WORLD - 1 else [])
                 fw.set_draft_head(torch.cat([sl[a:b] for a, b in spans]).cuda(),
                                   torch.cat([torch.arange(a, b) for a, b in spans]).cuda())
+            headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH")))   # TF_GLM53_DRAFT_HEAD,
+            head = None                                  # TF_GLM53_VERIFY_HEAD (fp8 may free the bf16 share)
             if ROCE and comm.__class__.__name__ == "NCCL":
                 fast = None
                 try:
@@ -168,6 +171,7 @@ class Glm53Engine:
         print(f"[tensorfold] rank {rank}: host anon {int(rss) / 2**20 if rss != '?' else 0:.1f} GiB after load, "
               f"device free {free / 2**30:.1f} of {total / 2**30:.1f} GiB", flush=True)
         self.eos = tuple(cfg.eos_token_ids)
+        self.busy_since: float | None = None            # one stream: the running request's last progress (/health)
         self.capacity = self.limit
         self.concurrent = self.parallel > 1
         self.multi = self.scheduler = None
@@ -237,8 +241,19 @@ class Glm53Engine:
         same reply."""
         if self.runner is not None:
             sample = None if s is None else (lambda lg, pos: self._sample(lg, pos, s))
-            st = self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos, on_tokens, k,
-                                      mode, sampling=s)
+
+            def progress(new):                           # each round's tokens: the stall clock restarts
+                self.busy_since = time.monotonic()
+                watch()
+                return on_tokens(new)
+            self.busy_since = time.monotonic()
+            watch()                                      # TF_GLM_MULTI_WATCHDOG_S: also covers the prompt's prefill
+            try:
+                st = self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos, progress,
+                                          k, mode, sampling=s)
+            finally:
+                unwatch()
+                self.busy_since = None
             out = st.pop("out")
             if self.runner.cap is not None:
                 fn = self.runner.cap.finish(list(prompt) + out, {"temp": s.temperature if s else 0.0,
@@ -309,6 +324,12 @@ class Glm53Engine:
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "sha256": hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16]}
+
+    def iteration_s(self) -> float:
+        """/health: seconds the running round (concurrent) or request (one stream: since its last tokens) has gone
+        without progress; 0 when idle. A stalled rank keeps growing it."""
+        since = self.multi.iteration_since if self.multi is not None else self.busy_since
+        return round(time.monotonic() - since, 1) if since is not None else 0.0
 
     def close(self) -> None:
         """Rank 0 of a concurrent engine: stop the scheduler's worker and release the followers."""
