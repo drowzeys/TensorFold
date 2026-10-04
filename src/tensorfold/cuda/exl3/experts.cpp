@@ -4,19 +4,21 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t);
+                        int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
+                        const at::Tensor&, const at::Tensor&, at::Tensor&, double, int64_t, const at::Tensor&,
+                        at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&, at::Tensor&, int64_t);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
-void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                       at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+                       at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                                double, int64_t);
+                                double, int64_t, int64_t);
 void exl3x_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
-                              int64_t, int64_t, int64_t, int64_t);
-void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+                              int64_t, int64_t, int64_t, int64_t, int64_t);
+void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
-                             at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+                             at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -27,7 +29,10 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
              int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
-             int64_t ns) {
+             int64_t ns, int64_t vec, int64_t fuse, const at::Tensor& pick, int64_t E, const at::Tensor& svh_g,
+             const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor xd, double limit, int64_t act_mode,
+             const at::Tensor& svh_d, at::Tensor y, const at::Tensor& wts, at::Tensor out, const at::Tensor& sy,
+             at::Tensor done, int64_t pdl) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -42,8 +47,40 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     TORCH_CHECK(ns == 0 || ns >= N / 16, "ns (row stride in tiles) must be 0 or >= N/16");
+    // fuse 1 (down: y, and with wts the combine into out, + sy when given), 2 (gate/up: xd); ``done`` int32 counts,
+    // zero between launches. Unused tensors may be empty.
+    TORCH_CHECK(fuse >= 0 && fuse <= 2, "fuse: 0, 1 (down) or 2 (gate/up)");
+    if (fuse) {
+        check(pick, at::kInt, "pick");
+        TORCH_CHECK(pick.numel() >= P, "pick too small");
+        check(done, at::kInt, "done");
+    }
+    if (fuse == 2) {
+        check(svh_g, at::kHalf, "svh_g");
+        check(svh_u, at::kHalf, "svh_u");
+        check(suh_d, at::kHalf, "suh_d");
+        check(xd, at::kHalf, "xd");
+        TORCH_CHECK(xd.numel() >= P * N, "xd too small");
+        TORCH_CHECK(done.numel() >= uids.numel() * ((members.size(1) + 15) / 16) * (N / 128), "done too small");
+    }
+    if (fuse == 1) {
+        check(svh_d, at::kHalf, "svh_d");
+        check(y, at::kFloat, "y");
+        TORCH_CHECK(y.numel() >= P * N, "y too small");
+        if (wts.numel()) {
+            check(wts, at::kFloat, "wts");
+            check(out, at::kFloat, "out");
+            TORCH_CHECK(P % slots == 0 && wts.numel() >= P && out.numel() >= (P / slots) * N, "wts / out too small");
+            TORCH_CHECK(done.numel() >= (P / slots) * (N / 128), "done too small");
+            if (sy.numel()) {
+                check(sy, at::kFloat, "sy");
+                TORCH_CHECK(sy.numel() >= (P / slots) * N, "sy too small");
+            }
+        }
+    }
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi, ns);
+                       pf, lo, hi, ns, vec, fuse, pick, E, svh_g, svh_u, suh_d, xd, limit, act_mode, svh_d, y, wts,
+                       out, sy, done, pdl);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
@@ -58,7 +95,7 @@ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
 }
 
 void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
-           int64_t E) {
+           int64_t E, int64_t pdl) {
     check(pick, at::kInt, "pick");
     check(uids, at::kInt, "uids");
     check(ucount, at::kInt, "ucount");
@@ -67,12 +104,12 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
     TORCH_CHECK(uids.numel() >= std::min<int64_t>(R * slots, E), "uids too small");
     TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
     c10::cuda::CUDAGuard guard(pick.device());
-    exl3x_group_cuda(pick, uids, ucount, members, R, slots, E);
+    exl3x_group_cuda(pick, uids, ucount, members, R, slots, E, pdl);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
             const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, int64_t rows, int64_t K, int64_t slots,
-            int64_t E) {
+            int64_t E, int64_t pdl) {
     TORCH_CHECK(x.is_cuda() && (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf), "x: bf16/fp16 CUDA");
     check(pick, at::kInt, "pick");
     check(suh0, at::kHalf, "suh0");
@@ -81,12 +118,12 @@ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const
     check(out1, at::kHalf, "out1");
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
     c10::cuda::CUDAGuard guard(x.device());
-    exl3x_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots, E);
+    exl3x_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots, E, pdl);
 }
 
 void gateup_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
                      const at::Tensor& suh_d, at::Tensor xd, int64_t rows, int64_t P, int64_t N, int64_t SK,
-                     int64_t slots, int64_t E, double limit, int64_t act_mode) {
+                     int64_t slots, int64_t E, double limit, int64_t act_mode, int64_t pdl) {
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_g, at::kHalf, "svh_g");
@@ -95,31 +132,32 @@ void gateup_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tens
     check(xd, at::kHalf, "xd");
     TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128");
     c10::cuda::CUDAGuard guard(Z.device());
-    exl3x_gateup_epilogue_cuda(Z, pick, svh_g, svh_u, suh_d, xd, rows, P, N, SK, slots, E, limit, act_mode);
+    exl3x_gateup_epilogue_cuda(Z, pick, svh_g, svh_u, suh_d, xd, rows, P, N, SK, slots, E, limit, act_mode, pdl);
 }
 
 void down_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor y, int64_t rows,
-                   int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E) {
+                   int64_t P, int64_t D, int64_t SK, int64_t slots, int64_t E, int64_t pdl) {
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_d, at::kHalf, "svh_d");
     check(y, at::kFloat, "y");
     TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
     c10::cuda::CUDAGuard guard(Z.device());
-    exl3x_down_epilogue_cuda(Z, pick, svh_d, y, rows, P, D, SK, slots, E);
+    exl3x_down_epilogue_cuda(Z, pick, svh_d, y, rows, P, D, SK, slots, E, pdl);
 }
 
-void combine(const at::Tensor& y, const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t D, int64_t slots) {
+void combine(const at::Tensor& y, const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t D, int64_t slots,
+             int64_t pdl) {
     check(y, at::kFloat, "y");
     check(wts, at::kFloat, "wts");
     check(out, at::kFloat, "out");
     c10::cuda::CUDAGuard guard(y.device());
-    exl3x_combine_cuda(y, wts, out, rows, D, slots);
+    exl3x_combine_cuda(y, wts, out, rows, D, slots, pdl);
 }
 
 void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor y,
                   const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots,
-                  int64_t E) {
+                  int64_t E, int64_t pdl) {
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_d, at::kHalf, "svh_d");
@@ -128,7 +166,7 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     check(out, at::kFloat, "out");
     TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
     c10::cuda::CUDAGuard guard(Z.device());
-    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E);
+    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E, pdl);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

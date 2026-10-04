@@ -74,6 +74,10 @@ TUNE = os.environ.get("TF_GLM53_TUNE", "1") != "0"
 # small exchanges off the head (sampled verify candidates, DFlash2 block candidates: a few KB) over the RoCE one-shot
 # gather when it is up (``small_gather``); 0: NCCL. Every rank must be given the same setting
 FAST_GATHER = os.environ.get("TF_GLM53_FAST_GATHER", "1") != "0"
+# TF_GLM53_FOLD_SHARED (default 1): the shared expert runs before the routed experts (disjoint buffers, the same
+# kernels: the same bits) and the routed kernel chain adds its output while combining (out = combine + sy, the bits of
+# the separate add); 0: routed, shared expert, then part += sy as before.
+FOLD_SHARED = os.environ.get("TF_GLM53_FOLD_SHARED", "1") != "0"
 
 
 # ------------------------------------------------------------------------------------------------ kernels ---
@@ -473,6 +477,7 @@ class Weights:
         ex = next((L.experts for L in layers if L.experts is not None), None)
         self.expert_shape = ex
         self.fast = None                 # RoceReduce for decode windows (engine sets it)
+        self.l2pf = None                 # l2pf.Prefetch: L2 prefetch in decode windows (engine installs it)
         self.tap_slot: dict[int, int] = {}   # DFlash2: target layer -> slot in Buffers.taps (engine sets it)
         self.dcp = 1                     # decode context parallelism: KV positions interleaved over the ranks
         self.vocab_part = self.lm_head.shape[0]  # this rank's vocabulary share
@@ -998,9 +1003,16 @@ def _attention_dcp(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, nw,
     _dcp_combine[(R, H)](orecv[o0:], lrecv[l0:], b.ol, R, ss, ssl, H=H, LW=lw, WORLD=G, num_warps=4)
 
 
+def _l2pf(w: Weights, L: Layer, name: str) -> None:
+    """TF_GLM53_L2PF: prefetch site ``name`` of layer L on the side stream (a no-op outside decode windows)."""
+    if w.l2pf is not None:
+        w.l2pf.site(L.index, name)
+
+
 def attention(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
               pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> torch.Tensor:
     attention_part(w, L, b, R, cache, icache, pos, T, base)
+    _l2pf(w, L, "a")                                     # the FFN's first weights, during the all-reduce
     return gather(w, b, R)
 
 
@@ -1058,6 +1070,7 @@ def attention_core(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
         _absorb[(H, lw // 32, triton.cdiv(R, rbk))](b.q, L.extra["wk"], w.inv, b.qlat, b.qrot, pos, R, H=H,
                                                     QD=nope + rd, NOPE=nope, NOPE_P=triton.next_power_of_2(nope),
                                                     RD=rd, LW=lw, BN=32, RBK=rbk, ROWS=rows, num_warps=4)
+        _l2pf(w, L, "o")                                 # expand's and o_proj's weights, during the attention core
     chk, kt, nw, ns = ATTN_DECODE if R <= b.small else ATTN_PROMPT
     nch = max(1, c.index_topk // chk)
     if dcp > 1:
@@ -1086,6 +1099,7 @@ def mlp(w: Weights, L: Layer, b: Buffers, R: int, out: torch.Tensor) -> None:
 
 def ffn(w: Weights, L: Layer, b: Buffers, R: int) -> torch.Tensor:
     ffn_part(w, L, b, R)
+    _l2pf(w, L, "f")                                     # the next layer's input projections, during the all-reduce
     return gather(w, b, R)
 
 
@@ -1110,7 +1124,15 @@ def route(w: Weights, L: Layer, b: Buffers, r0: int, n: int) -> None:
 
 def experts_part(w: Weights, L: Layer, b: Buffers, R: int) -> None:
     """Routed experts (picks in b.pick) + the shared expert of rows b.normed[:R] -> fp32 partial b.part[:R]."""
-    if not hasattr(L.experts, "prefill"):
+    shared_impl = hasattr(L.experts, "prefill")
+    if FOLD_SHARED and (not shared_impl or R <= b.xs.rows):
+        mlp(w, L, b, R, b.sy[:R])                        # first: its weights may still be in L2 (TF_GLM53_L2PF)
+        if shared_impl:
+            L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R, sy=b.sy[:R])
+        else:
+            x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R, sy=b.sy[:R])
+        return
+    if not shared_impl:
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R)
     elif R <= b.xs.rows:
         L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R)
@@ -1187,6 +1209,19 @@ def compute(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits:
     hidden in b.hidden[:R]; logits of all rows, the last row ("last") or none. A ``Rows`` state (several streams):
     row r at st.pos[r] in the cache rows from st.base[r]. ``layers`` (lo, hi): only those layers (a prompt chunk
     paused between layers: the rows' activations wait in b.x; lo == 0 embeds, hi == every layer finishes)."""
+    pf = w.l2pf
+    if pf is not None and layers is None and not pf.active and R <= min(b.small, pf.s.rows):
+        pf.active = True                                 # TF_GLM53_L2PF: this decode window's sites prefetch
+        try:
+            return _compute(w, st, b, R, T, logits=logits, pick=pick, layers=layers)
+        finally:
+            pf.join()                                    # the side stream rejoins (inside a capture: before its end)
+            pf.active = False
+    return _compute(w, st, b, R, T, logits=logits, pick=pick, layers=layers)
+
+
+def _compute(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits: str = "all",
+             pick: str = "full", layers: tuple[int, int] | None = None) -> None:
     lo, hi = layers or (0, len(w.layers))
     x = b.x[:R]
     if lo == 0:

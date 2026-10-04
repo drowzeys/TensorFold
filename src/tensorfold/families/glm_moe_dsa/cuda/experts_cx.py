@@ -107,8 +107,8 @@ class SharedExperts:
     def scratch(self, rows: int, slots: int, device="cuda"):
         return self.tfx.Scratch(self.ex, rows, slots, device=device)
 
-    def decode(self, x, pick, wts, scratch, out, R: int) -> None:
-        self.tfx.routed(x, pick, wts, self.ex, scratch, out, R)
+    def decode(self, x, pick, wts, scratch, out, R: int, sy=None) -> None:
+        self.tfx.routed(x, pick, wts, self.ex, scratch, out, R, sy=sy)
 
     # prompt chunks: TensorFold's own prompt kernel when TF_EXL3_PROMPT_EXPERTS=1 (off by default), else cuda-exl3's
     # grouped GEMM, one width group after another accumulating into one output
