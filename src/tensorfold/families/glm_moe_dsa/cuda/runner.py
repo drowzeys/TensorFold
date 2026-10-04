@@ -22,6 +22,7 @@ import torch
 from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
+from . import depth as depth_policy
 from . import fused
 from .prefixes import cut_chunks, even_chunks
 
@@ -209,6 +210,8 @@ class Runner:
         self.carry = torch.zeros((c.hidden_size,), dtype=torch.bfloat16, device=w.device)
         self.G = GraphSet(graphs)
         self.profiler = RoundProfiler(w.rank)
+        # TF_GLM53_MTP_REUSE: draft steps 2.. attend step 1's selection (an MTP layer with its own indexer)
+        self.reuse = fused.MTP_REUSE if k and w.mtp is not None and w.mtp.layer.indexer is not None else 0
         self.set_mode(fused.MTP_MODE)
 
     # ------------------------------------------------------------------------------------------------ prompt ---
@@ -247,6 +250,8 @@ class Runner:
                     self._mtp(m, 1, 0, T)
                 for j in range(2, self.k + 1):
                     self._mtp(1, j, 0, T)
+                    if self.reuse and T is not None:
+                        self._mtp(1, j, 0, T, self.reuse)
         torch.cuda.synchronize()
         print(f"[tensorfold] rank {self.w.rank}: {len(self.G.graphs)} decode graphs captured in "
               f"{time.perf_counter() - t0:.1f}s (key buckets {buckets})", flush=True)
@@ -451,18 +456,26 @@ class Runner:
         self.carry.copy_(h[R - 1])
 
     # ------------------------------------------------------------------------------------------------ decode ---
-    def _mtp(self, m: int, j: int, P0: int, T: int | None) -> None:
-        """MTP window of m rows at P0 ..; its last row's draft goes to verify slot j and feeds the next MTP step."""
+    def _mtp(self, m: int, j: int, P0: int, T: int | None, reuse: int = 0) -> None:
+        """MTP window of m rows at P0 ..; its last row's draft goes to verify slot j and feeds the next MTP step.
+        ``reuse`` (TF_GLM53_MTP_REUSE, a one-row step j > 1): attend the chain's first step's selection (``_reuse``)."""
         w, st, mb, vb = self.w, self.st, self.mb, self.vb
         cn, full = self.chain_normed, self.draft_full
+        keep = j == 1 and bool(self.reuse) and T is not None   # the first step keeps its last row's selection
         st.mpos.fill_(P0)
 
         def fn():
-            fused.mtp_compute(w, st, mb, m, T, logits="last", chain_normed=cn, draft_full=full)
+            fused.mtp_compute(w, st, mb, m, T, logits="last", chain_normed=cn, draft_full=full, keep_sel=keep,
+                              reuse=reuse)
             vb.ids[j:j + 1].copy_(mb.argmax[:1])
             mb.ids[:1].copy_(mb.argmax[:1])
             mb.hin[:1].copy_(mb.hidden[m - 1:m])
-        self.G.run(("mtp", m, j, T, cn, full), fn)
+        self.G.run(("mtp", m, j, T, cn, full, keep, reuse), fn)
+
+    def _reuse(self, P: int, T: int | None) -> int:
+        """The reuse mode of a round's draft steps 2.. (pending token at P, so the first step's last row sits at
+        P - 1): TF_GLM53_MTP_REUSE when that row selected a full list of real keys (P - 1 >= index_topk), else 0."""
+        return self.reuse if T is not None and P - 1 >= self.topk else 0
 
     def _verify(self, R: int, P: int, T: int | None, pick: str) -> None:
         w, st, vb = self.w, self.st, self.vb
@@ -600,9 +613,10 @@ class Runner:
                 vb.ids[:1].fill_(tok)
                 if room:
                     Tm = self._T(P + room)
+                    ru = self._reuse(P, Tm)
                     self._mtp(m, 1, P - m, Tm)
                     for j in range(2, room + 1):
-                        self._mtp(1, j, P + j - 2, Tm)
+                        self._mtp(1, j, P + j - 2, Tm, ru)
                     m = 0                                # the merged call wrote the backlog
                 R = room + 1
             else:
@@ -813,6 +827,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         t1 = time.perf_counter()
         t_sample = t_stream = 0.0
+        policy = depth_policy.for_runner(k)              # TF_GLM53_DEPTH_POLICY: this request's depth by acceptance
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
         spick = self._sampled_pick() if sampling is not None else "full"
@@ -820,13 +835,15 @@ class Runner:
             rounds += 1
             self.profiler.begin()
             tr = time.perf_counter()
-            room = max(0, min(k, max_tokens - len(out) - 1, self.capacity - P - 1))
+            room = max(0, min(k if policy is None else policy.depth(), max_tokens - len(out) - 1,
+                              self.capacity - P - 1))
             vb.ids[:1].fill_(tok)
             if room:
                 Tm = self._T(P + room)
+                ru = self._reuse(P, Tm)
                 self._mtp(m, 1, P - m, Tm)
                 for j in range(2, room + 1):
-                    self._mtp(1, j, P + j - 2, Tm)
+                    self._mtp(1, j, P + j - 2, Tm, ru)
             R = room + 1
             pick = "argmax" if sample is None else spick
             self._vote_arm(on_tokens, R, pick)
@@ -860,6 +877,8 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
+            if policy is not None and drafts:
+                policy.update(len(drafts), n)
             was = len(out)
             for e_tok in emit:
                 out.append(e_tok)
@@ -889,4 +908,5 @@ class Runner:
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "sample_ms_per_round": round(1e3 * t_sample / max(rounds, 1), 2),
                 "stream_ms_per_round": round(1e3 * t_stream / max(rounds, 1), 2), "stopped": on_tokens.agreed,
-                "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
+                "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1),
+                **({"depths": dict(sorted(policy.depths.items()))} if policy is not None else {}), "out": out}

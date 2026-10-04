@@ -80,6 +80,34 @@ FAST_GATHER = os.environ.get("TF_GLM53_FAST_GATHER", "1") != "0"
 FOLD_SHARED = os.environ.get("TF_GLM53_FOLD_SHARED", "1") != "0"
 
 
+def _side_letters(v: str) -> str:
+    v = (v or "1").strip().lower()
+    v = {"0": "", "off": "", "1": "af", "on": "af"}.get(v, v)
+    if set(v) - set("awf") or ("a" in v and "w" in v):
+        raise ValueError(f"TF_GLM53_SIDE: 0, 1 or letters of 'af' / 'wf' ('a' and 'w' exclude each other), not {v!r}")
+    return v
+
+
+# TF_GLM53_SIDE (default 1 = "af"): decode windows (``compute`` / ``mtp_compute`` up to Buffers.small rows, not prompt
+# chunks) queue independent work on a second stream (Buffers.side). "a": the key path - kv_a (out of q_a's launch),
+# the latent / rope key write, the indexer's wk and index key write - beside the query path (q_a, its norm,
+# weights_proj, wq_b / q_b, the index query's rope), joined before select (or before the attention kernels when no
+# row selects); "w": the same with kv_a left in q_a's launch (only the writes beside); "f": the shared expert beside
+# the router and the routed experts, joined before the launch that adds its output (TF_GLM53_FOLD_SHARED: the routed
+# down + combine; else part += sy). Every kernel computes what it did on one stream: the same bits. 0: one stream.
+SIDE = _side_letters(os.environ.get("TF_GLM53_SIDE", "1"))
+# TF_GLM53_MTP_REUSE (default 2; the checkpoint's index_share_for_mtp_iteration): a draft chain's first MTP step (the
+# rows the last round kept) scores and selects; its later one-row steps attend the first step's last row's selection
+# (mtp_compute ``keep_sel`` / ``reuse``) and neither score, select nor write index keys. 1: the list's last (highest)
+# entry gives its slot to the row's own position (DCP 1; else as 2); 2: the reused list alone; 0: every step
+# selects, as before. Drafts only propose - the target verifies every token - so replies are the same in every mode.
+# A draft row's index key is never read before the next round's first step rewrites it with the target hidden: that
+# step's rows are contiguous from the first uncommitted position, and later steps reuse instead of selecting.
+MTP_REUSE = int(os.environ.get("TF_GLM53_MTP_REUSE", "2") or 0)
+if MTP_REUSE not in (0, 1, 2):
+    raise ValueError(f"TF_GLM53_MTP_REUSE={MTP_REUSE}: 0, 1 or 2")
+
+
 # ------------------------------------------------------------------------------------------------ kernels ---
 @triton.jit
 def _rope_pair(a, b, cos, sin):
@@ -815,6 +843,11 @@ class Buffers:
         self.mh = torch.empty((rows, D), dtype=bf, device=dev)
         self.mcat = torch.empty((rows, 2 * D), dtype=bf, device=dev)
         self.mx32 = torch.empty((rows, D), dtype=f32, device=dev)
+        # TF_GLM53_SIDE: the second stream of this buffer set's decode windows (the EXL3 linears it runs allocate their
+        # own scratch on it); ``side_on``: the letters of the window running now ("" outside decode windows)
+        self.side = torch.cuda.Stream(device=dev) if dev.type == "cuda" else None
+        self.side_on = ""
+        self.forked = False
 
 
 # ------------------------------------------------------------------------------------------------- blocks ---
@@ -1009,50 +1042,107 @@ def _l2pf(w: Weights, L: Layer, name: str) -> None:
         w.l2pf.site(L.index, name)
 
 
+class _SideWindow:
+    """TF_GLM53_SIDE for one decode window: b.side_on holds the letters while it runs; the side stream rejoins the
+    current stream at the end (each layer joins it already; inside a capture this keeps the branch inside the graph)."""
+
+    def __init__(self, b: Buffers, on: bool) -> None:
+        self.b = b
+        self.on = bool(on and SIDE and b.side is not None and not b.side_on)
+
+    def __enter__(self) -> None:
+        if self.on:
+            self.b.side_on = SIDE
+
+    def __exit__(self, *exc) -> None:
+        if self.on:
+            _join(self.b)
+            self.b.side_on = ""
+
+
+def _fork(b: Buffers):
+    """A context queuing on b.side after everything the current stream has queued so far."""
+    b.side.wait_stream(torch.cuda.current_stream())
+    b.forked = True
+    return torch.cuda.stream(b.side)
+
+
+def _join(b: Buffers) -> None:
+    """The current stream waits for the side stream's work so far."""
+    if b.forked:
+        torch.cuda.current_stream().wait_stream(b.side)
+        b.forked = False
+
+
 def attention(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
-              pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> torch.Tensor:
-    attention_part(w, L, b, R, cache, icache, pos, T, base)
+              pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None, reuse: int = 0) -> torch.Tensor:
+    attention_part(w, L, b, R, cache, icache, pos, T, base, reuse)
     _l2pf(w, L, "a")                                     # the FFN's first weights, during the all-reduce
     return gather(w, b, R)
 
 
 def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
-                   pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> None:
+                   pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None, reuse: int = 0) -> None:
     """Attention of the window's rows (b.normed): writes this layer's latent (and index key), leaves this rank's
     fp32 partial in b.part[:R]. ``T``: None while every row is below index_topk (no selection).
     ``base`` (several streams in one window): row r sits at position pos[r] of the stream whose cache rows start at
-    base[r] (int32 tables); every row keeps the bits it has alone (the per-row kernels compute the same values)."""
+    base[r] (int32 tables); every row keeps the bits it has alone (the per-row kernels compute the same values).
+    ``reuse`` (TF_GLM53_MTP_REUSE, a one-row MTP draft step after the chain's first): the row attends the selection
+    already in b.tok[0] (b.cnt[0]) - mode 1 with its own position in the last slot - and writes no index key."""
     c = w.cfg
     lw, rd = c.kv_lora_rank, c.qk_rope_head_dim
-    lins([L.q_a, L.kv_a], b, b.normed[:R], [b.qa[:R], b.kva[:R]])
-    glue.rmsnorm(b.qa[:R], L.q_a_norm, c.rms_norm_eps, b.qn[:R])
     dcp, rank = w.dcp, (w.rank if w.dcp > 1 else 0)
     rows = base is not None
     if rows and dcp > 1:
         raise ValueError("several streams in one window need decode context parallelism off (DCP 1)")
-    _kv_write[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd, DCP=dcp,
-                    RANK=rank, BASE=base, ROWS=rows, num_warps=4)
-    q_done = False                                       # q_b run with wq_b
-    if L.indexer is not None:
-        ix = L.indexer
-        glue.router(b.normed[:R], ix["wk"], b.ik[:R])
-        _ik_write[(R,)](b.ik, L.extra["ik_w"], L.extra["ik_b"], w.inv, icache, pos, 1e-6, D=c.index_head_dim, RD=rd,
+    ix = L.indexer
+    if reuse and (ix is None or R != 1 or rows):
+        raise ValueError("MTP index reuse: one-row windows of one stream on an indexer layer")
+
+    def keys(kv_a: bool) -> None:
+        """The window's latent and rope key (and, on indexer layers, index key) into the caches (kv_a first if asked)."""
+        if kv_a:
+            lin(L.kv_a, b, b.normed[:R], b.kva[:R])      # the bits of its share of the grouped launch
+        _kv_write[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd,
                         DCP=dcp, RANK=rank, BASE=base, ROWS=rows, num_warps=4)
-        if T is not None:
-            glue.router(b.normed[:R], ix["weights_proj"], b.iw[:R])
-            lins([ix["wq_b"], L.q_b], b, b.qn[:R], [b.iq[:R], b.q[:R]])   # q_b early: select leaves b.q alone
-            q_done = True
-            _iq_rope[(R, c.index_n_heads)](b.iq, w.inv, pos, NH=c.index_n_heads, D=c.index_head_dim, RD=rd,
-                                           ROWS=rows, num_warps=1)
-            select(w, b, icache, pos, R, T, base=base)
-    attention_core(w, L, b, R, cache, pos, q_done, base)
+        if ix is not None and not reuse:
+            glue.router(b.normed[:R], ix["wk"], b.ik[:R])
+            _ik_write[(R,)](b.ik, L.extra["ik_w"], L.extra["ik_b"], w.inv, icache, pos, 1e-6, D=c.index_head_dim,
+                            RD=rd, DCP=dcp, RANK=rank, BASE=base, ROWS=rows, num_warps=4)
+
+    side = "a" if "a" in b.side_on else "w" if "w" in b.side_on else ""   # TF_GLM53_SIDE: the key path beside
+    if side == "a":
+        with _fork(b):
+            keys(True)
+        lin(L.q_a, b, b.normed[:R], b.qa[:R])
+    else:
+        lins([L.q_a, L.kv_a], b, b.normed[:R], [b.qa[:R], b.kva[:R]])
+        if side:
+            with _fork(b):
+                keys(False)
+    glue.rmsnorm(b.qa[:R], L.q_a_norm, c.rms_norm_eps, b.qn[:R])
+    if not side:
+        keys(False)
+    q_done = False                                       # q_b run with wq_b
+    if reuse == 1 and T is not None and dcp == 1:        # the row's own key in the reused list's last slot
+        b.tok[0, c.index_topk - 1:].copy_(pos)
+    if ix is not None and T is not None and not reuse:
+        glue.router(b.normed[:R], ix["weights_proj"], b.iw[:R])
+        lins([ix["wq_b"], L.q_b], b, b.qn[:R], [b.iq[:R], b.q[:R]])   # q_b early: select leaves b.q alone
+        q_done = True
+        _iq_rope[(R, c.index_n_heads)](b.iq, w.inv, pos, NH=c.index_n_heads, D=c.index_head_dim, RD=rd,
+                                       ROWS=rows, num_warps=1)
+        _join(b)                                         # the window's index keys are in
+        select(w, b, icache, pos, R, T, base=base)
+    attention_core(w, L, b, R, cache, pos, q_done, base, side=b if side else None)
 
 
 def attention_core(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, pos: torch.Tensor,
-                   q_done: bool = False, base: torch.Tensor | None = None) -> None:
+                   q_done: bool = False, base: torch.Tensor | None = None, side: Buffers | None = None) -> None:
     """The head-sharded rest of attention for rows b.qn[:R] (selection in b.tok): q_b (unless attention_part already
     ran it grouped with wq_b), absorb, attention over the cache, expand, o_proj -> this rank's fp32 partial b.part[:R].
-    ``base``: per-row positions pos[r] and cache bases (several streams, see attention_part)."""
+    ``base``: per-row positions pos[r] and cache bases (several streams, see attention_part). ``side``: buffers whose
+    side stream still writes the window's keys (TF_GLM53_SIDE): joined before the attention kernels read the cache."""
     c = w.cfg
     H = w.heads
     lw, rd, nope = c.kv_lora_rank, c.qk_rope_head_dim, c.qk_nope_head_dim
@@ -1073,6 +1163,8 @@ def attention_core(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
         _l2pf(w, L, "o")                                 # expand's and o_proj's weights, during the attention core
     chk, kt, nw, ns = ATTN_DECODE if R <= b.small else ATTN_PROMPT
     nch = max(1, c.index_topk // chk)
+    if side is not None:
+        _join(side)                                      # the window's latents are in the cache
     if dcp > 1:
         _attention_dcp(w, b, R, cache, pos, nch, chk, kt, nw, ns)
     else:
@@ -1108,8 +1200,12 @@ def ffn_part(w: Weights, L: Layer, b: Buffers, R: int) -> None:
     if L.experts is None:
         mlp(w, L, b, R, b.part[:R])
         return
+    side = "f" in b.side_on and (not hasattr(L.experts, "prefill") or R <= b.xs.rows)
+    if side:                                             # TF_GLM53_SIDE: the shared expert beside the router and
+        with _fork(b):                                   # the routed experts (joined in experts_part)
+            mlp(w, L, b, R, b.sy[:R])
     route(w, L, b, 0, R)
-    experts_part(w, L, b, R)
+    experts_part(w, L, b, R, shared=side)
 
 
 def route(w: Weights, L: Layer, b: Buffers, r0: int, n: int) -> None:
@@ -1122,15 +1218,28 @@ def route(w: Weights, L: Layer, b: Buffers, r0: int, n: int) -> None:
                      SLOTP=triton.next_power_of_2(K + 1), NORM=c.norm_topk_prob, num_warps=4)
 
 
-def experts_part(w: Weights, L: Layer, b: Buffers, R: int) -> None:
-    """Routed experts (picks in b.pick) + the shared expert of rows b.normed[:R] -> fp32 partial b.part[:R]."""
+def experts_part(w: Weights, L: Layer, b: Buffers, R: int, shared: bool = False) -> None:
+    """Routed experts (picks in b.pick) + the shared expert of rows b.normed[:R] -> fp32 partial b.part[:R].
+    ``shared``: the shared expert is already queued on b.side (TF_GLM53_SIDE, decode windows), writing b.sy: the
+    current stream joins it right before the first launch that reads b.sy."""
     shared_impl = hasattr(L.experts, "prefill")
+    ready = (lambda: _join(b)) if shared else None
     if FOLD_SHARED and (not shared_impl or R <= b.xs.rows):
-        mlp(w, L, b, R, b.sy[:R])                        # first: its weights may still be in L2 (TF_GLM53_L2PF)
+        if not shared:
+            mlp(w, L, b, R, b.sy[:R])                    # first: its weights may still be in L2 (TF_GLM53_L2PF)
         if shared_impl:
-            L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R, sy=b.sy[:R])
+            L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R, sy=b.sy[:R], sy_ready=ready)
         else:
-            x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R, sy=b.sy[:R])
+            x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R, sy=b.sy[:R],
+                             sy_ready=ready)
+        return
+    if shared:                                           # unfolded: routed into part, then part += sy
+        if shared_impl:
+            L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R)
+        else:
+            x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R)
+        _join(b)
+        b.part[:R].add_(b.sy[:R])
         return
     if not shared_impl:
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R)
@@ -1142,10 +1251,11 @@ def experts_part(w: Weights, L: Layer, b: Buffers, R: int) -> None:
     b.part[:R].add_(b.sy[:R])
 
 
-def layer(w: Weights, L: Layer, b: Buffers, x: torch.Tensor, R: int, cache, icache, pos, T, base=None) -> None:
+def layer(w: Weights, L: Layer, b: Buffers, x: torch.Tensor, R: int, cache, icache, pos, T, base=None,
+          reuse: int = 0) -> None:
     c = w.cfg
     glue.rmsnorm(x, L.input_norm, c.rms_norm_eps, b.normed[:R])
-    glue.residual_add(x, x, attention(w, L, b, R, cache, icache, pos, T, base))
+    glue.residual_add(x, x, attention(w, L, b, R, cache, icache, pos, T, base, reuse))
     glue.rmsnorm(x, L.post_attn_norm, c.rms_norm_eps, b.normed[:R])
     glue.residual_add(x, x, ffn(w, L, b, R))
 
@@ -1209,6 +1319,12 @@ def compute(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits:
     hidden in b.hidden[:R]; logits of all rows, the last row ("last") or none. A ``Rows`` state (several streams):
     row r at st.pos[r] in the cache rows from st.base[r]. ``layers`` (lo, hi): only those layers (a prompt chunk
     paused between layers: the rows' activations wait in b.x; lo == 0 embeds, hi == every layer finishes)."""
+    with _SideWindow(b, layers is None and R <= min(b.small, MAX_ROWS)):   # TF_GLM53_SIDE: decode windows
+        _compute_pf(w, st, b, R, T, logits=logits, pick=pick, layers=layers)
+
+
+def _compute_pf(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits: str = "all",
+                pick: str = "full", layers: tuple[int, int] | None = None) -> None:
     pf = w.l2pf
     if pf is not None and layers is None and not pf.active and R <= min(b.small, pf.s.rows):
         pf.active = True                                 # TF_GLM53_L2PF: this decode window's sites prefetch
@@ -1541,11 +1657,14 @@ def sp_fits(w: Weights, b0: Buffers, b1: Buffers, R: int) -> bool:
 
 def mtp_compute(w: Weights, st: State, b: Buffers, n: int, T: int | None, *, logits: str = "last",
                 zero_first: bool = False, chain_normed: bool = False, draft_full: bool = False,
-                last: torch.Tensor | None = None) -> None:
+                last: torch.Tensor | None = None, keep_sel: bool = False, reuse: int = 0) -> None:
     """The MTP layer for rows (b.hin[:n] = the previous position's hidden, b.ids[:n] = the token) at st.mpos ..;
     its output hidden in b.hidden[:n] (raw, or shared_head-normed per MTP_CHAIN) and the last row's logits/argmax.
     A ``Rows`` state (several streams): row r at st.mpos[r] in the MTP cache rows from st.mbase[r]; ``last`` (device
-    row indices, one a stream): the rows whose picks go to b.argmax[:len(last)]."""
+    row indices, one a stream): the rows whose picks go to b.argmax[:len(last)].
+    TF_GLM53_MTP_REUSE: ``keep_sel`` (a chain's first step) leaves its last row's selection in b.tok[0] (b.cnt[0]);
+    ``reuse`` (a later one-row step, mode 1 or 2) attends it instead of selecting (attention_part). The caller reuses
+    only when that last row sat at or past index_topk (a full list of real keys)."""
     c = w.cfg
     m = w.mtp
     D = c.hidden_size
@@ -1558,7 +1677,12 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, T: int | None, *, log
     glue.router(b.mcat[:n], m.eh_proj, b.mx32[:n])
     x = b.x[:n]
     x.copy_(b.mx32[:n])
-    layer(w, m.layer, b, x, n, st.mkc, st.mic, st.mpos, T, getattr(st, "mbase", None))
+    with _SideWindow(b, n <= min(b.small, MAX_ROWS)):    # TF_GLM53_SIDE: draft and MTP refresh windows too
+        layer(w, m.layer, b, x, n, st.mkc, st.mic, st.mpos, T, getattr(st, "mbase", None), reuse)
+    if keep_sel and T is not None and n > 1:             # the chain's later steps attend this (b.tok is spent)
+        b.tok[0].copy_(b.tok[n - 1])
+        if w.dcp > 1:
+            b.cnt[0:1].copy_(b.cnt[n - 1:n])
     if chain_normed:
         glue.rmsnorm(x, m.head_norm, c.rms_norm_eps, b.hidden[:n])
     else:
