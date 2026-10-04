@@ -105,7 +105,8 @@ class Glm53Engine:
                 spans = [(rank * q, (rank + 1) * q)] + ([(V - fused.SPECIALS, V)] if rank == WORLD - 1 else [])
                 fw.set_draft_head(torch.cat([sl[a:b] for a, b in spans]).cuda(),
                                   torch.cat([torch.arange(a, b) for a, b in spans]).cuda())
-            headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH")))   # TF_GLM53_DRAFT_HEAD
+            headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH")))   # TF_GLM53_DRAFT_HEAD,
+            head = None                                  # TF_GLM53_VERIFY_HEAD (fp8 may free the bf16 share)
             if ROCE and comm.__class__.__name__ == "NCCL":
                 fast = None
                 try:
