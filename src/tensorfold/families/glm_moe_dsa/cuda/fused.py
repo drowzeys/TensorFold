@@ -96,6 +96,16 @@ def _side_letters(v: str) -> str:
 # the router and the routed experts, joined before the launch that adds its output (TF_GLM53_FOLD_SHARED: the routed
 # down + combine; else part += sy). Every kernel computes what it did on one stream: the same bits. 0: one stream.
 SIDE = _side_letters(os.environ.get("TF_GLM53_SIDE", "1"))
+# TF_GLM53_MTP_REUSE (default 2; the checkpoint's index_share_for_mtp_iteration): a draft chain's first MTP step (the
+# rows the last round kept) scores and selects; its later one-row steps attend the first step's last row's selection
+# (mtp_compute ``keep_sel`` / ``reuse``) and neither score, select nor write index keys. 1: the list's last (highest)
+# entry gives its slot to the row's own position (DCP 1; else as 2); 2: the reused list alone; 0: every step
+# selects, as before. Drafts only propose - the target verifies every token - so replies are the same in every mode.
+# A draft row's index key is never read before the next round's first step rewrites it with the target hidden: that
+# step's rows are contiguous from the first uncommitted position, and later steps reuse instead of selecting.
+MTP_REUSE = int(os.environ.get("TF_GLM53_MTP_REUSE", "2") or 0)
+if MTP_REUSE not in (0, 1, 2):
+    raise ValueError(f"TF_GLM53_MTP_REUSE={MTP_REUSE}: 0, 1 or 2")
 
 
 # ------------------------------------------------------------------------------------------------ kernels ---
@@ -1065,18 +1075,20 @@ def _join(b: Buffers) -> None:
 
 
 def attention(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
-              pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> torch.Tensor:
-    attention_part(w, L, b, R, cache, icache, pos, T, base)
+              pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None, reuse: int = 0) -> torch.Tensor:
+    attention_part(w, L, b, R, cache, icache, pos, T, base, reuse)
     _l2pf(w, L, "a")                                     # the FFN's first weights, during the all-reduce
     return gather(w, b, R)
 
 
 def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
-                   pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> None:
+                   pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None, reuse: int = 0) -> None:
     """Attention of the window's rows (b.normed): writes this layer's latent (and index key), leaves this rank's
     fp32 partial in b.part[:R]. ``T``: None while every row is below index_topk (no selection).
     ``base`` (several streams in one window): row r sits at position pos[r] of the stream whose cache rows start at
-    base[r] (int32 tables); every row keeps the bits it has alone (the per-row kernels compute the same values)."""
+    base[r] (int32 tables); every row keeps the bits it has alone (the per-row kernels compute the same values).
+    ``reuse`` (TF_GLM53_MTP_REUSE, a one-row MTP draft step after the chain's first): the row attends the selection
+    already in b.tok[0] (b.cnt[0]) - mode 1 with its own position in the last slot - and writes no index key."""
     c = w.cfg
     lw, rd = c.kv_lora_rank, c.qk_rope_head_dim
     dcp, rank = w.dcp, (w.rank if w.dcp > 1 else 0)
@@ -1084,6 +1096,8 @@ def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
     if rows and dcp > 1:
         raise ValueError("several streams in one window need decode context parallelism off (DCP 1)")
     ix = L.indexer
+    if reuse and (ix is None or R != 1 or rows):
+        raise ValueError("MTP index reuse: one-row windows of one stream on an indexer layer")
 
     def keys(kv_a: bool) -> None:
         """The window's latent and rope key (and, on indexer layers, index key) into the caches (kv_a first if asked)."""
@@ -1091,7 +1105,7 @@ def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
             lin(L.kv_a, b, b.normed[:R], b.kva[:R])      # the bits of its share of the grouped launch
         _kv_write[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd,
                         DCP=dcp, RANK=rank, BASE=base, ROWS=rows, num_warps=4)
-        if ix is not None:
+        if ix is not None and not reuse:
             glue.router(b.normed[:R], ix["wk"], b.ik[:R])
             _ik_write[(R,)](b.ik, L.extra["ik_w"], L.extra["ik_b"], w.inv, icache, pos, 1e-6, D=c.index_head_dim,
                             RD=rd, DCP=dcp, RANK=rank, BASE=base, ROWS=rows, num_warps=4)
@@ -1110,7 +1124,9 @@ def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
     if not side:
         keys(False)
     q_done = False                                       # q_b run with wq_b
-    if ix is not None and T is not None:
+    if reuse == 1 and T is not None and dcp == 1:        # the row's own key in the reused list's last slot
+        b.tok[0, c.index_topk - 1:].copy_(pos)
+    if ix is not None and T is not None and not reuse:
         glue.router(b.normed[:R], ix["weights_proj"], b.iw[:R])
         lins([ix["wq_b"], L.q_b], b, b.qn[:R], [b.iq[:R], b.q[:R]])   # q_b early: select leaves b.q alone
         q_done = True
@@ -1235,10 +1251,11 @@ def experts_part(w: Weights, L: Layer, b: Buffers, R: int, shared: bool = False)
     b.part[:R].add_(b.sy[:R])
 
 
-def layer(w: Weights, L: Layer, b: Buffers, x: torch.Tensor, R: int, cache, icache, pos, T, base=None) -> None:
+def layer(w: Weights, L: Layer, b: Buffers, x: torch.Tensor, R: int, cache, icache, pos, T, base=None,
+          reuse: int = 0) -> None:
     c = w.cfg
     glue.rmsnorm(x, L.input_norm, c.rms_norm_eps, b.normed[:R])
-    glue.residual_add(x, x, attention(w, L, b, R, cache, icache, pos, T, base))
+    glue.residual_add(x, x, attention(w, L, b, R, cache, icache, pos, T, base, reuse))
     glue.rmsnorm(x, L.post_attn_norm, c.rms_norm_eps, b.normed[:R])
     glue.residual_add(x, x, ffn(w, L, b, R))
 
@@ -1640,11 +1657,14 @@ def sp_fits(w: Weights, b0: Buffers, b1: Buffers, R: int) -> bool:
 
 def mtp_compute(w: Weights, st: State, b: Buffers, n: int, T: int | None, *, logits: str = "last",
                 zero_first: bool = False, chain_normed: bool = False, draft_full: bool = False,
-                last: torch.Tensor | None = None) -> None:
+                last: torch.Tensor | None = None, keep_sel: bool = False, reuse: int = 0) -> None:
     """The MTP layer for rows (b.hin[:n] = the previous position's hidden, b.ids[:n] = the token) at st.mpos ..;
     its output hidden in b.hidden[:n] (raw, or shared_head-normed per MTP_CHAIN) and the last row's logits/argmax.
     A ``Rows`` state (several streams): row r at st.mpos[r] in the MTP cache rows from st.mbase[r]; ``last`` (device
-    row indices, one a stream): the rows whose picks go to b.argmax[:len(last)]."""
+    row indices, one a stream): the rows whose picks go to b.argmax[:len(last)].
+    TF_GLM53_MTP_REUSE: ``keep_sel`` (a chain's first step) leaves its last row's selection in b.tok[0] (b.cnt[0]);
+    ``reuse`` (a later one-row step, mode 1 or 2) attends it instead of selecting (attention_part). The caller reuses
+    only when that last row sat at or past index_topk (a full list of real keys)."""
     c = w.cfg
     m = w.mtp
     D = c.hidden_size
@@ -1658,7 +1678,11 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, T: int | None, *, log
     x = b.x[:n]
     x.copy_(b.mx32[:n])
     with _SideWindow(b, n <= min(b.small, MAX_ROWS)):    # TF_GLM53_SIDE: draft and MTP refresh windows too
-        layer(w, m.layer, b, x, n, st.mkc, st.mic, st.mpos, T, getattr(st, "mbase", None))
+        layer(w, m.layer, b, x, n, st.mkc, st.mic, st.mpos, T, getattr(st, "mbase", None), reuse)
+    if keep_sel and T is not None and n > 1:             # the chain's later steps attend this (b.tok is spent)
+        b.tok[0].copy_(b.tok[n - 1])
+        if w.dcp > 1:
+            b.cnt[0:1].copy_(b.cnt[n - 1:n])
     if chain_normed:
         glue.rmsnorm(x, m.head_norm, c.rms_norm_eps, b.hidden[:n])
     else:
