@@ -117,3 +117,40 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## Full GLM-5.3 (`families/glm_moe_dsa`) on four DGX Sparks
+
+The tensor-parallel-4 engine for full GLM-5.3 (drowzeys, TensorFold PR #159 and its follow-ups) builds on the work
+below. Ports keep each source's license; Apache-2.0 text: `LICENSES/Apache-2.0.txt`.
+
+- **MiaAI-Lab, [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)**
+  (Apache-2.0, Copyright 2026 MiaAI-Lab). Adapted from its patches (ideas re-implemented for this family unless
+  marked as code):
+  - prompt experts (`cuda/exl3/prompt_experts.*`): its glm-prompt-kernels, glm-prompt-experts-order and
+    glm-exl3-prompt-experts designs;
+  - `cuda/exl3/experts_grouped.cuh`, `experts.cu`, `experts.py`: 16-byte non-coherent trellis loads (0047) and fused
+    decode epilogues (0016);
+  - `families/glm_moe_dsa/cuda/l2pf.cu` / `l2pf.py`: the L2 prefetch kernel of 0046, **code, unchanged**;
+  - `families/glm_moe_dsa/cuda/headq.py`: the FP8 head layout and matmul of 0002-glm-dense-fp8;
+  - `families/glm_moe_dsa/cuda/prefixes.py`: prompt-state reuse after 0008 (keep points), 0015 (shared prefixes),
+    0042 (replays with the head row) and 0063 (eviction order);
+  - `runner.py` / `dflash.py`: the stop vote of 0070, the late token stream and pinned candidate copy of 0013;
+  - `src/tensorfold/cuda/sampling.py`: the nucleus union test of 0034;
+  - `multi.py`: sealed rank messages and the watchdog of 0065; the dual-rail setup (CHANGELOG v1.3.3 #30).
+- **Jay Leaton, [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark)** (Apache-2.0,
+  Copyright 2026 Jay Leaton): MiaAI-Lab's 0046 (L2 prefetch, from its patch 0460) and 0047 (16-byte trellis loads,
+  from its patch 0580) are adapted from that project, so `l2pf.cu` and the experts' load path carry its notice too.
+- **BertholomusAI (Albert Lee), [TensorFold `glm-dsa-tp4`](https://github.com/bertholomus/TensorFold/tree/glm-dsa-tp4)**
+  and [glm-5.3-tensorfold-tp4-4xgb10](https://github.com/bertholomus/glm-5.3-tensorfold-tp4-4xgb10) (Apache-2.0,
+  Copyright 2026 Albert Lee). Ideas re-implemented for this family, no code copied: the decode side stream for the
+  key path and the shared expert (f14e7f7), MTP index reuse (b4d87ca), draft depth by acceptance (14b43b0), the draft
+  cut for concurrent rounds (145ee42), graphs captured at warm-up (4016d27) and quick fills (14b43b0).
+- **[b12x](https://github.com/local-inference-lab/b12x)** (Apache-2.0, the b12x contributors): the RoCE one-shot
+  all-reduce and all-gather used for decode windows, called as a library from the container.
+- **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (MIT, Copyright (c) 2025 Turboderp): the EXL3 format of
+  the checkpoint, read as described above.
+- **vcruz305**: the per-expert mixed-width EXL3 work the 2.75 bpw checkpoint's quantization builds on.
+
+No model weights are included. GLM-5.3 is Z.ai's (its license on the model card). The default drafter is GLM-5.3's
+own MTP layer. The optional DFlash2 drafter, `incoai/GLM-5.3-DFlash2`, is CC BY-NC-ND 4.0 (non-commercial, no
+derivatives): users download it themselves; it is never redistributed.
