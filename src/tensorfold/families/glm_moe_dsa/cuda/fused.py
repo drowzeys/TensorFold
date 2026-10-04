@@ -468,6 +468,7 @@ class Weights:
         ex = next((L.experts for L in layers if L.experts is not None), None)
         self.expert_shape = ex
         self.fast = None                 # RoceReduce for decode windows (engine sets it)
+        self.l2pf = None                 # l2pf.Prefetch: L2 prefetch in decode windows (engine installs it)
         self.tap_slot: dict[int, int] = {}   # DFlash2: target layer -> slot in Buffers.taps (engine sets it)
         self.dcp = 1                     # decode context parallelism: KV positions interleaved over the ranks
         self.vocab_off = rank * self.lm_head.shape[0]
@@ -958,9 +959,16 @@ def _attention_dcp(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, nw,
     _dcp_combine[(R, H)](orecv[o0:], lrecv[l0:], b.ol, R, ss, ssl, H=H, LW=lw, WORLD=G, num_warps=4)
 
 
+def _l2pf(w: Weights, L: Layer, name: str) -> None:
+    """TF_GLM53_L2PF: prefetch site ``name`` of layer L on the side stream (a no-op outside decode windows)."""
+    if w.l2pf is not None:
+        w.l2pf.site(L.index, name)
+
+
 def attention(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
               pos: torch.Tensor, T: int | None, base: torch.Tensor | None = None) -> torch.Tensor:
     attention_part(w, L, b, R, cache, icache, pos, T, base)
+    _l2pf(w, L, "a")                                     # the FFN's first weights, during the all-reduce
     return gather(w, b, R)
 
 
@@ -1018,6 +1026,7 @@ def attention_core(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
         _absorb[(H, lw // 32, triton.cdiv(R, rbk))](b.q, L.extra["wk"], w.inv, b.qlat, b.qrot, pos, R, H=H,
                                                     QD=nope + rd, NOPE=nope, NOPE_P=triton.next_power_of_2(nope),
                                                     RD=rd, LW=lw, BN=32, RBK=rbk, ROWS=rows, num_warps=4)
+        _l2pf(w, L, "o")                                 # expand's and o_proj's weights, during the attention core
     chk, kt, nw, ns = ATTN_DECODE if R <= b.small else ATTN_PROMPT
     nch = max(1, c.index_topk // chk)
     if dcp > 1:
@@ -1046,6 +1055,7 @@ def mlp(w: Weights, L: Layer, b: Buffers, R: int, out: torch.Tensor) -> None:
 
 def ffn(w: Weights, L: Layer, b: Buffers, R: int) -> torch.Tensor:
     ffn_part(w, L, b, R)
+    _l2pf(w, L, "f")                                     # the next layer's input projections, during the all-reduce
     return gather(w, b, R)
 
 
@@ -1144,6 +1154,19 @@ def compute(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits:
     hidden in b.hidden[:R]; logits of all rows, the last row ("last") or none. A ``Rows`` state (several streams):
     row r at st.pos[r] in the cache rows from st.base[r]. ``layers`` (lo, hi): only those layers (a prompt chunk
     paused between layers: the rows' activations wait in b.x; lo == 0 embeds, hi == every layer finishes)."""
+    pf = w.l2pf
+    if pf is not None and layers is None and not pf.active and R <= min(b.small, pf.s.rows):
+        pf.active = True                                 # TF_GLM53_L2PF: this decode window's sites prefetch
+        try:
+            return _compute(w, st, b, R, T, logits=logits, pick=pick, layers=layers)
+        finally:
+            pf.join()                                    # the side stream rejoins (inside a capture: before its end)
+            pf.active = False
+    return _compute(w, st, b, R, T, logits=logits, pick=pick, layers=layers)
+
+
+def _compute(w: Weights, st: State, b: Buffers, R: int, T: int | None, *, logits: str = "all",
+             pick: str = "full", layers: tuple[int, int] | None = None) -> None:
     lo, hi = layers or (0, len(w.layers))
     x = b.x[:R]
     if lo == 0:

@@ -131,6 +131,11 @@ class Glm53Engine:
                 print(f"[tensorfold] rank {rank}: one launch for {len(grouped)} linear groups: "
                       + ", ".join(" + ".join(f"{a}x{b}" for a, b in k) + f" {v}" for k, v in grouped.items()),
                       flush=True)
+            from . import l2pf
+
+            pf = l2pf.install(fw)                        # TF_GLM53_L2PF: after the tiles are final, before any capture
+            if pf is not None and rank == 0:
+                print(f"[tensorfold] {pf.summary()}", flush=True)
             sl = None                                    # the checkpoint reader's handles and heap: gone before
             r._open.clear()                              # the caches and buffers allocate (GB10 unified memory:
             del r                                        # host memory is device memory; a 1M cache needs it all)
