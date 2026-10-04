@@ -217,3 +217,37 @@ def test_choose_keeps_end_system_and_fork():
     other = p1[:604] + _text(rng, 3000) + [ASSISTANT, THINK]      # the same system block and <|user|>
     begin, stops, keeps = r.choose(other, True, "normed")
     assert begin == 603 and stops == [] and keeps == []  # a new conversation on the same system block
+
+
+# ---------------------------------------------------------------------------------------- concurrent streams ---
+def _slot_kept(ids, slot, head=False, ring=True):
+    e = _kept(ids, head=head)
+    e.ring = [_T(10)] if ring else None
+    e.extra["slot"] = slot
+    return e
+
+
+def test_slot_reuse_in_place_fork_and_overwrite():
+    rng = np.random.default_rng(6)
+    r = prefixes.SlotReuse(_plan(), 1 << 30, 32, False)
+    st = r.store
+    p1 = _turn1(rng)
+    p2 = p1 + [END_THINK] + _text(rng, 1500) + [USER] + _text(rng, 30) + [ASSISTANT, THINK]
+    st.lives[1] = np.asarray(p1, dtype=np.int64)
+    st.remember(_slot_kept(p1[:603], 1))
+    st.remember(_slot_kept(p1, 1, head=True, ring=False))       # an MTP stream's state: no drafter window
+    # slot 1 free: in place; a DFlash2 stream cannot take the ring-less end state, only the system block's
+    assert r.choose(p2, True, "normed", [0, 1, 2], ring=False)[:3] == (1, len(p1), -1)
+    assert r.choose(p2, True, "normed", [0, 1, 2], ring=True)[:3] == (1, 603, -1)
+    # slot 1 busy: the emptiest free slot gets a copy of slot 1's rows
+    st.remember(_slot_kept(list(range(10)), 2))
+    assert r.choose(p2, True, "normed", [0, 2], ring=False)[:3] == (0, len(p1), 1)
+    # the serial reference resumes nothing and takes the free slot used least recently (slot 1: its states are older)
+    assert r.choose(p2, False, "normed", [1, 2], ring=False)[:3] == (1, 0, -1)
+    # admitted in place at p1's end: slot 1 keeps its prefixes of p2; another prompt there drops them
+    assert r.admit(p2, 1, len(p1), -1, None).n == len(p1)
+    assert sorted(e.n for e in st.in_slot(1)) == [603, len(p1)]
+    r.filled(1, p2)
+    other = _text(rng, 50)
+    r.admit(other, 1, 0, -1, None)
+    assert st.in_slot(1) == [] and [e.n for e in st.in_slot(2)] == [10]

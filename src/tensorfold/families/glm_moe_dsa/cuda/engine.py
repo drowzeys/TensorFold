@@ -205,19 +205,17 @@ class Glm53Engine:
         self.comm.barrier()
 
     def _prompt_reuse(self):
-        """TF_GLM53_PROMPT_REUSE=1 (one stream): kept prompt states (prefixes.PromptReuse), the same settings and
-        byte budget (the ranks' least) on every rank - every rank must save and drop alike. Off with a DFlash2
-        capture (it needs every prompt row) and with --parallel > 1 (not wired into multi.py yet)."""
+        """TF_GLM53_PROMPT_REUSE=1: kept prompt states (prefixes.PromptReuse; --parallel > 1: prefixes.SlotReuse in
+        the streams' slots), the same settings and byte budget (the ranks' least) on every rank - every rank must
+        save and drop alike. Off with a DFlash2 capture (it needs every prompt row)."""
         from . import prefixes
         from .runner import CAPTURE_LABEL
 
         on = prefixes.enabled()
         cfg = prefixes.settings()
-        why = ("a DFlash2 capture needs every prompt row" if os.environ.get("TF_GLM53_CAPTURE_DIR") or CAPTURE_LABEL
-               else f"--parallel {self.parallel}: one stream only for now" if self.multi is not None else "")
-        if on and why:
+        if on and (os.environ.get("TF_GLM53_CAPTURE_DIR") or CAPTURE_LABEL):
             if self.rank == 0:
-                print(f"[tensorfold] prompt reuse off: {why}", flush=True)
+                print("[tensorfold] prompt reuse off: a DFlash2 capture needs every prompt row", flush=True)
             on = False
         budget = Runner.kept_budget(int(cfg["gib"] * 2**30)) if on else 0
         mine = torch.tensor([int(on), cfg["gap"], cfg["entries"], int(cfg["loose"]), budget >> 20], dtype=torch.int64,
@@ -237,8 +235,12 @@ class Glm53Engine:
         if self.rank == 0:
             print(f"[tensorfold] prompt reuse on: kept prompt states up to {budget / 2**30:.2f} GiB a rank and "
                   f"{cfg['entries']} entries (TF_GLM53_CACHE_GIB / _ENTRIES), keep points every >= {cfg['gap']} "
-                  f"tokens at assistant openers{' (loose: any kept prefix resumes)' if cfg['loose'] else ''}; "
+                  f"tokens at assistant openers{' (loose: any kept prefix resumes)' if cfg['loose'] else ''}"
+                  f"{'; in the streams slots, never saved out of them' if self.multi is not None else ''}; "
                   f"<|user|> {ids['user']}, <|assistant|> {ids['assistant']}, <think> {ids['think']}", flush=True)
+        if self.multi is not None:
+            self.multi.reuse = prefixes.SlotReuse(plan, budget, cfg["entries"], cfg["loose"])
+            return None                                  # the single-stream path never runs
         return prefixes.PromptReuse(self.runner, plan, budget, cfg["entries"], cfg["loose"])
 
     # ---------------------------------------------------------------------------------------------- sharing ---

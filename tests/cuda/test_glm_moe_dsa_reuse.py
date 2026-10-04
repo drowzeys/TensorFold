@@ -114,3 +114,74 @@ def test_flush_file_forgets_every_state(monkeypatch, tmp_path):
     (_, a), (warm, b), (cold, c) = run_ranks(_flush, 4)[0]
     assert a["cached"] == 0 and b["cached"] > 0 and c["cached"] == 0
     assert warm == cold
+
+
+# ---------------------------------------------------------------------------------------- concurrent streams ---
+def _admit_all(dec, items):
+    """Rank 0: items (name, prompt, tokens, sampling, draft, round it arrives at) through the decoder's rounds;
+    returns each name's tokens and the prompt tokens it found cached."""
+    from tensorfold.cuda.streams import Stream
+
+    got, streams = {}, {}
+    pending = sorted(items, key=lambda x: x[5])
+    rnd = 0
+    while pending or dec.live():
+        while pending and pending[0][5] <= rnd and dec.free:
+            name, prompt, n, s, draft, _ = pending.pop(0)
+            got[name] = []
+            st = Stream(list(prompt), n, s, draft=draft, stop_eos=False)
+            st.emit = lambda new, name=name: got[name].extend(new)
+            dec.admit(st)
+            streams[name] = st
+        dec.finish(dec.round())
+        rnd += 1
+    return {name: (got[name], streams[name].cached) for name in got}
+
+
+def _slots(rank, comm, sampling):
+    from test_glm_moe_dsa_multi import K, _sample_fn, _weights
+
+    from tensorfold.families.glm_moe_dsa.cuda.multi import GlmMultiDecoder
+    from tensorfold.families.glm_moe_dsa.cuda.prefixes import PromptPlan, SlotReuse
+    from tensorfold.families.glm_moe_dsa.cuda.runner import Runner
+
+    w = _weights(rank, 4, comm)
+    run = Runner(w, 1024 + K + 1, K, graphs=False, slots=2)
+    dec = GlmMultiDecoder(run, rank=rank, world=4, comm=comm, limit=1024, eos=tuple(w.cfg.eos_token_ids),
+                          sample=_sample_fn())
+    dec.reuse = SlotReuse(PromptPlan(USER, ASSISTANT, THINK, gap=16, system_min=8), 1 << 30, 32, False)
+    p1, p2, _ = _turns()
+    p3 = p2 + [END_THINK] + _text(np.random.default_rng(9), 40) + [USER] + _text(np.random.default_rng(10), 9) + \
+        [ASSISTANT, THINK]
+    out = None
+    if rank:
+        dec.follow()
+    else:
+        out = [_admit_all(dec, [("a", p1, 10, sampling, True, 0)]),
+               _admit_all(dec, [("b", p2, 10, sampling, True, 0)]),
+               _admit_all(dec, [("cold", p2, 10, sampling, False, 0)]),
+               _admit_all(dec, [("replay", p2, 10, sampling, True, 0)]),
+               # p3 resumes in place at p2's end; p2 sent again meanwhile replays from a copy of that busy slot
+               _admit_all(dec, [("p3", p3, 10, sampling, True, 0), ("fork", p2, 10, sampling, True, 1)]),
+               _admit_all(dec, [("p3cold", p3, 10, sampling, False, 0)])]
+        dec.stop()
+    torch.cuda.synchronize()
+    comm.barrier()
+    return out, len(p1), len(p2)
+
+
+@pytest.mark.parametrize("sampled", [False, True])
+def test_concurrent_streams_resume_in_place_and_from_busy_slots(monkeypatch, sampled):
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+
+    monkeypatch.setattr(multi, "FILL_MIN_ROWS", 0)       # resumed fills in layer steps too
+    s = Sampling(77, 0.8, 20, 0.95, 0.0) if sampled else None
+    out, n1, n2 = run_ranks(lambda r, c: _slots(r, c, s), 4)[0]
+    merged = {k: v for part in out for k, v in part.items()}
+    assert merged["a"][1] == 0
+    assert merged["b"][1] == n1                          # turn 2 in place in turn 1's slot
+    assert merged["cold"][1] == 0 and merged["b"][0] == merged["cold"][0]
+    assert merged["replay"][1] == n2 and merged["replay"][0] == merged["b"][0]
+    assert merged["p3"][1] == n2 and merged["p3"][0] == merged["p3cold"][0]
+    assert merged["fork"][1] == n2 and merged["fork"][0] == merged["b"][0]

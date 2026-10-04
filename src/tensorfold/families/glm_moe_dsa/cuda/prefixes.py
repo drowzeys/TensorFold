@@ -199,14 +199,17 @@ class KeptPrompts:
         self.entries = [x for x in self.entries if x is not e]
         e.carry = e.head = e.ring = e.rows = None
 
-    def best(self, prompt: np.ndarray, points, mode: str) -> Kept | None:
+    def best(self, prompt: np.ndarray, points, mode: str, fits=None) -> Kept | None:
         """Rank 0: the longest state ``prompt`` resumes from - a strict prefix at one of the prompt's own points
-        (any kept prefix with TF_GLM53_REUSE_LOOSE=1), or the whole prompt when it kept its head row (a replay)."""
+        (any kept prefix with TF_GLM53_REUSE_LOOSE=1), or the whole prompt when it kept its head row (a replay);
+        ``fits(e)``: what else the request needs of it."""
         L, at = len(prompt), set(points)
         best = None
         for e in self.entries:
             n = e.n
             if e.mode != mode or n > L or (best is not None and n <= best.n) or not self.usable(e):
+                continue
+            if fits is not None and not fits(e):
                 continue
             if n == L:
                 ok = e.head is not None
@@ -355,6 +358,30 @@ def mode_key(mode: str | None, default: str) -> str:
     return m.partition(":")[0].split("/")[0]
 
 
+def cut_and_keep(plan: PromptPlan, store: KeptPrompts, arr: np.ndarray, points: list[int], begin: int,
+                 resume: bool) -> tuple[list[int], list[int]]:
+    """Rank 0: a prompt resumed at ``begin``: its points past it short of its end (where its chunks are cut), and
+    the ones it keeps (n * 2 + shared; its end is kept besides): the last one (a next turn's resume point when the
+    end is not one), the system block's end, and where it stops sharing a kept state (0015), at most KEEP_MOST.
+    ``resume`` False (the serial reference): cut alike, nothing kept."""
+    L = len(arr)
+    stops = [p for p in points if begin < p < L]
+    if not resume:
+        return stops, []
+    keeps: dict[int, bool] = {}
+    if stops:
+        keeps[stops[-1]] = False
+    sp = plan.system_point(points, arr)
+    if sp is not None and begin < sp < L:
+        keeps[sp] = True
+    shared = store.longest_shared(arr)
+    fork = max((p for p in stops if p <= shared), default=None)
+    if fork is not None and fork not in keeps:
+        keeps[fork] = True
+    chosen = list(keeps.items())[:KEEP_MOST]
+    return stops, sorted(n * 2 + int(s) for n, s in chosen)
+
+
 class PromptReuse:
     """Rank 0 picks (``choose``); every rank runs (``run``) the keep / resume bookkeeping around Runner.generate."""
 
@@ -369,25 +396,11 @@ class PromptReuse:
     def choose(self, prompt: list[int], resume: bool, mode: str) -> tuple[int, list[int], list[int]]:
         """(resume point, the prompt's points past it short of its end, the ones kept: n * 2 + shared)."""
         arr = np.asarray(prompt, dtype=np.int64)
-        L = len(arr)
         points = self.plan.points(arr)
         hit = self.store.best(arr, points, mode) if resume else None
         begin = hit.n if hit is not None else 0
-        stops = [p for p in points if begin < p < L]
-        if not resume:                                   # the serial reference: cut alike, nothing resumed or kept
-            return begin, stops, []
-        keeps: dict[int, bool] = {}
-        if stops:
-            keeps[stops[-1]] = False                       # a next turn's resume point when the end is not one
-        sp = self.plan.system_point(points, arr)
-        if sp is not None and begin < sp < L:
-            keeps[sp] = True
-        shared = self.store.longest_shared(arr)
-        fork = max((p for p in stops if p <= shared), default=None)
-        if fork is not None and fork not in keeps:
-            keeps[fork] = True
-        chosen = list(keeps.items())[:KEEP_MOST]
-        return begin, stops, sorted(n * 2 + int(s) for n, s in chosen)
+        stops, keeps = cut_and_keep(self.plan, self.store, arr, points, begin, resume)
+        return begin, stops, keeps
 
     def flush_requested(self) -> bool:
         """Rank 0: a REUSE_FLUSH file next to the profile flag forgets every kept state (cold-vs-warm tests)."""
@@ -475,3 +488,128 @@ class PromptReuse:
                 store.drop(e)
                 dropped = True
         return dropped
+
+
+# ------------------------------------------------------------------------------------------ concurrent streams ---
+# --parallel N (multi.GlmMultiDecoder): a state stays in the cache rows of the slot its stream filled, valid while
+# that slot's rows still hold its ids (``SlotPrompts.lives``); a request resumes in place when that slot is free, else
+# its rows are copied into the free slot it gets (``copy_slot_rows``, rows a decoding stream never writes). States are
+# never saved out of the slots: a slot that takes another conversation forgets the states it overwrites.
+
+class SlotPrompts(KeptPrompts):
+    """Kept states in their slots (``e.extra["slot"]``); ``lives[slot]``: the ids whose rows that slot holds."""
+
+    def __init__(self, budget: int, entries: int = ENTRIES, loose: bool = False) -> None:
+        super().__init__(budget, entries, loose)
+        self.lives: dict[int, np.ndarray] = {}
+
+    def in_live(self, e: Kept) -> bool:
+        live = self.lives.get(e.extra["slot"])
+        return live is not None and e.n <= len(live) and np.array_equal(live[:e.n], e.ids)
+
+    def usable(self, e: Kept) -> bool:
+        return self.in_live(e)
+
+    def in_slot(self, slot: int) -> list[Kept]:
+        return [e for e in self.entries if e.extra["slot"] == slot]
+
+    def named_in(self, prompt: np.ndarray, n: int, slot: int) -> Kept | None:
+        return next((e for e in self.in_slot(slot)
+                     if e.n == n and self.usable(e) and np.array_equal(prompt[:n], e.ids)), None)
+
+    def overwritten_slot(self, slot: int, prompt: np.ndarray, begin: int) -> list[Kept]:
+        """The states of ``slot`` a request resumed there at ``begin`` overwrites."""
+        return [e for e in self.in_slot(slot) if not (e.n <= begin and np.array_equal(prompt[:e.n], e.ids))]
+
+
+def copy_slot_rows(st, src: int, dst: int, n: int) -> None:
+    """Slot ``src``'s cache rows of a state of n tokens into slot ``dst`` (target < n, MTP < n - 1; DCP is off with
+    slots)."""
+    a, b = src * st.local, dst * st.local
+    for t in list(st.kc) + [st.ic[i] for i in sorted(st.ic)]:
+        t[b:b + n].copy_(t[a:a + n])
+    if st.mkc is not None and n > 1:
+        for t in (st.mkc, st.mic):
+            t[b:b + n - 1].copy_(t[a:a + n - 1])
+
+
+def slot_ring_window(md, slot: int, n: int) -> list:
+    """``ring_window`` of a MultiDrafter slot's ring (rows slot * RING + p % RING of its pools)."""
+    import torch
+
+    from .dflash import RING
+
+    lo = max(0, n - md.d.window - 1)
+    if n <= lo:
+        return []
+    idx = slot * RING + torch.arange(lo, n, device=md.dev) % RING
+    return [c.index_select(1, idx) for c in md.kc] + [c.index_select(1, idx) for c in md.vc]
+
+
+def put_slot_ring_window(md, slot: int, n: int, rows: list) -> None:
+    import torch
+
+    from .dflash import RING
+
+    lo = max(0, n - md.d.window - 1)
+    if rows:
+        idx = slot * RING + torch.arange(lo, n, device=md.dev) % RING
+        for c, r in zip(list(md.kc) + list(md.vc), rows):
+            c.index_copy_(1, idx, r)
+    md.end[slot] = n
+
+
+class SlotReuse:
+    """Prompt reuse for concurrent streams: rank 0 ``choose``s the slot, the state and its points; every rank
+    ``admit``s and ``keep``s alike (multi.GlmMultiDecoder)."""
+
+    def __init__(self, plan: PromptPlan, budget: int, entries: int, loose: bool) -> None:
+        self.plan = plan
+        self.store = SlotPrompts(budget, entries, loose)
+
+    def choose(self, prompt: list[int], resume: bool, mode: str, free: list[int], ring: bool):
+        """Rank 0: (slot, resume point, source slot or -1 (in place / none), cut points, kept points). ``ring``: the
+        stream drafts with DFlash2 (a state without the drafter's window does not fit it)."""
+        arr = np.asarray(prompt, dtype=np.int64)
+        points = self.plan.points(arr)
+        st = self.store
+        hit = st.best(arr, points, mode, fits=(lambda e: e.ring is not None) if ring else None) if resume else None
+        if hit is not None and hit.extra["slot"] in free:
+            slot, src = hit.extra["slot"], -1
+        else:                                            # the free slot whose states are worth least (none first)
+            slot = min(free, key=lambda f: (max((e.tick for e in st.in_slot(f)), default=0), f))
+            src = hit.extra["slot"] if hit is not None else -1
+        begin = hit.n if hit is not None else 0
+        stops, keeps = cut_and_keep(self.plan, st, arr, points, begin, resume)
+        return slot, begin, src, stops, keeps
+
+    def admit(self, prompt: list[int], slot: int, begin: int, src: int, st) -> Kept | None:
+        """Every rank: forget the states of ``slot`` this request overwrites, bring the resumed state's rows into it
+        (copied from ``src`` unless in place); returns that state."""
+        arr = np.asarray(prompt, dtype=np.int64)
+        store = self.store
+        hit = None
+        if begin:
+            hit = store.named_in(arr, begin, src if src >= 0 else slot)
+            if hit is None:
+                raise RuntimeError(f"no kept prompt state of the {begin} tokens rank 0 resumes from in slot "
+                                   f"{src if src >= 0 else slot}")
+        for e in store.overwritten_slot(slot, arr, begin):
+            if e is not hit:
+                store.drop(e)
+        if src >= 0:
+            copy_slot_rows(st, src, slot, begin)
+        store.lives[slot] = arr[:begin]
+        if hit is not None:
+            store.touch(hit)
+        return hit
+
+    def keep(self, slot: int, ids: np.ndarray, mode: str, carry, ring, head, shared: bool) -> bool:
+        e = Kept(np.array(ids, dtype=np.int64), mode, carry=carry.clone(), ring=ring,
+                 head=head.clone() if head is not None else None, shared=shared)
+        e.extra["slot"] = slot
+        return self.store.remember(e)
+
+    def filled(self, slot: int, prompt: list[int]) -> None:
+        """Every rank: the slot's rows hold the whole prompt now."""
+        self.store.lives[slot] = np.asarray(prompt, dtype=np.int64)

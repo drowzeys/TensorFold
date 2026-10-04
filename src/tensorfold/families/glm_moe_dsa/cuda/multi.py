@@ -24,6 +24,12 @@ through the same layers and kernels (sequence-parallel, ring-overlapped or plain
 layers (the chunk's rows wait in the Runner's prompt buffers, which decode rounds never touch). A prompt filling while
 no stream decodes takes whole chunks, as alone. A DFlash2 stream's chunk feeds its drafter once the chunk is complete.
 
+Prompt reuse (TF_GLM53_PROMPT_REUSE=1, prefixes.SlotReuse): prompts are cut at their keep points (as alone), a
+stream's kept states stay in its slot's rows, and a new request resumes from one in place (that slot free) or from
+a copy of its rows into its own slot (that slot busy: a decoding stream never writes rows before its prompt's end);
+a slot taking another conversation forgets the states it overwrites. ADMIT carries the resume point and source slot,
+then rank 0's keep points.
+
 Graphs: keyed by the window's shape (rows, streams, MTP step, key bucket, pick), captured on first use; the position
 and base tables are static buffers, so one graph serves every position mix of that shape.
 
@@ -158,6 +164,7 @@ class GlmMultiDecoder:
         if self.dr is not None and runner.G.enabled:
             self.dr.capture()                     # every rank together (its passes gather over the ranks)
         self.fill_layers = FILL_LAYERS
+        self.reuse = None                         # prefixes.SlotReuse (TF_GLM53_PROMPT_REUSE=1; the engine sets it)
         self.mid_rounds = 0                       # decode rounds run while a prompt chunk was paused between layers
 
     # -------------------------------------------------------------------------------------------- messages ---
@@ -231,21 +238,51 @@ class GlmMultiDecoder:
         temp = getattr(s.sampling, "temperature", 0.0) if s.sampling is not None else 0.0
         if temp <= 0:
             s.sampling = None
-        slot = self.free.pop(0)
-        self._send([ADMIT, s.sid, slot, mode, int(s.sampling is not None), *_pack_sampling(s.sampling)])
-        self._send(list(s.prompt))
-        self._queue(s, slot, mode)
+        begin, src, stops, keeps = 0, -1, [], []
+        if self.reuse is not None:                # prompt reuse: the slot and the kept state to resume (drafted
+            from .prefixes import mode_key          # requests only: serial ones are the cold reference)
 
-    def _queue(self, s: Stream, slot: int, mode: int) -> None:
+            slot, begin, src, stops, keeps = self.reuse.choose(s.prompt, mode != SERIAL,
+                                                               mode_key(None, fused.MTP_MODE), self.free,
+                                                               self._taps(mode))
+            s.cached = begin
+        else:
+            slot = self.free[0]
+        self.free.remove(slot)
+        self._send([ADMIT, s.sid, slot, mode, int(s.sampling is not None), *_pack_sampling(s.sampling), begin, src])
+        self._send(list(s.prompt))
+        if self.reuse is not None:
+            self._send([len(stops), *stops, *keeps])
+        self._queue(s, slot, mode, begin, src, stops, keeps)
+
+    def _queue(self, s: Stream, slot: int, mode: int, begin: int = 0, src: int = -1, stops=(), keeps=()) -> None:
         s.slot, s.mode = slot, mode
-        s.chunks = self.runner.chunks(len(s.prompt))
+        L = len(s.prompt)
+        s.begin, s.named, s.carry0, s.head0 = begin, {k >> 1: bool(k & 1) for k in keeps}, None, None
+        hit = None
+        if self.reuse is not None:                # every rank: the slot's overwritten states go, the resumed rows come
+            hit = self.reuse.admit(s.prompt, slot, begin, src, self.st)
+            s.chunks = self.runner.segments(L, begin, stops) if begin < L else [(L, L)]   # (L, L): a replay
+        else:
+            s.chunks = self.runner.chunks(L)
+        if hit is not None:
+            s.carry0 = hit.carry.clone()          # restored at its first fill step (fills share the runner's carry)
+            if begin == L:
+                if hit.head is None:
+                    raise RuntimeError(f"stream {s.sid}: a replay of a kept prompt that kept no head row")
+                s.head0 = hit.head.clone()
         s.ci = 0
         s.li = 0                                  # the current chunk's next layer
         s.toks = torch.tensor(s.prompt, dtype=torch.long, device=self.w.device)
         s.ema, s.since = {"m": None, "f": None}, {"m": 0, "f": 0}
         self.samp[slot] = s.sampling
         if self.dr is not None:
-            self.dr.reset(slot)
+            if hit is not None and hit.ring is not None:
+                from .prefixes import put_slot_ring_window
+
+                put_slot_ring_window(self.dr, slot, begin, hit.ring)
+            else:
+                self.dr.reset(slot)
         self.filling.append(s)
 
     def _keeps_mtp(self, mode: int) -> bool:
@@ -282,12 +319,23 @@ class GlmMultiDecoder:
         return [s] if s.done else []
 
     def _chunk(self, s: Stream, a: int, e: int, lo: int, hi: int):
-        """Layers [lo, hi) of chunk a..e (all of them: the chunk in one go, as alone)."""
+        """Layers [lo, hi) of chunk a..e (all of them: the chunk in one go, as alone); a == e == len(prompt): a
+        replay's kept head row, nothing filled."""
         n = len(self.w.layers)
         if lo != s.li:
             raise RuntimeError(f"fill step at layer {lo}, the chunk is at layer {s.li}")
+        if lo == 0 and a == s.begin and s.carry0 is not None:   # a resumed prompt: the MTP carry at its point
+            self.runner.carry.copy_(s.carry0)
+            s.carry0 = None
+        L = len(s.prompt)
+        if a == e:
+            if a != L or s.head0 is None:
+                raise RuntimeError(f"stream {s.sid}: an empty prompt chunk {a} .. {e}")
+            s.ci += 1
+            out, s.head0 = s.head0, None
+            return out
         layers = None if (lo, hi) == (0, n) else (lo, hi)
-        out = self.runner.prefill_chunk(self.views[s.slot], s.toks, a, e, len(s.prompt), layers=layers)
+        out = self.runner.prefill_chunk(self.views[s.slot], s.toks, a, e, L, layers=layers)
         if hi < n:
             s.li = hi
             return None
@@ -295,7 +343,17 @@ class GlmMultiDecoder:
         s.ci += 1
         if self._taps(s.mode):                    # the drafter's context: this chunk's committed taps
             self.dr.commit([(s.slot, self.runner.pb.taps[:e - a])])
+        if self.reuse is not None and s.mode != SERIAL and (e in s.named or e == L):
+            self._keep(s, e, out if e == L else None)
         return out
+
+    def _keep(self, s: Stream, n: int, head) -> None:
+        """Every rank: the stream's state at prompt position n (its chunks reached n) kept in its slot."""
+        from .prefixes import mode_key, slot_ring_window
+
+        ring = slot_ring_window(self.dr, s.slot, n) if self._taps(s.mode) else None
+        self.reuse.keep(s.slot, s.prompt[:n], mode_key(None, fused.MTP_MODE), self.runner.carry, ring, head,
+                        s.named.get(n, False))
 
     def _start(self, s: Stream, tok: int) -> None:
         """Prompt done: the pending token at P = len(prompt); the MTP backlog (carry = hidden P - 1, token)."""
@@ -306,6 +364,8 @@ class GlmMultiDecoder:
             self.bh[i].copy_(self.runner.carry)
             self.bt[i:i + 1].fill_(tok)
         s.toks = None
+        if self.reuse is not None:
+            self.reuse.filled(s.slot, s.prompt)
         s.started = time.perf_counter()
         self.filling = [x for x in self.filling if x is not s]
         self.streams[s.sid] = s
@@ -626,10 +686,15 @@ class GlmMultiDecoder:
             kind = msg[0]
             if kind == ADMIT:
                 sid, slot, mode, sampled = msg[1:5]
+                begin, src = msg[18:20]
                 s = Stream(self._recv(), 1, _unpack_sampling(msg[5:18]), sid=sid)
                 s.sampled = bool(sampled)
+                stops, keeps = [], []
+                if self.reuse is not None:                   # rank 0's keep points (prefixes.SlotReuse.choose)
+                    lists = self._recv()
+                    stops, keeps = lists[1:1 + lists[0]], lists[1 + lists[0]:]
                 self.free = [x for x in self.free if x != slot]
-                self._queue(s, slot, mode)
+                self._queue(s, slot, mode, begin, src, stops, keeps)
             elif kind == FILL:
                 sid, a, e, lo, hi = msg[1:6]
                 s = next(x for x in self.filling if x.sid == sid)
