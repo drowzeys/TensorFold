@@ -561,8 +561,9 @@ class GlmMultiDecoder:
         rn, k = self.runner, self.k
         cap = rn.capacity - max(k, self.frows) - 2
         before = len(rn.G.graphs)
-        for T in rn.buckets():
-            P = 10 if T is None else min(T // 2 + 100, cap)
+        buckets = rn.buckets()
+        for i, T in enumerate(buckets):                  # P: past the previous bucket (or index_topk), so _T lands here
+            P = 10 if T is None else min((buckets[i - 1] or rn.topk) + 100, cap)
             if k and rn._T(P + k + 1) == T:
                 for S in range(1, self.N + 1):
                     for M in range(S, S * (k + 1) + 1):

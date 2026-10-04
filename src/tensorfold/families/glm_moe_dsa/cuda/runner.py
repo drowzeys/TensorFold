@@ -163,7 +163,7 @@ class Runner:
         t = 2 * self.topk
         while self.topk < self.capacity and t <= max(fused.bucket(self.capacity, self.topk) or 0, 2 * self.topk):
             buckets.append(t)
-            t *= 2
+            t = fused.bucket(t + 1, self.topk)
         return buckets
 
     @torch.no_grad()

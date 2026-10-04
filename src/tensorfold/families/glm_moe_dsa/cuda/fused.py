@@ -64,6 +64,12 @@ FAST_ROWS = 16           # windows up to this many rows reduce over RoCE (when a
 DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurrent DFlash2 rounds, 4 streams x 8 rows
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)
 SPECIALS = 128           # ... plus the vocabulary's last ids (GLM's special tokens)
+# decode index-key buckets (``bucket``): steps an octave past INDEX_FINE_FROM keys (1: powers of two, the old graphs;
+# 4: a 32K context scores 40,960 columns instead of 65,536 - same keys selected, ~2x the decode graphs)
+INDEX_SPLIT = int(os.environ.get("TF_GLM53_INDEX_SPLIT", "4"))
+INDEX_FINE_FROM = 16384
+if INDEX_SPLIT not in (1, 2, 4, 8):
+    raise ValueError(f"TF_GLM53_INDEX_SPLIT={INDEX_SPLIT}: 1, 2, 4 or 8")
 TUNE = os.environ.get("TF_GLM53_TUNE", "1") != "0"
 
 
@@ -1500,7 +1506,22 @@ def target_hidden_for_mtp(w: Weights, b: Buffers, rows: slice, out: torch.Tensor
 
 
 def bucket(t: int, topk: int) -> int | None:
-    """The indexer's key range for a window whose last row sits at t - 1: None while t <= topk, else a power of two."""
+    """The indexer's key range for a window whose last row sits at t - 1: None while t <= topk, else the power of two
+    p >= t (at least 2 topk) - or, past INDEX_FINE_FROM keys, the first of INDEX_SPLIT equal steps of the octave
+    (p / 2, p] that reaches t (TF_GLM53_INDEX_SPLIT=4: a 32,769-key window scores 40,960 columns, not 65,536).
+
+    Any range T >= t (and >= topk) selects the same keys, so the bucket only changes the work, never the bits: the
+    columns [t, T) hold keys no row of the window can see, which _index_scores packs as the int64 minimum + 1 (and
+    the radix select's 4-byte order words as 0), below every visible key. Visible keys carry their position in the
+    low word, so no two are equal: the K largest values are one set whatever the width, and torch.topk(sorted=False)
+    returns values, which select() decodes and sorts. A row with fewer than K visible keys takes padding values that
+    are all equal, so the multiset is again the same; the radix select breaks its ties by lower column, and every
+    padding column [p + 1, t) of the narrower range comes before [t, T). DCP: the same per rank, then over the
+    gathered candidates."""
     if t <= topk:
         return None
-    return max(2 * topk, 1 << (t - 1).bit_length())
+    p = max(2 * topk, 1 << (t - 1).bit_length())
+    if INDEX_SPLIT <= 1 or p <= INDEX_FINE_FROM:
+        return p
+    step = p // (2 * INDEX_SPLIT)
+    return -(-t // step) * step
