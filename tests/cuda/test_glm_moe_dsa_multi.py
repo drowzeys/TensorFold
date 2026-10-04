@@ -31,6 +31,7 @@ def _fill_in_steps(monkeypatch):
     from tensorfold.families.glm_moe_dsa.cuda import multi
 
     monkeypatch.setattr(multi, "FILL_MIN_ROWS", 0)
+    monkeypatch.setattr(multi, "BATCH_FILL", False)     # (quick fills would finish the short rests in one round)
 
 
 @pytest.fixture(autouse=True)
@@ -170,11 +171,11 @@ def _multi(rank, world, comm, w, reqs, graphs):
     phase(lambda: _cycles(dec))
     after = torch.cuda.memory_allocated()
     comm.barrier()
-    return None if rank else (outs, before, after, dec.free)
+    return None if rank else (outs, before, after, dec.free, dec.cuts)
 
 
 def _check(solo, res):
-    outs, before, after, free = res
+    outs, before, after, free, _ = res
     for sc, got in zip(SCENARIOS, outs):
         for name, _ in sc:
             assert got[name] == solo[name], f"{len(sc)} streams, request {name}: {got[name]} != alone {solo[name]}"
@@ -227,6 +228,87 @@ def test_concurrent_streams_equal_alone_graphs():
         res = _multi(0, 1, comm, w, reqs, graphs=True)
     assert len(set(map(tuple, solo.values()))) == len(solo), "degenerate replies: the check would be weak"
     _check(solo, res)
+
+
+@pytest.fixture
+def _cut_hard(monkeypatch):
+    """The draft cut from 2 streams at chain probability 0.9 (production: from 4 at 0.6), so most rounds here drop
+    drafts and close up their verify windows."""
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+
+    monkeypatch.setattr(multi, "DRAFT_CUT", 0.9)
+    monkeypatch.setattr(multi, "CUT_STREAMS", 2)
+
+
+def test_draft_cut_equal_alone_four_ranks(_cut_hard):
+    """Four ranks cutting drafts by chain probability (every rank from the same gathered numbers): every reply
+    equals its lone reply, and drafts were cut."""
+    reqs = _requests()
+
+    def run(rank, comm):
+        w = _weights(rank, 4, comm)
+        solo = _solo(w, reqs, graphs=False)
+        res = _multi(rank, 4, comm, w, reqs, graphs=False)
+        return solo, res
+
+    results = run_ranks(run, 4)
+    solo, res = results[0]
+    _check(solo, res)
+    assert res[4] > 0, "no draft was cut: the check would be weak"
+
+
+def test_draft_cut_equal_alone_graphs(_cut_hard):
+    """The cut with CUDA graphs (one thread, rank 0's quarter): the MTP steps' graphs record the cut's numbers, the
+    closed-up verify windows replay their width's graph."""
+    reqs = _requests()
+    comm = _Alone()
+    with torch.no_grad():
+        w = _weights(0, 4, comm)
+        solo = _solo(w, reqs, graphs=True)
+        res = _multi(0, 1, comm, w, reqs, graphs=True)
+    _check(solo, res)
+    assert res[4] > 0, "no draft was cut: the check would be weak"
+
+
+def test_quick_fills_burst_four_ranks():
+    """Four short prompts at once (859 rows after the first: under TF_GLM53_QUICK_ROWS): all four fill in the first
+    round and decode together from it; every reply equals its lone reply."""
+    from tensorfold.cuda.streams import Stream
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+    from tensorfold.families.glm_moe_dsa.cuda.runner import Runner
+
+    assert multi.BATCH_FILL and multi.QUICK_ROWS >= 859
+    reqs = _requests()
+    names = ["a", "b", "e", "c"]
+
+    def run(rank, comm):
+        w = _weights(rank, 4, comm)
+        solo = _solo(w, reqs, graphs=False)
+        rn = Runner(w, CAPACITY + K + 1, K, graphs=False, slots=4)
+        dec = multi.GlmMultiDecoder(rn, rank=rank, world=4, comm=comm, limit=CAPACITY,
+                                    eos=tuple(w.cfg.eos_token_ids), sample=_sample_fn())
+        got, first = {nm: [] for nm in names}, None
+        if rank:
+            dec.follow()
+        else:
+            for nm in names:
+                prompt, n, smp = reqs[nm]
+                st = Stream(list(prompt), n, smp, draft=True, stop_eos=False)
+                st.emit = lambda new, nm=nm: got[nm].extend(new)
+                dec.admit(st)
+            dec.finish(dec.round())
+            first = len(dec.streams)
+            while dec.live():
+                dec.finish(dec.round())
+            dec.stop()
+        torch.cuda.synchronize()
+        comm.barrier()
+        return solo, got, first
+
+    solo, got, first = run_ranks(run, 4)[0]
+    assert first == 4, f"{first} streams decoding after the first round (quick fills: 4)"
+    for nm in names:
+        assert got[nm] == solo[nm], f"request {nm} quick-filled: {got[nm]} != alone {solo[nm]}"
 
 
 def _engine_serve(rank, comm, reqs):

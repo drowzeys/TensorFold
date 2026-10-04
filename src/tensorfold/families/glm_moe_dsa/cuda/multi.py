@@ -33,6 +33,10 @@ then rank 0's keep points.
 Graphs: keyed by the window's shape (rows, streams, MTP step, key bucket, pick), captured on first use; the position
 and base tables are static buffers, so one graph serves every position mix of that shape.
 
+Draft cut (TF_GLM53_DRAFT_CUT, from 4 streams): the MTP chain runs at full depth, then every rank computes each
+stream's chain probability from the gathered pick logits and log-sum-exps and drops the drafts past the cut from the
+verify window before it runs (the window closes up; a dropped draft is a rejected one to the MTP cache).
+
 TP: rank 0 decides (admission, fills, rounds, arms) and samples; ranks 1..3 follow its messages - ADMIT (+ prompt),
 FILL (chunk, layer range; + the first token), ROUND (+ each stream's kept tokens), DONE - one fixed-size all-gather
 each, and run the same GPU work. DFlash2 drafts are computed on every rank from identical gathered candidates (as the one-stream path does),
@@ -48,6 +52,7 @@ patches (Apache-2.0: 0027 glm-multi-dflash2, 0029 glm-multi-dsa, 0030 glm-multi-
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 import time
@@ -133,6 +138,32 @@ FILL_LAYERS = int(os.environ.get("TF_GLM53_FILL_LAYERS", "8"))   # layers a fill
 # chunks under this many rows fill whole even while others decode: a short prompt in steps waited ~10 decode rounds
 # and queued fills stacked (4 short requests together: 4-5 s TTFT vs ~1 s whole); long chunks keep the steps
 FILL_MIN_ROWS = int(os.environ.get("TF_GLM53_FILL_MIN_ROWS", "2048"))
+# Batched short fills (after bertholomus' TensorFold 14b43b0's quick fills): after a round's fill step, queued
+# prompts whose rest fits in TF_GLM53_QUICK_ROWS rows (default 1024, together) fill to their first token before the
+# decode round instead of one prompt a round, so a burst of short requests starts decoding together (4 chats at once
+# waited up to 4 rounds for their first tokens). Each prompt takes the chunks and kernels it takes alone: the same
+# bits. TF_GLM53_BATCH_FILL=0: one fill step a round, as before.
+BATCH_FILL = os.environ.get("TF_GLM53_BATCH_FILL", "1") != "0"
+QUICK_ROWS = int(os.environ.get("TF_GLM53_QUICK_ROWS", "1024"))
+# Draft cut (after bertholomus' TensorFold 145ee42): with TF_GLM53_DRAFT_CUT_STREAMS (default 4, at least 2) or more
+# streams in a round, an MTP stream's drafts stop at the first one whose chain probability (the MTP head's softmax
+# probabilities of its drafts so far, multiplied) falls below TF_GLM53_DRAFT_CUT (default 0.6; 0: off), and a DFlash2
+# stream's chain confidence floor rises to TF_GLM53_DRAFT_CUT_DFLASH (default: the same). A concurrent round's draft
+# row costs mostly the routed experts' weight reads it adds, and what a row must earn grows with the streams (bert's
+# TP4 4 chat streams: 16.0 -> 12.1 rows a round, 66.3 -> 71.0 tok/s; at 2 streams the cut cost, so it waits for 4).
+# Drafts only propose: replies are the same. Every rank decides from the same gathered numbers.
+DRAFT_CUT = float(os.environ.get("TF_GLM53_DRAFT_CUT", "0.6") or 0)
+DRAFT_CUT_DFLASH = float(os.environ.get("TF_GLM53_DRAFT_CUT_DFLASH", "") or DRAFT_CUT)
+CUT_STREAMS = max(2, int(os.environ.get("TF_GLM53_DRAFT_CUT_STREAMS", "4") or 4))
+# Precapture (after bertholomus' TensorFold 4016d27: a burst of 4 streams after a start paid 36 captures in its first
+# rounds): prewarm also captures the round shapes it used to leave to first use - verify windows of every width with
+# both picks (the draft cut makes any width), auto streams' MTP first steps and backlog writes - from the shortest
+# contexts' key buckets up, at most TF_GLM53_PRECAPTURE_MAX (default 128) more graphs and TF_GLM53_PRECAPTURE_GB
+# (default 2) of device memory a rank, and never within 1 GiB of the cache reserve (TF_GLM53_CACHE_RESERVE_GB) on any
+# rank. 0: as before. The same graphs replay the same kernels: replies are the same.
+PRECAPTURE = os.environ.get("TF_GLM53_PRECAPTURE", "1") != "0"
+PRECAPTURE_MAX = int(os.environ.get("TF_GLM53_PRECAPTURE_MAX", "128"))
+PRECAPTURE_GB = float(os.environ.get("TF_GLM53_PRECAPTURE_GB", "2"))
 
 
 class GlmMultiDecoder:
@@ -189,6 +220,13 @@ class GlmMultiDecoder:
         self.vrows = fused.Rows(self.st, t32("vpos", R), t32("vbase", R), None, None)
         self.mrows = {j: fused.Rows(self.st, None, None, t32(f"mpos{j}", M), t32(f"mbase{j}", M))
                       for j in range(1, k + 1)}
+        # the draft cut's numbers, every MTP step's (captured with it): [0] the picked draft's logit (the gathered
+        # maximum, alike on every rank), [1] this rank's log-sum-exp over its vocabulary share
+        self.cut_on = DRAFT_CUT > 0 and k > 0
+        self.cs = torch.zeros((2, max(k, 1), N), dtype=torch.float32, device=dev)
+        self.cs_all = torch.zeros((world * max(k, 1) * N,), dtype=torch.float32, device=dev)
+        self.cuts = 0                             # drafts the cut dropped (MTP)
+        self._agree([int(self.cut_on)], "TF_GLM53_DRAFT_CUT (on/off)")     # the step graphs differ by it
         self.views = [self.st.view(s) for s in range(N)]
         self.samp: list = [None] * N               # each slot's sampling (every rank: DFlash2 chains use the seed)
         self.free = list(range(N))
@@ -245,6 +283,20 @@ class GlmMultiDecoder:
             raise RuntimeError(f"rank {self.rank}: rank 0's message {seq} ({n} ints) fails its checksum: the ranks "
                                "are out of step; restart all four")
         return out
+
+    def _agree(self, values: list[int], what: str) -> None:
+        """Every rank (startup): the same settings everywhere, or a named error (a setting that changes what a rank
+        captures or gathers would put the ranks' collectives out of step)."""
+        if self.world == 1:
+            return
+        dev = self.w.device
+        mine = torch.tensor(values, dtype=torch.long, device=dev)
+        got = torch.empty((self.world * len(values),), dtype=torch.long, device=dev)
+        self.comm.all_gather(mine, got)
+        rows = got.view(self.world, -1).tolist()
+        if any(r != rows[0] for r in rows):
+            raise RuntimeError(f"the ranks were started with different {what}: {rows}; give every rank the same "
+                               "settings")
 
     def _send(self, values: list[int]) -> None:
         if self.world > 1 and self.broken is None:
@@ -373,6 +425,23 @@ class GlmMultiDecoder:
         s.take([tok], self._ends(s))
         return [s] if s.done else []
 
+    def _quick_fills(self) -> list[Stream]:
+        """BATCH_FILL: after the round's fill step, the queued prompts whose rest fits in QUICK_ROWS rows (together)
+        fill to their first token before the decode round, oldest first, each in the chunks and kernels it takes alone
+        (one ``_fill`` a chunk: no other prompt's step comes between a prompt's chunks, as before, so the Runner's
+        prompt buffers and MTP carry stay that prompt's)."""
+        done, used = [], 0
+        while self.filling:
+            s = self.filling[0]
+            a = s.chunks[s.ci][0]
+            rest = len(s.prompt) - a
+            if used + rest > QUICK_ROWS:
+                break
+            used += rest
+            while self.filling and self.filling[0] is s:
+                done += self._fill(not any(not x.done for x in self.streams.values()))
+        return done
+
     def _chunk(self, s: Stream, a: int, e: int, lo: int, hi: int):
         """Layers [lo, hi) of chunk a..e (all of them: the chunk in one go, as alone); a == e == len(prompt): a
         replay's kept head row, nothing filled."""
@@ -482,6 +551,8 @@ class GlmMultiDecoder:
     def _round(self) -> list[Stream]:
         decoding = any(not s.done for s in self.streams.values())
         done = self._fill(not decoding) if self.filling else []
+        if BATCH_FILL:
+            done += self._quick_fills()
         live = [s for s in self.streams.values() if not s.done]
         if not live:
             return done
@@ -489,6 +560,11 @@ class GlmMultiDecoder:
             self.mid_rounds += 1
         t0 = time.perf_counter()
         depth, conf = self._dflash_cfg() if self.dr is not None else (0, 0.0)
+        cut = 0.0
+        if len(live) >= CUT_STREAMS:                     # the draft cut (rank 0's numbers in the message)
+            cut = DRAFT_CUT if self.cut_on else 0.0
+            if self.dr is not None and DRAFT_CUT_DFLASH > 0:
+                conf = max(conf, DRAFT_CUT_DFLASH)
         cap = self.runner.capacity
         plan = []
         for s in live:
@@ -496,9 +572,9 @@ class GlmMultiDecoder:
             room = (self.k if arm == ARM_M else
                     max(0, min(depth, s.count - len(s.out) - 1, cap - s.P - 1)) if arm == ARM_F else 0)
             plan.append((s.sid, s.slot, s.P, s.tok, s.m, s.mode, arm, room, int(s.sampling is not None)))
-        self._send([ROUND, len(plan), *_f64_ints(conf), *[x for item in plan for x in item]])
+        self._send([ROUND, len(plan), *_f64_ints(conf), *_f64_ints(cut), *[x for item in plan for x in item]])
         try:
-            offs, R, ds = self._gpu(plan, conf)
+            offs, R, ds = self._gpu(plan, conf, cut)
             results = self._picks(plan, live, offs, ds)
             self._send([x for n, emit in results for x in (n, len(emit), *emit)])
             self._commit(plan, offs, results)
@@ -529,9 +605,10 @@ class GlmMultiDecoder:
     def _ends(self, s: Stream) -> tuple[int, ...]:
         return self.eos if s.stop_eos else ()
 
-    def _gpu(self, plan, conf: float) -> tuple[list[int], int, list[int]]:
+    def _gpu(self, plan, conf: float, cut: float = 0.0) -> tuple[list[int], int, list[int]]:
         """Every rank: the DFlash2 drafts, the round's tables, the batched MTP chain, the verify window. Returns row
-        offsets, R and each stream's drafted rows."""
+        offsets, R and each stream's drafted rows. ``cut`` > 0: the MTP drafts past the cut leave the verify window
+        (``_cut``) before it runs."""
         w, rn, k, o = self.w, self.runner, self.k, self.off
         vb = self.vb
         drafts: dict[int, list[int]] = {}
@@ -554,12 +631,12 @@ class GlmMultiDecoder:
                 tab[o["vids"] + r + 1 + j] = t
             r += 1 + d
         R = r
-        self.widest = max(self.widest, R)
-        keep = [(item, off) for item, off in zip(plan, offs) if self._keeps_mtp(item[5])]
+        keep = [(q, item, off) for q, (item, off) in enumerate(zip(plan, offs)) if self._keeps_mtp(item[5])]
         S = M = 0
         Tm = None
+        drafting = []                                    # plan index of each MTP-drafting stream (step row order)
         if keep:
-            for (sid, slot, P, tok, m, mode, arm, room, _), off in keep:
+            for q, (sid, slot, P, tok, m, mode, arm, room, _), off in keep:
                 for i in range(m):
                     tab[o["mpos1"] + M] = P - m + i
                     tab[o["mbase1"] + M] = slot * self.local
@@ -567,6 +644,7 @@ class GlmMultiDecoder:
                     M += 1
                 if arm != ARM_M or not room:
                     continue
+                drafting.append(q)
                 tab[o["last1"] + S] = M - 1
                 tab[o["vdst1"] + S] = off + 1
                 for j in range(2, k + 1):
@@ -575,7 +653,7 @@ class GlmMultiDecoder:
                     tab[o[f"last{j}"] + S] = S
                     tab[o[f"vdst{j}"] + S] = off + j
                 S += 1
-            Tm = rn._T(max(item[2] for item, _ in keep) + k)
+            Tm = rn._T(max(item[2] for _, item, _ in keep) + k)
         self.t64.copy_(torch.tensor(tab, dtype=torch.long))
         self.t32.copy_(self.t64)
         vb.ids[:R].copy_(self.t64[o["vids"]:o["vids"] + R])
@@ -589,6 +667,9 @@ class GlmMultiDecoder:
                     self._mtp_step(j, M if j == 1 else S, S, Tm)
             else:                                        # auto streams on DFlash2 rounds: their backlog only
                 self._mtp_write(M, Tm)
+        if cut > 0 and S:
+            offs, ds, R = self._cut(plan, offs, ds, drafting, cut, R)
+        self.widest = max(self.widest, R)
         T = rn._T(max(P + 1 + d for (_, _, P, *_), d in zip(plan, ds)))
         pick = "full" if any(item[8] for item in plan) else "argmax"
         self._verify(R, T, pick)
@@ -607,10 +688,73 @@ class GlmMultiDecoder:
 
         def fn():
             fused.mtp_compute(w, rows, mb, n, Tm, chain_normed=cn, draft_full=full, last=last)
+            if self.cut_on:
+                self._draft_stats(j, S, full)
             vb.ids.index_copy_(0, vdst, mb.argmax[:S])
             mb.ids[:S].copy_(mb.argmax[:S])
             torch.index_select(mb.hidden, 0, last, out=mb.hin[:S])
         rn.G.run(("mm", n, S, j, Tm, cn, full), fn)
+
+    def _draft_stats(self, j: int, S: int, full: bool) -> None:
+        """MTP step j's S picks: their logit (the maximum the head gathered from every rank) and this rank's
+        log-sum-exp over its share of the head's vocabulary (still in mb.lpart), into self.cs[:, j - 1, :S]."""
+        w, mb = self.w, self.mb
+        from . import headq
+
+        table = w.draft_lm_head if full or w.draft_head is None else w.draft_head    # fused.head's draft table
+        V = headq.rows_of(table)
+        lg = mb.lpart.view(-1)[:S * V].view(S, V)
+        self.cs[1, j - 1, :S].copy_(torch.logsumexp(lg, dim=-1))
+        if w.world > 1:
+            g = mb.amax_all[:w.world * S * 4].view(w.world, S, 4)
+            self.cs[0, j - 1, :S].copy_(g[:, :, 0].amax(dim=0))
+        else:
+            self.cs[0, j - 1, :S].copy_(mb.amax[:S, 0])
+
+    def _cut(self, plan, offs, ds, drafting, cut: float, R: int) -> tuple[list[int], list[int], int]:
+        """Every rank, after the MTP chain: each drafting stream keeps its drafts while their chain probability stays
+        at or above ``cut``; the rest leave the verify window, which closes up (positions, bases, ids). The
+        probabilities come from numbers every rank holds alike - the gathered pick logits and every rank's
+        log-sum-exp, gathered here - so every rank cuts the same rows. Drafts only propose: the replies keep."""
+        k, N, o, vb = self.k, self.N, self.off, self.vb
+        S = len(drafting)
+        if self.world > 1:
+            self.comm.all_gather(self.cs[1].reshape(-1), self.cs_all)
+            lse = self.cs_all.view(self.world, k, N)[:, :, :S]
+        else:
+            lse = self.cs[1:2, :, :S]
+        flat = torch.cat([self.cs[0, :, :S].reshape(-1), lse.reshape(-1)]).tolist()
+        pick, parts = flat[:k * S], flat[k * S:]
+        ranks = len(parts) // (k * S)
+        new = list(ds)
+        for s, q in enumerate(drafting):
+            chain, keep = 1.0, 0
+            for j in range(min(k, ds[q])):
+                ls = [parts[r * k * S + j * S + s] for r in range(ranks)]
+                top = max(ls)
+                total = top + math.log(sum(math.exp(x - top) for x in ls))
+                chain *= math.exp(min(0.0, pick[j * S + s] - total))
+                if chain < cut:
+                    break
+                keep = j + 1
+            new[q] = keep
+        if new == list(ds):
+            return offs, ds, R
+        self.cuts += sum(ds) - sum(new)
+        src, pos, base, noffs, r = [], [], [], [], 0
+        for (sid, slot, P, *_), off, d in zip(plan, offs, new):
+            noffs.append(r)
+            for j in range(1 + d):
+                src.append(off + j)
+                pos.append(P + j)
+                base.append(slot * self.local)
+            r += 1 + d
+        t = torch.tensor(pos + base + src, dtype=torch.long).to(self.w.device)
+        for name, part in (("vpos", t[:r]), ("vbase", t[r:2 * r])):
+            self.t64[o[name]:o[name] + r].copy_(part)
+            self.t32[o[name]:o[name] + r].copy_(part)
+        vb.ids[:r].copy_(vb.ids[:R].index_select(0, t[2 * r:]))
+        return noffs, new, r
 
     def _mtp_write(self, n: int, Tm: int | None) -> None:
         """The MTP layer's cache at backlog rows only (no drafts this round)."""
@@ -679,9 +823,13 @@ class GlmMultiDecoder:
     def prewarm(self) -> None:
         """Every rank (no messages): capture the windows of 1..N MTP-drafting streams with every backlog total
         (S..S(k+1) MTP rows), and (DFlash2 loaded) verify windows of every width up to the widest, in every key
-        bucket; sampled MTP mixes capture with pick "full", other mixes on first use. Caches get scratch values at
-        the positions used; every request writes a position before reading it."""
+        bucket; sampled MTP mixes capture with pick "full"; then (TF_GLM53_PRECAPTURE) the remaining round shapes within a
+        memory and count budget (``_precapture``), other shapes on first use. Caches get scratch values at the
+        positions used; every request writes a position before reading it."""
+        self._agree([int(PRECAPTURE), PRECAPTURE_MAX, int(PRECAPTURE_GB * 1000)],
+                    "TF_GLM53_PRECAPTURE / _MAX / _GB")  # the ranks' captures pair their collectives
         t0 = time.perf_counter()
+        free0 = torch.cuda.mem_get_info()[0]
         rn, k = self.runner, self.k
         cap = rn.capacity - max(k, self.frows) - 2
         before = len(rn.G.graphs)
@@ -703,8 +851,92 @@ class GlmMultiDecoder:
                 for R in range(1, self.rows + 1):
                     self._verify(R, T, "argmax")
         torch.cuda.synchronize()
+        free1 = torch.cuda.mem_get_info()[0]
+        extra = self._precapture(buckets, cap) if PRECAPTURE and rn.G.enabled else ""
         print(f"[tensorfold] rank {self.w.rank}: {len(rn.G.graphs) - before} concurrent decode graphs captured in "
-              f"{time.perf_counter() - t0:.1f}s", flush=True)
+              f"{time.perf_counter() - t0:.1f}s ({(free0 - free1) / 2**30:.2f} GiB of device memory{extra})",
+              flush=True)
+
+    def _frees(self) -> list[int]:
+        """Every rank's free device memory (bytes), on every rank (a collective: every rank calls it together)."""
+        free = torch.cuda.mem_get_info()[0]
+        if self.world == 1:
+            return [free]
+        dev = self.w.device
+        got = torch.empty((self.world,), dtype=torch.long, device=dev)
+        self.comm.all_gather(torch.tensor([free], dtype=torch.long, device=dev), got)
+        return got.tolist()
+
+    def _scratch(self, P: int, width: int) -> None:
+        """Tables for scratch windows: verify row r in slot r // width at P + r % width; MTP backlog row i in slot
+        i // BL at P + i % BL, gathering backlog row i; drafting stream s's last MTP row s, its draft into row s.
+        Positions stay below the capacity (P <= capacity - max(k, frows) - 2)."""
+        o, R, MR, BL = self.off, self.rows, self.MR, self.BL
+        tab = torch.zeros((self.tab_n,), dtype=torch.long)
+        r = torch.arange(R)
+        tab[o["vpos"]:o["vpos"] + R] = P + r % width
+        tab[o["vbase"]:o["vbase"] + R] = (r // width) * self.local
+        if self.k:
+            i = torch.arange(MR)
+            tab[o["mpos1"]:o["mpos1"] + MR] = P + i % BL
+            tab[o["mbase1"]:o["mbase1"] + MR] = (i // BL) * self.local
+            tab[o["src"]:o["src"] + MR] = i
+            tab[o["last1"]:o["last1"] + self.N] = torch.arange(self.N)
+            tab[o["vdst1"]:o["vdst1"] + self.N] = torch.arange(self.N)
+            self.mb.ids.fill_(1000)
+            self.mb.hin.zero_()
+        self.t64.copy_(tab)
+        self.t32.copy_(self.t64)
+        self.vb.ids.fill_(1000)
+
+    def _precapture(self, buckets, cap: int) -> str:
+        """PRECAPTURE (every rank, the same keys in the same order): the round shapes prewarm leaves to first use - verify
+        windows of every width 1..rows with both picks (the draft cut, serial streams and sampled mixes make any width),
+        and with DFlash2 and MTP both loaded (auto streams), MTP first steps of S drafting streams among more keeping
+        ones and backlog-only writes - bucket by bucket from the shortest contexts, until PRECAPTURE_MAX graphs or
+        PRECAPTURE_GB of device memory on any rank, or free memory on any rank near the cache reserve (GB10's unified
+        memory: an overcommit swaps the node instead of failing). Shapes left over capture on first use, as before."""
+        rn, k, N = self.runner, self.k, self.N
+        cn, full = rn.chain_normed, rn.draft_full
+        auto = self.dr is not None and k > 0
+        t0 = time.perf_counter()
+        start = self._frees()
+        reserve = min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), min(start) / 2)
+        budget = PRECAPTURE_GB * (1 << 30)
+        made, stop, used, free = 0, "", 0, start
+        for i, T in enumerate(buckets):
+            P = 10 if T is None else min((buckets[i - 1] or rn.topk) + 100, cap)
+            items = [(("mt", R, T, pick), lambda R=R, pick=pick, T=T: self._verify(R, T, pick))
+                     for pick in ("argmax", "full") for R in range(1, self.rows + 1)]
+            if auto:
+                items += [(("mw", n, T, cn), lambda n=n, T=T: self._mtp_write(n, T)) for n in range(1, self.MR + 1)]
+                items += [(("mm", n, S, 1, T, cn, full), lambda n=n, S=S, T=T: self._mtp_step(1, n, S, T))
+                          for S in range(1, N + 1) for n in range(S, self.MR + 1)]
+            items = [(key, run) for key, run in items if key not in rn.G.graphs]
+            if not items:
+                continue
+            self._scratch(P, self.rows // N)
+            for key, run in items:
+                if made >= PRECAPTURE_MAX:
+                    stop = f"TF_GLM53_PRECAPTURE_MAX={PRECAPTURE_MAX}"
+                elif made % 8 == 0:                      # every rank at the same counts (the check is a collective)
+                    free = self._frees()
+                    used = max(a - b for a, b in zip(start, free))
+                    if used > budget:
+                        stop = f"TF_GLM53_PRECAPTURE_GB={PRECAPTURE_GB:g}"
+                    elif min(free) < reserve + (1 << 30):
+                        stop = f"{min(free) / 2**30:.1f} GiB free on a rank"
+                if stop:
+                    break
+                run()
+                made += 1
+            if stop:
+                break
+        torch.cuda.synchronize()
+        free = self._frees()
+        used = max(a - b for a, b in zip(start, free))
+        return (f"; precapture {made} more in {time.perf_counter() - t0:.1f}s, {used / 2**30:.2f} GiB on the rank that "
+                f"gave most, {min(free) / 2**30:.1f} GiB free on the tightest{'; stopped at ' + stop if stop else ''}")
 
     # ------------------------------------------------------------------------------------------- endings ---
     def finish(self, done: list[Stream]) -> None:
@@ -775,9 +1007,9 @@ class GlmMultiDecoder:
                 self._start(s, self._recv()[0])
         elif kind == ROUND:
             n = msg[1]
-            conf = _ints_f64(*msg[2:5])
-            plan = [tuple(msg[5 + ITEM * i:5 + ITEM * (i + 1)]) for i in range(n)]
-            offs, R, ds = self._gpu(plan, conf)
+            conf, cut = _ints_f64(*msg[2:5]), _ints_f64(*msg[5:8])
+            plan = [tuple(msg[8 + ITEM * i:8 + ITEM * (i + 1)]) for i in range(n)]
+            offs, R, ds = self._gpu(plan, conf, cut)
             flat = self._recv()
             results, i = [], 0
             for _ in plan:
