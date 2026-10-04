@@ -243,7 +243,7 @@ class Runner:
         self.st.pos.fill_(0)
         for T in buckets:
             for R in range(1, max(self.k + 1, self.vrows) + 1):
-                for pick in ("argmax", self._sampled_pick()):
+                for pick in dict.fromkeys(("argmax", "full", self._sampled_pick())):
                     self._verify(R, 0, T, pick)
             if self.k:
                 for m in range(1, (max(self.k + 1, self.vrows) if self.w.tap_slot else self.k + 1) + 1):
@@ -512,9 +512,12 @@ class Runner:
         return (got[:-1], got[-1] > 0) if word is not None else (got, None)
 
     # ------------------------------------------------------------------------------------------- sampling ---
-    def _sampled_pick(self) -> str:
-        """The verify head of sampled windows: "local" (``_sample_local``) unless TF_GLM53_SHARDED_SAMPLE=0 or a
-        training capture records every row's full logits ("full")."""
+    def _sampled_pick(self, sampling: Sampling | None = None) -> str:
+        """The verify head of sampled windows: "local" (``_sample_local``) for top_k draws unless
+        TF_GLM53_SHARDED_SAMPLE=0 or a training capture records every row's full logits; "full" for the rest (top_k
+        off keeps the full-logits draw: its whole-vocabulary nucleus would read whole shards a row)."""
+        if sampling is not None and not sampling.top_k:
+            return "full"
         return "local" if SHARDED and self.cap is None else "full"
 
     def _gather(self) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -593,7 +596,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
-        spick = self._sampled_pick() if sampling is not None else "full"
+        spick = self._sampled_pick(sampling) if sampling is not None else "full"
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -711,7 +714,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
-        spick = self._sampled_pick() if sampling is not None else "full"
+        spick = self._sampled_pick(sampling) if sampling is not None else "full"
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -830,7 +833,7 @@ class Runner:
         policy = depth_policy.for_runner(k)              # TF_GLM53_DEPTH_POLICY: this request's depth by acceptance
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
-        spick = self._sampled_pick() if sampling is not None else "full"
+        spick = self._sampled_pick(sampling) if sampling is not None else "full"
         while not done:
             rounds += 1
             self.profiler.begin()

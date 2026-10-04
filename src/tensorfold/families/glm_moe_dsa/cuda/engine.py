@@ -17,7 +17,6 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 import os
@@ -26,7 +25,7 @@ from ..config import Config
 from . import fused, headq
 from .model import RankModel
 from .multi import unwatch, watch
-from .runner import SHARDED, Runner
+from .runner import Runner
 from .weights import RankReader, load_layer, load_mtp
 
 WORLD = 4
@@ -280,8 +279,6 @@ class Glm53Engine:
     def _sample(self, logits: torch.Tensor, position: int, s: Sampling | None) -> int:
         if s is None or s.temperature <= 0:
             return int(torch.argmax(logits[-1]).item())
-        if not s.top_k and SHARDED:                      # the sharded verify's rule on full logits (every rank has
-            return nucleus_rows(logits[-1:], [position], s)[0]      # them): the whole reply under one top_k-off rule
         k = min(logits.shape[-1], (int(s.top_k) if s.top_k else 256) + MARGIN)
         vals, ids = torch.topk(logits[-1:].float(), k, dim=-1)
         return int(choose_rows(vals.cpu().numpy(), ids.cpu().numpy().astype(np.int64), [position], s)[0])
