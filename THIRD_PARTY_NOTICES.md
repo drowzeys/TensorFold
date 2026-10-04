@@ -135,6 +135,9 @@ below. Ports keep each source's license; Apache-2.0 text: `LICENSES/Apache-2.0.t
   - `families/glm_moe_dsa/cuda/prefixes.py`: prompt-state reuse after 0008 (keep points), 0015 (shared prefixes),
     0042 (replays with the head row) and 0063 (eviction order);
   - `runner.py` / `dflash.py`: the stop vote of 0070, the late token stream and pinned candidate copy of 0013;
+  - `families/glm_moe_dsa/cuda/copies.py` and its rounds in `runner.py`: copy (prompt-lookup) drafts after
+    0007-glm-copy-drafts and 0032-glm-code-copy-drafts (the occurrence copied, copy rounds ahead of the drafters,
+    windows padded to a captured width), with a hashed index of our own;
   - `src/tensorfold/cuda/sampling.py`: the nucleus union test of 0034;
   - `multi.py`: sealed rank messages and the watchdog of 0065; the dual-rail setup (CHANGELOG v1.3.3 #30).
 - **Jay Leaton, [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark)** (Apache-2.0,

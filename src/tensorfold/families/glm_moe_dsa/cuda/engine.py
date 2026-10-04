@@ -123,15 +123,15 @@ class Glm53Engine:
                 if rank == 0:
                     print(f"[tensorfold] decode-window reductions: {'RoCE one-shot' if fw.fast else 'NCCL'}", flush=True)
             if WORLD > 1:                                # settings that change which windows / collectives a round
-                from . import depth                      # runs: a rank on its own would hang the others
-                mine = torch.tensor([fused.MTP_REUSE, int(depth.COST * 1e6), depth.LOW, int(depth.RATE * 1e6)],
-                                    dtype=torch.int32, device="cuda")
+                from . import copies, depth              # runs: a rank on its own would hang the others
+                mine = torch.tensor([fused.MTP_REUSE, int(depth.COST * 1e6), depth.LOW, int(depth.RATE * 1e6),
+                                     *copies.SETTINGS], dtype=torch.int32, device="cuda")
                 every = torch.empty((WORLD, mine.numel()), dtype=torch.int32, device="cuda")
                 comm.all_gather(mine, every)
                 if not bool((every == every[0]).all()):
                     raise RuntimeError("the ranks were started with different TF_GLM53_MTP_REUSE / "
-                                       "TF_GLM53_DEPTH_POLICY / _MIN / _RATE (rank rows: "
-                                       f"{every.tolist()}); give every rank the same environment")
+                                       "TF_GLM53_DEPTH_POLICY / _MIN / _RATE / TF_GLM53_COPY_DRAFTS / _MIN / _MAX "
+                                       f"(rank rows: {every.tolist()}); give every rank the same environment")
             if WORLD > 1 and os.environ.get("TF_GLM53_TUNE_SHARED", "1") != "0":
                 n = fused.share_tiles(fw, comm)             # rank 0's tiles everywhere: one pick paces every layer
                 print(f"[tensorfold] rank {rank}: took rank 0's tiles ({n} of {len(fw.tunable)} linears differed)",
@@ -158,6 +158,11 @@ class Glm53Engine:
                 dcfg = json.loads((Path(dpath) / "config.json").read_text())
                 fw.tap_slot = {int(i): s for s, i in enumerate(dcfg["dflash_config"]["target_layer_ids"])}
             self.runner = Runner(fw, self.limit + self.k + 1, self.k, graphs=GRAPHS, slots=self.parallel)
+            if rank == 0 and self.runner.copy_on:
+                rn = self.runner
+                print(f"[tensorfold] copy drafts: a reply whose last {rn.copy_match} tokens occurred before verifies "
+                      f"up to {rn.copy_max} of the tokens that followed (TF_GLM53_COPY_DRAFTS / _MIN / _MAX); verify "
+                      f"windows of {rn.widths} rows", flush=True)
             if dpath:
                 from .dflash import GlmDrafter
 
@@ -301,10 +306,12 @@ class Glm53Engine:
                 watch()
                 return on_tokens(new)
 
+            drafted = reuse is None or bool(reuse[4])     # "draft": false is the serial reference: no copies
+
             def gen(begin: int = 0, stops=(), keep=None, head=None) -> dict[str, Any]:
                 return self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos,
                                             progress, k, mode, sampling=s, begin=begin, stops=stops, keep=keep,
-                                            head=head)
+                                            head=head, copies=drafted)
             self.busy_since = time.monotonic()
             watch()                                      # TF_GLM_MULTI_WATCHDOG_S: also covers the prompt's prefill
             try:

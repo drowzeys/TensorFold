@@ -22,6 +22,7 @@ import torch
 from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
+from . import copies as copy_drafts
 from . import depth as depth_policy
 from . import fused
 from .prefixes import cut_chunks, even_chunks
@@ -193,9 +194,19 @@ class Runner:
 
             self.cap = Capture(os.environ["TF_GLM53_CAPTURE_DIR"], len(w.tap_slot), w.cfg.hidden_size)
         self.vrows = max(k + 1, int(os.environ.get("TF_GLM53_VERIFY_ROWS", "8")) if w.tap_slot else 1)
-        self.vb = fused.Buffers(w, self.vrows, max(cols, 1), decode=True)       # verify windows
-        self.mb = (fused.Buffers(w, max(k + 1, self.vrows), max(cols, 1), decode=True)   # MTP windows (+ a backlog
-                   if k else None)                                                # of rows DFlash2 rounds kept)
+        # copy drafts (copies.py, TF_GLM53_COPY_*; MiaAI-Lab 0007 / 0032, Apache-2.0): up to copy_max drafts a round,
+        # in windows of the drafters' widths or of the copy widths (8 and copy_max + 1 rows; _copied pads up to them),
+        # so one or two widths more are captured - not every width up to copy_max + 1
+        on, self.copy_match, self.copy_max = copy_drafts.SETTINGS
+        self.copy_on = bool(on) and bool(k or w.tap_slot) and slots == 1     # one stream, a drafted run only
+        crows = self.copy_max + 1 if self.copy_on else 1
+        self.widths = sorted(set(range(1, max(k + 1, self.vrows) + 1))
+                             | ({min(8, crows), crows} if self.copy_on else set()))    # verify windows captured
+        self.wrows = self.widths[-1]
+        self.vb = fused.Buffers(w, self.wrows, max(cols, 1), decode=True)       # verify windows
+        # MTP windows (+ a backlog of rows DFlash2 or copied rounds kept), every width up to mrows captured
+        self.mrows = max((max(k + 1, self.vrows) if w.tap_slot else k + 1), crows)
+        self.mb = (fused.Buffers(w, max(k + 1, self.vrows, crows), max(cols, 1), decode=True) if k else None)
         self.prompt_rows = PROMPT_ROWS if w.dcp == 1 else min(PROMPT_ROWS, 1024)      # DCP: room for the long cache
         self.pb = fused.Buffers(w, self.prompt_rows, max(capacity, 1))            # prompt chunks (exact key range)
         ring = fused.PREFILL_REDUCE == "ring" and hasattr(w.comm, "all_reduce")
@@ -242,11 +253,11 @@ class Runner:
         cn, full = self.chain_normed, self.draft_full
         self.st.pos.fill_(0)
         for T in buckets:
-            for R in range(1, max(self.k + 1, self.vrows) + 1):
+            for R in self.widths:
                 for pick in dict.fromkeys(("argmax", "full", self._sampled_pick())):
                     self._verify(R, 0, T, pick)
             if self.k:
-                for m in range(1, (max(self.k + 1, self.vrows) if self.w.tap_slot else self.k + 1) + 1):
+                for m in range(1, self.mrows + 1):
                     self._mtp(m, 1, 0, T)
                 for j in range(2, self.k + 1):
                     self._mtp(1, j, 0, T)
@@ -580,7 +591,47 @@ class Runner:
             pass
         return min(self.drafter.block - 1, self.vrows - 1, int(cfg["depth"])), float(cfg["confidence"])
 
-    def _generate_auto(self, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k):
+    def _copied(self, copies: copy_drafts.CopyIndex | None, left: int, P: int) -> list[int]:
+        """This round's copy drafts (copies.py; ``copies`` None: off, []: no match): at most TF_GLM53_COPY_MAX, as
+        many as ``left`` (tokens the reply may still take past the pending one) and the cache allow, in a captured
+        window width - a proposal short of one is padded up to it by repeating its last draft (MiaAI-Lab 0032; padded
+        drafts are verified like any other) when there is room, else cut to the widest captured width below it.
+        Every rank holds the same context, so every rank proposes the same drafts and runs the same window."""
+        if copies is None:
+            return []
+        room = max(0, min(self.copy_max, left, self.capacity - P - 1))
+        drafts = copies.propose(room) if room else []
+        R = 1 + len(drafts)
+        if not drafts or R in self.widths:
+            return drafts
+        up = next(r for r in self.widths if r > R)       # the widest width is copy_max + 1 >= R
+        if up - 1 <= room:
+            return drafts + [drafts[-1]] * (up - R)
+        return drafts[:max(r for r in self.widths if r < R) - 1]
+
+    @staticmethod
+    def _copy_stats(copies, rounds: int, drafted: int, accepted: int) -> dict[str, Any]:
+        """A run's copy-draft counts (none when copy drafts were off for it)."""
+        if copies is None:
+            return {}
+        return {"copy_rounds": rounds, "copy_drafted": drafted, "copy_accepted": accepted}
+
+    def _add_taps(self, n: int) -> None:
+        """DFlash2's context: the verify window's first n (kept) rows' taps, a block at most a call - the drafter's
+        captured tap passes (a copied round keeps up to TF_GLM53_COPY_MAX + 1 rows; wider calls would run eagerly)."""
+        dr, vb = self.drafter, self.vb
+        for a in range(0, n, dr.block):
+            dr.add_taps(vb.taps[a:min(n, a + dr.block)])
+
+    def _mtp_flush(self, m: int, P: int) -> int:
+        """Write an MTP backlog of m rows (positions P - m .. P - 1) without drafting from it (its draft lands in
+        vb.ids[1], which the next window overwrites): before a copied round's rows would outgrow mb. Returns 0."""
+        if m:
+            self._mtp(m, 1, P - m, self._T(P))
+        return 0
+
+    def _generate_auto(self, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k,
+                       copies=None):
         """Each round MTP ("m") or DFlash2 ("f"), whichever has been emitting more tokens a second (EMAs of rank 0's
         round times, shared so every rank takes the same arm; a probe of the other every PROBE rounds). Both stay current: DFlash2 absorbs every round's kept taps; the MTP layer carries a
         backlog of kept rows (target hidden, next token) that its next merged call writes - flushed when it outgrows the
@@ -593,6 +644,7 @@ class Runner:
         arms = []
         m = 1                                            # backlog rows in mb.hin/ids: positions P - m .. P - 1
         rounds = drafted = accepted = 0
+        c_rounds = c_drafted = c_accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
@@ -601,17 +653,24 @@ class Runner:
         while not done:
             tr = time.perf_counter()
             rounds += 1
-            if ema["m"] is None or ema["f"] is None:
+            copied = self._copied(copies, max_tokens - len(out) - 1, P)
+            if copied:                                   # copy ("c"): neither drafter runs nor learns from the round;
+                arm = "c"                                # the MTP backlog grows, DFlash2 still takes the kept taps
+            elif ema["m"] is None or ema["f"] is None:
                 arm = "m" if ema["m"] is None else "f"
             else:
                 arm = "m" if ema["m"] >= ema["f"] else "f"
                 other = "f" if arm == "m" else "m"
                 if since[other] >= probe:
                     arm = other
-            since[arm] = 0
-            since["f" if arm == "m" else "m"] += 1
+            if arm != "c":
+                since[arm] = 0
+                since["f" if arm == "m" else "m"] += 1
             arms.append(arm)
-            if arm == "m":
+            if arm == "c":
+                R = 1 + len(copied)
+                vb.ids[:R].copy_(torch.tensor([tok] + copied, dtype=torch.long), non_blocking=True)
+            elif arm == "m":
                 room = max(0, min(k, max_tokens - len(out) - 1, self.capacity - P - 1))
                 vb.ids[:1].fill_(tok)
                 if room:
@@ -653,14 +712,13 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
-            dr.add_taps(vb.taps[:n + 1])                 # DFlash2 context: every round's kept rows
+            if copied:
+                c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + n
+            self._add_taps(n + 1)                        # DFlash2 context: every round's kept rows
             if self.cap is not None:
                 self.cap.add_taps(vb.taps[:n + 1])
             if m + n + 1 > mb.rows:                      # MTP backlog would outgrow its window: write it now
-                if m:
-                    self.st.mpos.fill_(P - m)
-                    fused.mtp_compute(w, self.st, mb, m, self._T(P), logits="none", chain_normed=self.chain_normed)
-                m = 0
+                m = self._mtp_flush(m, P)
             fused.target_hidden_for_mtp(w, vb, slice(0, n + 1), mb.hin[m:m + n + 1], self.hid_normed)
             mb.ids[m:m + n + 1].copy_(torch.tensor(emit, dtype=torch.long), non_blocking=True)
             m += n + 1
@@ -671,11 +729,15 @@ class Runner:
                     done = True
                     break
             late(out[was:])
+            if copies is not None:
+                copies.extend(out[was:])
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             P, tok = P + n + 1, emit[-1]
             dt = time.perf_counter() - tr
             round_ms.append(1e3 * dt)
+            if arm == "c":                               # every rank copied alike: no clock to share, no EMA
+                continue
             if w.world > 1:                              # rank 0's round time on every rank: the arm choice must
                 mine = torch.tensor([dt], dtype=torch.float32, device=w.device)       # be identical on all ranks
                 allt = torch.empty((w.world,), dtype=torch.float32, device=w.device)
@@ -691,11 +753,13 @@ class Runner:
                 "tokens_per_round": round((len(out) - 1) / max(rounds, 1), 3),
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
-                "round_ms": _pct(round_ms), "mtp_mode": "auto", "arms": {"m": arm_s.count("m"), "f": arm_s.count("f")},
-                "stopped": on_tokens.agreed,
+                "round_ms": _pct(round_ms), "mtp_mode": "auto", "arms": {"m": arm_s.count("m"), "f": arm_s.count("f"),
+                                                                        "c": arm_s.count("c")},
+                "stopped": on_tokens.agreed, **self._copy_stats(copies, c_rounds, c_drafted, c_accepted),
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
 
-    def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling):
+    def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling,
+                         copies=None):
         """DFlash2 rounds: the drafter proposes up to its block - 1 tokens after the pending one, the target verifies
         [pending, drafts] in one window (graph), the kept rows' taps extend the drafter's context."""
         vb, dr = self.vb, self.drafter
@@ -711,6 +775,7 @@ class Runner:
         conf = float(cfg["confidence"])
         t_draft = t_verify = t_taps = 0.0
         rounds = drafted = accepted = 0
+        c_rounds = c_drafted = c_accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
@@ -720,8 +785,12 @@ class Runner:
             tr = time.perf_counter()
             rounds += 1
             self.profiler.begin()
-            room = max(0, min(depth_max, max_tokens - len(out) - 1, self.capacity - P - 1))
-            drafts = dr.propose(tok, room, sampling, conf) if room else []
+            copied = self._copied(copies, max_tokens - len(out) - 1, P)
+            if copied:                                   # a copy round: the drafter proposes nothing (still takes taps)
+                drafts = copied
+            else:
+                room = max(0, min(depth_max, max_tokens - len(out) - 1, self.capacity - P - 1))
+                drafts = dr.propose(tok, room, sampling, conf) if room else []
             ta = time.perf_counter()
             R = 1 + len(drafts)
             vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
@@ -750,9 +819,11 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
+            if copied:
+                c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + n
             if sample is not None:
                 tb = time.perf_counter()
-            dr.add_taps(vb.taps[:n + 1])
+            self._add_taps(n + 1)
             if self.cap is not None:
                 self.cap.add_taps(vb.taps[:n + 1])
             torch.cuda.synchronize()
@@ -767,6 +838,8 @@ class Runner:
                     done = True
                     break
             late(out[was:])
+            if copies is not None:
+                copies.extend(out[was:])
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             P, tok = P + n + 1, emit[-1]
@@ -780,7 +853,7 @@ class Runner:
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "mtp_mode": "dflash", "depth": depth_max, "confidence": conf,
-                "stopped": on_tokens.agreed,
+                "stopped": on_tokens.agreed, **self._copy_stats(copies, c_rounds, c_drafted, c_accepted),
                 "ms_per_round": {k: round(1e3 * v / max(rounds, 1), 2) for k, v in
                                  (("draft", t_draft), ("verify", t_verify), ("taps", t_taps))},
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
@@ -789,12 +862,13 @@ class Runner:
     def generate(self, prompt: list[int], max_tokens: int, sample: Callable, stop: Callable[[int], bool],
                  on_tokens: Callable[[list[int]], Any], k: int, mode: str | None = None,
                  sampling=None, begin: int = 0, stops=(), keep: Callable | None = None,
-                 head: torch.Tensor | None = None) -> dict[str, Any]:
+                 head: torch.Tensor | None = None, copies: bool = True) -> dict[str, Any]:
         """sample(logits_row [1, V], position) -> token (None: greedy on the device's argmax).
         Prompt reuse (prefixes.PromptReuse): ``begin`` the kept state the caches resume at, ``stops`` the prompt's keep
         points, ``keep(n, head=None)`` called at the kept ones and at the prompt's end (with its logits row, before
         any decode round moves the drafter); ``head``: a replay of a kept whole prompt - its logits row, nothing
-        prefilled."""
+        prefilled. ``copies``: copy drafts (copies.py) in drafted runs when TF_GLM53_COPY_DRAFTS allows (the serial
+        reference, k = 0 in an MTP mode, never copies)."""
         w, vb, mb = self.w, self.vb, self.mb
         k = min(k, self.k)
         self.set_mode(mode or fused.MTP_MODE)
@@ -808,11 +882,16 @@ class Runner:
             lg = self.prefill(prompt, begin, stops, keep)
             if keep is not None:
                 keep(L0, lg)
+        cx = None                                        # the prompt's copy index: built while the GPU ends prefill
+        if copies and self.copy_on and ((self.dflash and self.drafter is not None) or (k and not self.dflash)):
+            cx = copy_drafts.CopyIndex(prompt, self.copy_match, self.copy_max)
         if self.cap is not None and sample is not None:
             self.cap.add_logits(L0 - 1, lg[0])
         tok = sample(lg, L0) if sample else int(torch.argmax(lg[0]).item())
         prefill_s = time.perf_counter() - t0
         out = [tok]
+        if cx is not None:
+            cx.extend([tok])
         on_tokens = StopVote(on_tokens)                  # rank 0's stop, heard on every rank (every rank wraps alike)
         vb.amax[:, 2].zero_()                            # a previous run's vote
         on_tokens([tok])
@@ -823,10 +902,11 @@ class Runner:
             mb.ids[:1].fill_(tok)
         if self.dflash:
             return self._generate_dflash(prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s,
-                                         sampling)
+                                         sampling, cx)
         if self.auto and k:
-            return self._generate_auto(out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k)
+            return self._generate_auto(out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k, cx)
         rounds = drafted = accepted = 0
+        c_rounds = c_drafted = c_accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         t1 = time.perf_counter()
         t_sample = t_stream = 0.0
@@ -838,16 +918,21 @@ class Runner:
             rounds += 1
             self.profiler.begin()
             tr = time.perf_counter()
-            room = max(0, min(k if policy is None else policy.depth(), max_tokens - len(out) - 1,
-                              self.capacity - P - 1))
-            vb.ids[:1].fill_(tok)
-            if room:
-                Tm = self._T(P + room)
-                ru = self._reuse(P, Tm)
-                self._mtp(m, 1, P - m, Tm)
-                for j in range(2, room + 1):
-                    self._mtp(1, j, P + j - 2, Tm, ru)
-            R = room + 1
+            copied = self._copied(cx, max_tokens - len(out) - 1, P)
+            if copied:                                   # a copy round: no MTP step; its backlog waits (m rows)
+                R = 1 + len(copied)
+                vb.ids[:R].copy_(torch.tensor([tok] + copied, dtype=torch.long), non_blocking=True)
+            else:
+                room = max(0, min(k if policy is None else policy.depth(), max_tokens - len(out) - 1,
+                                  self.capacity - P - 1))
+                vb.ids[:1].fill_(tok)
+                if room:
+                    Tm = self._T(P + room)
+                    ru = self._reuse(P, Tm)
+                    self._mtp(m, 1, P - m, Tm)
+                    for j in range(2, room + 1):
+                        self._mtp(1, j, P + j - 2, Tm, ru)
+                R = room + 1
             pick = "argmax" if sample is None else spick
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
@@ -880,7 +965,9 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
-            if policy is not None and drafts:
+            if copied:                                   # a copied round's acceptance does not move the MTP depth
+                c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + n
+            elif policy is not None and drafts:
                 policy.update(len(drafts), n)
             was = len(out)
             for e_tok in emit:
@@ -891,14 +978,20 @@ class Runner:
             ts = time.perf_counter()
             late(out[was:])                              # held until the next window is queued (or at once)
             t_stream += time.perf_counter() - ts
+            if cx is not None:
+                cx.extend(out[was:])
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             if self.cap is not None:
                 self.cap.add_taps(vb.taps[:n + 1])
             if k:                                # next round's MTP rows: (target hidden P + i, token P + i + 1)
-                m = n + 1
-                fused.target_hidden_for_mtp(w, vb, slice(0, m), mb.hin[:m], self.hid_normed)
-                mb.ids[:m].copy_(torch.tensor(emit, dtype=torch.long), non_blocking=True)
+                if not copied:                           # the round's MTP step wrote the backlog
+                    m = 0
+                elif m + n + 1 > mb.rows:                # copied rounds' backlog would outgrow its window
+                    m = self._mtp_flush(m, P)
+                fused.target_hidden_for_mtp(w, vb, slice(0, n + 1), mb.hin[m:m + n + 1], self.hid_normed)
+                mb.ids[m:m + n + 1].copy_(torch.tensor(emit, dtype=torch.long), non_blocking=True)
+                m += n + 1
             P, tok = P + n + 1, emit[-1]
             self.profiler.end()
             round_ms.append(1e3 * (time.perf_counter() - tr))
@@ -911,5 +1004,6 @@ class Runner:
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "sample_ms_per_round": round(1e3 * t_sample / max(rounds, 1), 2),
                 "stream_ms_per_round": round(1e3 * t_stream / max(rounds, 1), 2), "stopped": on_tokens.agreed,
+                **self._copy_stats(cx, c_rounds, c_drafted, c_accepted),
                 "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1),
                 **({"depths": dict(sorted(policy.depths.items()))} if policy is not None else {}), "out": out}
