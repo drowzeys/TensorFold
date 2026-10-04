@@ -23,6 +23,7 @@ from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import fused
+from .prefixes import cut_chunks, even_chunks
 
 PROMPT_ROWS = fused.PROMPT_ROWS
 PROFILE_FLAG = os.environ.get("TF_GLM53_PROFILE_FLAG", "/tf/PROFILE")      # touch it: the next PROFILE_ROUNDS traced
@@ -265,16 +266,18 @@ class Runner:
         self.draft_full = head == "full"
 
     @torch.no_grad()
-    def prefill(self, prompt: list[int]) -> torch.Tensor:
+    def prefill(self, prompt: list[int], begin: int = 0, stops=(), keep: Callable | None = None) -> torch.Tensor:
+        """``begin`` > 0: resume a kept state there (prefixes.PromptReuse restored it); ``stops``: keep points the
+        chunks end at (``segments``), ``keep(n)`` called at each with the state there."""
         flag = PROFILE_FLAG + "_PREFILL"
         if not os.path.exists(flag):
-            return self._prefill(prompt)
+            return self._prefill(prompt, begin, stops, keep)
         from torch.profiler import ProfilerActivity, profile
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
-            out = self._prefill(prompt)
+            out = self._prefill(prompt, begin, stops, keep)
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         rows = {}
@@ -296,31 +299,40 @@ class Runner:
             pass
         return out
 
-    def chunks(self, L0: int) -> list[tuple[int, int]]:
-        """A prompt's chunks (a, e): equal ones - a short remainder would read every weight again for a few rows
-        (4102 = 2 x 2051, not 4096 + 6). Concurrent fills take the same chunks, so a prompt's bits never depend on
-        what else runs."""
-        rows = self.prompt_rows
-        if L0 < 3 * rows:                                # big chunks pay only over several of them (fused.PROMPT_ROWS_SHORT)
-            rows = min(rows, fused.PROMPT_ROWS_SHORT)
-        n = -(-L0 // rows)
-        step = -(-L0 // n)
-        return [(a, min(a + step, L0)) for a in range(0, L0, step)]
+    def chunks(self, L0: int, begin: int = 0) -> list[tuple[int, int]]:
+        """A prompt's chunks (a, e) over [begin, L0): equal ones - a short remainder would read every weight again for
+        a few rows (4102 = 2 x 2051, not 4096 + 6). Concurrent fills take the same chunks, so a prompt's bits never
+        depend on what else runs. A function of (begin, L0) alone (prefixes.even_chunks)."""
+        return even_chunks(begin, L0, self.prompt_rows, fused.PROMPT_ROWS_SHORT)
 
-    def _prefill(self, prompt: list[int]) -> torch.Tensor:
-        """Every prompt row through the target (and the MTP layer); returns the last row's logits [1, vocab]."""
+    def segments(self, L0: int, begin: int = 0, stops=()) -> list[tuple[int, int]]:
+        """The chunks of [begin, L0) cut at ``stops`` (prefixes.PromptPlan's keep points): each piece chunked as a
+        prompt resumed at its start would be, so a fresh prompt and one resumed at any of its points run the same
+        chunks - their rows get the same bits although prompt chunks are not row-invariant (prefixes.cut_chunks)."""
+        return cut_chunks(begin, L0, stops, self.prompt_rows, fused.PROMPT_ROWS_SHORT)
+
+    def _prefill(self, prompt: list[int], begin: int = 0, stops=(), keep: Callable | None = None) -> torch.Tensor:
+        """Every prompt row from ``begin`` through the target (and the MTP layer); returns the last row's logits
+        [1, vocab]. ``begin`` > 0: the caches, the MTP carry and the drafter's window already hold a kept state
+        there."""
         w = self.w
         L0 = len(prompt)
         toks = torch.tensor(prompt, dtype=torch.long, device=w.device)
         logits = None
-        if self.drafter is not None:
-            self.drafter.reset()
-        if self.cap is not None:
-            self.cap.reset()
-        for a, e in self.chunks(L0):
+        if begin == 0:
+            if self.drafter is not None:
+                self.drafter.reset()
+            if self.cap is not None:
+                self.cap.reset()
+        elif self.cap is not None:
+            raise RuntimeError("a capture needs every prompt row: resuming a kept prompt state is off with it")
+        cuts = set(int(p) for p in stops if begin < p < L0)
+        for a, e in self.segments(L0, begin, cuts):
             lg = self.prefill_chunk(self.st, toks, a, e, L0, taps=True)
             if lg is not None:
                 logits = lg
+            if e in cuts and keep is not None:
+                keep(e)
         return logits
 
     @staticmethod
@@ -333,13 +345,27 @@ class Runner:
         row = len(w.layers) * (c.kv_lora_rank + c.qk_rope_head_dim) * 2         # bf16 latent rows, every layer
         need = row * local * slots
         free = torch.cuda.mem_get_info()[0]
-        spare = min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), free / 2)   # small GPUs /
-        # several ranks on one GPU (tests: four rank threads): the reserve never exceeds half of what is free
+        spare = Runner._reserve(free)
         if need > free - spare:
             fit = max(0, int((free - spare) // (row * slots)) * w.dcp)
             raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
                                f"{free / 2**30:.1f} GiB is free (keeping {spare / 2**30:.0f} GiB spare): use --context "
                                f"<= {fit} with --parallel {slots}, or fewer streams")
+
+    @staticmethod
+    def _reserve(free: int) -> float:
+        """The bytes left free for the system (TF_GLM53_CACHE_RESERVE_GB, default 6); small GPUs / several ranks on one
+        GPU (tests: four rank threads): never more than half of what is free."""
+        return min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), free / 2)
+
+    @staticmethod
+    def kept_budget(wanted: int) -> int:
+        """Bytes kept prompt states may hold on this rank (prefixes.PromptReuse): at most ``wanted``
+        (TF_GLM53_CACHE_GIB), and at most half of what is free past ``_check_cache_fits``'s reserve now - called once
+        the caches, buffers, drafter and graphs exist, so saved rows never eat into the reserve that keeps a GB10
+        from swapping (half: room for graphs captured later and torch's pool)."""
+        free = torch.cuda.mem_get_info()[0]
+        return int(max(0, min(float(wanted), (free - Runner._reserve(free)) / 2)))
 
     def _label_rows(self, toks: torch.Tensor, a: int, e: int) -> None:
         """CAPTURE_LABEL: the full logits of chunk rows a..e-1 from the last <|assistant|> on (every rank: the head
@@ -745,14 +771,26 @@ class Runner:
     @torch.no_grad()
     def generate(self, prompt: list[int], max_tokens: int, sample: Callable, stop: Callable[[int], bool],
                  on_tokens: Callable[[list[int]], Any], k: int, mode: str | None = None,
-                 sampling=None) -> dict[str, Any]:
-        """sample(logits_row [1, V], position) -> token (None: greedy on the device's argmax)."""
+                 sampling=None, begin: int = 0, stops=(), keep: Callable | None = None,
+                 head: torch.Tensor | None = None) -> dict[str, Any]:
+        """sample(logits_row [1, V], position) -> token (None: greedy on the device's argmax).
+        Prompt reuse (prefixes.PromptReuse): ``begin`` the kept state the caches resume at, ``stops`` the prompt's keep
+        points, ``keep(n, head=None)`` called at the kept ones and at the prompt's end (with its logits row, before
+        any decode round moves the drafter); ``head``: a replay of a kept whole prompt - its logits row, nothing
+        prefilled."""
         w, vb, mb = self.w, self.vb, self.mb
         k = min(k, self.k)
         self.set_mode(mode or fused.MTP_MODE)
         t0 = time.perf_counter()
         L0 = len(prompt)
-        lg = self.prefill(prompt)
+        if head is not None:
+            if begin != L0:
+                raise ValueError("a replay resumes at its prompt's end")
+            lg = head.clone()
+        else:
+            lg = self.prefill(prompt, begin, stops, keep)
+            if keep is not None:
+                keep(L0, lg)
         if self.cap is not None and sample is not None:
             self.cap.add_logits(L0 - 1, lg[0])
         tok = sample(lg, L0) if sample else int(torch.argmax(lg[0]).item())
