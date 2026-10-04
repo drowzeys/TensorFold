@@ -1090,7 +1090,8 @@ def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, ro
          mode: str = "full"):
     """Rows' next-token pick into b.argmax[:n]; "full" also leaves full fp32 logits (every rank alike) in b.logits[:n].
     "argmax": each rank's first maximum over its vocabulary share, exchanged as 16 bytes a row and resolved by lowest
-    rank - the full argmax's own choice. "draft": the same over the reduced draft vocabulary.
+    rank - the full argmax's own choice. "draft": the same over the reduced draft vocabulary. "local": only this
+    rank's share of the logits, b.lpart[:n], and no pick (the runner's sharded sample, TF_GLM53_SHARDED_SAMPLE).
     Each exchange carries one spare word a round (a stop vote, runner.StopVote; nothing here reads it): "argmax"
     b.amax[0, 2], gathered at b.amax_all[2] (rank 0's); "full" b.lflat[n * V] right behind the rows, at
     b.lgath[n * V] (rank 0's)."""
@@ -1098,6 +1099,9 @@ def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, ro
     x = x if rows is None else x[rows]
     n = x.shape[0]
     glue.rmsnorm(x, norm, c.rms_norm_eps, b.fnormed[:n])
+    if mode == "local":                                  # this rank's vocabulary share only, no exchange: the
+        glue.router(b.fnormed[:n], w.lm_head, b.lpart[:n])      # runner's sharded sample gathers its candidates
+        return b.lpart[:n]
     if mode == "full":
         V = w.lm_head.shape[0]
         glue.router(b.fnormed[:n], w.lm_head, b.lpart[:n])

@@ -16,7 +16,11 @@ import os
 import time
 from typing import Any, Callable
 
+import numpy as np
 import torch
+
+from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import fused
 
@@ -28,6 +32,9 @@ PROFILE_ROUNDS = 8
 CAPTURE_LABEL = os.environ.get("TF_GLM53_CAPTURE_LABEL", "0") == "1"
 ASSISTANT_ID = int(os.environ.get("TF_GLM53_ASSISTANT_ID", "154828"))       # GLM-5.3's <|assistant|>
 LATE_TOKENS = os.environ.get("TF_GLM53_LATE_TOKENS", "1") != "0"           # on_tokens a round late (LateTokens)
+# sampled verify windows (T > 0) from each rank's top candidates of its own vocabulary share, every row in one call
+# (Runner._sample_local); 0: every rank all-gathers the full fp32 logits and samples row by row, as before
+SHARDED = os.environ.get("TF_GLM53_SHARDED_SAMPLE", "1") != "0"
 
 
 class RoundProfiler:
@@ -94,8 +101,8 @@ class StopVote:
     run on every rank after the same round (MiaAI-Lab 0070, their issue #38; before, every rank decoded on to
     max_tokens). Only rank 0's callback wishes (followers' return None); the wish rides on a spare word of the next
     verify window's own exchange (``fused.head``: the argmax head's spare column, the word behind the full head's
-    rows), so every rank reads the same decision with no collective of its own. Only when the run ends changes,
-    never a token."""
+    rows; one word more in the sharded sample's first gather), so every rank reads the same decision with no
+    collective of its own. Only when the run ends changes, never a token."""
 
     def __init__(self, on_tokens: Callable[[list[int]], Any]) -> None:
         self.fn = on_tokens
@@ -232,7 +239,7 @@ class Runner:
         self.st.pos.fill_(0)
         for T in buckets:
             for R in range(1, max(self.k + 1, self.vrows) + 1):
-                for pick in ("argmax", "full"):
+                for pick in ("argmax", self._sampled_pick()):
                     self._verify(R, 0, T, pick)
             if self.k:
                 for m in range(1, (max(self.k + 1, self.vrows) if self.w.tap_slot else self.k + 1) + 1):
@@ -449,9 +456,10 @@ class Runner:
             vb.lflat[R * w.lm_head.shape[0]].fill_(1.0 if vote.mine else 0.0)
 
     def _vote_word(self, R: int, pick: str) -> torch.Tensor | None:
-        """After a verify window of R rows: the device word holding rank 0's vote (None: one rank)."""
+        """After a verify window of R rows: the device word holding rank 0's vote (None: one rank, or head "local",
+        whose sample reads its own)."""
         w, vb = self.w, self.vb
-        if w.world == 1:
+        if w.world == 1 or pick == "local":
             return None
         if pick == "argmax":
             return vb.amax_all[2:3]
@@ -463,6 +471,60 @@ class Runner:
         """Int tensors and the vote word in one device-to-host read: (their values, the vote or None)."""
         got = torch.cat(parts + ([word.long()] if word is not None else [])).tolist()
         return (got[:-1], got[-1] > 0) if word is not None else (got, None)
+
+    # ------------------------------------------------------------------------------------------- sampling ---
+    def _sampled_pick(self) -> str:
+        """The verify head of sampled windows: "local" (``_sample_local``) unless TF_GLM53_SHARDED_SAMPLE=0 or a
+        training capture records every row's full logits ("full")."""
+        return "local" if SHARDED and self.cap is None else "full"
+
+    def _gather(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Every rank's fp32 words [n] -> [world, n] in rank order (one rank: its own)."""
+        return one_rank if self.w.world == 1 else comm_gather(self.w.comm)
+
+    def _sample_local(self, R: int, P: int, s: Sampling, vote: StopVote, ids: torch.Tensor | None = None):
+        """A sampled verify window (head "local") without the full logits: every row at once from each rank's top
+        candidates of its own vocabulary share, gathered once (upstream glm5_next's sharded sample; MiaAI-Lab 0034).
+        top_k: each rank's top_k + MARGIN by value - they hold the window's top_k by (value, id), the only candidates
+        ``choose_rows`` keeps, so the draw is the full-logits path's bits. top_k off: ``nucleus_rows``, the whole
+        vocabulary's top_p / min_p nucleus in fixed-point mass (the full-logits path drew from the top 256 + MARGIN
+        only; its draws differ). Draws stay keyed by (seed, position, id): a verify row samples what a serial step
+        at its position would, so drafted replies equal serial ones. Rank 0's stop wish rides as one word more on
+        the first gather. ``ids``: a device int tensor read in the same transfer (the window's drafts).
+        Returns (one pick a row, the vote or None on one rank, ids' values or None)."""
+        w, vb = self.w, self.vb
+        lg = vb.lpart[:R]
+        positions = [P + i + 1 for i in range(R)]
+        wish = 1.0 if w.rank == 0 and vote.mine else 0.0
+        gather = self._gather()
+        if not s.top_k:
+            flags: list[torch.Tensor] = []
+
+            def voting(words: torch.Tensor) -> torch.Tensor:
+                if flags:
+                    return gather(words)
+                got = gather(torch.cat([words, words.new_full((1,), wish)]))
+                flags.append(got[:, -1])
+                return got[:, :-1].contiguous()
+            picks = nucleus_rows(lg, positions, s, offset=w.vocab_off, gather=voting)
+            voted = None if w.world == 1 else bool(flags[0][0].item() > 0)
+            return picks, voted, (None if ids is None else ids.tolist())
+        k = min(lg.shape[1], int(s.top_k) + MARGIN)
+        vals, cols = torch.topk(lg, k, dim=-1)
+        gids = (cols + w.vocab_off).to(torch.int32)
+        words = torch.cat([vals, gids.view(torch.float32)], dim=1).view(-1)
+        got = gather(torch.cat([words, words.new_full((1,), wish)]))          # [world, R * 2k + 1]
+        n = got.numel()
+        host = torch.cat([got.view(-1), ids.to(torch.float32)]) if ids is not None else got.view(-1)
+        host = host.cpu()                                # one device-to-host read (ids < 2^24: exact as fp32)
+        g = host[:n].view(-1, R * 2 * k + 1)
+        voted = None if w.world == 1 else bool(g[0, -1] > 0)
+        g = g[:, :-1].reshape(-1, R, 2 * k)
+        values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy()
+        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+                           dim=1).numpy().astype(np.int64)
+        extra = None if ids is None else [int(v) for v in host[n:].tolist()]
+        return choose_rows(values, tokens, positions, s), voted, extra
 
     def _dflash_cfg(self) -> tuple[int, float]:
         cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
@@ -491,6 +553,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
+        spick = self._sampled_pick() if sampling is not None else "full"
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -520,7 +583,7 @@ class Runner:
                 drafts = dr.propose(tok, room, sampling, conf) if room else []
                 R = 1 + len(drafts)
                 vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
-            pick = "argmax" if sample is None else "full"
+            pick = "argmax" if sample is None else spick
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
             late.flush()                                 # the last round's tokens, while the GPU verifies
@@ -528,6 +591,8 @@ class Runner:
             if sample is None:
                 both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
                 picks, drafts = both[:R], both[R:]
+            elif pick == "local":
+                picks, voted, drafts = self._sample_local(R, P, sampling, on_tokens, vb.ids[1:R])
             else:
                 drafts = vb.ids[1:R].tolist()
                 voted = None if word is None else float(word.item()) > 0
@@ -605,6 +670,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
+        spick = self._sampled_pick() if sampling is not None else "full"
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -615,7 +681,7 @@ class Runner:
             ta = time.perf_counter()
             R = 1 + len(drafts)
             vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
-            pick = "argmax" if sample is None else "full"
+            pick = "argmax" if sample is None else spick
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
             late.flush()                                 # the last round's tokens, while the GPU verifies
@@ -623,6 +689,8 @@ class Runner:
             if sample is None:
                 picks, voted = self._read([vb.argmax[:R]], word)
                 tb = time.perf_counter()
+            elif pick == "local":
+                picks, voted, _ = self._sample_local(R, P, sampling, on_tokens)
             else:
                 voted = None if word is None else float(word.item()) > 0
                 picks = []
@@ -708,6 +776,7 @@ class Runner:
         t_sample = t_stream = 0.0
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
+        spick = self._sampled_pick() if sampling is not None else "full"
         while not done:
             rounds += 1
             self.profiler.begin()
@@ -720,7 +789,7 @@ class Runner:
                 for j in range(2, room + 1):
                     self._mtp(1, j, P + j - 2, Tm)
             R = room + 1
-            pick = "argmax" if sample is None else "full"
+            pick = "argmax" if sample is None else spick
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
             ts = time.perf_counter()
@@ -730,6 +799,10 @@ class Runner:
             if sample is None:
                 both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
                 picks, drafts = both[:R], both[R:]
+            elif pick == "local":
+                ts = time.perf_counter()
+                picks, voted, drafts = self._sample_local(R, P, sampling, on_tokens, vb.ids[1:R])
+                t_sample += time.perf_counter() - ts
             else:
                 drafts = vb.ids[1:R].tolist()
                 voted = None if word is None else float(word.item()) > 0
