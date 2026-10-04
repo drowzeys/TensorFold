@@ -47,4 +47,9 @@ class ChatTemplate:
         kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=True,
                       enable_thinking=enable_thinking)
         kwargs.update(extra or {})
-        return self.template.render(**kwargs)
+        text = self.template.render(**kwargs)
+        # GLM-5.3's template ends every generation prompt with a bare "<think>" whatever the switch: close it when
+        # thinking is off, as server.text.render_prompt_ids does for the other server
+        if not enable_thinking and text.endswith("<think>"):
+            text += "</think>"
+        return text
