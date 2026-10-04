@@ -45,6 +45,9 @@ CAPACITY = base.CAPACITY
 def _full_depth(monkeypatch):
     monkeypatch.setenv("TF_GLM53_DFLASH_CONFIDENCE", "0")       # every DFlash2 round drafts its full depth
     monkeypatch.setenv("TF_GLM53_DFLASH_DEPTH", "7")
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+
+    monkeypatch.setattr(multi, "DRAFT_CUT_DFLASH", 0.0)          # ... also with four streams (no draft cut)
 
 
 def _weights(rank, world, comm):
