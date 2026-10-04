@@ -11,12 +11,20 @@ a prefill is reproducible at all (``TF_EXL3_PROMPT_DET=slots16``; with the defau
 resumed prompt is one valid fresh prefill, as any cold one is).
 
 What a state at n keeps (``Kept``): the target's latent and index-key rows [0, n) and the MTP layer's [0, n - 1) - left
-in the live caches, copied out only before another conversation overwrites them (``save_rows``) - the MTP carry (the
-target hidden n - 1), DFlash2's sliding window (``ring_window``: decode overwrites the ring), and at a prompt's own
-end the head's logits row, so an identical prompt samples its first token with nothing prefilled (0042-glm-prompt-
-replay). Kept points besides the end (0015-glm-shared-prefix): the system block's end, the last point short of the
-end, and where the prompt stops sharing a kept one. Past ``TF_GLM53_CACHE_ENTRIES`` or the byte budget a
-conversation's superseded shorter states go first, then the least recently used (0063-glm-kept-cap-superseded-first).
+in the live caches, copied out only before another conversation overwrites them (``save_rows``: one copy a
+conversation, its shorter states read the first rows of it) - the MTP carry (the target hidden n - 1), DFlash2's sliding
+window (``ring_window``: decode overwrites the ring), and at a prompt's own end the head's logits row, so an identical
+prompt samples its first token with nothing prefilled (0042-glm-prompt-replay). A request that rewrites a kept state's
+rows at one of its own cut points (the cold reference of the same prompt, a resume in another MTP mode) keeps that
+state again from its own rows instead of saving it (``PromptReuse.run``). Kept points besides the end
+(0015-glm-shared-prefix): the system block's end, the last point short of the end, and where the prompt stops sharing a
+kept one. Past ``TF_GLM53_CACHE_ENTRIES`` or the byte budget a conversation's superseded shorter states go first, then
+the least recently used (0063-glm-kept-cap-superseded-first).
+
+What a cold prompt (nothing resumed) pays: the chunks cut at its points (a 1-row tail chunk when it ends in
+"<|assistant|><think></think>", thinking off: its point is after <think>; a system block's own chunk), one device copy
+of the previous conversation's longest state that fits the budget (none when it fits nowhere or the new prompt rewrites
+it at its own points), and the host bookkeeping.
 
 Every rank keeps the same store: rank 0 picks the resume point and the keep points and shares them with the request;
 every rank then saves, drops and keeps alike (byte counts do not depend on the rank, the budget is the ranks' least).
@@ -161,7 +169,8 @@ class Kept:
     ring: list | None = None               # DFlash2's window before n (``ring_window``)
     head: object = None                    # at a prompt's end: the logits row its first token was sampled from
     shared: bool = False                   # a system block or fork point: outlives its conversation's turns
-    rows: list | None = None               # saved copies of the cache rows (``save_rows``)
+    rows: list | None = None               # saved copies of the cache rows (``save_rows``): views of ``saved``
+    saved: object = None                   # the ``Saved`` copy ``rows`` view (a conversation's states share one)
     tick: int = 0
     extra: dict = field(default_factory=dict)
 
@@ -170,7 +179,10 @@ class Kept:
         return len(self.ids)
 
     def held(self) -> int:
-        ts = [t for t in (self.carry, self.head) if t is not None] + list(self.ring or []) + list(self.rows or [])
+        """Bytes of this state's own tensors (a shared ``Saved`` copy is counted once, by ``KeptPrompts.held``)."""
+        ts = [t for t in (self.carry, self.head) if t is not None] + list(self.ring or [])
+        if self.saved is None:
+            ts += list(self.rows or [])
         return sum(t.numel() * t.element_size() for t in ts)
 
 
@@ -184,8 +196,11 @@ class KeptPrompts:
         self.live = np.zeros((0,), dtype=np.int64)     # the ids whose rows the live caches hold
         self.clock = 0
 
-    def held(self) -> int:
-        return sum(e.held() for e in self.entries)
+    def held(self, entries=None) -> int:
+        """Bytes ``entries`` (all states) hold: their own tensors, and each saved copy once."""
+        es = self.entries if entries is None else entries
+        copies = {id(e.saved): e.saved.nbytes for e in es if e.saved is not None}
+        return sum(e.held() for e in es) + sum(copies.values())
 
     def touch(self, e: Kept) -> None:
         self.clock += 1
@@ -197,7 +212,7 @@ class KeptPrompts:
 
     def drop(self, e: Kept) -> None:
         self.entries = [x for x in self.entries if x is not e]
-        e.carry = e.head = e.ring = e.rows = None
+        e.carry = e.head = e.ring = e.rows = e.saved = None     # a shared copy goes with its last state
 
     def best(self, prompt: np.ndarray, points, mode: str, fits=None) -> Kept | None:
         """Rank 0: the longest state ``prompt`` resumes from - a strict prefix at one of the prompt's own points
@@ -251,7 +266,7 @@ class KeptPrompts:
     def fit(self, need: int, protect=()) -> bool:
         """Drop states until ``need`` more bytes fit the budget; False (nothing dropped) when even dropping every
         unprotected state would not make room."""
-        floor = sum(e.held() for e in self.entries if any(e is p for p in protect))
+        floor = self.held([e for e in self.entries if any(e is p for p in protect)])
         if floor + need > self.budget:
             return False
         while self.held() + need > self.budget:
@@ -312,11 +327,57 @@ def row_views(st, n: int, dcp: int = 1) -> list:
 
 
 def row_bytes(st, n: int, dcp: int = 1) -> int:
-    return sum(v.numel() * v.element_size() for v in row_views(st, n, dcp))
+    """The bytes ``save_rows`` takes for a state of n tokens (``Saved``: each view's rows aligned)."""
+    return Saved.size([v.numel() * v.element_size() for v in row_views(st, n, dcp)])[0]
 
 
-def save_rows(st, e: Kept, dcp: int = 1) -> None:
-    e.rows = [v.clone() for v in row_views(st, e.n, dcp)]
+class Saved:
+    """One copy of the cache rows of a state (``row_views``) in one allocation: a single block torch's pool hands back
+    to the next copy (no cudaMalloc, no new pages on the request path), and the states of the same conversation with
+    fewer tokens (its earlier points: prefixes of the same live rows) read its first rows (``share_rows``)."""
+
+    ALIGN = 256
+
+    def __init__(self, views: list) -> None:
+        import torch
+
+        sizes = [v.numel() * v.element_size() for v in views]
+        o, offs = self.size(sizes)
+        self.nbytes = o
+        self.flat = torch.empty((max(o, 1),), dtype=torch.uint8, device=views[0].device)
+        self.parts = []
+        for v, a, b in zip(views, offs, sizes):
+            part = self.flat[a:a + b].view(v.dtype).view(v.shape)
+            part.copy_(v)
+            self.parts.append(part)
+
+    @classmethod
+    def size(cls, sizes: list[int]) -> tuple[int, list[int]]:
+        """(total bytes, each part's offset) of parts of ``sizes`` bytes, each starting ALIGN-aligned."""
+        offs, o = [], 0
+        for b in sizes:
+            offs.append(o)
+            o += -(-b // cls.ALIGN) * cls.ALIGN
+        return o, offs
+
+    def rows_for(self, views: list) -> list:
+        """The first rows of the copy that ``views`` (a shorter state's ``row_views``) cover."""
+        if len(views) != len(self.parts) or any(v.shape[0] > p.shape[0] or v.shape[1:] != p.shape[1:]
+                                                for v, p in zip(views, self.parts)):
+            raise RuntimeError("a prompt state does not fit the saved rows it would share")
+        return [p[:v.shape[0]] for p, v in zip(self.parts, views)]
+
+
+def save_rows(st, e: Kept, dcp: int = 1) -> Saved:
+    e.saved = Saved(row_views(st, e.n, dcp))
+    e.rows = e.saved.parts
+    return e.saved
+
+
+def share_rows(st, saved: Saved, e: Kept, dcp: int = 1) -> None:
+    """``e`` (a live prefix of the state ``saved`` was copied from: the same live rows) reads its rows there."""
+    e.rows = saved.rows_for(row_views(st, e.n, dcp))
+    e.saved = saved
 
 
 def load_rows(st, e: Kept, dcp: int = 1) -> None:
@@ -325,7 +386,7 @@ def load_rows(st, e: Kept, dcp: int = 1) -> None:
         raise RuntimeError("a saved prompt state's rows do not match the caches they go back to")
     for dst, src in zip(views, e.rows):
         dst.copy_(src)
-    e.rows = None                                       # live again
+    e.rows = e.saved = None                             # live again (states sharing the copy keep it)
 
 
 def ring_window(dr, n: int) -> list:
@@ -424,7 +485,10 @@ class PromptReuse:
     def run(self, prompt: list[int], begin: int, stops: list[int], keeps: list[int], flags: int, keep_end: bool,
             mode: str, gen) -> dict:
         """Take the live caches over for this prompt, restore its resume point, prefill (``gen(begin, stops, keep,
-        head)`` -> Runner.generate's stats) keeping the states rank 0 named and the prompt's end (``keep_end``)."""
+        head)`` -> Runner.generate's stats) keeping the states rank 0 named and the prompt's end (``keep_end``).
+        Kept states of this prompt's own ids at its cut points past ``begin`` (and at its end) are rewritten by it,
+        cut alike: it keeps them again from its own rows (``renew``) - neither saved nor dropped - so a cold
+        reference ("draft": false, ``keep_end`` False) of a kept prompt leaves it resumable and replayable."""
         import torch
 
         rn, store = self.runner, self.store
@@ -443,29 +507,37 @@ class PromptReuse:
         if hit is not None and hit.rows is not None:     # its saved rows replace the live ones before ``begin``:
             at = set(self.plan.points(arr))               # a live prefix keeps its bits only where it was cut alike
             same = lambda e: e.mode == hit.mode and (e.n in at or e.n == begin)    # noqa: E731
-        dropped = self._take_over(arr, begin, hit, same)
+        cut = set(int(p) for p in stops if begin < p < L) | ({L} if begin < L else set())
+        renew = [e for e in store.entries
+                 if e is not hit and e.n in cut and np.array_equal(arr[:e.n], e.ids)]
+        self._take_over(arr, begin, hit, same, renew)
         if hit is not None:
             if hit.rows is not None:
+                copy = hit.saved
                 load_rows(rn.st, hit, self.dcp)
+                for e in store.entries:                  # its shorter states that shared the copy: live again
+                    if copy is not None and e.saved is copy and e.n <= begin:
+                        e.rows = e.saved = None
             rn.carry.copy_(hit.carry)
             if rn.drafter is not None:
                 put_ring_window(rn.drafter, begin, hit.ring or [])
             store.touch(hit)
-        store.live = arr[:begin]                         # rows past it are about to change
-        if dropped:
-            torch.cuda.empty_cache()                     # GB10: freed rows back to the system, not torch's pool
+        store.live = arr[:begin]                         # rows past it are about to change (a failed request: the
+        self._trim()                                     # states past ``begin`` stay unusable, ``usable``)
         named = {k >> 1: bool(k & 1) for k in keeps}
+        renewed = {e.n: e.shared for e in renew}
         added: list[int] = []
 
         def keep(n: int, head=None) -> None:
-            if n < L and n not in named:
+            if n < L and n not in named and n not in renewed:
                 return
-            if n == L and not keep_end:
+            if n == L and not keep_end and n not in renewed:
                 return
             e = Kept(arr[:n].copy(), mode, carry=rn.carry.clone(),
                      ring=ring_window(rn.drafter, n) if rn.drafter is not None else None,
-                     head=head.clone() if head is not None and n == L else None, shared=named.get(n, False))
-            if store.remember(e, protect=(hit,) if hit is not None else ()):
+                     head=head.clone() if head is not None and n == L else None,
+                     shared=named.get(n, False) or renewed.get(n, False))
+            if store.remember(e, protect=(hit,) if hit is not None else ()):    # replaces a state of the same ids
                 added.append(n)
 
         replay = hit is not None and begin == L
@@ -477,26 +549,50 @@ class PromptReuse:
             stats["replay"] = True
         return stats
 
-    def _take_over(self, arr: np.ndarray, begin: int, hit: Kept | None, same=None) -> bool:
-        """Save (within the budget) or drop the live states this request overwrites; True when any were dropped."""
-        store = self.store
+    def _take_over(self, arr: np.ndarray, begin: int, hit: Kept | None, same=None, renew=()) -> bool:
+        """The live states this request overwrites (but ``renew``s): every one is a prefix of the live ids, so they
+        are one conversation's - the longest one that fits the budget is copied out once (``save_rows``) and the
+        shorter ones read their rows from that copy (``share_rows``); longer ones that do not fit are dropped, as are
+        states whose rows are no longer live. At most one copy a request; none when the request resumes past every
+        live state or rewrites them at its own cut points. True when any state was dropped."""
+        store, st = self.store, self.runner.st
         dropped = False
+        chain = []
         for e in store.overwritten(arr, begin, same):
-            if e not in store.entries:                   # dropped making room for a newer one
+            if e is hit or any(e is r for r in renew):
                 continue
-            if e is hit:
-                continue
-            if not store.in_live(e):
+            if store.in_live(e):
+                chain.append(e)
+            else:
                 store.drop(e)
                 dropped = True
+        copy = None
+        for e in sorted(chain, key=lambda x: -x.n):
+            if e not in store.entries:                   # dropped making room for the copy
                 continue
-            need = row_bytes(self.runner.st, e.n, self.dcp)
-            if store.fit(need, protect=tuple(x for x in (hit, e) if x is not None)):
-                save_rows(self.runner.st, e, self.dcp)
+            if copy is not None:
+                share_rows(st, copy, e, self.dcp)
+                continue
+            need = row_bytes(st, e.n, self.dcp)
+            if store.fit(need, protect=tuple(x for x in (hit, e) if x is not None) + tuple(renew)):
+                copy = save_rows(st, e, self.dcp)
             else:
                 store.drop(e)
                 dropped = True
         return dropped
+
+    def _trim(self) -> None:
+        """Dropped copies stay in torch's pool, which hands them to the next copy (a cudaMalloc of GiBs maps fresh
+        pages of GB10's unified memory, and the empty_cache it took before synchronized the device and also gave back
+        the prompt path's scratch, every request); the pool gives them back to the system only when what it holds
+        unused passes the kept-state budget (so kept + idle stays within about twice the budget, which
+        ``Runner.kept_budget`` sized to half of what is free past the reserve)."""
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        if torch.cuda.memory_reserved() - torch.cuda.memory_allocated() > max(self.store.budget, 1 << 30):
+            torch.cuda.empty_cache()
 
 
 # ------------------------------------------------------------------------------------------ concurrent streams ---

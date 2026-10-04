@@ -265,3 +265,143 @@ def test_loaded_rows_keep_only_prefixes_cut_alike():
     assert s.overwritten(prompt, 100) == []
     gone = s.overwritten(prompt, 100, same=lambda e: e.n in {20})
     assert [e.n for e in gone] == [50]
+
+
+# ----------------------------------------------------------------------- one stream: copies and renewed states ---
+class _CpuRows:
+    """A one-stream Runner's caches on the host: what prefixes.row_views reads (kc, ic, mkc, mic)."""
+
+    def __init__(self, torch, cap=512):
+        self.kc = [torch.zeros((cap, 8), dtype=torch.float32) for _ in range(2)]
+        self.ic = {0: torch.zeros((cap, 4), dtype=torch.float32), 1: torch.zeros((cap, 4), dtype=torch.float32)}
+        self.mkc = torch.zeros((cap, 8), dtype=torch.float32)
+        self.mic = torch.zeros((cap, 4), dtype=torch.float32)
+
+
+class _CpuRunner:
+    def __init__(self, torch):
+        from types import SimpleNamespace
+
+        self.torch = torch
+        self.st = _CpuRows(torch)
+        self.carry = torch.zeros((8,), dtype=torch.float32)
+        self.drafter = None
+        self.w = SimpleNamespace(rank=0, dcp=1)
+        self.prefilled = []                               # rows each request ran
+
+    def gen(self, prompt, salt):
+        """Runner.generate as prefixes.PromptReuse.run drives it: rows [begin, L) cut at the stops (each row's
+        value: its token and the request's salt), keep(n) at each cut, keep(L, logits) at the end; a replay runs
+        nothing."""
+        torch = self.torch
+        arr = np.asarray(prompt, dtype=np.int64)
+        L = len(arr)
+
+        def gen(begin, stops, keep, head):
+            if head is not None:
+                self.prefilled.append(0)
+                return {"out": []}
+            cuts = sorted(set(int(p) for p in stops if begin < p < L))
+            a = begin
+            for e in cuts + [L]:
+                vals = torch.as_tensor((arr[a:e] % 997 + 1000 * salt).astype(np.float32))[:, None]
+                for t in self.st.kc + [self.st.ic[i] for i in sorted(self.st.ic)] + [self.st.mkc, self.st.mic]:
+                    t[a:e] = vals
+                self.carry.fill_(float(arr[e - 1] % 997 + 1000 * salt))
+                if e < L:
+                    keep(e)
+                a = e
+            self.prefilled.append(L - begin)
+            keep(L, torch.full((1, 4), float(salt)))
+            return {"out": []}
+        return gen
+
+
+def _ask(r, rn, prompt, draft=True, salt=0):
+    begin, stops, keeps = r.choose(prompt, draft, "normed")
+    return r.run(prompt, begin, stops, keeps, 0, draft, "normed", rn.gen(prompt, salt))
+
+
+def _reuse(budget):
+    torch = pytest.importorskip("torch")
+    rn = _CpuRunner(torch)
+    return prefixes.PromptReuse(rn, _plan(gap=16, system_min=8), budget, 32, False), rn, torch
+
+
+def _small_turns(rng):
+    p1 = [GMASK, SOP, SYSTEM] + _text(rng, 20) + [USER] + _text(rng, 30) + [ASSISTANT, THINK]
+    p2 = p1 + [END_THINK] + _text(rng, 30) + [USER] + _text(rng, 10) + [ASSISTANT, THINK]
+    return p1, p2
+
+
+def test_cold_reference_renews_the_states_it_rewrites():
+    """The cold reference ("draft": false) of a kept prompt rewrites its rows cut alike: it keeps those states again
+    from its own rows - nothing is copied, nothing dropped - and the identical resend after it still replays, with a
+    budget too small for any copy (a long conversation's states on the cluster)."""
+    r, rn, _ = _reuse(1024)
+    p1, p2 = _small_turns(np.random.default_rng(11))
+    assert _ask(r, rn, p1)["cached"] == 0
+    assert _ask(r, rn, p2, salt=1)["cached"] == len(p1)
+    cold = _ask(r, rn, p2, draft=False, salt=2)
+    assert cold["cached"] == 0 and rn.prefilled[-1] == len(p2)
+    assert all(e.rows is None for e in r.store.entries)          # renewed in place, not saved
+    end = [e for e in r.store.entries if e.n == len(p2)]
+    assert len(end) == 1 and end[0].head is not None and float(end[0].head[0, 0]) == 2.0   # the cold run's own row
+    assert float(end[0].carry[0]) == float(p2[-1] % 997 + 2000)
+    again = _ask(r, rn, p2, salt=3)
+    assert again["cached"] == len(p2) and again.get("replay") and rn.prefilled[-1] == 0
+    nxt = p2 + [END_THINK] + _text(np.random.default_rng(12), 20) + [USER, ASSISTANT, THINK]
+    assert _ask(r, rn, nxt, salt=4)["cached"] == len(p2)  # turn 3 resumes at turn 2's renewed prompt end
+
+
+def test_another_conversation_costs_one_copy_shared_by_the_shorter_states():
+    r, rn, torch = _reuse(1 << 30)
+    rng = np.random.default_rng(13)
+    p1, p2 = _small_turns(rng)
+    _ask(r, rn, p1)
+    _ask(r, rn, p2, salt=1)
+    chain = sorted(e.n for e in r.store.entries)
+    assert len(chain) >= 3                               # the system block, turn 1's end, turn 2's end
+    rows_p2 = [t[:len(p2)].clone() for t in rn.st.kc]
+    other = [GMASK, SOP, SYSTEM] + _text(rng, 60) + [USER] + _text(rng, 40) + [ASSISTANT, THINK]
+    _ask(r, rn, other, salt=5)
+    p2_states = [e for e in r.store.entries if prefixes.is_prefix(e.ids, np.asarray(p2))]
+    copies = {id(e.saved) for e in p2_states}
+    assert len(copies) == 1 and None not in [e.saved for e in p2_states]   # one copy, every state reads it
+    longest = max(p2_states, key=lambda e: e.n)
+    assert r.store.held() == sum(e.held() for e in r.store.entries) + longest.saved.nbytes
+    back = _ask(r, rn, p2, salt=6)                       # replays turn 2's end: its rows come back
+    assert back.get("replay") and back["cached"] == len(p2)
+    assert all(torch.equal(t[:len(p2)], old) for t, old in zip(rn.st.kc, rows_p2))
+    assert all(e.rows is None for e in r.store.entries   # the shorter states that shared the copy: live again
+               if prefixes.is_prefix(e.ids, np.asarray(p2)))
+    assert len({id(e.saved) for e in r.store.entries if e.saved is not None}) == 1    # the other conversation's
+
+
+def test_the_longest_state_that_fits_is_copied():
+    """A budget that holds the system block's state but not the conversation's end: the end is dropped, the system
+    block is copied (a new conversation on it still resumes)."""
+    rng = np.random.default_rng(14)
+    p1 = [GMASK, SOP, SYSTEM] + _text(rng, 40) + [USER] + _text(rng, 200) + [ASSISTANT, THINK]
+    per_token = (2 * 8 + 2 * 4 + 8 + 4) * 4
+    r, rn, _ = _reuse(60 * per_token)
+    _ask(r, rn, p1)
+    other = p1[:44] + _text(rng, 100) + [ASSISTANT, THINK]
+    q = [GMASK, SOP] + _text(rng, 300)
+    _ask(r, rn, q, salt=1)
+    assert sorted(e.n for e in r.store.entries if e.saved is not None) == [43]
+    assert _ask(r, rn, other, salt=2)["cached"] == 43
+
+
+def test_thinking_off_prompt_is_cut_after_its_think_opener():
+    """Thinking off, the prompt ends "<|assistant|><think></think>": its point (after <think>) is one token short of
+    the end - a 1-row tail chunk - and the next turn (that history rendered alike) resumes there."""
+    r, rn, _ = _reuse(1 << 30)
+    rng = np.random.default_rng(15)
+    p1 = [GMASK, SOP, SYSTEM] + _text(rng, 4) + [USER] + _text(rng, 60) + [ASSISTANT, THINK, END_THINK]
+    begin, stops, keeps = r.choose(p1, True, "normed")
+    assert stops == [len(p1) - 1] and keeps == [(len(p1) - 1) * 2]
+    assert cut_chunks(0, len(p1), stops, 8192, 4096)[-1] == (len(p1) - 1, len(p1))
+    _ask(r, rn, p1)
+    p2 = p1 + _text(rng, 20) + [USER] + _text(rng, 30) + [ASSISTANT, THINK, END_THINK]
+    assert _ask(r, rn, p2, salt=1)["cached"] == len(p1) - 1

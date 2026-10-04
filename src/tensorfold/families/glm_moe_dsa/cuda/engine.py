@@ -432,7 +432,8 @@ class Glm53Engine:
         modes = fused.MTP_MODES
         mi = modes.index(mtp_mode) + 1 if mtp_mode in modes else 0          # 0: the default mode
         # prompt reuse: rank 0 picks the kept state to resume (drafted requests only: "draft": false is the cold
-        # reference, cut at the same keep points but never resumed nor kept) and the states to keep
+        # reference, cut at the same keep points, never resumed and keeping no new state - kept states it rewrites at
+        # its cut points it keeps again from its own rows, prefixes.PromptReuse.run) and the states to keep
         begin, flags, stops, keeps = 0, 0, [], []
         rz = self.reuse
         if rz is not None:

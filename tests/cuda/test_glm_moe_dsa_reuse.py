@@ -88,6 +88,36 @@ def test_next_turn_resend_and_other_conversation_equal_cold(sampled):
     assert s6["cached"] == n2 and back == warm, (s6, back, warm)   # p2's rows were saved, then put back
 
 
+def _cold_then_resend(rank, comm):
+    e = _engine(rank, comm)
+    p1, p2, _ = _turns()
+    if rank:
+        e.follow(requests=5)
+        return None
+    runs = []
+    for prompt, draft in ((p1, True), (p2, True), (p2, False), (p2, True), (p1 + [END_THINK, USER, ASSISTANT, THINK],
+                                                                             True)):
+        got = []
+        runs.append((got, e.generate(prompt, 12, None, got.extend, draft=draft, stop_eos=False)))
+    return runs, len(p1), len(p2)
+
+
+def test_cold_reference_keeps_the_states_it_rewrites(monkeypatch):
+    """No saved copy fits (a 60K-token conversation's states past TF_GLM53_CACHE_GIB on the cluster): the cold
+    reference of turn 2 rewrites turn 2's kept states at its own cut points and keeps them again from its own rows,
+    so the identical resend still replays, and a next turn still resumes at turn 1's end (renewed in place)."""
+    from tensorfold.families.glm_moe_dsa.cuda import prefixes
+
+    monkeypatch.setattr(prefixes, "row_bytes", lambda st, n, dcp=1: 1 << 50)     # never a copy
+    runs, n1, n2 = run_ranks(_cold_then_resend, 4)[0]
+    (_, s1), (warm, s2), (cold, s3), (again, s4), (_, s5) = runs
+    assert s2["cached"] == n1 and s3["cached"] == 0
+    assert warm == cold, (warm, cold)
+    assert s4["cached"] == n2 and s4.get("replay"), s4
+    assert again == cold
+    assert s5["cached"] == n1, s5                        # turn 1's end, renewed by the cold run of turn 2
+
+
 def _flush(rank, comm):
     from tensorfold.families.glm_moe_dsa.cuda import runner
 
