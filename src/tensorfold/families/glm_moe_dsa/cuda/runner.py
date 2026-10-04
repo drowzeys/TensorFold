@@ -19,7 +19,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
 from . import fused
@@ -479,8 +479,9 @@ class Runner:
         return "local" if SHARDED and self.cap is None else "full"
 
     def _gather(self) -> Callable[[torch.Tensor], torch.Tensor]:
-        """Every rank's fp32 words [n] -> [world, n] in rank order (one rank: its own)."""
-        return one_rank if self.w.world == 1 else comm_gather(self.w.comm)
+        """Every rank's fp32 words [n] -> [world, n] in rank order (one rank: its own): RoCE for the candidates,
+        NCCL for what outgrows it (a nucleus row's whole shards; ``fused.small_gather``)."""
+        return lambda words: fused.small_gather(self.w, words)
 
     def _sample_local(self, R: int, P: int, s: Sampling, vote: StopVote, ids: torch.Tensor | None = None):
         """A sampled verify window (head "local") without the full logits: every row at once from each rank's top

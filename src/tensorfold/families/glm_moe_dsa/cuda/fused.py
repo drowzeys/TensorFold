@@ -25,7 +25,7 @@ from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import linear as x3linear
 from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.families.glm5_next.cuda import glue, latent
-from tensorfold.families.glm_moe_dsa.cuda import topk
+from tensorfold.families.glm_moe_dsa.cuda import roce, topk
 
 from ..config import Config
 from .weights import Layer, MtpHead
@@ -65,6 +65,9 @@ DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurre
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)
 SPECIALS = 128           # ... plus the vocabulary's last ids (GLM's special tokens)
 TUNE = os.environ.get("TF_GLM53_TUNE", "1") != "0"
+# small exchanges off the head (sampled verify candidates, DFlash2 block candidates: a few KB) over the RoCE one-shot
+# gather when it is up (``small_gather``); 0: NCCL. Every rank must be given the same setting
+FAST_GATHER = os.environ.get("TF_GLM53_FAST_GATHER", "1") != "0"
 
 
 # ------------------------------------------------------------------------------------------------ kernels ---
@@ -851,6 +854,36 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     out = b.gath[:w.world * R * d]
     w.comm.all_gather(b.part[:R].reshape(-1), out)
     return out.view(w.world, R, d)
+
+
+def small_gather(w: Weights, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Every rank's fp32 words x [n] -> [world, n] in rank order: the RoCE one-shot gather when it is up and the whole
+    result fits its buffers (sampling candidates, DFlash2 drafts - where NCCL's launch and proxy latency is most of
+    the cost), else NCCL. A gather only moves words: both give the same bits. Capturable; ``out`` [world * n]: the
+    result's storage (else a new tensor). RoCE messages are padded to 16 bytes."""
+    world, n = w.world, x.numel()
+    x = x.reshape(-1)
+    if world == 1:
+        if out is None:
+            return x.view(1, n)
+        out.copy_(x)
+        return out.view(1, n)
+    pad = -n % 4
+    if FAST_GATHER and w.fast is not None and world * (n + pad) * 4 <= roce.MAX_BYTES:
+        if pad:
+            g = torch.empty((world * (n + pad),), dtype=x.dtype, device=x.device)
+            w.fast.all_gather(torch.cat([x, x.new_zeros((pad,))]), g)
+            got = g.view(world, n + pad)[:, :n]
+            if out is None:
+                return got.contiguous()
+            out.view(world, n).copy_(got)
+            return out.view(world, n)
+        out = torch.empty((world * n,), dtype=x.dtype, device=x.device) if out is None else out
+        w.fast.all_gather(x, out)
+        return out.view(world, n)
+    out = torch.empty((world * n,), dtype=x.dtype, device=x.device) if out is None else out
+    w.comm.all_gather(x, out)
+    return out.view(world, n)
 
 
 def dcp_gather(w: Weights, x: torch.Tensor, out: torch.Tensor, small: bool) -> None:

@@ -141,18 +141,10 @@ class GlmDrafter(Drafter):
         gids = (local + self.fw.vocab_off).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
         if PINNED:                                       # static buffers (graph replays write them): ``candidates``
-            if self.world > 1:
-                self.fw.comm.all_gather(packed.view(-1), self.cand[:self.cand_n])
-            else:
-                self.cand[:self.cand_n].copy_(packed.view(-1))
+            fused.small_gather(self.fw, packed.view(-1), self.cand[:self.cand_n])     # RoCE when it is up
             self.cand[self.cand_n:].view(n - 1, -1).copy_(F.linear(h, self.hproj).float())
             return
-        if self.world > 1:
-            got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
-            self.fw.comm.all_gather(packed.view(-1), got)
-            self.packed = got.view(self.world, n - 1, 2 * self.top_k)
-        else:
-            self.packed = packed.view(1, n - 1, 2 * self.top_k)
+        self.packed = fused.small_gather(self.fw, packed.view(-1)).view(-1, n - 1, 2 * self.top_k)
         self.proj = F.linear(h, self.hproj).float()
 
     @torch.no_grad()
