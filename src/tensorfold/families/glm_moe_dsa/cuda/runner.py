@@ -22,6 +22,7 @@ import torch
 from tensorfold.cuda.sampling import nucleus_rows
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
+from . import depth as depth_policy
 from . import fused
 
 PROMPT_ROWS = fused.PROMPT_ROWS
@@ -788,6 +789,7 @@ class Runner:
         done = len(out) >= max_tokens or stop(tok)
         t1 = time.perf_counter()
         t_sample = t_stream = 0.0
+        policy = depth_policy.for_runner(k)              # TF_GLM53_DEPTH_POLICY: this request's depth by acceptance
         round_ms: list[float] = []
         late = LateTokens(on_tokens)
         spick = self._sampled_pick() if sampling is not None else "full"
@@ -795,7 +797,8 @@ class Runner:
             rounds += 1
             self.profiler.begin()
             tr = time.perf_counter()
-            room = max(0, min(k, max_tokens - len(out) - 1, self.capacity - P - 1))
+            room = max(0, min(k if policy is None else policy.depth(), max_tokens - len(out) - 1,
+                              self.capacity - P - 1))
             vb.ids[:1].fill_(tok)
             if room:
                 Tm = self._T(P + room)
@@ -836,6 +839,8 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
+            if policy is not None and drafts:
+                policy.update(len(drafts), n)
             was = len(out)
             for e_tok in emit:
                 out.append(e_tok)
@@ -865,4 +870,5 @@ class Runner:
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "sample_ms_per_round": round(1e3 * t_sample / max(rounds, 1), 2),
                 "stream_ms_per_round": round(1e3 * t_stream / max(rounds, 1), 2), "stopped": on_tokens.agreed,
-                "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
+                "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1),
+                **({"depths": dict(sorted(policy.depths.items()))} if policy is not None else {}), "out": out}

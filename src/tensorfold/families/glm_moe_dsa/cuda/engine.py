@@ -123,6 +123,16 @@ class Glm53Engine:
                 fw.fast = fast if bool(every.all()) else None
                 if rank == 0:
                     print(f"[tensorfold] decode-window reductions: {'RoCE one-shot' if fw.fast else 'NCCL'}", flush=True)
+            if WORLD > 1:                                # settings that change which windows / collectives a round
+                from . import depth                      # runs: a rank on its own would hang the others
+                mine = torch.tensor([fused.MTP_REUSE, int(depth.COST * 1e6), depth.LOW, int(depth.RATE * 1e6)],
+                                    dtype=torch.int32, device="cuda")
+                every = torch.empty((WORLD, mine.numel()), dtype=torch.int32, device="cuda")
+                comm.all_gather(mine, every)
+                if not bool((every == every[0]).all()):
+                    raise RuntimeError("the ranks were started with different TF_GLM53_MTP_REUSE / "
+                                       "TF_GLM53_DEPTH_POLICY / _MIN / _RATE (rank rows: "
+                                       f"{every.tolist()}); give every rank the same environment")
             if WORLD > 1 and os.environ.get("TF_GLM53_TUNE_SHARED", "1") != "0":
                 n = fused.share_tiles(fw, comm)             # rank 0's tiles everywhere: one pick paces every layer
                 print(f"[tensorfold] rank {rank}: took rank 0's tiles ({n} of {len(fw.tunable)} linears differed)",
