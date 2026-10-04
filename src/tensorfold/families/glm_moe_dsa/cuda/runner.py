@@ -27,6 +27,7 @@ PROFILE_ROUNDS = 8
 # reply's rows (the target's own samples, replayed as prompt + reply) - as decode rounds would have recorded them.
 CAPTURE_LABEL = os.environ.get("TF_GLM53_CAPTURE_LABEL", "0") == "1"
 ASSISTANT_ID = int(os.environ.get("TF_GLM53_ASSISTANT_ID", "154828"))       # GLM-5.3's <|assistant|>
+LATE_TOKENS = os.environ.get("TF_GLM53_LATE_TOKENS", "1") != "0"           # on_tokens a round late (LateTokens)
 
 
 class RoundProfiler:
@@ -111,6 +112,31 @@ class StopVote:
         """The last verify window's vote (None: one rank, whose own wish decides) -> whether the run ends now."""
         self.agreed = self.agreed or (self.mine if voted is None else bool(voted))
         return self.agreed
+
+
+class LateTokens:
+    """TF_GLM53_LATE_TOKENS (default on; MiaAI-Lab 0013): a round's tokens reach ``on_tokens`` in one call once the
+    next verify window is queued on the GPU (``flush`` right after it), so rank 0's server work on them (detokenizing,
+    stop strings, the stream write) runs while the GPU verifies, instead of between rounds, where the other three
+    ranks would wait for rank 0 at the window's first all-reduce. All of them arrive before the run returns (``flush``
+    at its end); the first token (after the prompt) is never held. Off: token by token at once, as before. Only when
+    the tokens arrive changes (a stop rank 0 asks for lands a round later, StopVote)."""
+
+    def __init__(self, on_tokens: Callable[[list[int]], Any], late: bool = LATE_TOKENS) -> None:
+        self.fn, self.late, self.held = on_tokens, late, None
+
+    def __call__(self, tokens: list[int]) -> None:
+        if not self.late:
+            for t in tokens:
+                self.fn([t])
+            return
+        self.flush()
+        self.held = list(tokens)
+
+    def flush(self) -> None:
+        if self.held is not None:
+            held, self.held = self.held, None
+            self.fn(held)
 
 
 class GraphSet:
@@ -464,6 +490,7 @@ class Runner:
         rounds = drafted = accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
+        late = LateTokens(on_tokens)
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -496,6 +523,7 @@ class Runner:
             pick = "argmax" if sample is None else "full"
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
+            late.flush()                                 # the last round's tokens, while the GPU verifies
             word = self._vote_word(R, pick)
             if sample is None:
                 both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
@@ -527,12 +555,13 @@ class Runner:
             fused.target_hidden_for_mtp(w, vb, slice(0, n + 1), mb.hin[m:m + n + 1], self.hid_normed)
             mb.ids[m:m + n + 1].copy_(torch.tensor(emit, dtype=torch.long), non_blocking=True)
             m += n + 1
+            was = len(out)
             for e_tok in emit:
                 out.append(e_tok)
-                on_tokens([e_tok])
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            late(out[was:])
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             P, tok = P + n + 1, emit[-1]
@@ -545,6 +574,7 @@ class Runner:
                 dt = float(allt[0].item())
             rate = (n + 1) / dt
             ema[arm] = rate if ema[arm] is None else 0.8 * ema[arm] + 0.2 * rate
+        late.flush()
         torch.cuda.synchronize()
         dec = time.perf_counter() - t1
         arm_s = "".join(arms)
@@ -574,6 +604,7 @@ class Runner:
         rounds = drafted = accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         round_ms: list[float] = []
+        late = LateTokens(on_tokens)
         t1 = time.perf_counter()
         while not done:
             tr = time.perf_counter()
@@ -587,6 +618,7 @@ class Runner:
             pick = "argmax" if sample is None else "full"
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
+            late.flush()                                 # the last round's tokens, while the GPU verifies
             word = self._vote_word(R, pick)
             if sample is None:
                 picks, voted = self._read([vb.argmax[:R]], word)
@@ -616,17 +648,19 @@ class Runner:
             t_draft += ta - tr
             t_verify += tb - ta
             t_taps += tc - tb
+            was = len(out)
             for e_tok in emit:
                 out.append(e_tok)
-                on_tokens([e_tok])
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            late(out[was:])
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             P, tok = P + n + 1, emit[-1]
             self.profiler.end()
             round_ms.append(1e3 * (time.perf_counter() - tr))
+        late.flush()
         torch.cuda.synchronize()
         dec = time.perf_counter() - t1
         return {"prefill_s": prefill_s, "decode_s": dec, "tokens": len(out), "rounds": rounds,
@@ -673,6 +707,7 @@ class Runner:
         t1 = time.perf_counter()
         t_sample = t_stream = 0.0
         round_ms: list[float] = []
+        late = LateTokens(on_tokens)
         while not done:
             rounds += 1
             self.profiler.begin()
@@ -688,6 +723,9 @@ class Runner:
             pick = "argmax" if sample is None else "full"
             self._vote_arm(on_tokens, R, pick)
             self._verify(R, P, self._T(P + R), pick)
+            ts = time.perf_counter()
+            late.flush()                                 # the last round's tokens, while the GPU verifies
+            t_stream += time.perf_counter() - ts
             word = self._vote_word(R, pick)
             if sample is None:
                 both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
@@ -710,14 +748,15 @@ class Runner:
             emit = picks[:n + 1]
             drafted += len(drafts)
             accepted += n
+            was = len(out)
             for e_tok in emit:
                 out.append(e_tok)
-                ts = time.perf_counter()
-                on_tokens([e_tok])
-                t_stream += time.perf_counter() - ts
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            ts = time.perf_counter()
+            late(out[was:])                              # held until the next window is queued (or at once)
+            t_stream += time.perf_counter() - ts
             if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
                 done = True
             if self.cap is not None:
@@ -729,6 +768,7 @@ class Runner:
             P, tok = P + n + 1, emit[-1]
             self.profiler.end()
             round_ms.append(1e3 * (time.perf_counter() - tr))
+        late.flush()
         torch.cuda.synchronize()
         dec = time.perf_counter() - t1
         return {"prefill_s": prefill_s, "decode_s": dec, "tokens": len(out), "rounds": rounds,

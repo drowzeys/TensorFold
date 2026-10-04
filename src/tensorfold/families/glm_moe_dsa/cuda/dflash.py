@@ -11,6 +11,7 @@ Checkpoint: e.g. incoai/GLM-5.3-DFlash2 (6 layers, block 8, taps 5/19/33/47/61/7
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,9 @@ from tensorfold.families.glm5_next.cuda import glue
 from tensorfold.families.glm5_next.cuda.dflash2 import NO_LIMIT, Drafter, _dconv, _mm, _dattn_kernel  # noqa: F401
 
 RING = 4096          # drafter KV slots: its sliding window (2047) + a block (8) + a tap batch (64), rounded up
+# a block pass's candidates and selector rows land in one device buffer, read back by one pinned copy (MiaAI-Lab 0013;
+# the base Drafter's two .cpu() calls were two syncs and two pageable copies). 0: the base Drafter's reads
+PINNED = os.environ.get("TF_GLM53_PINNED_DRAFTS", "1") != "0"
 
 
 @triton.jit
@@ -84,6 +88,11 @@ class GlmDrafter(Drafter):
         self.fw = w
         V = w.lm_head.shape[0]
         self.logits = torch.empty((self.block - 1, V), dtype=torch.float32, device=w.device)
+        m = self.block - 1                               # PINNED: every rank's [m, 2 top_k], then [m, selector rank]
+        self.cand_n = max(self.world, 1) * m * 2 * self.top_k
+        self.cand = torch.zeros((self.cand_n + m * self.hproj.shape[0],), dtype=torch.float32, device=self.dev)
+        self.cand_host = torch.zeros(self.cand.shape, dtype=torch.float32, pin_memory=True)
+        self.cand_ready = torch.cuda.Event()
 
     def _layer(self, i: int, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         L = self.layers[i]
@@ -131,6 +140,13 @@ class GlmDrafter(Drafter):
         vals, local = torch.topk(self.logits, self.top_k, dim=-1)
         gids = (local + self.fw.vocab_off).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
+        if PINNED:                                       # static buffers (graph replays write them): ``candidates``
+            if self.world > 1:
+                self.fw.comm.all_gather(packed.view(-1), self.cand[:self.cand_n])
+            else:
+                self.cand[:self.cand_n].copy_(packed.view(-1))
+            self.cand[self.cand_n:].view(n - 1, -1).copy_(F.linear(h, self.hproj).float())
+            return
         if self.world > 1:
             got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
             self.fw.comm.all_gather(packed.view(-1), got)
@@ -138,6 +154,26 @@ class GlmDrafter(Drafter):
         else:
             self.packed = packed.view(1, n - 1, 2 * self.top_k)
         self.proj = F.linear(h, self.hproj).float()
+
+    @torch.no_grad()
+    def candidates(self, pending: int, depth: int):
+        """The base Drafter's candidates (ids, logits, projected rows of the ``depth`` positions after ``pending``),
+        PINNED: read back by one pinned non-blocking copy of the block pass's buffer and one wait, the same values."""
+        if not PINNED:
+            return super().candidates(pending, depth)
+        self.ids_host[0] = pending
+        self.ids[:1].copy_(self.ids_host, non_blocking=True)
+        if self.block_graph is not None:
+            self.block_graph.replay()
+        else:
+            self._block_compute()
+        self.cand_host.copy_(self.cand, non_blocking=True)
+        self.cand_ready.record()
+        self.cand_ready.synchronize()
+        m = self.block - 1
+        g = self.cand_host[:self.cand_n].view(-1, m, 2 * self.top_k)[:, :depth]
+        proj = self.cand_host[self.cand_n:].view(m, -1)[:depth]
+        return merge_candidates(g, proj, self.top_k)        # copies: nothing keeps cand_host past this call
 
 
 # ------------------------------------------------------------------------------------------- several streams ---
