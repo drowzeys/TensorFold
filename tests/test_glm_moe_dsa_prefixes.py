@@ -251,3 +251,17 @@ def test_slot_reuse_in_place_fork_and_overwrite():
     other = _text(rng, 50)
     r.admit(other, 1, 0, -1, None)
     assert st.in_slot(1) == [] and [e.n for e in st.in_slot(2)] == [10]
+
+
+def test_loaded_rows_keep_only_prefixes_cut_alike():
+    """A saved state loaded over the live rows: a live prefix state survives only at one of the prompt's points (an
+    end state that was not a point had its rows cut differently in the loaded prompt)."""
+    s = KeptPrompts(1 << 30)
+    a = list(range(100))
+    s.live = np.asarray(a[:50], dtype=np.int64)
+    for n in (20, 50):
+        s.remember(_kept(a[:n]))
+    prompt = np.asarray(a + [1], dtype=np.int64)
+    assert s.overwritten(prompt, 100) == []
+    gone = s.overwritten(prompt, 100, same=lambda e: e.n in {20})
+    assert [e.n for e in gone] == [50]

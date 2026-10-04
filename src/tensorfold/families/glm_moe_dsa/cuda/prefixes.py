@@ -263,7 +263,7 @@ class KeptPrompts:
 
     def remember(self, e: Kept, protect=()) -> bool:
         """Keep ``e`` (newest), replacing a state of the same ids; within the entry cap and the byte budget."""
-        for old in [x for x in self.entries if x.n == e.n and np.array_equal(x.ids, e.ids)]:
+        for old in [x for x in self.entries if self.same_place(x, e) and x.n == e.n and np.array_equal(x.ids, e.ids)]:
             self.drop(old)
         protect = tuple(protect) + (e,)
         while len(self.entries) >= self.cap:
@@ -277,14 +277,19 @@ class KeptPrompts:
         self.entries.append(e)
         return True
 
-    def overwritten(self, prompt: np.ndarray, begin: int) -> list[Kept]:
+    def same_place(self, a: Kept, b: Kept) -> bool:
+        """Whether two states' rows live in the same caches (one stream: always)."""
+        return True
+
+    def overwritten(self, prompt: np.ndarray, begin: int, same=None) -> list[Kept]:
         """The states in the live caches that a request resumed at ``begin`` overwrites (newest first): all but
-        prefixes of its prompt no longer than ``begin``."""
+        prefixes of its prompt no longer than ``begin`` - and when the resumed rows replace the live ones (a saved
+        state loaded), only those ``same(e)`` accepts (cut alike, so the replacing rows have their bits)."""
         out = []
         for e in self.entries:
             if e.rows is not None:
                 continue
-            if e.n <= begin and np.array_equal(prompt[:e.n], e.ids):
+            if e.n <= begin and np.array_equal(prompt[:e.n], e.ids) and (same is None or same(e)):
                 continue
             out.append(e)
         return sorted(out, key=lambda e: -e.tick)
@@ -434,7 +439,11 @@ class PromptReuse:
             if hit is None:
                 raise RuntimeError(f"rank {rn.w.rank} has no kept prompt state of the {begin} tokens rank 0 resumes "
                                    "from")
-        dropped = self._take_over(arr, begin, hit)
+        same = None
+        if hit is not None and hit.rows is not None:     # its saved rows replace the live ones before ``begin``:
+            at = set(self.plan.points(arr))               # a live prefix keeps its bits only where it was cut alike
+            same = lambda e: e.mode == hit.mode and (e.n in at or e.n == begin)    # noqa: E731
+        dropped = self._take_over(arr, begin, hit, same)
         if hit is not None:
             if hit.rows is not None:
                 load_rows(rn.st, hit, self.dcp)
@@ -468,11 +477,11 @@ class PromptReuse:
             stats["replay"] = True
         return stats
 
-    def _take_over(self, arr: np.ndarray, begin: int, hit: Kept | None) -> bool:
+    def _take_over(self, arr: np.ndarray, begin: int, hit: Kept | None, same=None) -> bool:
         """Save (within the budget) or drop the live states this request overwrites; True when any were dropped."""
         store = self.store
         dropped = False
-        for e in store.overwritten(arr, begin):
+        for e in store.overwritten(arr, begin, same):
             if e not in store.entries:                   # dropped making room for a newer one
                 continue
             if e is hit:
@@ -510,6 +519,9 @@ class SlotPrompts(KeptPrompts):
     def usable(self, e: Kept) -> bool:
         return self.in_live(e)
 
+    def same_place(self, a: Kept, b: Kept) -> bool:
+        return a.extra["slot"] == b.extra["slot"]
+
     def in_slot(self, slot: int) -> list[Kept]:
         return [e for e in self.entries if e.extra["slot"] == slot]
 
@@ -517,9 +529,11 @@ class SlotPrompts(KeptPrompts):
         return next((e for e in self.in_slot(slot)
                      if e.n == n and self.usable(e) and np.array_equal(prompt[:n], e.ids)), None)
 
-    def overwritten_slot(self, slot: int, prompt: np.ndarray, begin: int) -> list[Kept]:
-        """The states of ``slot`` a request resumed there at ``begin`` overwrites."""
-        return [e for e in self.in_slot(slot) if not (e.n <= begin and np.array_equal(prompt[:e.n], e.ids))]
+    def overwritten_slot(self, slot: int, prompt: np.ndarray, begin: int, same=None) -> list[Kept]:
+        """The states of ``slot`` a request resumed there at ``begin`` overwrites (``same``: as in ``overwritten``,
+        when rows copied from another slot replace the slot's)."""
+        return [e for e in self.in_slot(slot)
+                if not (e.n <= begin and np.array_equal(prompt[:e.n], e.ids) and (same is None or same(e)))]
 
 
 def copy_slot_rows(st, src: int, dst: int, n: int) -> None:
@@ -594,7 +608,11 @@ class SlotReuse:
             if hit is None:
                 raise RuntimeError(f"no kept prompt state of the {begin} tokens rank 0 resumes from in slot "
                                    f"{src if src >= 0 else slot}")
-        for e in store.overwritten_slot(slot, arr, begin):
+        same = None
+        if src >= 0 and hit is not None:                 # the source slot's rows replace this slot's before ``begin``
+            at = set(self.plan.points(arr))
+            same = lambda e: e.mode == hit.mode and (e.n in at or e.n == begin)    # noqa: E731
+        for e in store.overwritten_slot(slot, arr, begin, same):
             if e is not hit:
                 store.drop(e)
         if src >= 0:
@@ -603,6 +621,9 @@ class SlotReuse:
         if hit is not None:
             store.touch(hit)
         return hit
+
+    def flush_requested(self) -> bool:
+        return PromptReuse.flush_requested(self)
 
     def keep(self, slot: int, ids: np.ndarray, mode: str, carry, ring, head, shared: bool) -> bool:
         e = Kept(np.array(ids, dtype=np.int64), mode, carry=carry.clone(), ring=ring,

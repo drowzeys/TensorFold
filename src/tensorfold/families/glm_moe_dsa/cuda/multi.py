@@ -238,10 +238,13 @@ class GlmMultiDecoder:
         temp = getattr(s.sampling, "temperature", 0.0) if s.sampling is not None else 0.0
         if temp <= 0:
             s.sampling = None
-        begin, src, stops, keeps = 0, -1, [], []
+        begin, src, stops, keeps, flush = 0, -1, [], [], 0
         if self.reuse is not None:                # prompt reuse: the slot and the kept state to resume (drafted
             from .prefixes import mode_key          # requests only: serial ones are the cold reference)
 
+            if self.reuse.flush_requested():      # REUSE_FLUSH: every rank forgets every kept state first
+                flush = 1
+                self.reuse.store.clear()
             slot, begin, src, stops, keeps = self.reuse.choose(s.prompt, mode != SERIAL,
                                                                mode_key(None, fused.MTP_MODE), self.free,
                                                                self._taps(mode))
@@ -249,7 +252,8 @@ class GlmMultiDecoder:
         else:
             slot = self.free[0]
         self.free.remove(slot)
-        self._send([ADMIT, s.sid, slot, mode, int(s.sampling is not None), *_pack_sampling(s.sampling), begin, src])
+        self._send([ADMIT, s.sid, slot, mode, int(s.sampling is not None), *_pack_sampling(s.sampling), begin, src,
+                    flush])
         self._send(list(s.prompt))
         if self.reuse is not None:
             self._send([len(stops), *stops, *keeps])
@@ -686,7 +690,9 @@ class GlmMultiDecoder:
             kind = msg[0]
             if kind == ADMIT:
                 sid, slot, mode, sampled = msg[1:5]
-                begin, src = msg[18:20]
+                begin, src, flush = msg[18:21]
+                if flush and self.reuse is not None:
+                    self.reuse.store.clear()
                 s = Stream(self._recv(), 1, _unpack_sampling(msg[5:18]), sid=sid)
                 s.sampled = bool(sampled)
                 stops, keeps = [], []
