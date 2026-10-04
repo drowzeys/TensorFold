@@ -216,9 +216,11 @@ class Scratch:
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, loads: int | None = None, fuse: int | None = None, pdl: int | None = None,
-           sy: torch.Tensor | None = None) -> torch.Tensor:
+           sy: torch.Tensor | None = None, sy_ready=None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
     ``sy`` (fp32 [R, D], with ``wts``): out = (the weighted sum) + sy, the bits of ``out.add_(sy)`` after it.
+    ``sy_ready``: called right before the first launch that reads ``sy`` (a caller whose sy comes from another
+    stream joins it there).
     ``loads`` / ``fuse`` / ``pdl``: TF_EXL3_EXPERTS_LOADS / _FUSE / _PDL for this call (None: the module's); none
     changes a bit."""
 
@@ -250,6 +252,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     if fuse & 1 and nt == 8 and sk == 1:
         # down with its epilogue (y) and, given wts, the combine (+ sy) in the same launch
+        if sy_ready is not None:
+            sy_ready()
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                     D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0, vec, 1, pick, E, nh, nh, nh, nh,
                     0.0, act_mode, ex.svh_d, s.y, nf if wts is None else wts, nf if out is None else out,
@@ -263,6 +267,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         return s.y[:P]
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
     ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, pdl)
+    if sy_ready is not None:
+        sy_ready()
     if sy is not None:
         out.add_(sy)
     return out
