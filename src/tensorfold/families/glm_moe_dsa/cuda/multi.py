@@ -132,6 +132,13 @@ FILL_LAYERS = int(os.environ.get("TF_GLM53_FILL_LAYERS", "8"))   # layers a fill
 # chunks under this many rows fill whole even while others decode: a short prompt in steps waited ~10 decode rounds
 # and queued fills stacked (4 short requests together: 4-5 s TTFT vs ~1 s whole); long chunks keep the steps
 FILL_MIN_ROWS = int(os.environ.get("TF_GLM53_FILL_MIN_ROWS", "2048"))
+# Batched short fills (after bertholomus' TensorFold 14b43b0's quick fills): after a round's fill step, queued
+# prompts whose rest fits in TF_GLM53_QUICK_ROWS rows (default 1024, together) fill to their first token before the
+# decode round instead of one prompt a round, so a burst of short requests starts decoding together (4 chats at once
+# waited up to 4 rounds for their first tokens). Each prompt takes the chunks and kernels it takes alone: the same
+# bits. TF_GLM53_BATCH_FILL=0: one fill step a round, as before.
+BATCH_FILL = os.environ.get("TF_GLM53_BATCH_FILL", "1") != "0"
+QUICK_ROWS = int(os.environ.get("TF_GLM53_QUICK_ROWS", "1024"))
 # Draft cut (after bertholomus' TensorFold 145ee42): with TF_GLM53_DRAFT_CUT_STREAMS (default 4, at least 2) or more
 # streams in a round, an MTP stream's drafts stop at the first one whose chain probability (the MTP head's softmax
 # probabilities of its drafts so far, multiplied) falls below TF_GLM53_DRAFT_CUT (default 0.6; 0: off), and a DFlash2
@@ -377,6 +384,23 @@ class GlmMultiDecoder:
         s.take([tok], self._ends(s))
         return [s] if s.done else []
 
+    def _quick_fills(self) -> list[Stream]:
+        """BATCH_FILL: after the round's fill step, the queued prompts whose rest fits in QUICK_ROWS rows (together)
+        fill to their first token before the decode round, oldest first, each in the chunks and kernels it takes alone
+        (one ``_fill`` a chunk: no other prompt's step comes between a prompt's chunks, as before, so the Runner's
+        prompt buffers and MTP carry stay that prompt's)."""
+        done, used = [], 0
+        while self.filling:
+            s = self.filling[0]
+            a = s.chunks[s.ci][0]
+            rest = len(s.prompt) - a
+            if used + rest > QUICK_ROWS:
+                break
+            used += rest
+            while self.filling and self.filling[0] is s:
+                done += self._fill(not any(not x.done for x in self.streams.values()))
+        return done
+
     def _chunk(self, s: Stream, a: int, e: int, lo: int, hi: int):
         """Layers [lo, hi) of chunk a..e (all of them: the chunk in one go, as alone)."""
         n = len(self.w.layers)
@@ -463,6 +487,8 @@ class GlmMultiDecoder:
     def _round(self) -> list[Stream]:
         decoding = any(not s.done for s in self.streams.values())
         done = self._fill(not decoding) if self.filling else []
+        if BATCH_FILL:
+            done += self._quick_fills()
         live = [s for s in self.streams.values() if not s.done]
         if not live:
             return done

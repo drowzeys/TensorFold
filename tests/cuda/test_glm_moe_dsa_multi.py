@@ -31,6 +31,7 @@ def _fill_in_steps(monkeypatch):
     from tensorfold.families.glm_moe_dsa.cuda import multi
 
     monkeypatch.setattr(multi, "FILL_MIN_ROWS", 0)
+    monkeypatch.setattr(multi, "BATCH_FILL", False)     # (quick fills would finish the short rests in one round)
 
 
 @pytest.fixture(autouse=True)
@@ -267,6 +268,47 @@ def test_draft_cut_equal_alone_graphs(_cut_hard):
         res = _multi(0, 1, comm, w, reqs, graphs=True)
     _check(solo, res)
     assert res[4] > 0, "no draft was cut: the check would be weak"
+
+
+def test_quick_fills_burst_four_ranks():
+    """Four short prompts at once (859 rows after the first: under TF_GLM53_QUICK_ROWS): all four fill in the first
+    round and decode together from it; every reply equals its lone reply."""
+    from tensorfold.cuda.streams import Stream
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+    from tensorfold.families.glm_moe_dsa.cuda.runner import Runner
+
+    assert multi.BATCH_FILL and multi.QUICK_ROWS >= 859
+    reqs = _requests()
+    names = ["a", "b", "e", "c"]
+
+    def run(rank, comm):
+        w = _weights(rank, 4, comm)
+        solo = _solo(w, reqs, graphs=False)
+        rn = Runner(w, CAPACITY + K + 1, K, graphs=False, slots=4)
+        dec = multi.GlmMultiDecoder(rn, rank=rank, world=4, comm=comm, limit=CAPACITY,
+                                    eos=tuple(w.cfg.eos_token_ids), sample=_sample_fn())
+        got, first = {nm: [] for nm in names}, None
+        if rank:
+            dec.follow()
+        else:
+            for nm in names:
+                prompt, n, smp = reqs[nm]
+                st = Stream(list(prompt), n, smp, draft=True, stop_eos=False)
+                st.emit = lambda new, nm=nm: got[nm].extend(new)
+                dec.admit(st)
+            dec.finish(dec.round())
+            first = len(dec.streams)
+            while dec.live():
+                dec.finish(dec.round())
+            dec.stop()
+        torch.cuda.synchronize()
+        comm.barrier()
+        return solo, got, first
+
+    solo, got, first = run_ranks(run, 4)[0]
+    assert first == 4, f"{first} streams decoding after the first round (quick fills: 4)"
+    for nm in names:
+        assert got[nm] == solo[nm], f"request {nm} quick-filled: {got[nm]} != alone {solo[nm]}"
 
 
 def _engine_serve(rank, comm, reqs):
