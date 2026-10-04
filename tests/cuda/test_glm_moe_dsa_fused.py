@@ -181,6 +181,45 @@ def test_runner_drafted_equals_serial_with_mtp():
             assert out[(mode, 2)][0] == out[(mode, 0)][0], f"{mode}: drafted != serial"
 
 
+@pytest.mark.parametrize("sampling", [None, (99, 0.9, 20, 0.95, 0.0), (7, 0.9, 0, 0.95, 0.0)],
+                         ids=["greedy", "top_k", "nucleus"])
+def test_stop_vote_ends_every_rank_after_the_same_round(sampling):
+    """--parallel 1 stop (MiaAI-Lab issue #38): rank 0's on_tokens asks to stop once it has 5 tokens; every rank ends
+    after the same round, well before max_tokens, every token decoded reached on_tokens (late ones flushed), and they
+    are the unstopped reply's prefix. Greedy (the argmax head's spare word), sampled top_k (the sharded candidates
+    or, TF_GLM53_SHARDED_SAMPLE=0, the word behind the full head's rows) and top_k off (the nucleus gather)."""
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.glm_moe_dsa.cuda import fused
+    from tensorfold.families.glm_moe_dsa.cuda.engine import Glm53Engine
+    from tensorfold.families.glm_moe_dsa.cuda.runner import Runner
+    from tensorfold.families.glm_moe_dsa.cuda.weights import load_mtp
+
+    s = Sampling(*sampling) if sampling else None
+    prompt = _tokens(150, seed=31).tolist()
+
+    def run(rank, comm):
+        cfg, r, (embed, norm, head), layers = _parts(rank, 4)
+        w = fused.Weights(cfg, rank, 4, comm, embed, norm, head, layers, load_mtp(r, cfg))
+        run_ = Runner(w, 512, 2, graphs=False)
+        fn = None if s is None else (lambda lg, pos: Glm53Engine._sample(None, lg, pos, s))
+        full = run_.generate(prompt, 40, fn, lambda t: False, lambda new: None, 2, sampling=s)
+        seen = []
+
+        def on_tokens(new):
+            seen.extend(new)
+            return rank == 0 and len(seen) >= 5
+        cut = run_.generate(prompt, 40, fn, lambda t: False, on_tokens, 2, sampling=s)
+        return full["out"], cut["out"], cut["rounds"], cut["stopped"], seen
+
+    res = run_ranks(run, 4)
+    full, cut, rounds, stopped, seen = res[0]
+    assert stopped and 5 <= len(cut) < 40, (len(cut), stopped)
+    assert cut == full[:len(cut)], "a stopped reply is the unstopped reply's prefix"
+    assert seen == cut, "every decoded token reached on_tokens"
+    for i, (_, other, other_rounds, other_stopped, _) in enumerate(res[1:], 1):
+        assert other == cut and other_rounds == rounds and other_stopped, f"rank {i} ended elsewhere"
+
+
 def test_wide_prompt_chunk_matches_reference():
     """A 300-row prompt chunk (prompt GEMM for the EXL3 linears, exact reduce-scatter, row-blocked absorb/expand)
     agrees with the reference path, and decode windows after it stay exact."""
