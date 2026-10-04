@@ -107,3 +107,10 @@ def test_a_concurrent_stream_reports_its_drafted_rows_and_kept_drafts():
     s.take([8])                               # a one-row round
     stats = s.stats()
     assert (stats["rounds"], stats["drafted"], stats["accepted"]) == (2, 3, 1)
+
+
+def test_an_engine_reports_how_long_its_round_has_run(tmp_path):
+    engine = PacedEngine()
+    engine.iteration_s = lambda: 12.5             # glm_moe_dsa: a stalled round keeps growing it
+    app = app_for(tmp_path, engine)
+    assert health.of(app).snapshot(app)["iteration_s"] == 12.5

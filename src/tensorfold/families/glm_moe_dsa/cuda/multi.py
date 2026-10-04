@@ -60,6 +60,44 @@ NONE, ARM_M, ARM_F = 0, 1, 2               # a stream's drafts this round
 ITEM = 9                                   # ints a round's plan carries a stream
 PROBE = int(os.environ.get("TF_GLM53_AUTO_PROBE", "16"))
 
+# Rank checks (MiaAI-Lab GLM-5.3-Flash 0065-glm-rank-checks, Apache-2.0): every message rank 0 shares carries a
+# sequence number and a checksum, so a follower that falls out of step stops with a named error instead of applying
+# another round's ints; TF_GLM_MULTI_WATCHDOG_S > 0: a round (rank 0) or the handling of one message (ranks 1..3)
+# that takes longer dumps every thread's stack to stderr and exits the process (code 1), so a supervisor sees a stalled
+# rank instead of four ranks waiting on each other's collectives forever. 0 (default): off. Set it above the longest
+# prompt chunk (a whole 8,192-row chunk alone takes ~8 s) - the single-stream path re-arms it a round, so there it
+# must also exceed the longest prompt's prefill.
+SEAL_MOD = 2_147_483_647                   # a message's checksum, modulo this prime
+WATCHDOG_S = float(os.environ.get("TF_GLM_MULTI_WATCHDOG_S", "0") or 0)
+
+
+def digest(values: list[int], seq: int) -> int:
+    """A message's checksum: its ints weighted by position, plus its sequence number, modulo SEAL_MOD."""
+    import numpy as np
+
+    a = np.asarray(values, dtype=np.int64) % SEAL_MOD
+    w = np.arange(1, len(a) + 1, dtype=np.int64) % SEAL_MOD
+    return int((int((a * w % SEAL_MOD).sum()) + seq * 1_000_003) % SEAL_MOD)
+
+
+def watch(seconds: float = WATCHDOG_S) -> None:
+    """Arm (or re-arm) the stall watchdog: stacks to stderr, then exit, after ``seconds`` (<= 0: nothing)."""
+    if seconds > 0:
+        import faulthandler
+        import sys
+
+        try:                                              # the process's stderr (a test may swap sys.stderr)
+            faulthandler.dump_traceback_later(seconds, repeat=False, file=sys.__stderr__, exit=True)
+        except (ValueError, OSError, AttributeError):     # no file descriptor to write to: no watchdog
+            pass
+
+
+def unwatch(seconds: float = WATCHDOG_S) -> None:
+    if seconds > 0:
+        import faulthandler
+
+        faulthandler.cancel_dump_traceback_later()
+
 
 def _f64_ints(x: float) -> list[int]:
     bits = int.from_bytes(struct.pack("<d", float(x)), "little")
@@ -153,6 +191,8 @@ class GlmMultiDecoder:
         self.next_id = 0
         self.broken: Exception | None = None
         self.rounds = 0
+        self.seq = 0                              # messages shared so far (every rank counts the same)
+        self.iteration_since: float | None = None  # rank 0: when the running round began (/health iteration_s)
         self.widest = 0                           # the widest verify window so far (rows)
         self._cfg, self._cfg_t = (7, 0.4), -1.0
         if self.dr is not None and runner.G.enabled:
@@ -162,12 +202,17 @@ class GlmMultiDecoder:
 
     # -------------------------------------------------------------------------------------------- messages ---
     def _share(self, values: list[int] | None) -> list[int]:
-        """Rank 0's int list on every rank: one all-gather of MSG ints (a longer list: one more for the rest)."""
+        """Rank 0's int list on every rank: one all-gather of MSG ints (a longer list: one more for the rest), headed
+        by its length, sequence number and checksum (``digest``); a follower whose count or checksum disagrees stops
+        with a named error (the ranks are out of step)."""
         dev = self.w.device
+        H = 3                                             # length, sequence number, checksum
+        seq = self.seq
+        self.seq = (self.seq + 1) % SEAL_MOD
         buf = torch.zeros((MSG,), dtype=torch.long, device=dev)
         if self.rank == 0:
             n = len(values)
-            head = [n] + list(values[:MSG - 1])
+            head = [n, seq, digest(list(values), seq)] + list(values[:MSG - H])
             buf[:len(head)] = torch.tensor(head, dtype=torch.long)
         if self.world == 1:
             got = buf
@@ -175,17 +220,23 @@ class GlmMultiDecoder:
             got = torch.empty((self.world * MSG,), dtype=torch.long, device=dev)
             self.comm.all_gather(buf, got)
         first = got[:MSG].tolist()
-        n = int(first[0])
-        out = first[1:1 + min(n, MSG - 1)]
+        n, got_seq, check = (int(v) for v in first[:H])
+        if self.rank != 0 and got_seq != seq:
+            raise RuntimeError(f"rank {self.rank}: expected rank 0's message {seq}, received number {got_seq} "
+                               f"({n} ints): the ranks are out of step; restart all four")
+        out = first[H:H + min(n, MSG - H)]
         rest = n - len(out)
         if rest > 0:
-            tail = (torch.tensor(values[MSG - 1:], dtype=torch.long, device=dev) if self.rank == 0
+            tail = (torch.tensor(values[MSG - H:], dtype=torch.long, device=dev) if self.rank == 0
                     else torch.zeros((rest,), dtype=torch.long, device=dev))
             if self.world > 1:
                 allt = torch.empty((self.world * rest,), dtype=torch.long, device=dev)
                 self.comm.all_gather(tail, allt)
                 tail = allt[:rest]
             out += tail.tolist()
+        if self.rank != 0 and check != digest(out, seq):
+            raise RuntimeError(f"rank {self.rank}: rank 0's message {seq} ({n} ints) fails its checksum: the ranks "
+                               "are out of step; restart all four")
         return out
 
     def _send(self, values: list[int]) -> None:
@@ -356,6 +407,15 @@ class GlmMultiDecoder:
         """A prompt chunk for the oldest queued prompt, then one decode round over the decoding streams; returns the
         streams that finished."""
         self._check()
+        self.iteration_since = time.monotonic()
+        watch()                                          # TF_GLM_MULTI_WATCHDOG_S: a stalled round exits
+        try:
+            return self._round()
+        finally:
+            unwatch()
+            self.iteration_since = None
+
+    def _round(self) -> list[Stream]:
         decoding = any(not s.done for s in self.streams.values())
         done = self._fill(not decoding) if self.filling else []
         live = [s for s in self.streams.values() if not s.done]
@@ -621,34 +681,40 @@ class GlmMultiDecoder:
     def follow(self) -> None:
         """Ranks 1..3: mirror rank 0's admissions, fills, rounds and endings until it sends an empty message."""
         while True:
-            msg = self._recv()
+            msg = self._recv()                           # idle: waits as long as rank 0 has nothing to do
             if not msg:
                 return
-            kind = msg[0]
-            if kind == ADMIT:
-                sid, slot, mode, sampled = msg[1:5]
-                s = Stream(self._recv(), 1, _unpack_sampling(msg[5:18]), sid=sid)
-                s.sampled = bool(sampled)
-                self.free = [x for x in self.free if x != slot]
-                self._queue(s, slot, mode)
-            elif kind == FILL:
-                sid, a, e, lo, hi = msg[1:6]
-                s = next(x for x in self.filling if x.sid == sid)
-                if self._chunk(s, a, e, lo, hi) is not None:
-                    self._start(s, self._recv()[0])
-            elif kind == ROUND:
-                n = msg[1]
-                conf = _ints_f64(*msg[2:5])
-                plan = [tuple(msg[5 + ITEM * i:5 + ITEM * (i + 1)]) for i in range(n)]
-                offs, R, ds = self._gpu(plan, conf)
-                flat = self._recv()
-                results, i = [], 0
-                for _ in plan:
-                    kept, c = flat[i], flat[i + 1]
-                    results.append((kept, flat[i + 2:i + 2 + c]))
-                    i += 2 + c
-                self._commit(plan, offs, results)
-                self.rounds += 1
-            elif kind == DONE:
-                for sid in msg[2:2 + msg[1]]:
-                    self._finish(sid)
+            watch()                                      # busy: the message's work and its follow-up messages
+            self._apply(msg)
+            unwatch()
+
+    def _apply(self, msg: list[int]) -> None:
+        """Ranks 1..3: one message of rank 0 (and the messages that follow it), as rank 0 ran it."""
+        kind = msg[0]
+        if kind == ADMIT:
+            sid, slot, mode, sampled = msg[1:5]
+            s = Stream(self._recv(), 1, _unpack_sampling(msg[5:18]), sid=sid)
+            s.sampled = bool(sampled)
+            self.free = [x for x in self.free if x != slot]
+            self._queue(s, slot, mode)
+        elif kind == FILL:
+            sid, a, e, lo, hi = msg[1:6]
+            s = next(x for x in self.filling if x.sid == sid)
+            if self._chunk(s, a, e, lo, hi) is not None:
+                self._start(s, self._recv()[0])
+        elif kind == ROUND:
+            n = msg[1]
+            conf = _ints_f64(*msg[2:5])
+            plan = [tuple(msg[5 + ITEM * i:5 + ITEM * (i + 1)]) for i in range(n)]
+            offs, R, ds = self._gpu(plan, conf)
+            flat = self._recv()
+            results, i = [], 0
+            for _ in plan:
+                kept, c = flat[i], flat[i + 1]
+                results.append((kept, flat[i + 2:i + 2 + c]))
+                i += 2 + c
+            self._commit(plan, offs, results)
+            self.rounds += 1
+        elif kind == DONE:
+            for sid in msg[2:2 + msg[1]]:
+                self._finish(sid)

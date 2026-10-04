@@ -89,6 +89,9 @@ class Health:
         if decoder is not None:                         # read, never locked: sizes of the decoder's own tables
             body["streams"] = {"decoding": len(getattr(decoder, "streams", ())),
                                "prefilling": len(getattr(decoder, "filling", ())), "max": scheduler.max_streams}
+        iteration = getattr(getattr(app, "engine", None), "iteration_s", None)
+        if callable(iteration):                         # how long the running round has gone without progress
+            body["iteration_s"] = iteration()
         window = getattr(app, "effective_context_window", None)
         if window:
             body["context_length"] = int(window)
