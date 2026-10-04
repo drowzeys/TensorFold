@@ -201,7 +201,45 @@ class Glm53Engine:
                 self.multi.prewarm()
             else:
                 self.runner.prewarm()
+        self.reuse = self._prompt_reuse() if self.runner is not None else None
         self.comm.barrier()
+
+    def _prompt_reuse(self):
+        """TF_GLM53_PROMPT_REUSE=1 (one stream): kept prompt states (prefixes.PromptReuse), the same settings and
+        byte budget (the ranks' least) on every rank - every rank must save and drop alike. Off with a DFlash2
+        capture (it needs every prompt row) and with --parallel > 1 (not wired into multi.py yet)."""
+        from . import prefixes
+        from .runner import CAPTURE_LABEL
+
+        on = prefixes.enabled()
+        cfg = prefixes.settings()
+        why = ("a DFlash2 capture needs every prompt row" if os.environ.get("TF_GLM53_CAPTURE_DIR") or CAPTURE_LABEL
+               else f"--parallel {self.parallel}: one stream only for now" if self.multi is not None else "")
+        if on and why:
+            if self.rank == 0:
+                print(f"[tensorfold] prompt reuse off: {why}", flush=True)
+            on = False
+        budget = Runner.kept_budget(int(cfg["gib"] * 2**30)) if on else 0
+        mine = torch.tensor([int(on), cfg["gap"], cfg["entries"], int(cfg["loose"]), budget >> 20], dtype=torch.int64,
+                            device="cuda")
+        every = torch.empty((WORLD * mine.numel(),), dtype=torch.int64, device="cuda")
+        self.comm.all_gather(mine, every)
+        rows = every.view(WORLD, -1).tolist()
+        if any(r[:-1] != rows[0][:-1] for r in rows):
+            raise RuntimeError(f"the ranks were started with different prompt-reuse settings (TF_GLM53_PROMPT_REUSE, "
+                               f"TF_GLM53_REUSE_GAP, TF_GLM53_CACHE_ENTRIES, TF_GLM53_REUSE_LOOSE): {rows}")
+        if not on:
+            return None
+        budget = min(r[-1] for r in rows) << 20
+        ids = prefixes.special_ids(self.model_dir)
+        plan = prefixes.PromptPlan(ids["user"], ids["assistant"], ids["think"], gap=cfg["gap"],
+                                   system_min=prefixes.SYSTEM_MIN)
+        if self.rank == 0:
+            print(f"[tensorfold] prompt reuse on: kept prompt states up to {budget / 2**30:.2f} GiB a rank and "
+                  f"{cfg['entries']} entries (TF_GLM53_CACHE_GIB / _ENTRIES), keep points every >= {cfg['gap']} "
+                  f"tokens at assistant openers{' (loose: any kept prefix resumes)' if cfg['loose'] else ''}; "
+                  f"<|user|> {ids['user']}, <|assistant|> {ids['assistant']}, <think> {ids['think']}", flush=True)
+        return prefixes.PromptReuse(self.runner, plan, budget, cfg["entries"], cfg["loose"])
 
     # ---------------------------------------------------------------------------------------------- sharing ---
     def _share(self, values: list[int] | None) -> list[int]:
@@ -228,14 +266,26 @@ class Glm53Engine:
         return self._sample(lg[None], position, s)
 
     def _run(self, prompt: list[int], max_tokens: int, s: Sampling | None, stop_eos: bool,
-             on_tokens: Callable[[list[int]], Any], k: int = 0, mode: str | None = None) -> dict[str, Any]:
+             on_tokens: Callable[[list[int]], Any], k: int = 0, mode: str | None = None,
+             reuse: tuple | None = None) -> dict[str, Any]:
         """Prefill, then serial decoding (k = 0) or MTP drafts verified by the target (k > 0): a verify window's rows
         get their one-row bits (row_exact), and every emitted token is the target's own sample, so both give the
-        same reply."""
+        same reply. ``reuse``: rank 0's (resume point, keep points, kept points, flags, drafted) for
+        prefixes.PromptReuse."""
         if self.runner is not None:
             sample = None if s is None else (lambda lg, pos: self._sample(lg, pos, s))
-            st = self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos, on_tokens, k,
-                                      mode, sampling=s)
+
+            def gen(begin: int = 0, stops=(), keep=None, head=None) -> dict[str, Any]:
+                return self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos,
+                                            on_tokens, k, mode, sampling=s, begin=begin, stops=stops, keep=keep,
+                                            head=head)
+            if self.reuse is not None and reuse is not None:
+                from .prefixes import mode_key
+
+                begin, stops, keeps, flags, drafted = reuse
+                st = self.reuse.run(prompt, begin, stops, keeps, flags, drafted, mode_key(mode, fused.MTP_MODE), gen)
+            else:
+                st = gen()
             out = st.pop("out")
             if self.runner.cap is not None:
                 fn = self.runner.cap.finish(list(prompt) + out, {"temp": s.temperature if s else 0.0,
@@ -342,12 +392,27 @@ class Glm53Engine:
         k = self.k if draft else 0
         modes = fused.MTP_MODES
         mi = modes.index(mtp_mode) + 1 if mtp_mode in modes else 0          # 0: the default mode
+        # prompt reuse: rank 0 picks the kept state to resume (drafted requests only: "draft": false is the cold
+        # reference, cut at the same keep points but never resumed nor kept) and the states to keep
+        begin, flags, stops, keeps = 0, 0, [], []
+        rz = self.reuse
+        if rz is not None:
+            from .prefixes import mode_key
+
+            if rz.flush_requested():
+                flags |= rz.FLUSH
+                rz.store.clear()
+            begin, stops, keeps = rz.choose(list(prompt), bool(draft),
+                                            mode_key(modes[mi - 1] if mi else None, fused.MTP_MODE))
         header = [max_tokens, int(stop_eos), k | (mi << 8), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
                   *_f64_ints(s.temperature if s else 0.0), int(s.top_k) if s else 0,
-                  *_f64_ints(s.top_p if s else 1.0), *_f64_ints(s.min_p if s else 0.0)]
+                  *_f64_ints(s.top_p if s else 1.0), *_f64_ints(s.min_p if s else 0.0), begin, flags | int(draft) << 1]
         self._share(header)
         self._share(list(prompt))
-        stats = self._run(list(prompt), max_tokens, s, stop_eos, on_tokens, k, modes[mi - 1] if mi else None)
+        if rz is not None:
+            self._share([len(stops), *stops, *keeps])
+        stats = self._run(list(prompt), max_tokens, s, stop_eos, on_tokens, k, modes[mi - 1] if mi else None,
+                          (begin, stops, keeps, flags, bool(draft)))
         stats["mtp_drafts"] = k
         return stats
 
@@ -359,13 +424,17 @@ class Glm53Engine:
         done = 0
         while requests is None or done < requests:
             done += 1
-            (max_tokens, stop_eos, k, s_lo, s_hi, s_top, t0, t1, t2, top_k, p0, p1, p2, m0, m1, m2) = \
+            (max_tokens, stop_eos, k, s_lo, s_hi, s_top, t0, t1, t2, top_k, p0, p1, p2, m0, m1, m2, begin, flags) = \
                 self._share(None)
             prompt = self._share(None)
+            stops, keeps = [], []
+            if self.reuse is not None:                   # rank 0's keep points (prefixes.PromptReuse.choose)
+                lists = self._share(None)
+                stops, keeps = lists[1:1 + lists[0]], lists[1 + lists[0]:]
             temperature = _ints_f64(t0, t1, t2)
             seed = (s_top << 62) | (s_hi << 31) | s_lo
             s = Sampling(seed, temperature, top_k, _ints_f64(p0, p1, p2), _ints_f64(m0, m1, m2)) \
                 if temperature > 0 else None
             mi = k >> 8
             self._run(prompt, max_tokens, s, bool(stop_eos), lambda new: None, k & 0xFF,
-                      fused.MTP_MODES[mi - 1] if mi else None)
+                      fused.MTP_MODES[mi - 1] if mi else None, (begin, stops, keeps, flags & 1, bool(flags & 2)))
