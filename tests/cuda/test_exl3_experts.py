@@ -329,13 +329,13 @@ def test_fused_down_and_combine_equal_the_separate_launches(slots):
         P, sk = R * slots, scratch.cfg_d[2]
 
         scratch.y[:P].copy_(shared)
-        fused = experts.routed(x, sel, w, ex, scratch, None, R).clone()
+        fused = experts.routed(x, sel, w, ex, scratch, None, R, fuse=0).clone()   # fuse 0: Z keeps down's sums
         y_fused = scratch.y[:P].clone()
         # the same call's down projection output is still in scratch.z: finish it with the two separate launches
         scratch.y[:P].copy_(shared)
-        ext.down_epilogue(scratch.z, sel, ex.svh_d, scratch.y, R, P, D, sk, slots, E)
+        ext.down_epilogue(scratch.z, sel, ex.svh_d, scratch.y, R, P, D, sk, slots, E, 0)
         apart = torch.empty((R, D), dtype=torch.float32, device="cuda")
-        ext.combine(scratch.y, w, apart, R, D, slots)
+        ext.combine(scratch.y, w, apart, R, D, slots, 0)
         torch.cuda.synchronize()
         assert torch.equal(y_fused.view(torch.int32), scratch.y[:P].view(torch.int32)), (slots, R)
         assert torch.equal(fused.view(torch.int32), apart.view(torch.int32)), (slots, R)

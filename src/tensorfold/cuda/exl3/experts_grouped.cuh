@@ -6,6 +6,8 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <utility>
 
 namespace tf_exl3x {
 
@@ -254,6 +256,150 @@ __device__ __forceinline__ void warp_tiles_v(const uint32_t* __restrict__ T, int
     __syncwarp();                                         // the staging slice is the warp's red rows again
 }
 
+// ---- the epilogues' arithmetic, one copy for the separate kernels (experts.cu) and the fused ones below ----------
+
+constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+
+// Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
+__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
+    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? o - v[j] : v[j] + o;
+        }
+    }
+}
+
+__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+
+// A partial another block of this launch wrote (CG: through L2, after the arrival count) or an earlier kernel did.
+template <bool CG>
+__device__ __forceinline__ float ld_part(const float* p) {
+    if constexpr (CG) return __ldcg(p);
+    else return *p;
+}
+
+// Pair p's gate/up epilogue on the lane's 4 columns from n (of one 128-column block): the splits summed in order
+// from 0, rotated, * svh, SwiGLU (act_mode 0: GLM's bf16 roundings, 1: fp32), then xd = fp16((act * suh_d) @ H).
+template <bool CG>
+__device__ __forceinline__ void gateup_epi(const float* __restrict__ Z, int p, int e, int n, int P, int N, int SK,
+                                           const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                           const half* __restrict__ suh_d, half* __restrict__ xd, float limit,
+                                           int act_mode, int lane) {
+    float gv[4], uv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float sg = 0.f, su = 0.f;
+        for (int s = 0; s < SK; ++s) {
+            sg += ld_part<CG>(Z + ((size_t)(0 * SK + s) * P + p) * N + n + j);
+            su += ld_part<CG>(Z + ((size_t)(1 * SK + s) * P + p) * N + n + j);
+        }
+        gv[j] = sg;
+        uv[j] = su;
+    }
+    fwht128(gv, lane);
+    fwht128(uv, lane);
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float act;
+        if (act_mode == 0) {
+            float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
+            float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
+                             limit);
+            act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
+        } else {
+            float gg = fminf(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]), limit);
+            float uu = fminf(fmaxf(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), -limit), limit);
+            act = gg / (1.f + expf(-gg)) * uu;
+        }
+        v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
+    }
+    fwht128(v, lane);
+    half* o = xd + (size_t)p * N + n;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// The down epilogue of a pair's 128 columns from their summed splits v: o = (v @ H) * svh_d (fp32).
+__device__ __forceinline__ void down_epi(float (&v)[4], int e, int n, int D, const half* __restrict__ svh_d,
+                                         int lane, float (&o)[4]) {
+    fwht128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
+}
+
+// Row r's combine on 4 columns from n: sum over slots in order of wts[r][q] * y[r * slots + q] (fp32 fma chain
+// from 0), the arithmetic of combine_kernel and down_combine_kernel.
+template <bool CG>
+__device__ __forceinline__ void combine4(const float* __restrict__ y, const float* __restrict__ wts, int r, int slots,
+                                         int D, int n, float (&acc)[4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = 0.f;
+    for (int q = 0; q < slots; ++q) {
+        const float w = wts[r * slots + q];
+        const float* yp = y + ((size_t)r * slots + q) * D + n;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[j] = fmaf(w, ld_part<CG>(yp + j), acc[j]);
+    }
+}
+
+// Programmatic dependent launch (no-ops when the launch did not ask for it), as linear.cu: wait for the previous
+// kernel's writes (and so, kernel by kernel, every earlier one's) before reading or writing anything but weights; let
+// the next PDL kernel launch (it waits in turn for all of this one).
+__device__ __forceinline__ void griddep_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void griddep_launch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+template <typename... KArgs, typename... Args>
+void launch_ex(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream, bool pdl,
+               Args&&... args) {
+    cudaLaunchConfig_t config = {};
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = smem;
+    config.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    config.attrs = attr;
+    config.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, std::forward<Args>(args)...));
+}
+
+// The fused epilogues of a grouped launch (MiaAI-Lab patch 0016's decode kernel, onto this kernel's settings).
+struct Epi {
+    int fuse = 0;        // 0: Z partials; 1 (down; SK 1, one matrix): y = its epilogue, and with wts the combine
+                         // into out (+ sy); 2 (gate and up): Z, then each (expert, member tile, 128 columns)'s last
+                         // block runs the gate/up epilogue into xd. Both need 8 n tiles (one Hadamard block) a program
+    const int* pick = nullptr;           // [P] (fuse 1 with wts: the row's routed slots)
+    int E = 0;
+    const half* svh_g = nullptr;         // fuse 2
+    const half* svh_u = nullptr;
+    const half* suh_d = nullptr;
+    half* xd = nullptr;
+    float limit = 0.f;
+    int act_mode = 1;
+    const half* svh_d = nullptr;         // fuse 1
+    float* y = nullptr;                  // [P, D]: routed slots written, the others the caller's
+    const float* wts = nullptr;          // [R, slots] or null (no combine)
+    float* out = nullptr;                // [R, D]
+    const float* sy = nullptr;           // [R, D] added to out (fp32, after the combine) or null
+    int* done = nullptr;                 // arrival counts, zero between launches (the last arrival resets its own):
+                                         // fuse 2 [grid.x * member tiles * grid.y], fuse 1 with wts [R * grid.y]
+};
+
 // The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
 __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
@@ -261,13 +407,37 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
 // V > 0: warp_tiles_v (16-byte loads V k steps ahead, staged in the warp's slice of red), else warp_tiles (PF tiles).
+// ep.fuse 1 / 2: the epilogues fused (Epi); every sum keeps the separate kernels' order, so the outputs keep their bits.
 template <int CB, int NT, int W, int PF, int V, int LO, int HI>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int NS) {
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int NS, const Epi ep) {
+    griddep_wait();                                       // the plan, X and the outputs are earlier kernels'
+    griddep_launch();
     const int u = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if constexpr (NT == 8) {
+        // fused combine: rows without a routed slot get no arrival, so one block a column block combines them
+        // (only the caller's y) here, before any early exit
+        if (ep.fuse == 1 && ep.wts != nullptr && blockIdx.x == gridDim.x - 1 && blockIdx.z == 0) {
+            const int n = blockIdx.y * 128 + 4 * lane;
+            for (int r = warp; r < P / slots; r += W) {
+                int routed = 0;
+                for (int q = 0; q < slots; ++q) {
+                    const int pe = ep.pick[r * slots + q];
+                    routed += pe >= 0 && pe < ep.E;
+                }
+                if (routed) continue;
+                float acc[4];
+                combine4<false>(ep.y, ep.wts, r, slots, N, n, acc);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    ep.out[(size_t)r * N + n + j] = ep.sy ? __fadd_rn(acc[j], ep.sy[(size_t)r * N + n + j]) : acc[j];
+            }
+        }
+    }
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
     const int mtile = blockIdx.z % MT;
@@ -277,7 +447,6 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
     const int k2 = mat ? K2_1[e] : K2_0[e];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int KT = K >> 4, NTILES = NS > 0 ? NS : (N >> 4);  // row stride of the trellis, in tiles (gate/up column blocks)
 
@@ -354,6 +523,67 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
     __syncthreads();
+    if constexpr (NT == 8) {
+        if (ep.fuse == 1) {
+            // down (SK 1): down_epilogue on this block's sums, z = 0 + (warps added in order) as its split sum
+            const int n = nt0 * 16 + 4 * lane;
+            for (int i = warp; i < 16; i += W) {
+                const int p = rows_sh[i];
+                if (p < 0) continue;
+                float v[4], o[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float s = red[0][i][4 * lane + j];
+#pragma unroll
+                    for (int w = 1; w < W; ++w) s += red[w][i][4 * lane + j];
+                    float z = 0.f;
+                    z += s;
+                    v[j] = z;
+                }
+                down_epi(v, e, n, N, ep.svh_d, lane, o);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) ep.y[(size_t)p * N + n + j] = o[j];
+            }
+            if (ep.wts == nullptr) return;
+            // the combine: a row's last arriving block (of its routed slots, this column block) sums its slots' y in
+            // slot order, as down_combine does, whichever block arrives last
+            __shared__ int last_row[16];
+            __threadfence();                              // this block's y before its arrivals
+            __syncthreads();
+            if (threadIdx.x < 16) {
+                const int p = rows_sh[threadIdx.x];
+                int last = 0;
+                if (p >= 0) {
+                    const int r = p / slots;
+                    int routed = 0;
+                    for (int q = 0; q < slots; ++q) {
+                        const int pe = ep.pick[r * slots + q];
+                        routed += pe >= 0 && pe < ep.E;
+                    }
+                    int* c = ep.done + (size_t)r * gridDim.y + blockIdx.y;
+                    last = atomicAdd(c, 1) == routed - 1;
+                    if (last) *c = 0;                     // every arrival is in: the next launch starts from zero
+                }
+                last_row[threadIdx.x] = last;
+            }
+            __syncthreads();
+            bool fenced = false;
+            for (int i = warp; i < 16; i += W) {
+                if (!last_row[i]) continue;
+                if (!fenced) {
+                    __threadfence();                      // every arrival's y is visible from here
+                    fenced = true;
+                }
+                const int r = rows_sh[i] / slots;
+                float acc[4];
+                combine4<true>(ep.y, ep.wts, r, slots, N, n, acc);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    ep.out[(size_t)r * N + n + j] = ep.sy ? __fadd_rn(acc[j], ep.sy[(size_t)r * N + n + j]) : acc[j];
+            }
+            return;
+        }
+    }
     for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
@@ -362,6 +592,30 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #pragma unroll
         for (int w = 1; w < W; ++w) s += red[w][row][col];
         Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+    }
+    if constexpr (NT == 8) {
+        if (ep.fuse == 2) {
+            // gate/up: the last of the 2 * SK blocks of (expert, member tile, 128 columns) runs gateup_epilogue on
+            // its rows, the partials read in split order: the same sums whichever block arrives last
+            __shared__ int last;
+            __threadfence();                              // this block's partials before its arrival
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                int* c = ep.done + ((size_t)u * MT + mtile) * gridDim.y + blockIdx.y;
+                last = atomicAdd(c, 1) == 2 * SK - 1;
+                if (last) *c = 0;
+            }
+            __syncthreads();
+            if (!last) return;
+            __threadfence();
+            const int n = nt0 * 16 + 4 * lane;
+            for (int i = warp; i < 16; i += W) {
+                const int p = rows_sh[i];
+                if (p < 0) continue;
+                gateup_epi<true>(Z, p, e, n, P, N, SK, ep.svh_g, ep.svh_u, ep.suh_d, ep.xd, ep.limit, ep.act_mode,
+                                 lane);
+            }
+        }
     }
 }
 
@@ -404,16 +658,21 @@ struct GroupedArgs {
     int ns = 0;          // trellis row stride in tiles (0 = N/16)
     int vec = 0;         // 0: 32-bit loads, pf tiles in flight; 1..4: 16-byte loads that many k steps ahead (nt 8,
                          // 4 warps; other tiles keep the 32-bit walk)
+    bool pdl = false;    // programmatic dependent launch
+    Epi ep;
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    TORCH_CHECK(a.ep.fuse == 0 || a.nt == 8, "fused epilogues need 8 n tiles (one Hadamard block) a program");
+    TORCH_CHECK(a.ep.fuse != 1 || (a.SK == 1 && a.mats == 1), "the fused down epilogue takes one split of one matrix");
+    TORCH_CHECK(a.ep.fuse != 2 || a.mats == 2, "the fused gate/up epilogue takes gate and up");
 #define TF_LAUNCH(NT_, W_, PF_, V_, LO_, HI_)                                                                   \
-    grouped_kernel<CB, NT_, W_, PF_, V_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                               \
-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots, a.ns)
+    launch_ex(grouped_kernel<CB, NT_, W_, PF_, V_, LO_, HI_>, grid, dim3(W_ * 32), 0, stream, a.pdl, a.x0, a.x1,  \
+              a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,      \
+              a.slots, a.ns, a.ep)
 #define TF_RANGES(NT_, W_, PF_, V_)                                                                             \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, V_, 8, 8);                                              \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, V_, 2, 10);                                       \

@@ -36,6 +36,15 @@ def _knob(name: str, default: int, lo: int, hi: int) -> int:
 # the setting's tiles in flight (the original walk); 1..4: 16-byte ld.global.nc loads 1..4 k steps ahead, staged in
 # shared memory (MiaAI-Lab patch 0047: 1 measured best there). Data movement only: every value gives the same bits.
 LOADS = _knob("TF_EXL3_EXPERTS_LOADS", 1, 0, 4)
+# TF_EXL3_EXPERTS_FUSE (a bit mask; 8 n tiles a program, else that part stays separate): 1 (default): the down
+# projection runs its epilogue and the weighted combine (``out``, + ``sy`` when given) itself, the last arriving block
+# of a row summing its slots in slot order - no Z round trip, no down_combine launch; 2: gate/up's epilogue in the last
+# of an expert's 2 * splits blocks (MiaAI-Lab measured it slower on its shapes: off by default, try 3). 0: the
+# separate kernels. Every value gives the same bits (MiaAI-Lab patch 0016's decode kernel, adapted).
+FUSE = _knob("TF_EXL3_EXPERTS_FUSE", 1, 0, 3)
+# TF_EXL3_EXPERTS_PDL (default 1): the chain's kernels launch with programmatic dependent launch (as linear.cu's);
+# each waits for the previous kernel before touching memory. 0: plain launches. The same bits either way.
+PDL = _knob("TF_EXL3_EXPERTS_PDL", 1, 0, 1)
 
 
 @lru_cache(maxsize=1)
@@ -44,7 +53,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -189,6 +198,13 @@ class Scratch:
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+        # fused epilogues' arrival counts (zero between launches; each launch's last arrival resets its own):
+        # gate/up a (expert, member tile, 128 columns), the combine a (row, 128 columns)
+        self.done_gu = torch.zeros((maxu * (-(-rows // 16)) * max(I // 128, 1),), dtype=torch.int32, device=device)
+        self.done_d = torch.zeros((rows * max(D // 128, 1),), dtype=torch.int32, device=device)
+        self.none_h = torch.empty((0,), dtype=torch.float16, device=device)
+        self.none_f = torch.empty((0,), dtype=torch.float32, device=device)
+        self.none_i = torch.empty((0,), dtype=torch.int32, device=device)
 
     def window(self, R: int):
         """(ids, members) sized for R rows: the grids only span what R rows can use."""
@@ -199,9 +215,12 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, loads: int | None = None) -> torch.Tensor:
+           group: bool = True, loads: int | None = None, fuse: int | None = None, pdl: int | None = None,
+           sy: torch.Tensor | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
-    ``loads``: TF_EXL3_EXPERTS_LOADS for this call (None: the module's LOADS); never changes a bit."""
+    ``sy`` (fp32 [R, D], with ``wts``): out = (the weighted sum) + sy, the bits of ``out.add_(sy)`` after it.
+    ``loads`` / ``fuse`` / ``pdl``: TF_EXL3_EXPERTS_LOADS / _FUSE / _PDL for this call (None: the module's); none
+    changes a bit."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -211,23 +230,41 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     vec = (LOADS if loads is None else int(loads)) if ex.aligned16 else 0
+    fuse = FUSE if fuse is None else int(fuse)
+    pdl = PDL if pdl is None else int(pdl)
+    nh, nf, ni = s.none_h, s.none_f, s.none_i
     if group:
-        ext.group(pick, ids, s.count, members, R, slots, E)
-    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+        ext.group(pick, ids, s.count, members, R, slots, E, pdl)
+    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E, pdl)
     nt, w, sk, pf = s.cfg_gu
+    fgu = 2 if fuse & 2 and nt == 8 else 0
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.gu_stride, vec)
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.gu_stride, vec, fgu, pick, E,
+                ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), act_mode, nh, nf, nf, nf, nf,
+                s.done_gu if fgu else ni, pdl)
+    if not fgu:
+        ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit),
+                            act_mode, pdl)
     nt, w, sk, pf = s.cfg_d
-    ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0, vec)
-    if wts is None:
-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
-        return s.y[:P]
-    if out is None:
+    if wts is not None and out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    if fuse & 1 and nt == 8 and sk == 1:
+        # down with its epilogue (y) and, given wts, the combine (+ sy) in the same launch
+        ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
+                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0, vec, 1, pick, E, nh, nh, nh, nh,
+                    0.0, act_mode, ex.svh_d, s.y, nf if wts is None else wts, nf if out is None else out,
+                    nf if (sy is None or wts is None) else sy, s.done_d, pdl)
+        return s.y[:P] if wts is None else out
+    ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], 0, vec, 0, pick, E, nh, nh, nh, nh, 0.0,
+                act_mode, nh, nf, nf, nf, nf, ni, pdl)
+    if wts is None:
+        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E, pdl)
+        return s.y[:P]
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E, pdl)
+    if sy is not None:
+        out.add_(sy)
     return out
 
 

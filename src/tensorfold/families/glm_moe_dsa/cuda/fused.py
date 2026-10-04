@@ -65,6 +65,10 @@ DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurre
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)
 SPECIALS = 128           # ... plus the vocabulary's last ids (GLM's special tokens)
 TUNE = os.environ.get("TF_GLM53_TUNE", "1") != "0"
+# TF_GLM53_FOLD_SHARED (default 1): the shared expert runs before the routed experts (disjoint buffers, the same
+# kernels: the same bits) and the routed kernel chain adds its output while combining (out = combine + sy, the bits of
+# the separate add); 0: routed, shared expert, then part += sy as before.
+FOLD_SHARED = os.environ.get("TF_GLM53_FOLD_SHARED", "1") != "0"
 
 
 # ------------------------------------------------------------------------------------------------ kernels ---
@@ -1066,7 +1070,15 @@ def route(w: Weights, L: Layer, b: Buffers, r0: int, n: int) -> None:
 
 def experts_part(w: Weights, L: Layer, b: Buffers, R: int) -> None:
     """Routed experts (picks in b.pick) + the shared expert of rows b.normed[:R] -> fp32 partial b.part[:R]."""
-    if not hasattr(L.experts, "prefill"):
+    shared_impl = hasattr(L.experts, "prefill")
+    if FOLD_SHARED and (not shared_impl or R <= b.xs.rows):
+        mlp(w, L, b, R, b.sy[:R])                        # first: its weights may still be in L2 (TF_GLM53_L2PF)
+        if shared_impl:
+            L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R, sy=b.sy[:R])
+        else:
+            x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R, sy=b.sy[:R])
+        return
+    if not shared_impl:
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], L.experts, b.xs, b.part[:R], R)
     elif R <= b.xs.rows:
         L.experts.decode(b.normed[:R], b.pick[:R], b.wts[:R], b.xs, b.part[:R], R)
