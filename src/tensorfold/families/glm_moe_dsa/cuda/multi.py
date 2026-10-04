@@ -142,6 +142,15 @@ FILL_MIN_ROWS = int(os.environ.get("TF_GLM53_FILL_MIN_ROWS", "2048"))
 DRAFT_CUT = float(os.environ.get("TF_GLM53_DRAFT_CUT", "0.6") or 0)
 DRAFT_CUT_DFLASH = float(os.environ.get("TF_GLM53_DRAFT_CUT_DFLASH", "") or DRAFT_CUT)
 CUT_STREAMS = max(2, int(os.environ.get("TF_GLM53_DRAFT_CUT_STREAMS", "4") or 4))
+# Precapture (after bertholomus' TensorFold 4016d27: a burst of 4 streams after a start paid 36 captures in its first
+# rounds): prewarm also captures the round shapes it used to leave to first use - verify windows of every width with
+# both picks (the draft cut makes any width), auto streams' MTP first steps and backlog writes - from the shortest
+# contexts' key buckets up, at most TF_GLM53_PRECAPTURE_MAX (default 128) more graphs and TF_GLM53_PRECAPTURE_GB
+# (default 2) of device memory a rank, and never within 1 GiB of the cache reserve (TF_GLM53_CACHE_RESERVE_GB) on any
+# rank. 0: as before. The same graphs replay the same kernels: replies are the same.
+PRECAPTURE = os.environ.get("TF_GLM53_PRECAPTURE", "1") != "0"
+PRECAPTURE_MAX = int(os.environ.get("TF_GLM53_PRECAPTURE_MAX", "128"))
+PRECAPTURE_GB = float(os.environ.get("TF_GLM53_PRECAPTURE_GB", "2"))
 
 
 class GlmMultiDecoder:
@@ -724,9 +733,13 @@ class GlmMultiDecoder:
     def prewarm(self) -> None:
         """Every rank (no messages): capture the windows of 1..N MTP-drafting streams with every backlog total
         (S..S(k+1) MTP rows), and (DFlash2 loaded) verify windows of every width up to the widest, in every key
-        bucket; sampled MTP mixes capture with pick "full", other mixes on first use. Caches get scratch values at
-        the positions used; every request writes a position before reading it."""
+        bucket; sampled MTP mixes capture with pick "full"; then (TF_GLM53_PRECAPTURE) the remaining round shapes within a
+        memory and count budget (``_precapture``), other shapes on first use. Caches get scratch values at the
+        positions used; every request writes a position before reading it."""
+        self._agree([int(PRECAPTURE), PRECAPTURE_MAX, int(PRECAPTURE_GB * 1000)],
+                    "TF_GLM53_PRECAPTURE / _MAX / _GB")  # the ranks' captures pair their collectives
         t0 = time.perf_counter()
+        free0 = torch.cuda.mem_get_info()[0]
         rn, k = self.runner, self.k
         cap = rn.capacity - max(k, self.frows) - 2
         before = len(rn.G.graphs)
@@ -748,8 +761,92 @@ class GlmMultiDecoder:
                 for R in range(1, self.rows + 1):
                     self._verify(R, T, "argmax")
         torch.cuda.synchronize()
+        free1 = torch.cuda.mem_get_info()[0]
+        extra = self._precapture(buckets, cap) if PRECAPTURE and rn.G.enabled else ""
         print(f"[tensorfold] rank {self.w.rank}: {len(rn.G.graphs) - before} concurrent decode graphs captured in "
-              f"{time.perf_counter() - t0:.1f}s", flush=True)
+              f"{time.perf_counter() - t0:.1f}s ({(free0 - free1) / 2**30:.2f} GiB of device memory{extra})",
+              flush=True)
+
+    def _frees(self) -> list[int]:
+        """Every rank's free device memory (bytes), on every rank (a collective: every rank calls it together)."""
+        free = torch.cuda.mem_get_info()[0]
+        if self.world == 1:
+            return [free]
+        dev = self.w.device
+        got = torch.empty((self.world,), dtype=torch.long, device=dev)
+        self.comm.all_gather(torch.tensor([free], dtype=torch.long, device=dev), got)
+        return got.tolist()
+
+    def _scratch(self, P: int, width: int) -> None:
+        """Tables for scratch windows: verify row r in slot r // width at P + r % width; MTP backlog row i in slot
+        i // BL at P + i % BL, gathering backlog row i; drafting stream s's last MTP row s, its draft into row s.
+        Positions stay below the capacity (P <= capacity - max(k, frows) - 2)."""
+        o, R, MR, BL = self.off, self.rows, self.MR, self.BL
+        tab = torch.zeros((self.tab_n,), dtype=torch.long)
+        r = torch.arange(R)
+        tab[o["vpos"]:o["vpos"] + R] = P + r % width
+        tab[o["vbase"]:o["vbase"] + R] = (r // width) * self.local
+        if self.k:
+            i = torch.arange(MR)
+            tab[o["mpos1"]:o["mpos1"] + MR] = P + i % BL
+            tab[o["mbase1"]:o["mbase1"] + MR] = (i // BL) * self.local
+            tab[o["src"]:o["src"] + MR] = i
+            tab[o["last1"]:o["last1"] + self.N] = torch.arange(self.N)
+            tab[o["vdst1"]:o["vdst1"] + self.N] = torch.arange(self.N)
+            self.mb.ids.fill_(1000)
+            self.mb.hin.zero_()
+        self.t64.copy_(tab)
+        self.t32.copy_(self.t64)
+        self.vb.ids.fill_(1000)
+
+    def _precapture(self, buckets, cap: int) -> str:
+        """PRECAPTURE (every rank, the same keys in the same order): the round shapes prewarm leaves to first use - verify
+        windows of every width 1..rows with both picks (the draft cut, serial streams and sampled mixes make any width),
+        and with DFlash2 and MTP both loaded (auto streams), MTP first steps of S drafting streams among more keeping
+        ones and backlog-only writes - bucket by bucket from the shortest contexts, until PRECAPTURE_MAX graphs or
+        PRECAPTURE_GB of device memory on any rank, or free memory on any rank near the cache reserve (GB10's unified
+        memory: an overcommit swaps the node instead of failing). Shapes left over capture on first use, as before."""
+        rn, k, N = self.runner, self.k, self.N
+        cn, full = rn.chain_normed, rn.draft_full
+        auto = self.dr is not None and k > 0
+        t0 = time.perf_counter()
+        start = self._frees()
+        reserve = min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), min(start) / 2)
+        budget = PRECAPTURE_GB * (1 << 30)
+        made, stop, used, free = 0, "", 0, start
+        for i, T in enumerate(buckets):
+            P = 10 if T is None else min((buckets[i - 1] or rn.topk) + 100, cap)
+            items = [(("mt", R, T, pick), lambda R=R, pick=pick, T=T: self._verify(R, T, pick))
+                     for pick in ("argmax", "full") for R in range(1, self.rows + 1)]
+            if auto:
+                items += [(("mw", n, T, cn), lambda n=n, T=T: self._mtp_write(n, T)) for n in range(1, self.MR + 1)]
+                items += [(("mm", n, S, 1, T, cn, full), lambda n=n, S=S, T=T: self._mtp_step(1, n, S, T))
+                          for S in range(1, N + 1) for n in range(S, self.MR + 1)]
+            items = [(key, run) for key, run in items if key not in rn.G.graphs]
+            if not items:
+                continue
+            self._scratch(P, self.rows // N)
+            for key, run in items:
+                if made >= PRECAPTURE_MAX:
+                    stop = f"TF_GLM53_PRECAPTURE_MAX={PRECAPTURE_MAX}"
+                elif made % 8 == 0:                      # every rank at the same counts (the check is a collective)
+                    free = self._frees()
+                    used = max(a - b for a, b in zip(start, free))
+                    if used > budget:
+                        stop = f"TF_GLM53_PRECAPTURE_GB={PRECAPTURE_GB:g}"
+                    elif min(free) < reserve + (1 << 30):
+                        stop = f"{min(free) / 2**30:.1f} GiB free on a rank"
+                if stop:
+                    break
+                run()
+                made += 1
+            if stop:
+                break
+        torch.cuda.synchronize()
+        free = self._frees()
+        used = max(a - b for a, b in zip(start, free))
+        return (f"; precapture {made} more in {time.perf_counter() - t0:.1f}s, {used / 2**30:.2f} GiB on the rank that "
+                f"gave most, {min(free) / 2**30:.1f} GiB free on the tightest{'; stopped at ' + stop if stop else ''}")
 
     # ------------------------------------------------------------------------------------------- endings ---
     def finish(self, done: list[Stream]) -> None:
