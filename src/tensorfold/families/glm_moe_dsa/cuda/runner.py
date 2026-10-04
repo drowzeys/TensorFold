@@ -168,7 +168,7 @@ class GraphSet:
         t0 = time.perf_counter()
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, pool=self.pool):
+        with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
             fn()
         torch.cuda.synchronize()
         self.graphs[key] = g

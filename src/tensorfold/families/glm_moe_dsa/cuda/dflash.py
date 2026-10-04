@@ -395,7 +395,7 @@ class MultiDrafter:
                 self._taps_compute(T)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self.pool):
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
                 self._taps_compute(T)
             self.tap_graphs[T] = g
         for S in range(1, self.N + 1):
@@ -403,7 +403,7 @@ class MultiDrafter:
                 self._block_compute(S)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self.pool):
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
                 self._block_compute(S)
             self.block_graphs[S] = g
         torch.cuda.synchronize()

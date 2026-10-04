@@ -410,7 +410,7 @@ class Drafter:
                 self._taps_compute(n)
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self.pool):
+            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
                 self._taps_compute(n)
             self.tap_graphs[n] = g
             self.reset()
@@ -418,7 +418,7 @@ class Drafter:
             self._block_compute()
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, pool=self.pool):
+        with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
             self._block_compute()
         self.block_graph = g
         torch.cuda.synchronize()
