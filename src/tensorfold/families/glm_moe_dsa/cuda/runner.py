@@ -88,6 +88,31 @@ def _pct(v: list[float]) -> dict:
     return {"p10": at(0.1), "p50": at(0.5), "p90": at(0.9), "max": round(v[-1], 1), "mean": round(sum(v) / len(v), 1)}
 
 
+class StopVote:
+    """--parallel 1: a stop rank 0's ``on_tokens`` asks for (the client has gone, a stop string, a gate's cut) ends the
+    run on every rank after the same round (MiaAI-Lab 0070, their issue #38; before, every rank decoded on to
+    max_tokens). Only rank 0's callback wishes (followers' return None); the wish rides on a spare word of the next
+    verify window's own exchange (``fused.head``: the argmax head's spare column, the word behind the full head's
+    rows), so every rank reads the same decision with no collective of its own. Only when the run ends changes,
+    never a token."""
+
+    def __init__(self, on_tokens: Callable[[list[int]], Any]) -> None:
+        self.fn = on_tokens
+        self.mine = False                # this rank's on_tokens asked to stop (sticky)
+        self.armed = False               # the argmax head's spare column holds it (sticky)
+        self.agreed = False              # rank 0 asked, as of the last verify window read (sticky)
+
+    def __call__(self, tokens: list[int]) -> bool:
+        if self.fn(tokens):
+            self.mine = True
+        return self.mine
+
+    def settle(self, voted: bool | None) -> bool:
+        """The last verify window's vote (None: one rank, whose own wish decides) -> whether the run ends now."""
+        self.agreed = self.agreed or (self.mine if voted is None else bool(voted))
+        return self.agreed
+
+
 class GraphSet:
     """CUDA graphs by key, captured on first use (after an eager run that is the step's real result)."""
 
@@ -385,6 +410,34 @@ class Runner:
         st.pos.fill_(P)
         self.G.run(("tgt", R, T, pick), lambda: fused.compute(w, st, vb, R, T, logits="all", pick=pick))
 
+    def _vote_arm(self, vote: StopVote, R: int, pick: str) -> None:
+        """Before a verify window of R rows: rank 0's stop wish into the spare word its head exchanges."""
+        w, vb = self.w, self.vb
+        if w.world == 1 or w.rank != 0:
+            return
+        if pick == "argmax":
+            if vote.mine and not vote.armed:             # the head never writes the column: once is enough
+                vb.amax[:, 2].fill_(1.0)
+                vote.armed = True
+        elif pick == "full":                             # behind the rows: a wider window's logits overwrite it
+            vb.lflat[R * w.lm_head.shape[0]].fill_(1.0 if vote.mine else 0.0)
+
+    def _vote_word(self, R: int, pick: str) -> torch.Tensor | None:
+        """After a verify window of R rows: the device word holding rank 0's vote (None: one rank)."""
+        w, vb = self.w, self.vb
+        if w.world == 1:
+            return None
+        if pick == "argmax":
+            return vb.amax_all[2:3]
+        n = R * w.lm_head.shape[0]
+        return vb.lgath[n:n + 1]
+
+    @staticmethod
+    def _read(parts: list[torch.Tensor], word: torch.Tensor | None) -> tuple[list[int], bool | None]:
+        """Int tensors and the vote word in one device-to-host read: (their values, the vote or None)."""
+        got = torch.cat(parts + ([word.long()] if word is not None else [])).tolist()
+        return (got[:-1], got[-1] > 0) if word is not None else (got, None)
+
     def _dflash_cfg(self) -> tuple[int, float]:
         cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
                "confidence": float(os.environ.get("TF_GLM53_DFLASH_CONFIDENCE", "0.3"))}
@@ -440,12 +493,16 @@ class Runner:
                 drafts = dr.propose(tok, room, sampling, conf) if room else []
                 R = 1 + len(drafts)
                 vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
-            self._verify(R, P, self._T(P + R), "argmax" if sample is None else "full")
+            pick = "argmax" if sample is None else "full"
+            self._vote_arm(on_tokens, R, pick)
+            self._verify(R, P, self._T(P + R), pick)
+            word = self._vote_word(R, pick)
             if sample is None:
-                both = torch.cat([vb.argmax[:R], vb.ids[1:R]]).tolist()
+                both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
                 picks, drafts = both[:R], both[R:]
             else:
                 drafts = vb.ids[1:R].tolist()
+                voted = None if word is None else float(word.item()) > 0
                 picks = []
                 for i in range(R):
                     picks.append(sample(vb.logits[i:i + 1], P + i + 1))
@@ -476,6 +533,8 @@ class Runner:
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
+                done = True
             P, tok = P + n + 1, emit[-1]
             dt = time.perf_counter() - tr
             round_ms.append(1e3 * dt)
@@ -494,6 +553,7 @@ class Runner:
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "mtp_mode": "auto", "arms": {"m": arm_s.count("m"), "f": arm_s.count("f")},
+                "stopped": on_tokens.agreed,
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
 
     def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling):
@@ -524,11 +584,15 @@ class Runner:
             ta = time.perf_counter()
             R = 1 + len(drafts)
             vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
-            self._verify(R, P, self._T(P + R), "argmax" if sample is None else "full")
+            pick = "argmax" if sample is None else "full"
+            self._vote_arm(on_tokens, R, pick)
+            self._verify(R, P, self._T(P + R), pick)
+            word = self._vote_word(R, pick)
             if sample is None:
-                picks = vb.argmax[:R].tolist()
+                picks, voted = self._read([vb.argmax[:R]], word)
                 tb = time.perf_counter()
             else:
+                voted = None if word is None else float(word.item()) > 0
                 picks = []
                 for i in range(R):
                     picks.append(sample(vb.logits[i:i + 1], P + i + 1))
@@ -558,6 +622,8 @@ class Runner:
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
+                done = True
             P, tok = P + n + 1, emit[-1]
             self.profiler.end()
             round_ms.append(1e3 * (time.perf_counter() - tr))
@@ -568,6 +634,7 @@ class Runner:
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "mtp_mode": "dflash", "depth": depth_max, "confidence": conf,
+                "stopped": on_tokens.agreed,
                 "ms_per_round": {k: round(1e3 * v / max(rounds, 1), 2) for k, v in
                                  (("draft", t_draft), ("verify", t_verify), ("taps", t_taps))},
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
@@ -588,6 +655,8 @@ class Runner:
         tok = sample(lg, L0) if sample else int(torch.argmax(lg[0]).item())
         prefill_s = time.perf_counter() - t0
         out = [tok]
+        on_tokens = StopVote(on_tokens)                  # rank 0's stop, heard on every rank (every rank wraps alike)
+        vb.amax[:, 2].zero_()                            # a previous run's vote
         on_tokens([tok])
         P = L0                                   # tok sits at P, not yet in the caches
         m = 1                                    # MTP rows pending: (carry = hidden P - 1, tok) at P - 1
@@ -616,12 +685,16 @@ class Runner:
                 for j in range(2, room + 1):
                     self._mtp(1, j, P + j - 2, Tm)
             R = room + 1
-            self._verify(R, P, self._T(P + R), "argmax" if sample is None else "full")
+            pick = "argmax" if sample is None else "full"
+            self._vote_arm(on_tokens, R, pick)
+            self._verify(R, P, self._T(P + R), pick)
+            word = self._vote_word(R, pick)
             if sample is None:
-                both = torch.cat([vb.argmax[:R], vb.ids[1:R]]).tolist()
+                both, voted = self._read([vb.argmax[:R], vb.ids[1:R]], word)
                 picks, drafts = both[:R], both[R:]
             else:
                 drafts = vb.ids[1:R].tolist()
+                voted = None if word is None else float(word.item()) > 0
                 picks = []
                 for i in range(R):
                     ts = time.perf_counter()
@@ -645,6 +718,8 @@ class Runner:
                 if len(out) >= max_tokens or stop(e_tok):
                     done = True
                     break
+            if on_tokens.settle(voted):                  # rank 0 asked to stop: every rank ends after this round
+                done = True
             if self.cap is not None:
                 self.cap.add_taps(vb.taps[:n + 1])
             if k:                                # next round's MTP rows: (target hidden P + i, token P + i + 1)
@@ -661,5 +736,5 @@ class Runner:
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
                 "round_ms": _pct(round_ms), "sample_ms_per_round": round(1e3 * t_sample / max(rounds, 1), 2),
-                "stream_ms_per_round": round(1e3 * t_stream / max(rounds, 1), 2),
+                "stream_ms_per_round": round(1e3 * t_stream / max(rounds, 1), 2), "stopped": on_tokens.agreed,
                 "mtp_mode": self.mode, "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}

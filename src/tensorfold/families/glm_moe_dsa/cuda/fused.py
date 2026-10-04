@@ -787,8 +787,10 @@ class Buffers:
         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
         V = w.lm_head.shape[0]
         hr = min(rows, self.small)           # head rows: a window's, or a prompt chunk's last one
-        self.lpart = torch.empty((hr, V), dtype=f32, device=dev)
-        self.lgath = torch.empty((w.world * hr * V,), dtype=f32, device=dev)
+        # one word more behind the rows: "full" heads gather it with them (rank 0's stop vote, runner.StopVote)
+        self.lflat = torch.zeros((hr * V + 1,), dtype=f32, device=dev)
+        self.lpart = self.lflat[:hr * V].view(hr, V)
+        self.lgath = torch.empty((w.world * (hr * V + 1),), dtype=f32, device=dev)
         self.logits = torch.empty((hr, V * w.world), dtype=f32, device=dev)
         self.argmax = torch.zeros((hr,), dtype=torch.long, device=dev)
         # MTP
@@ -1088,7 +1090,10 @@ def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, ro
          mode: str = "full"):
     """Rows' next-token pick into b.argmax[:n]; "full" also leaves full fp32 logits (every rank alike) in b.logits[:n].
     "argmax": each rank's first maximum over its vocabulary share, exchanged as 16 bytes a row and resolved by lowest
-    rank - the full argmax's own choice. "draft": the same over the reduced draft vocabulary."""
+    rank - the full argmax's own choice. "draft": the same over the reduced draft vocabulary.
+    Each exchange carries one spare word a round (a stop vote, runner.StopVote; nothing here reads it): "argmax"
+    b.amax[0, 2], gathered at b.amax_all[2] (rank 0's); "full" b.lflat[n * V] right behind the rows, at
+    b.lgath[n * V] (rank 0's)."""
     c = w.cfg
     x = x if rows is None else x[rows]
     n = x.shape[0]
@@ -1097,9 +1102,11 @@ def head(w: Weights, b: Buffers, x: torch.Tensor, norm: torch.Tensor, R: int, ro
         V = w.lm_head.shape[0]
         glue.router(b.fnormed[:n], w.lm_head, b.lpart[:n])
         if w.world > 1:
-            g = b.lgath[:w.world * n * V]
-            w.comm.all_gather(b.lpart[:n].reshape(-1), g)
-            b.logits[:n].view(n, w.world, V).copy_(g.view(w.world, n, V).permute(1, 0, 2))
+            m = n * V + 1                                # the rows, then the spare word
+            g = b.lgath[:w.world * m]
+            w.comm.all_gather(b.lflat[:m], g)
+            rows_g = g.view(w.world, m)[:, :n * V].view(w.world, n, V)
+            b.logits[:n].view(n, w.world, V).copy_(rows_g.permute(1, 0, 2))
         else:
             b.logits[:n].copy_(b.lpart[:n])
         torch.argmax(b.logits[:n], dim=-1, out=b.argmax[:n])
