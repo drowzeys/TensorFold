@@ -290,7 +290,9 @@ class Runner:
             return
         per = max(1, need // max(1, capacity))
         fit = max(0, int((free - spare) // per))
-        raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
+        kvd = getattr(w, "kv_dtype", "bf16")
+        raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank"
+                           f"{'' if kvd == 'bf16' else f' ({kvd} latent)'}, "
                            f"{free / 2**30:.1f} GiB is free on rank {w.rank} (keeping {spare / 2**30:.0f} GiB spare; "
                            f"too little on rank{'s' if len(refused) > 1 else ''} {', '.join(map(str, refused))}): use "
                            f"--context <= {fit} with --parallel {slots} (this rank's figure), or fewer streams")

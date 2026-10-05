@@ -38,6 +38,24 @@ def test_bytes_for_is_what_state_allocates(mtp, dcp, slots):
     assert fused.State.bytes_for(w, 1001, slots) == st.nbytes()
 
 
+@pytest.mark.parametrize("kv", ["int8", "int4"])
+@pytest.mark.parametrize("mtp", [False, True])
+def test_bytes_for_counts_the_quantized_cache(kv, mtp):
+    """--kv-dtype int8 / int4: codes, fp16 scales and the bf16 RoPE of every latent row, as State allocates them."""
+    w = _w(layers=7, indexers=3, mtp=mtp)
+    w.cfg = SimpleNamespace(kv_lora_rank=64, qk_rope_head_dim=8, index_head_dim=4)
+    w.kv_dtype = kv
+    assert fused.State.bytes_for(w, 1001) == fused.State(w, 1001).nbytes()
+
+
+def test_int4_at_262k_on_glm53():
+    """78 x 416 + 21 x 256 B a token a rank: 9.234 GiB at 262,144 tokens, DCP 1."""
+    w = _w()
+    w.kv_dtype = "int4"
+    assert fused.State.bytes_for(w, 262144 - 1) == (78 * 416 + 21 * 256) * 262144
+    assert round(fused.State.bytes_for(w, 262144 - 1) / GIB, 3) == 9.234
+
+
 def _scores(capacity, vrows=8, prompt_rows=2048, overlap=True):
     cols = max(fused.bucket(capacity, 2048) or 0, 1)
     out = [(vrows, cols), (prompt_rows, capacity)]
