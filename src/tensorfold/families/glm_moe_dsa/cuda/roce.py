@@ -11,6 +11,16 @@ import torch
 MAX_BYTES = 1 << 20              # decode windows: up to 32 rows x 6144 fp32 = 768 KB; logits argmax rows: tiny
 
 
+def hca_names(value: str | None) -> list[str] | None:
+    """NCCL_IB_HCA as RoCEnante device names: NCCL's exact-match "=" prefix and ":port" suffixes dropped (its proxy
+    compares names verbatim, so "=rocep1s0f0" found no device). An exclusion list ("^...") names none: refused."""
+    v = (value or "").strip()
+    if v.startswith("^"):
+        raise ValueError(f"NCCL_IB_HCA={value!r} excludes devices; RoCE reductions need the devices named")
+    names = [n.split(":", 1)[0].strip() for n in v.lstrip("=").split(",")]
+    return [n for n in names if n] or None
+
+
 class RoceReduce:
     def __init__(self, rank: int, world: int, master: str, port: int, nccl=None) -> None:
         import torch.distributed as dist
@@ -23,11 +33,11 @@ class RoceReduce:
 
             dist.init_process_group("gloo", init_method=f"tcp://{master}:{port}", rank=rank, world_size=world,
                                     timeout=timedelta(seconds=120))
-        hca = os.environ.get("NCCL_IB_HCA")
+        hca = hca_names(os.environ.get("NCCL_IB_HCA"))
         gid = os.environ.get("NCCL_IB_GID_INDEX")
-        self.rt = AllReduce(exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=MAX_BYTES,
-                            max_gather_bytes=MAX_BYTES, hca_names=[hca] if hca else None,
-                            gid_index=int(gid) if gid else None)
+        self.device = torch.device("cuda", 0)
+        self.rt = AllReduce(exchange_group=dist.group.WORLD, device=self.device, max_size=MAX_BYTES,
+                            max_gather_bytes=MAX_BYTES, hca_names=hca, gid_index=int(gid) if gid else None)
         self.rt.prepare((torch.float32,), padded_gather=True)
         self.rank, self.world = rank, world
         if nccl is not None:
@@ -40,19 +50,20 @@ class RoceReduce:
         return self.rt.all_gather(x.reshape(-1), dim=0, out=out.view(-1))
 
     def _check(self, nccl) -> None:
-        """Every rank's sum must carry the same bits (compared through NCCL), else refuse to serve on RoCE; checked
-        at a 3-row window and the widest decode window (fused.DECODE_ROWS: concurrent DFlash2 rounds)."""
+        """Every rank's sum must carry the same bits (compared through NCCL), and the bits of the NCCL fallback's
+        rank-order sum, else refuse to serve on RoCE (every rank reaches the same verdict, so every rank falls back
+        to NCCL); checked at a 3-row window and the widest decode window (fused.DECODE_ROWS)."""
         from .fused import DECODE_ROWS
 
         same = order = True
         for rows in (3, DECODE_ROWS):
             g = torch.Generator(device="cpu").manual_seed(1000 + self.rank + rows)
-            x = (torch.randn(rows, 6144, generator=g) * 10.0 ** (self.rank - 1)).cuda()
+            x = (torch.randn(rows, 6144, generator=g) * 10.0 ** (self.rank - 1)).to(self.device)
             s = torch.empty_like(x)
             self.all_reduce(x, s)
-            allv = torch.empty((self.world, rows, 6144), device="cuda")
+            allv = torch.empty((self.world, rows, 6144), device=self.device)
             nccl.all_gather(s, allv)
-            parts = torch.empty((self.world, rows, 6144), device="cuda")
+            parts = torch.empty((self.world, rows, 6144), device=self.device)
             nccl.all_gather(x, parts)
             ref = parts[0].clone()
             for r in range(1, self.world):
@@ -61,5 +72,7 @@ class RoceReduce:
             order &= torch.equal(allv[0], ref)
         if not same:
             raise RuntimeError("RoCE all-reduce: ranks hold different bits")
+        if not order:
+            raise RuntimeError("RoCE all-reduce: the sum is not the NCCL rank-order sum (decode would change bits)")
         print(f"[tensorfold] RoCE one-shot reduce ready (ranks bit-equal: {same}; equals the NCCL rank-order sum: "
               f"{order}; windows of 3 and {DECODE_ROWS} rows)", flush=True)
