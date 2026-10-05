@@ -254,7 +254,7 @@ class Runner:
         self.st.pos.fill_(0)
         for T in buckets:
             for R in self.widths:
-                for pick in dict.fromkeys(("argmax", "full", self._sampled_pick())):
+                for pick in dict.fromkeys(("argmax", self._sampled_pick())):   # "full" (top_k off): on first use
                     self._verify(R, 0, T, pick)
             if self.k:
                 for m in range(1, self.mrows + 1):
