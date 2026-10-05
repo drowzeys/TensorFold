@@ -228,14 +228,15 @@ class Glm53Engine:
         return self._sample(lg[None], position, s)
 
     def _run(self, prompt: list[int], max_tokens: int, s: Sampling | None, stop_eos: bool,
-             on_tokens: Callable[[list[int]], Any], k: int = 0, mode: str | None = None) -> dict[str, Any]:
+             on_tokens: Callable[[list[int]], Any], k: int = 0, mode: str | None = None,
+             dflash: tuple[int, float] | None = None) -> dict[str, Any]:
         """Prefill, then serial decoding (k = 0) or MTP drafts verified by the target (k > 0): a verify window's rows
         get their one-row bits (row_exact), and every emitted token is the target's own sample, so both give the
-        same reply."""
+        same reply. ``dflash``: rank 0's DFlash2 (depth, confidence) for this request."""
         if self.runner is not None:
             sample = None if s is None else (lambda lg, pos: self._sample(lg, pos, s))
             st = self.runner.generate(prompt, max_tokens, sample, lambda t: stop_eos and t in self.eos, on_tokens, k,
-                                      mode, sampling=s)
+                                      mode, sampling=s, dflash=dflash)
             out = st.pop("out")
             if self.runner.cap is not None:
                 fn = self.runner.cap.finish(list(prompt) + out, {"temp": s.temperature if s else 0.0,
@@ -323,7 +324,7 @@ class Glm53Engine:
                 got.extend(new)
                 return on_tokens(new)
             s = sampling if sampling is not None and sampling.temperature > 0 else None
-            mode = mtp_mode if mtp_mode in fused.MTP_MODES else CONC_MODE or fused.MTP_MODE
+            mode = mtp_mode if mtp_mode in fused.MTP_MODES else CONC_MODE or self._default_mode() or fused.MTP_MODE
             if mode in ("dflash", "auto") and self.multi.dr is None:
                 raise ValueError(f"mtp mode {mode!r}: no DFlash2 drafter loaded (TF_GLM53_DFLASH)")
             want = (mode if mode in ("dflash", "auto") else bool(self.k)) if draft else False   # multi._mode
@@ -341,15 +342,27 @@ class Glm53Engine:
         seed = (s.seed if s else 0) & 0xFFFFFFFFFFFFFFFF
         k = self.k if draft else 0
         modes = fused.MTP_MODES
+        if draft and mtp_mode not in modes:
+            mtp_mode = self._default_mode()
         mi = modes.index(mtp_mode) + 1 if mtp_mode in modes else 0          # 0: the default mode
+        dr = self.runner is not None and self.runner.drafter is not None     # rank 0's DFlash2 policy, every rank
+        depth, conf = self.runner._dflash_cfg() if dr else (0, 0.0)
         header = [max_tokens, int(stop_eos), k | (mi << 8), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
                   *_f64_ints(s.temperature if s else 0.0), int(s.top_k) if s else 0,
-                  *_f64_ints(s.top_p if s else 1.0), *_f64_ints(s.min_p if s else 0.0)]
+                  *_f64_ints(s.top_p if s else 1.0), *_f64_ints(s.min_p if s else 0.0), depth, *_f64_ints(conf)]
         self._share(header)
         self._share(list(prompt))
-        stats = self._run(list(prompt), max_tokens, s, stop_eos, on_tokens, k, modes[mi - 1] if mi else None)
+        stats = self._run(list(prompt), max_tokens, s, stop_eos, on_tokens, k, modes[mi - 1] if mi else None,
+                          (depth, conf))
         stats["mtp_drafts"] = k
         return stats
+
+    def _default_mode(self) -> str | None:
+        """The drafts of a request that names none ("tf_mtp"): DFlash2 when the checkpoint has no MTP layer and a
+        drafter is loaded (the MTP default would decode serially there), else None (fused.MTP_MODE)."""
+        if self.k or self.runner is None or self.runner.drafter is None:
+            return None
+        return "dflash"
 
     def follow(self, requests: int | None = None) -> None:
         """Ranks 1..3: mirror every request rank 0 serves, forever (``requests``: stop after that many; tests)."""
@@ -359,8 +372,8 @@ class Glm53Engine:
         done = 0
         while requests is None or done < requests:
             done += 1
-            (max_tokens, stop_eos, k, s_lo, s_hi, s_top, t0, t1, t2, top_k, p0, p1, p2, m0, m1, m2) = \
-                self._share(None)
+            (max_tokens, stop_eos, k, s_lo, s_hi, s_top, t0, t1, t2, top_k, p0, p1, p2, m0, m1, m2, depth,
+             c0, c1, c2) = self._share(None)
             prompt = self._share(None)
             temperature = _ints_f64(t0, t1, t2)
             seed = (s_top << 62) | (s_hi << 31) | s_lo
@@ -368,4 +381,4 @@ class Glm53Engine:
                 if temperature > 0 else None
             mi = k >> 8
             self._run(prompt, max_tokens, s, bool(stop_eos), lambda new: None, k & 0xFF,
-                      fused.MTP_MODES[mi - 1] if mi else None)
+                      fused.MTP_MODES[mi - 1] if mi else None, (depth, _ints_f64(c0, c1, c2)))
