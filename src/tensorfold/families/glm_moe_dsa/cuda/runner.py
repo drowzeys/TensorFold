@@ -124,7 +124,16 @@ class Runner:
         self.topk = c.index_topk
         cols = fused.bucket(capacity, self.topk) or 0
         self.cols = max(cols, 1)
-        self._check_cache_fits(w, capacity, slots)
+        self.vrows = max(k + 1, int(os.environ.get("TF_GLM53_VERIFY_ROWS", "8")) if w.tap_slot else 1)
+        self.prompt_rows = PROMPT_ROWS if w.dcp == 1 else min(PROMPT_ROWS, 1024)      # DCP: room for the long cache
+        ring = fused.PREFILL_REDUCE == "ring" and hasattr(w.comm, "all_reduce")
+        sp = fused.PROMPT_SP and hasattr(w.comm, "all_to_all")      # sequence parallel: ring or exact reduce
+        self.overlap = (fused.PROMPT_OVERLAP and w.world > 1 and (ring or sp)
+                        and w.dcp == 1)                               # DCP: its collectives stay in order
+        scores = [(self.vrows, self.cols), (max(k + 1, self.vrows), self.cols) if k else (0, 0),
+                  (self.prompt_rows, max(capacity, 1)),
+                  (self.prompt_rows - self.prompt_rows // 2, max(capacity, 1)) if self.overlap else (0, 0)]
+        self._check_cache_fits(w, capacity, slots, [s for s in scores if s[0]])
         self.st = fused.State(w, capacity, slots)
         self.drafter = None                              # DFlash2 (engine attaches; set_drafter)
         self.cap = None                                  # DFlash2 training capture (rank 0, TF_GLM53_CAPTURE_DIR)
@@ -132,16 +141,10 @@ class Runner:
             from .capture import Capture
 
             self.cap = Capture(os.environ["TF_GLM53_CAPTURE_DIR"], len(w.tap_slot), w.cfg.hidden_size)
-        self.vrows = max(k + 1, int(os.environ.get("TF_GLM53_VERIFY_ROWS", "8")) if w.tap_slot else 1)
         self.vb = fused.Buffers(w, self.vrows, max(cols, 1), decode=True)       # verify windows
         self.mb = (fused.Buffers(w, max(k + 1, self.vrows), max(cols, 1), decode=True)   # MTP windows (+ a backlog
                    if k else None)                                                # of rows DFlash2 rounds kept)
-        self.prompt_rows = PROMPT_ROWS if w.dcp == 1 else min(PROMPT_ROWS, 1024)      # DCP: room for the long cache
         self.pb = fused.Buffers(w, self.prompt_rows, max(capacity, 1))            # prompt chunks (exact key range)
-        ring = fused.PREFILL_REDUCE == "ring" and hasattr(w.comm, "all_reduce")
-        sp = fused.PROMPT_SP and hasattr(w.comm, "all_to_all")      # sequence parallel: ring or exact reduce
-        self.overlap = (fused.PROMPT_OVERLAP and w.world > 1 and (ring or sp)
-                        and w.dcp == 1)                               # DCP: its collectives stay in order
         if self.overlap:                                 # the second micro-batch of a prompt chunk
             self.pb1 = fused.Buffers(w, self.prompt_rows - self.prompt_rows // 2, max(capacity, 1))
             self.pos1 = torch.zeros((1,), dtype=torch.int32, device=w.device)
@@ -266,22 +269,31 @@ class Runner:
         return logits
 
     @staticmethod
-    def _check_cache_fits(w, capacity: int, slots: int) -> None:
-        """Refuse a context x streams whose latent caches leave under TF_GLM53_CACHE_RESERVE_GB (default 6) free: on
-        GB10's unified memory an overcommitted cache does not fail, it swaps the node until its watchdog reboots it
-        (10-02: --parallel 4 x 140K context = ~50 GB a rank on top of 65 GB of weights rebooted all four Sparks)."""
-        c = w.cfg
-        local = -(-capacity // w.dcp) + 1
-        row = len(w.layers) * (c.kv_lora_rank + c.qk_rope_head_dim) * 2         # bf16 latent rows, every layer
-        need = row * local * slots
+    def _check_cache_fits(w, capacity: int, slots: int, scores: list[tuple[int, int]] = ()) -> None:
+        """Refuse, on every rank, a context x streams whose caches leave under TF_GLM53_CACHE_RESERVE_GB (default 6)
+        free on any rank: on GB10's unified memory an overcommitted cache does not fail, it swaps the node until its
+        watchdog reboots it (10-02: --parallel 4 x 140K context = ~50 GB a rank on top of 65 GB of weights rebooted
+        all four Sparks). Counts what grows with the context: every byte of ``fused.State`` and the indexer score
+        scratch of the buffers ``scores`` lists (rows, key range). The ranks agree before any of them allocates."""
+        need = fused.State.bytes_for(w, capacity, slots) + 8 * sum(fused.Buffers.score_len(w, r, c) for r, c in scores)
         free = torch.cuda.mem_get_info()[0]
         spare = min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), free / 2)   # small GPUs /
         # several ranks on one GPU (tests: four rank threads): the reserve never exceeds half of what is free
-        if need > free - spare:
-            fit = max(0, int((free - spare) // (row * slots)) * w.dcp)
-            raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
-                               f"{free / 2**30:.1f} GiB is free (keeping {spare / 2**30:.0f} GiB spare): use --context "
-                               f"<= {fit} with --parallel {slots}, or fewer streams")
+        short = need > free - spare
+        refused = [w.rank] if short else []
+        if w.world > 1:                                  # one rank short: none allocates (a lone rank would swap)
+            mine = torch.tensor([int(short)], dtype=torch.int32, device=w.device)
+            every = torch.empty((w.world,), dtype=torch.int32, device=w.device)
+            w.comm.all_gather(mine, every)
+            refused = [r for r, v in enumerate(every.tolist()) if v]
+        if not refused:
+            return
+        per = max(1, need // max(1, capacity))
+        fit = max(0, int((free - spare) // per))
+        raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
+                           f"{free / 2**30:.1f} GiB is free on rank {w.rank} (keeping {spare / 2**30:.0f} GiB spare; "
+                           f"too little on rank{'s' if len(refused) > 1 else ''} {', '.join(map(str, refused))}): use "
+                           f"--context <= {fit} with --parallel {slots} (this rank's figure), or fewer streams")
 
     def _label_rows(self, toks: torch.Tensor, a: int, e: int) -> None:
         """CAPTURE_LABEL: the full logits of chunk rows a..e-1 from the last <|assistant|> on (every rank: the head

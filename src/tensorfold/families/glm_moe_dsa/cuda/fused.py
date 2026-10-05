@@ -669,6 +669,15 @@ class State:
             self.mkc = torch.zeros((rows, lw), dtype=torch.bfloat16, device=dev)
             self.mic = torch.zeros((rows, c.index_head_dim), dtype=torch.bfloat16, device=dev)
 
+    @staticmethod
+    def bytes_for(w: Weights, capacity: int, slots: int = 1) -> int:
+        """The bytes ``State(w, capacity, slots)`` allocates, without allocating: latent rows on every layer, index
+        keys on the full-indexer layers, both for the MTP layer."""
+        c = w.cfg
+        lw, ik = c.kv_lora_rank + c.qk_rope_head_dim, c.index_head_dim
+        per = len(w.layers) * lw + sum(L.indexer is not None for L in w.layers) * ik + (lw + ik) * (w.mtp is not None)
+        return 2 * per * (-(-capacity // w.dcp) + 1) * slots
+
     def nbytes(self) -> int:
         ts = self.kc + list(self.ic.values()) + [t for t in (self.mkc, self.mic) if t is not None]
         return sum(t.numel() * t.element_size() for t in ts)
@@ -753,7 +762,7 @@ class Buffers:
         self.ik = torch.empty((rows, idd), dtype=f32, device=dev)
         self.iw = torch.empty((rows, nh), dtype=f32, device=dev)
         self.iq = torch.empty((rows, nh * idd), dtype=bf, device=dev)
-        self.sc = torch.empty((min(rows, SEL_ROWS) * (-(-score_cols // w.dcp)),), dtype=torch.int64, device=dev)
+        self.sc = torch.empty((Buffers.score_len(w, rows, score_cols),), dtype=torch.int64, device=dev)
         self.tok = torch.zeros((rows, c.index_topk), dtype=torch.int32, device=dev)
         # MLPs
         width = max(c.intermediate_size, c.moe_intermediate_size * max(c.n_shared_experts, 1)) // w.world
@@ -796,6 +805,11 @@ class Buffers:
         self.mh = torch.empty((rows, D), dtype=bf, device=dev)
         self.mcat = torch.empty((rows, 2 * D), dtype=bf, device=dev)
         self.mx32 = torch.empty((rows, D), dtype=f32, device=dev)
+
+    @staticmethod
+    def score_len(w: Weights, rows: int, score_cols: int) -> int:
+        """int64 entries of the indexer's score scratch (``sc``): it grows with the key range, i.e. the context."""
+        return min(rows, SEL_ROWS) * (-(-score_cols // w.dcp))
 
 
 # ------------------------------------------------------------------------------------------------- blocks ---
