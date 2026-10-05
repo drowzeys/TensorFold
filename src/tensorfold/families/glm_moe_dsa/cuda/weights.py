@@ -45,7 +45,8 @@ class RankReader:
         f = self._file(name)
         kind = split.rule(name)
         if kind == "rep":
-            return f.get_tensor(name).to(device)
+            t = f.get_tensor(name)
+            return t.to(device) if str(device) != "cpu" else t.clone()     # own memory: the shard can leave the cache
         sl = f.get_slice(name)
         shape = list(sl.get_shape())
         split._check_cut(name, kind, shape, self.world)
@@ -53,7 +54,7 @@ class RankReader:
         n = shape[axis] // self.world
         a, b = self.rank * n, (self.rank + 1) * n
         part = sl[a:b] if axis == 0 else sl[:, a:b]
-        return part.contiguous().to(device)
+        return part.to(device).contiguous() if str(device) != "cpu" else part.clone(memory_format=torch.contiguous_format)
 
     def drop(self) -> None:
         """Close the open shards and drop their pages from the page cache (posix_fadvise DONTNEED). Called after each
