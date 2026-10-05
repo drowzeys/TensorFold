@@ -1,9 +1,15 @@
 """Full GLM-5.3's RoCE decode reductions (b12x RoCEnante) on a CPU, no NICs: NCCL-style NCCL_IB_HCA values reach the
-proxy as device names, a sum other than the NCCL rank-order sum is refused at startup, and a runtime that timed out
-stops every rank before a window's tokens are read."""
+proxy as device names, a sum other than the NCCL rank-order sum is refused at startup, a runtime that timed out
+stops every rank before a window's tokens are read, and the RoCE setup rendezvous starts only once every rank has
+loaded.
+
+The setup tests run four rank threads: ``ready`` is the NCCL store barrier, ``all_gather`` a rank-order
+concatenation, and a stand-in RoceReduce joins a rendezvous with a short timeout, as b12x's gloo rendezvous does."""
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -130,3 +136,90 @@ def test_no_token_leaves_a_prefill_whose_reductions_failed(monkeypatch):
     with pytest.raises(RuntimeError, match="failed on rank 1"):
         r.generate([1, 2, 3], 4, None, lambda t: False, sent.extend, 0)
     assert sent == []
+
+
+class _Ranks:
+    """What four rank threads share: the store barrier behind ``ready``, the all-gather slots, and the RoCE setup
+    rendezvous, whose ``join_s`` stands in for the 120 s gloo join timeout."""
+
+    def __init__(self, join_s, world=4):
+        self.world = world
+        self.loaded = threading.Barrier(world, timeout=30)
+        self.gathered = threading.Barrier(world, timeout=30)
+        self.rendezvous = threading.Barrier(world, timeout=join_s)
+        self.slots = [None] * world
+
+
+class _RankComm:
+    def __init__(self, ranks, rank):
+        self.ranks, self.rank, self.world, self.labels = ranks, rank, ranks.world, []
+
+    def ready(self, label):
+        self.labels.append(label)
+        self.ranks.loaded.wait()
+
+    def all_gather(self, send, recv):
+        self.ranks.slots[self.rank] = send.reshape(-1).clone()
+        self.ranks.gathered.wait()
+        recv.view(-1).copy_(torch.cat(self.ranks.slots))
+        self.ranks.gathered.wait()
+
+
+def _start_four(monkeypatch, *, late=(), late_s=0.0, join_s=0.5, fails=()):
+    """roce.start_everywhere on four rank threads; ranks in ``late`` reach it ``late_s`` after the others."""
+    ranks = _Ranks(join_s)
+
+    class Rendezvous:                            # RoceReduce's setup: every rank joins within join_s, or none does
+        def __init__(self, rank, world, master, port, nccl=None):
+            ranks.rendezvous.wait()              # threading.BrokenBarrierError: "3/4 clients joined"
+            if rank in fails:
+                raise RuntimeError("no RoCE v2 GID for this address")
+            self.rank = rank
+
+    monkeypatch.setattr(roce, "RoceReduce", Rendezvous)
+    comms = [_RankComm(ranks, r) for r in range(4)]
+    got, errors = [None] * 4, [None] * 4
+
+    def rank_thread(r):
+        if r in late:
+            time.sleep(late_s)                   # this rank's weights take longer to load
+        try:
+            got[r] = roce.start_everywhere(r, 4, "127.0.0.1", 29861, comms[r], device="cpu")
+        except Exception as exc:                 # noqa: BLE001
+            errors[r] = exc
+
+    threads = [threading.Thread(target=rank_thread, args=(r,)) for r in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    return got, errors, comms
+
+
+def test_the_setup_rendezvous_waits_for_a_rank_that_loads_late(monkeypatch):
+    """rank 0 hosts the rendezvous and loads last: the others wait for it at the store barrier, not in the join."""
+    got, errors, comms = _start_four(monkeypatch, late=(0,), late_s=1.5, join_s=0.5)
+    assert errors == [None] * 4
+    assert [g.rank if g is not None else None for g in got] == [0, 1, 2, 3]
+    assert [c.labels for c in comms] == [["loading"]] * 4
+
+
+def test_one_rank_without_roce_leaves_every_rank_on_nccl(monkeypatch):
+    got, errors, _ = _start_four(monkeypatch, fails=(2,))
+    assert errors == [None] * 4
+    assert got == [None] * 4
+
+
+def test_a_rank_missing_at_the_barrier_stops_startup(monkeypatch):
+    """ready() raises after its hour naming the missing rank: that is an error, not a silent NCCL fallback, and the
+    rendezvous never opens."""
+    built = []
+    monkeypatch.setattr(roce, "RoceReduce", lambda *a, **k: built.append(a))
+
+    class Missing(_Nccl):
+        def ready(self, label):
+            raise RuntimeError(f"rank 1 finished {label} but rank 0 has not after 60 min")
+
+    with pytest.raises(RuntimeError, match="rank 0 has not"):
+        roce.start_everywhere(1, 1, "127.0.0.1", 29861, Missing(), device="cpu")
+    assert built == []

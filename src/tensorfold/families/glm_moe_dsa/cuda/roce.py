@@ -22,6 +22,32 @@ def hca_names(value: str | None) -> list[str] | None:
     return [n for n in names if n] or None
 
 
+def start_everywhere(rank: int, world: int, master: str, port: int, nccl, *, device="cuda") -> RoceReduce | None:
+    """RoCE reductions on every rank or on none (None: the caller keeps NCCL).
+
+    RoceReduce opens its own gloo rendezvous with a fixed 120 s timeout as soon as it is built, and ranks finish
+    loading minutes apart: a follower's store client gives up about 3.5 minutes after it first knocks (120 s, one
+    jittered backoff, one more try), so it can quit before a slower rank 0 opens the rendezvous ("3/4 clients
+    joined"), and then no rank gets RoCE. Every rank first waits until all have loaded (``nccl.ready`` on the store
+    NCCL already joined: it names the missing rank every minute and raises after an hour), so the rendezvous starts
+    on every rank together."""
+    import time
+
+    t0 = time.monotonic()
+    nccl.ready("loading")
+    print(f"[tensorfold] rank {rank}: every rank loaded (waited {time.monotonic() - t0:.0f} s), RoCE setup on "
+          f"{master}:{port}", flush=True)
+    fast = None
+    try:
+        fast = RoceReduce(rank, world, master, port, nccl=nccl)
+    except Exception as exc:                 # noqa: BLE001  NCCL keeps serving
+        print(f"[tensorfold] RoCE reduce unavailable on rank {rank} ({exc})", flush=True)
+    ok = torch.tensor([1 if fast is not None else 0], dtype=torch.int32, device=device)
+    every = torch.empty((world,), dtype=torch.int32, device=device)
+    nccl.all_gather(ok, every)                # all ranks or none: a lone RoCE rank would deadlock
+    return fast if bool(every.all()) else None
+
+
 class RoceReduce:
     def __init__(self, rank: int, world: int, master: str, port: int, nccl=None) -> None:
         import torch.distributed as dist
