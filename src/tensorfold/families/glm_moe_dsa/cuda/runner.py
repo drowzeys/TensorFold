@@ -386,6 +386,8 @@ class Runner:
         self.G.run(("tgt", R, T, pick), lambda: fused.compute(w, st, vb, R, T, logits="all", pick=pick))
 
     def _dflash_cfg(self) -> tuple[int, float]:
+        """(depth, confidence) of DFlash2 rounds as this rank reads them: env, then the DFLASH_CFG file. Rank 0 reads
+        them once a request and every rank decodes with its values (Glm53Engine shares them in the header)."""
         cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
                "confidence": float(os.environ.get("TF_GLM53_DFLASH_CONFIDENCE", "0.3"))}
         try:
@@ -396,13 +398,13 @@ class Runner:
             pass
         return min(self.drafter.block - 1, self.vrows - 1, int(cfg["depth"])), float(cfg["confidence"])
 
-    def _generate_auto(self, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k):
+    def _generate_auto(self, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k, dflash=None):
         """Each round MTP ("m") or DFlash2 ("f"), whichever has been emitting more tokens a second (EMAs of rank 0's
         round times, shared so every rank takes the same arm; a probe of the other every PROBE rounds). Both stay current: DFlash2 absorbs every round's kept taps; the MTP layer carries a
         backlog of kept rows (target hidden, next token) that its next merged call writes - flushed when it outgrows the
         window. The target picks every token, so the reply equals the serial one whichever arm drafts."""
         w, vb, mb, dr = self.w, self.vb, self.mb, self.drafter
-        depth, conf = self._dflash_cfg()
+        depth, conf = dflash or self._dflash_cfg()
         probe = int(os.environ.get("TF_GLM53_AUTO_PROBE", "16"))
         ema = {"m": None, "f": None}
         since = {"m": 0, "f": 0}
@@ -496,20 +498,13 @@ class Runner:
                 "round_ms": _pct(round_ms), "mtp_mode": "auto", "arms": {"m": arm_s.count("m"), "f": arm_s.count("f")},
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
 
-    def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling):
+    def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling,
+                         dflash=None):
         """DFlash2 rounds: the drafter proposes up to its block - 1 tokens after the pending one, the target verifies
-        [pending, drafts] in one window (graph), the kept rows' taps extend the drafter's context."""
+        [pending, drafts] in one window (graph), the kept rows' taps extend the drafter's context. ``dflash``: the
+        request's (depth, confidence), rank 0's on every rank (else this rank's ``_dflash_cfg``)."""
         vb, dr = self.vb, self.drafter
-        cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
-               "confidence": float(os.environ.get("TF_GLM53_DFLASH_CONFIDENCE", "0.3"))}
-        try:                                             # runtime override (the same file on every node)
-            import json as _json
-
-            cfg.update(_json.loads(open(os.path.dirname(PROFILE_FLAG) + "/DFLASH_CFG").read()))
-        except (OSError, ValueError):
-            pass
-        depth_max = min(dr.block - 1, self.vrows - 1, int(cfg["depth"]))
-        conf = float(cfg["confidence"])
+        depth_max, conf = dflash or self._dflash_cfg()
         t_draft = t_verify = t_taps = 0.0
         rounds = drafted = accepted = 0
         done = len(out) >= max_tokens or stop(tok)
@@ -575,8 +570,9 @@ class Runner:
     @torch.no_grad()
     def generate(self, prompt: list[int], max_tokens: int, sample: Callable, stop: Callable[[int], bool],
                  on_tokens: Callable[[list[int]], Any], k: int, mode: str | None = None,
-                 sampling=None) -> dict[str, Any]:
-        """sample(logits_row [1, V], position) -> token (None: greedy on the device's argmax)."""
+                 sampling=None, dflash: tuple[int, float] | None = None) -> dict[str, Any]:
+        """sample(logits_row [1, V], position) -> token (None: greedy on the device's argmax). ``dflash``: DFlash2's
+        (depth, confidence) for this request (Glm53Engine passes rank 0's to every rank)."""
         w, vb, mb = self.w, self.vb, self.mb
         k = min(k, self.k)
         self.set_mode(mode or fused.MTP_MODE)
@@ -596,9 +592,10 @@ class Runner:
             mb.ids[:1].fill_(tok)
         if self.dflash:
             return self._generate_dflash(prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s,
-                                         sampling)
+                                         sampling, dflash)
         if self.auto and k:
-            return self._generate_auto(out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k)
+            return self._generate_auto(out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling, k,
+                                       dflash)
         rounds = drafted = accepted = 0
         done = len(out) >= max_tokens or stop(tok)
         t1 = time.perf_counter()
