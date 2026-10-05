@@ -80,6 +80,14 @@ class RoundProfiler:
             pass
 
 
+def healthy(w) -> None:
+    """Every rank raises when any rank's RoCE runtime timed out (roce.RoceReduce.healthy_everywhere); NCCL: nothing."""
+    from . import roce
+
+    if w.fast is not None and roce.HEALTH:
+        w.fast.healthy_everywhere()
+
+
 def _pct(v: list[float]) -> dict:
     if not v:
         return {}
@@ -384,6 +392,7 @@ class Runner:
         w, st, vb = self.w, self.st, self.vb
         st.pos.fill_(P)
         self.G.run(("tgt", R, T, pick), lambda: fused.compute(w, st, vb, R, T, logits="all", pick=pick))
+        healthy(w)
 
     def _dflash_cfg(self) -> tuple[int, float]:
         cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
@@ -583,6 +592,7 @@ class Runner:
         t0 = time.perf_counter()
         L0 = len(prompt)
         lg = self.prefill(prompt)
+        healthy(w)                               # short prompts' chunks reduce over RoCE too
         if self.cap is not None and sample is not None:
             self.cap.add_logits(L0 - 1, lg[0])
         tok = sample(lg, L0) if sample else int(torch.argmax(lg[0]).item())

@@ -9,6 +9,7 @@ import os
 import torch
 
 MAX_BYTES = 1 << 20              # decode windows: up to 32 rows x 6144 fp32 = 768 KB; logits argmax rows: tiny
+HEALTH = os.environ.get("TF_GLM53_ROCE_HEALTH", "1") != "0"    # every window: all ranks agree no runtime timed out
 
 
 def hca_names(value: str | None) -> list[str] | None:
@@ -39,7 +40,9 @@ class RoceReduce:
         self.rt = AllReduce(exchange_group=dist.group.WORLD, device=self.device, max_size=MAX_BYTES,
                             max_gather_bytes=MAX_BYTES, hca_names=hca, gid_index=int(gid) if gid else None)
         self.rt.prepare((torch.float32,), padded_gather=True)
-        self.rank, self.world = rank, world
+        self.rank, self.world, self.nccl = rank, world, nccl
+        self._flag = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        self._every = torch.zeros((world,), dtype=torch.int32, device=self.device)
         if nccl is not None:
             self._check(nccl)
 
@@ -48,6 +51,22 @@ class RoceReduce:
 
     def all_gather(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         return self.rt.all_gather(x.reshape(-1), dim=0, out=out.view(-1))
+
+    def healthy_everywhere(self) -> None:
+        """After a window's reductions, before its tokens are read: every rank agrees that no RoCE runtime timed out.
+        b12x is fail-stop (a wait past B12X_ROCE_SPIN_LIMIT poisons the runtime and later launches do nothing), so
+        inside a CUDA graph a timeout would leave stale sums and emit wrong tokens; every rank raises instead."""
+        self._flag.fill_(1 if self.rt.poisoned else 0)
+        if self.nccl is None:
+            bad = [self.rank] if int(self._flag.item()) else []
+        else:
+            self.nccl.all_gather(self._flag, self._every)
+            bad = [r for r, v in enumerate(self._every.tolist()) if v]
+        if not bad:
+            return
+        if self.rt.poisoned:
+            self.rt.check_health()                       # b12x's own reason, on the rank that timed out
+        raise RuntimeError(f"RoCE reductions failed on rank {', '.join(map(str, bad))}: tokens of this window dropped")
 
     def _check(self, nccl) -> None:
         """Every rank's sum must carry the same bits (compared through NCCL), and the bits of the NCCL fallback's

@@ -52,6 +52,7 @@ import torch
 from tensorfold.cuda.streams import Stream
 
 from . import fused
+from .runner import healthy
 
 ADMIT, ROUND, DONE, FILL = 1, 2, 3, 4      # rank 0's messages (an empty message: stop following)
 MSG = 128                                  # ints a one-shot message carries (longer ones take a second all-gather)
@@ -473,6 +474,7 @@ class GlmMultiDecoder:
     def _verify(self, R: int, T: int | None, pick: str) -> None:
         w, vb, rows = self.w, self.vb, self.vrows
         self.runner.G.run(("mt", R, T, pick), lambda: fused.compute(w, rows, vb, R, T, logits="all", pick=pick))
+        healthy(w)
 
     def _mtp_step(self, j: int, n: int, S: int, Tm: int | None) -> None:
         w, rn, mb, vb, o = self.w, self.runner, self.mb, self.vb, self.off
