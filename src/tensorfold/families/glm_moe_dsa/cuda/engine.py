@@ -106,17 +106,9 @@ class Glm53Engine:
                 fw.set_draft_head(torch.cat([sl[a:b] for a, b in spans]).cuda(),
                                   torch.cat([torch.arange(a, b) for a, b in spans]).cuda())
             if ROCE and comm.__class__.__name__ == "NCCL":
-                fast = None
-                try:
-                    from .roce import RoceReduce
+                from .roce import start_everywhere
 
-                    fast = RoceReduce(rank, WORLD, master, port + 11, nccl=comm)
-                except Exception as exc:                 # noqa: BLE001  NCCL keeps serving
-                    print(f"[tensorfold] RoCE reduce unavailable on rank {rank} ({exc})", flush=True)
-                ok = torch.tensor([1 if fast is not None else 0], dtype=torch.int32, device="cuda")
-                every = torch.empty((WORLD,), dtype=torch.int32, device="cuda")
-                comm.all_gather(ok, every)                # all ranks or none: a lone RoCE rank would deadlock
-                fw.fast = fast if bool(every.all()) else None
+                fw.fast = start_everywhere(rank, WORLD, master, port + 11, comm)   # once every rank has loaded
                 if rank == 0:
                     print(f"[tensorfold] decode-window reductions: {'RoCE one-shot' if fw.fast else 'NCCL'}", flush=True)
             if WORLD > 1 and os.environ.get("TF_GLM53_TUNE_SHARED", "1") != "0":

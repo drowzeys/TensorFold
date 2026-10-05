@@ -9,6 +9,43 @@ import os
 import torch
 
 MAX_BYTES = 1 << 20              # decode windows: up to 32 rows x 6144 fp32 = 768 KB; logits argmax rows: tiny
+HEALTH = os.environ.get("TF_GLM53_ROCE_HEALTH", "1") != "0"    # every window: all ranks agree no runtime timed out
+
+
+def hca_names(value: str | None) -> list[str] | None:
+    """NCCL_IB_HCA as RoCEnante device names: NCCL's exact-match "=" prefix and ":port" suffixes dropped (its proxy
+    compares names verbatim, so "=rocep1s0f0" found no device). An exclusion list ("^...") names none: refused."""
+    v = (value or "").strip()
+    if v.startswith("^"):
+        raise ValueError(f"NCCL_IB_HCA={value!r} excludes devices; RoCE reductions need the devices named")
+    names = [n.split(":", 1)[0].strip() for n in v.lstrip("=").split(",")]
+    return [n for n in names if n] or None
+
+
+def start_everywhere(rank: int, world: int, master: str, port: int, nccl, *, device="cuda") -> RoceReduce | None:
+    """RoCE reductions on every rank or on none (None: the caller keeps NCCL).
+
+    RoceReduce opens its own gloo rendezvous with a fixed 120 s timeout as soon as it is built, and ranks finish
+    loading minutes apart: a follower's store client gives up about 3.5 minutes after it first knocks (120 s, one
+    jittered backoff, one more try), so it can quit before a slower rank 0 opens the rendezvous ("3/4 clients
+    joined"), and then no rank gets RoCE. Every rank first waits until all have loaded (``nccl.ready`` on the store
+    NCCL already joined: it names the missing rank every minute and raises after an hour), so the rendezvous starts
+    on every rank together."""
+    import time
+
+    t0 = time.monotonic()
+    nccl.ready("loading")
+    print(f"[tensorfold] rank {rank}: every rank loaded (waited {time.monotonic() - t0:.0f} s), RoCE setup on "
+          f"{master}:{port}", flush=True)
+    fast = None
+    try:
+        fast = RoceReduce(rank, world, master, port, nccl=nccl)
+    except Exception as exc:                 # noqa: BLE001  NCCL keeps serving
+        print(f"[tensorfold] RoCE reduce unavailable on rank {rank} ({exc})", flush=True)
+    ok = torch.tensor([1 if fast is not None else 0], dtype=torch.int32, device=device)
+    every = torch.empty((world,), dtype=torch.int32, device=device)
+    nccl.all_gather(ok, every)                # all ranks or none: a lone RoCE rank would deadlock
+    return fast if bool(every.all()) else None
 
 
 class RoceReduce:
@@ -23,13 +60,15 @@ class RoceReduce:
 
             dist.init_process_group("gloo", init_method=f"tcp://{master}:{port}", rank=rank, world_size=world,
                                     timeout=timedelta(seconds=120))
-        hca = os.environ.get("NCCL_IB_HCA")
+        hca = hca_names(os.environ.get("NCCL_IB_HCA"))
         gid = os.environ.get("NCCL_IB_GID_INDEX")
-        self.rt = AllReduce(exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=MAX_BYTES,
-                            max_gather_bytes=MAX_BYTES, hca_names=[hca] if hca else None,
-                            gid_index=int(gid) if gid else None)
+        self.device = torch.device("cuda", 0)
+        self.rt = AllReduce(exchange_group=dist.group.WORLD, device=self.device, max_size=MAX_BYTES,
+                            max_gather_bytes=MAX_BYTES, hca_names=hca, gid_index=int(gid) if gid else None)
         self.rt.prepare((torch.float32,), padded_gather=True)
-        self.rank, self.world = rank, world
+        self.rank, self.world, self.nccl = rank, world, nccl
+        self._flag = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        self._every = torch.zeros((world,), dtype=torch.int32, device=self.device)
         if nccl is not None:
             self._check(nccl)
 
@@ -39,20 +78,37 @@ class RoceReduce:
     def all_gather(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         return self.rt.all_gather(x.reshape(-1), dim=0, out=out.view(-1))
 
+    def healthy_everywhere(self) -> None:
+        """After a window's reductions, before its tokens are read: every rank agrees that no RoCE runtime timed out.
+        b12x is fail-stop (a wait past B12X_ROCE_SPIN_LIMIT poisons the runtime and later launches do nothing), so
+        inside a CUDA graph a timeout would leave stale sums and emit wrong tokens; every rank raises instead."""
+        self._flag.fill_(1 if self.rt.poisoned else 0)
+        if self.nccl is None:
+            bad = [self.rank] if int(self._flag.item()) else []
+        else:
+            self.nccl.all_gather(self._flag, self._every)
+            bad = [r for r, v in enumerate(self._every.tolist()) if v]
+        if not bad:
+            return
+        if self.rt.poisoned:
+            self.rt.check_health()                       # b12x's own reason, on the rank that timed out
+        raise RuntimeError(f"RoCE reductions failed on rank {', '.join(map(str, bad))}: tokens of this window dropped")
+
     def _check(self, nccl) -> None:
-        """Every rank's sum must carry the same bits (compared through NCCL), else refuse to serve on RoCE; checked
-        at a 3-row window and the widest decode window (fused.DECODE_ROWS: concurrent DFlash2 rounds)."""
+        """Every rank's sum must carry the same bits (compared through NCCL), and the bits of the NCCL fallback's
+        rank-order sum, else refuse to serve on RoCE (every rank reaches the same verdict, so every rank falls back
+        to NCCL); checked at a 3-row window and the widest decode window (fused.DECODE_ROWS)."""
         from .fused import DECODE_ROWS
 
         same = order = True
         for rows in (3, DECODE_ROWS):
             g = torch.Generator(device="cpu").manual_seed(1000 + self.rank + rows)
-            x = (torch.randn(rows, 6144, generator=g) * 10.0 ** (self.rank - 1)).cuda()
+            x = (torch.randn(rows, 6144, generator=g) * 10.0 ** (self.rank - 1)).to(self.device)
             s = torch.empty_like(x)
             self.all_reduce(x, s)
-            allv = torch.empty((self.world, rows, 6144), device="cuda")
+            allv = torch.empty((self.world, rows, 6144), device=self.device)
             nccl.all_gather(s, allv)
-            parts = torch.empty((self.world, rows, 6144), device="cuda")
+            parts = torch.empty((self.world, rows, 6144), device=self.device)
             nccl.all_gather(x, parts)
             ref = parts[0].clone()
             for r in range(1, self.world):
@@ -61,5 +117,7 @@ class RoceReduce:
             order &= torch.equal(allv[0], ref)
         if not same:
             raise RuntimeError("RoCE all-reduce: ranks hold different bits")
+        if not order:
+            raise RuntimeError("RoCE all-reduce: the sum is not the NCCL rank-order sum (decode would change bits)")
         print(f"[tensorfold] RoCE one-shot reduce ready (ranks bit-equal: {same}; equals the NCCL rank-order sum: "
               f"{order}; windows of 3 and {DECODE_ROWS} rows)", flush=True)
