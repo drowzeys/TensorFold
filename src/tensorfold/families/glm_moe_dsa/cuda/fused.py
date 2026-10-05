@@ -65,8 +65,9 @@ DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurre
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)
 SPECIALS = 128           # ... plus the vocabulary's last ids (GLM's special tokens)
 # decode index-key buckets (``bucket``): steps an octave past INDEX_FINE_FROM keys (1: powers of two, the old graphs;
-# 4: a 32K context scores 40,960 columns instead of 65,536 - same keys selected, ~2x the decode graphs)
-INDEX_SPLIT = int(os.environ.get("TF_GLM53_INDEX_SPLIT", "4"))
+# 4: a 32K context scores 40,960 columns instead of 65,536 - same keys selected, but ~2.5x the decode graphs: the
+# default 1, as no 32K pass got faster and the graphs cost ~10 GB a rank, which GB10 cannot spare at 140K)
+INDEX_SPLIT = int(os.environ.get("TF_GLM53_INDEX_SPLIT", "1"))
 INDEX_FINE_FROM = 16384
 if INDEX_SPLIT not in (1, 2, 4, 8):
     raise ValueError(f"TF_GLM53_INDEX_SPLIT={INDEX_SPLIT}: 1, 2, 4 or 8")
