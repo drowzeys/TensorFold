@@ -25,7 +25,8 @@ from ..config import Config
 from . import fused
 from .model import RankModel
 from .runner import Runner
-from .weights import RankReader, load_layer, load_mtp
+from .weights import RankReader, drop_page_cache, load_layers, load_mtp
+from .weights import trim_host as _trim_host
 
 WORLD = 4
 DEFAULT_CONTEXT = 32768      # until the capacity estimate (M7) sizes it from free memory
@@ -35,6 +36,17 @@ GRAPHS = os.environ.get("TF_GLM53_GRAPHS", "1") != "0"
 ROCE = os.environ.get("TF_GLM53_ROCE", "1") != "0"
 CONC_MODE = os.environ.get("TF_GLM53_CONC_MODE", "")   # --parallel: drafts of requests without "tf_mtp" (dflash, auto, ...)
 DCP_AUTO = 200_000           # contexts past this interleave the KV cache over the ranks (decode context parallelism)
+
+
+def dcp_auto(cfg: Config, kv_dtype: str = "bf16") -> int:
+    """The context past which TF_GLM53_DCP unset turns decode context parallelism on: DCP_AUTO for the bf16 latent,
+    the same cache bytes for a quantized one (int4: 2.77x the tokens, int8: 1.71x)."""
+    if kv_dtype == "bf16":
+        return DCP_AUTO
+    from .kvq import row_bytes
+
+    lw, rd = cfg.kv_lora_rank, cfg.qk_rope_head_dim
+    return DCP_AUTO * row_bytes(lw, rd, "bf16") // row_bytes(lw, rd, kv_dtype)
 
 
 def _f64_ints(x: float) -> list[int]:
@@ -47,26 +59,21 @@ def _ints_f64(a: int, b: int, c: int) -> float:
     return struct.unpack("<d", (a | (b << 31) | (c << 62)).to_bytes(8, "little"))[0]
 
 
-def _trim_host() -> None:
-    """Safetensors slice reads leave freed host heap in malloc's arenas; on a unified-memory GB10 it is the same
-    memory the device buffers and graphs need, so hand it back to the OS."""
-    import ctypes
-    import gc
-
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except OSError:
-        pass
-
-
 class Glm53Engine:
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, context: int | None = None,
-                 comm=None, layers: int | None = None, mtp_drafts: int = 2, parallel: int = 1) -> None:
+                 comm=None, layers: int | None = None, mtp_drafts: int = 2, parallel: int = 1,
+                 kv_dtype: str = "bf16") -> None:
         """``comm``: a communicator with all_gather/barrier instead of NCCL (tests); ``layers``: first N only (tests);
         ``parallel`` > 1: up to that many requests decoded together (multi.GlmMultiDecoder), each in its own cache slot
-        of ``context`` tokens; 1: one request at a time, as before."""
+        of ``context`` tokens; 1: one request at a time, as before. ``kv_dtype``: the MLA latent cache - bf16, or
+        int8 / int4 (kvq: ExLlamaV3's -cq 8 / -cq 4 codes, one fp16 scale per 32 values; fused path only)."""
 
+        from .kvq import check as check_kv
+
+        self.kv_dtype = check_kv(kv_dtype)
+        if self.kv_dtype != "bf16" and not FUSED:
+            raise ValueError(f"--kv-dtype {kv_dtype} needs the fused path (TF_GLM53_FUSED=1): the reference path "
+                             "caches bf16 latents only")
         self.model_dir, self.rank = Path(model_dir), rank
         self.cfg = cfg = Config.from_dict(json.loads((self.model_dir / "config.json").read_text()))
         if comm is None:
@@ -75,6 +82,12 @@ class Glm53Engine:
             torch.cuda.set_device(0)
             comm = NCCL(rank, WORLD, master, port)
         self.comm = comm
+        mine = torch.tensor([("bf16", "int8", "int4").index(self.kv_dtype)], dtype=torch.int32, device="cuda")
+        every = torch.empty((WORLD,), dtype=torch.int32, device="cuda")
+        comm.all_gather(mine, every)                     # one cache format on every rank, or none starts
+        if len(set(every.tolist())) != 1:
+            raise RuntimeError(f"ranks started with different --kv-dtype ({[('bf16', 'int8', 'int4')[i] for i in every.tolist()]}): "
+                               "start all four with the same one")
         self.limit = int(context or DEFAULT_CONTEXT)
         self.parallel = max(1, int(parallel or 1))
         if self.parallel > 1 and not FUSED:
@@ -84,14 +97,16 @@ class Glm53Engine:
         n = cfg.num_hidden_layers if layers is None else layers
         embed, norm, head = (r.get(t, "cuda") for t in ("model.embed_tokens.weight", "model.norm.weight",
                                                          "lm_head.weight"))
-        layers = [load_layer(r, cfg, i) for i in range(n)]
+        layers = load_layers(r, cfg, n, verbose=rank == 0)
         self.k = int(mtp_drafts) if cfg.num_mtp_layers else 0
         self.mtp = load_mtp(r, cfg) if self.k else None
         _trim_host()
         self.runner = None
         if FUSED:
             fw = fused.Weights(cfg, rank, WORLD, comm, embed, norm, head, layers, self.mtp)
-            dcp = int(os.environ.get("TF_GLM53_DCP", "0")) or (WORLD if self.limit > DCP_AUTO else 1)
+            fw.kv_dtype = self.kv_dtype
+            dcp = int(os.environ.get("TF_GLM53_DCP", "0")) or (WORLD if self.limit > dcp_auto(cfg, self.kv_dtype)
+                                                               else 1)
             if dcp not in (1, WORLD):
                 raise ValueError(f"TF_GLM53_DCP={dcp}: 1 or {WORLD}")
             if self.parallel > 1 and dcp > 1:
@@ -132,9 +147,11 @@ class Glm53Engine:
                       + ", ".join(" + ".join(f"{a}x{b}" for a, b in k) + f" {v}" for k, v in grouped.items()),
                       flush=True)
             sl = None                                    # the checkpoint reader's handles and heap: gone before
-            r._open.clear()                              # the caches and buffers allocate (GB10 unified memory:
-            del r                                        # host memory is device memory; a 1M cache needs it all)
-            _trim_host()
+            dropped = r.drop_page_cache()                # the caches and buffers allocate (GB10 unified memory:
+            del r                                        # host memory is device memory; a 1M cache needs it all),
+            _trim_host()                                 # and every checkpoint file's page cache with them
+            print(f"[tensorfold] rank {rank}: dropped the page cache of {dropped} checkpoint files; device free "
+                  f"{torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB before the caches", flush=True)
             dpath = os.environ.get("TF_GLM53_DFLASH", "")
             if dpath:                                    # DFlash2: the target taps its layers before buffers exist
                 dcfg = json.loads((Path(dpath) / "config.json").read_text())
@@ -144,6 +161,7 @@ class Glm53Engine:
                 from .dflash import GlmDrafter
 
                 dr = GlmDrafter(dpath, fw, capacity=self.limit + 16)
+                drop_page_cache(sorted(Path(dpath).glob("*.safetensors")))   # the drafter's pages too
                 if GRAPHS and self.parallel == 1:        # concurrent: multi.MultiDrafter captures its own passes
                     dr.capture()
                 self.runner.drafter = dr
@@ -190,6 +208,7 @@ class Glm53Engine:
         print(f"[tensorfold] GLM-5.3 rank {rank}/{WORLD}: {n} layers loaded in {self.load_s:.0f}s, context "
               f"{self.limit} ({'fused, ' + ('CUDA graphs' if GRAPHS else 'eager') if FUSED else 'reference path'}; "
               f"MTP drafts {self.k}; token-level DSA past {cfg.index_topk}"
+              f"{'' if self.kv_dtype == 'bf16' else '; ' + self.kv_dtype + ' latent cache (ExLlamaV3 -cq codes, fp16 scale per 32 values; RoPE + index keys bf16)'}"
               f"{'; decode context parallel ' + str(self.runner.w.dcp) if self.runner is not None and self.runner.w.dcp > 1 else ''})", flush=True)
         with open("/proc/self/status") as f:
             rss = next((ln.split()[1] for ln in f if ln.startswith("RssAnon")), "0")
