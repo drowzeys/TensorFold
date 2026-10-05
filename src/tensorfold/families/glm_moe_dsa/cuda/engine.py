@@ -85,7 +85,11 @@ class Glm53Engine:
         n = cfg.num_hidden_layers if layers is None else layers
         embed, norm, head = (r.get(t, "cuda") for t in ("model.embed_tokens.weight", "model.norm.weight",
                                                          "lm_head.weight"))
-        layers = [load_layer(r, cfg, i) for i in range(n)]
+        r.drop()
+        layers = []
+        for i in range(n):                               # each layer's shards leave the page cache once read
+            layers.append(load_layer(r, cfg, i))
+            r.drop()
         self.k = int(mtp_drafts) if cfg.num_mtp_layers else 0
         self.mtp = load_mtp(r, cfg) if self.k else None
         _trim_host()
@@ -106,6 +110,7 @@ class Glm53Engine:
                 spans = [(rank * q, (rank + 1) * q)] + ([(V - fused.SPECIALS, V)] if rank == WORLD - 1 else [])
                 fw.set_draft_head(torch.cat([sl[a:b] for a, b in spans]).cuda(),
                                   torch.cat([torch.arange(a, b) for a, b in spans]).cuda())
+            r.drop()
             headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH")))   # TF_GLM53_DRAFT_HEAD,
             head = None                                  # TF_GLM53_VERIFY_HEAD (fp8 may free the bf16 share)
             if ROCE and comm.__class__.__name__ == "NCCL":
