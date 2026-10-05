@@ -8,6 +8,7 @@ rows) and each MoE layer's routed experts one ``Exl3RoutedExperts`` (a width per
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,22 @@ class RankReader:
         a, b = self.rank * n, (self.rank + 1) * n
         part = sl[a:b] if axis == 0 else sl[:, a:b]
         return part.contiguous().to(device)
+
+    def drop(self) -> None:
+        """Close the open shards and drop their pages from the page cache (posix_fadvise DONTNEED). Called after each
+        layer: on GB10 the GPU allocations are unified memory the kernel cannot reclaim, so ~250 GB of checkpoint
+        streaming through the page cache (an NFS export) made the kernel swap the engine out instead (swap full at
+        load with 25+ GB still "available"). A tensor already read keeps its own copy."""
+        for fn in list(self._open):
+            del self._open[fn]
+            try:
+                fd = os.open(self.dir / fn, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
 
     def codebook(self, prefix: str) -> str:
         return "mul1" if self.has(prefix + ".mul1") else ("mcg" if self.has(prefix + ".mcg") else "3inst")
