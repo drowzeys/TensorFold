@@ -168,9 +168,20 @@ def _experts(r: RankReader, cfg: Config, layer: int, device):
     return load_experts(r, cfg, layer, device)
 
 
+def as_bf16(t: torch.Tensor, name: str) -> torch.Tensor:
+    """The kernels read these unquantized tensors (kv_b, router gate, indexer wk / weights_proj / k_norm) as bf16;
+    EXL3 packs may store them as fp16. Cast only when every value is exactly a bf16 value; refuse anything else."""
+    if t.dtype != torch.float16:
+        return t
+    b = t.to(torch.bfloat16)
+    if not torch.equal(b.to(torch.float16), t):      # NaN never equals itself: refused too
+        raise ValueError(f"{name}: fp16 values that bf16 cannot hold exactly; refusing a rounding cast")
+    return b
+
+
 def load_layer(r: RankReader, cfg: Config, layer: int, device="cuda", experts: bool = True) -> Layer:
     p = f"model.layers.{layer}"
-    bf = lambda n: r.get(n, device)  # noqa: E731
+    bf = lambda n: as_bf16(r.get(n, device), n)  # noqa: E731
     moe = layer >= cfg.first_k_dense_replace
     mlp = f"{p}.mlp.shared_experts" if moe else f"{p}.mlp"
     idx = None
@@ -218,6 +229,7 @@ class MtpHead:
 def load_mtp(r: RankReader, cfg: Config, device="cuda") -> MtpHead:
     i = cfg.num_hidden_layers
     p = f"model.layers.{i}"
-    return MtpHead(layer=load_layer(r, cfg, i, device), eh_proj=r.get(f"{p}.eh_proj.weight", device),
-                   enorm=r.get(f"{p}.enorm.weight", device), hnorm=r.get(f"{p}.hnorm.weight", device),
-                   head_norm=r.get(f"{p}.shared_head.norm.weight", device))
+    bf = lambda n: as_bf16(r.get(n, device), n)  # noqa: E731
+    return MtpHead(layer=load_layer(r, cfg, i, device), eh_proj=bf(f"{p}.eh_proj.weight"),
+                   enorm=bf(f"{p}.enorm.weight"), hnorm=bf(f"{p}.hnorm.weight"),
+                   head_norm=bf(f"{p}.shared_head.norm.weight"))
