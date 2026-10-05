@@ -323,7 +323,7 @@ class Glm53Engine:
                 got.extend(new)
                 return on_tokens(new)
             s = sampling if sampling is not None and sampling.temperature > 0 else None
-            mode = mtp_mode if mtp_mode in fused.MTP_MODES else CONC_MODE or fused.MTP_MODE
+            mode = mtp_mode if mtp_mode in fused.MTP_MODES else CONC_MODE or self._default_mode() or fused.MTP_MODE
             if mode in ("dflash", "auto") and self.multi.dr is None:
                 raise ValueError(f"mtp mode {mode!r}: no DFlash2 drafter loaded (TF_GLM53_DFLASH)")
             want = (mode if mode in ("dflash", "auto") else bool(self.k)) if draft else False   # multi._mode
@@ -341,6 +341,8 @@ class Glm53Engine:
         seed = (s.seed if s else 0) & 0xFFFFFFFFFFFFFFFF
         k = self.k if draft else 0
         modes = fused.MTP_MODES
+        if draft and mtp_mode not in modes:
+            mtp_mode = self._default_mode()
         mi = modes.index(mtp_mode) + 1 if mtp_mode in modes else 0          # 0: the default mode
         header = [max_tokens, int(stop_eos), k | (mi << 8), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
                   *_f64_ints(s.temperature if s else 0.0), int(s.top_k) if s else 0,
@@ -350,6 +352,13 @@ class Glm53Engine:
         stats = self._run(list(prompt), max_tokens, s, stop_eos, on_tokens, k, modes[mi - 1] if mi else None)
         stats["mtp_drafts"] = k
         return stats
+
+    def _default_mode(self) -> str | None:
+        """The drafts of a request that names none ("tf_mtp"): DFlash2 when the checkpoint has no MTP layer and a
+        drafter is loaded (the MTP default would decode serially there), else None (fused.MTP_MODE)."""
+        if self.k or self.runner is None or self.runner.drafter is None:
+            return None
+        return "dflash"
 
     def follow(self, requests: int | None = None) -> None:
         """Ranks 1..3: mirror every request rank 0 serves, forever (``requests``: stop after that many; tests)."""
