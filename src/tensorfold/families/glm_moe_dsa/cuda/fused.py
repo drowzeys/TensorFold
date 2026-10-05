@@ -25,7 +25,7 @@ from tensorfold.cuda.exl3 import experts as x3experts
 from tensorfold.cuda.exl3 import linear as x3linear
 from tensorfold.cuda.exl3 import prefill as x3prefill
 from tensorfold.families.glm5_next.cuda import glue, latent
-from tensorfold.families.glm_moe_dsa.cuda import topk
+from tensorfold.families.glm_moe_dsa.cuda import tiles, topk
 
 from ..config import Config
 from .weights import Layer, MtpHead
@@ -470,7 +470,12 @@ class Weights:
         self.draft_head = self.draft_ids = None
         every = layers + ([mtp.layer] if mtp is not None else [])
         self.tunable = [lin for L in every for lin in linears(L)]   # the same order on every rank
-        if TUNE:
+        mode, path = tiles.spec()
+        if mode == "load":                                 # a saved table (TF_GLM53_TILES): no timing, same tiles
+            sha, n = tiles.load(self.tunable, path)
+            print(f"[tensorfold] rank {rank}: tiles from {path} (sha {sha[:16]}): {len(self.tunable)} linears, "
+                  f"{n} differ from the plan", flush=True)
+        elif TUNE:
             self.tuned = tune_linears(self.tunable)
             self.tuned_groups = tune_groups([g for L in every for g in groups(L)])
 

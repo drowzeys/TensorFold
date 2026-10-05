@@ -22,7 +22,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 import os
 
 from ..config import Config
-from . import fused
+from . import fused, tiles
 from .model import RankModel
 from .runner import Runner
 from .weights import RankReader, load_layer, load_mtp
@@ -123,6 +123,7 @@ class Glm53Engine:
                 n = fused.share_tiles(fw, comm)             # rank 0's tiles everywhere: one pick paces every layer
                 print(f"[tensorfold] rank {rank}: took rank 0's tiles ({n} of {len(fw.tunable)} linears differed)",
                       flush=True)
+            tiles.after_load(fw, rank)                   # TF_GLM53_TILES=save:PATH keeps this table for later boots
             if getattr(fw, "tuned", None):
                 changed = {k: v for k, v in fw.tuned.items() if v[0] != v[1]}
                 print(f"[tensorfold] rank {rank}: tuned {len(fw.tuned)} linear shapes, {len(changed)} retiled: "
