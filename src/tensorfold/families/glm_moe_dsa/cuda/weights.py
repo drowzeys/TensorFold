@@ -8,6 +8,7 @@ rows) and each MoE layer's routed experts one ``Exl3RoutedExperts`` (a width per
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,39 @@ from . import split
 EXL3_PARTS = ("trellis", "suh", "svh")
 
 
+def trim_host() -> None:
+    """Safetensors slice reads leave freed host heap in malloc's arenas; on a unified-memory GB10 it is the same
+    memory the device buffers and graphs need, so hand it back to the OS."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
+def drop_page_cache(paths) -> int:
+    """POSIX_FADV_DONTNEED on each file; returns how many were advised. On a unified-memory GPU (GB10)
+    torch.cuda.mem_get_info() counts clean page cache as used, so a load's checkpoint pages hide memory from the cache
+    guard. Only clean, unmapped pages go, so the next read of a file simply reads the disk again."""
+    n = 0
+    for p in paths:
+        try:
+            fd = os.open(str(p), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            n += 1
+        except (OSError, AttributeError):
+            pass
+        finally:
+            os.close(fd)
+    return n
+
+
 class RankReader:
     """Tensors of one rank's share, from the full checkpoint (safetensors slices)."""
 
@@ -33,6 +67,23 @@ class RankReader:
 
     def has(self, name: str) -> bool:
         return name in self.index
+
+    def release(self) -> int:
+        """Close every open file (their memory maps go with them), hand the freed heap back, then drop those files'
+        page cache: an open handle keeps the pages it read mapped, so a whole-model load held the checkpoint."""
+        opened = list(self._open)
+        self._open.clear()
+        trim_host()
+        return drop_page_cache(self.dir / fn for fn in opened)
+
+    def files(self) -> list[Path]:
+        """Every checkpoint file this reader may open: the index's shards and any other *.safetensors."""
+        return sorted({self.dir / fn for fn in self.index.values()} | set(self.dir.glob("*.safetensors")))
+
+    def drop_page_cache(self) -> int:
+        """Close every handle, then drop the page cache of every checkpoint file (``drop_page_cache``)."""
+        self._open.clear()
+        return drop_page_cache(self.files())
 
     def _file(self, name: str):
         fn = self.index[name]
@@ -139,6 +190,18 @@ def load_layer(r: RankReader, cfg: Config, layer: int, device="cuda", experts: b
         experts=_experts(r, cfg, layer, device) if (moe and experts) else None,
         shared={k: load_linear(r, f"{mlp}.{k}_proj", device) for k in ("gate", "up", "down")},
     )
+
+
+def load_layers(r: RankReader, cfg: Config, n: int, device="cuda", verbose: bool = False) -> list[Layer]:
+    """Layers 0..n-1, one at a time: each layer's files are closed and their pages dropped before the next opens
+    (``RankReader.release``), so host memory holds one layer's reads, not the checkpoint."""
+    out = []
+    for i in range(n):
+        out.append(load_layer(r, cfg, i, device))
+        r.release()
+        if verbose and (i % 10 == 9 or i == n - 1):
+            print(f"[tensorfold] loaded layer {i + 1} of {n}", flush=True)
+    return out
 
 
 @dataclass
