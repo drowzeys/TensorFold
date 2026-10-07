@@ -26,6 +26,8 @@ class Latents:
     latent_width: int
     audio_latents: int
     step_seconds: list[float]
+    reused_steps: int = 0   # attention outputs reused, the rest of the forward run
+    skipped_steps: int = 0  # no forward: the previous velocity reused
 
 
 def start_noise(config, latent_frames: int, latent_height: int, latent_width: int, audio_latents: int, seed: int,
@@ -61,15 +63,40 @@ def check_noise(name: str, rows: mx.array) -> None:
         raise ValueError(f"{name} start is not unit noise (mean {mean:.3f}, std {std:.3f})")
 
 
+def scaled_gate(steps: int, at_30: int) -> int:
+    """A window ``at_30`` steps wide on a 30-step schedule, scaled to ``steps``: at least 1, never wider."""
+
+    return max(1, min(at_30, steps * at_30 // 30))
+
+
+def attention_refresh(index: int, steps: int, every: int) -> bool:
+    """Whether step ``index`` computes attention afresh under reuse every ``every`` steps.
+
+    The first steps (4 of 30) and the last (2 of 30) always do; in between, every ``every``-th one.
+    """
+
+    if every <= 1:
+        return True
+    warmup, tail = scaled_gate(steps, 4), scaled_gate(steps, 2)
+    return index < warmup or index + tail >= steps or (index - warmup) % every == 0
+
+
 def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: int, seed: int = 0,
             subset: tuple[int, ...] | None = None, on_step=None, forward=None, release: bool = False,
             condition: mx.array | None = None, keyframes: tuple[str, ...] = (),
-            audio_shift: float | None = None) -> Latents:
+            audio_shift: float | None = None, step_cache: float = 0.0, attention_every: int = 0) -> Latents:
     """Denoise one clip. ``points`` is the number of sigma points, so ``points - 1`` forwards (fewer with
     ``subset``). ``forward`` replaces the plain DiT call. The AdaLN tables for the whole run are projected once
     up front; ``release`` then frees the projection weights. ``condition`` holds the encoded keyframe rows for
     ``keyframes`` (``first`` or ``last`` each); they condition every step and are not denoised. ``audio_shift``
-    replaces the audio schedule's sigma shift (3 in the released model)."""
+    replaces the audio schedule's sigma shift (3 in the released model).
+
+    Two savings for many-step runs, after mlx-serve's fast recipe (ddalcu), which combines a TeaCache-style
+    velocity cache with PAB-style attention reuse. ``step_cache`` (0.05 there) skips a forward and reuses the last
+    velocity while the summed relative move ``|d sigma| mean|v| / mean|x|`` since the last forward stays under it;
+    never on the first steps or the last, and at most twice running. ``attention_every`` (2 there) computes
+    attention only on every that-many-th step between the opening and closing steps and reuses each block's
+    attention output otherwise. Both change the result; neither suits a few-step adapter, whose steps are large."""
 
     config = dit.config
     latent_frames = h3.latent_frames(frames)
@@ -92,20 +119,45 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     dit.cache_modulation(table, release=release)
     run = forward or dit
     seconds = []
-    for index in range(len(video_schedule)):
+    steps = len(video_schedule)
+    kept = [None] * len(dit.blocks) if attention_every > 1 else None
+    last_video = last_audio = None
+    moved, running, reused, skipped = 0.0, 0, 0, 0
+    for index in range(steps):
         started = time.perf_counter()
-        video_velocity, audio_velocity = run(video_rows[None], audio_rows[None], text, table, plan[index],
-                                             packed.tags, packed.position_ids, packed.video_rows,
-                                             packed.audio_rows, packed.text_rows)
-        stepped = video_schedule.step(index, video_velocity[0, held:], video_rows[held:])
+        skip = False
+        if step_cache > 0 and last_video is not None and index >= scaled_gate(steps, 2) and index + 1 < steps \
+                and running < 2:
+            jump = abs(float(video_schedule.sigmas[index + 1] - video_schedule.sigmas[index]))
+            size = max(float(mx.mean(mx.abs(video_rows[held:])).item()), 1e-8)
+            move = jump * float(mx.mean(mx.abs(last_video)).item()) / size
+            if moved + move < step_cache:
+                moved += move
+                skip = True
+        if skip:
+            video_velocity, audio_velocity = last_video, last_audio
+            running += 1
+            skipped += 1
+        else:
+            refresh = attention_refresh(index, steps, attention_every)
+            extra = {} if kept is None else {"kept": kept, "refresh": refresh}
+            out_video, out_audio = run(video_rows[None], audio_rows[None], text, table, plan[index], packed.tags,
+                                       packed.position_ids, packed.video_rows, packed.audio_rows, packed.text_rows,
+                                       **extra)
+            video_velocity, audio_velocity = out_video[0, held:], out_audio[0]
+            if step_cache > 0:
+                last_video, last_audio = video_velocity, audio_velocity
+            moved, running = 0.0, 0
+            reused += int(kept is not None and not refresh)
+        stepped = video_schedule.step(index, video_velocity, video_rows[held:])
         video_rows = mx.concatenate([video_rows[:held], stepped]) if held else stepped
-        audio_rows = audio_schedule.step(index, audio_velocity[0], audio_rows)
+        audio_rows = audio_schedule.step(index, audio_velocity, audio_rows)
         mx.eval(video_rows, audio_rows)
         seconds.append(time.perf_counter() - started)
         if on_step is not None:
-            on_step(index + 1, len(video_schedule), seconds[-1])
+            on_step(index + 1, steps, seconds[-1])
     return Latents(video_rows[held:], audio_rows, packed, latent_frames, latent_height, latent_width, audio_latents,
-                   seconds)
+                   seconds, reused, skipped)
 
 
 def _block_inputs(block, x, table, adaln):

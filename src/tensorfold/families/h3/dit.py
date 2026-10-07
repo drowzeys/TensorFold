@@ -163,10 +163,19 @@ class Block(nn.Module):
         self.mlp = FeedForward(config)
         self.adaln_proj = Modulation(config, config.adaln_out_features)
 
-    def __call__(self, x: mx.array, tables: tuple[mx.array, ...], rows: mx.array, rotary) -> mx.array:
+    def __call__(self, x: mx.array, tables: tuple[mx.array, ...], rows: mx.array, rotary,
+                 kept: list | None = None, slot: int = 0, refresh: bool = True) -> mx.array:
+        """``kept`` is a per-block store of attention outputs: a refreshing call writes this block's into
+        ``kept[slot]``, a non-refreshing call reads it back and skips the attention branch."""
+
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = tables
-        h = self.norm1(x) * (1.0 + scale_a[rows]) + shift_a[rows]
-        x = x + (gate_a[rows] * self.attn(h, rotary)).astype(x.dtype)
+        if kept is not None and not refresh and kept[slot] is not None:
+            mixed = kept[slot]
+        else:
+            mixed = self.attn(self.norm1(x) * (1.0 + scale_a[rows]) + shift_a[rows], rotary)
+            if kept is not None:
+                kept[slot] = mixed
+        x = x + (gate_a[rows] * mixed).astype(x.dtype)
         h = self.norm2(x) * (1.0 + scale_m[rows]) + shift_m[rows]
         return x + (gate_m[rows] * self.mlp(h)).astype(x.dtype)
 
@@ -258,17 +267,20 @@ class H3DiT(nn.Module):
         return x, timestep_rows * MODALITIES + mx.maximum(tags, 0), rotary
 
     def __call__(self, video, audio, text, timestep, timestep_rows, tags, position_ids, video_rows, audio_rows,
-                 text_rows) -> tuple[mx.array, mx.array]:
+                 text_rows, kept: list | None = None, refresh: bool = True) -> tuple[mx.array, mx.array]:
         """Video and audio velocity for one packed sequence, in the order of ``video_rows`` and ``audio_rows``.
 
         ``timestep`` holds the distinct noise levels present and ``timestep_rows`` indexes it per sequence row;
-        ``tags`` is the modality per row.
+        ``tags`` is the modality per row. ``kept`` (one slot per block) with ``refresh`` false reuses each
+        block's attention output from the last refreshing call instead of computing it.
         """
 
         x, rows, rotary = self.pack(video, audio, text, timestep, timestep_rows, tags, position_ids, video_rows,
                                     audio_rows, text_rows)
         tables, final = self.modulation(timestep)
-        for block, table in zip(self.blocks, tables, strict=True):
-            x = block(x, table, rows, rotary)
+        for slot, (block, table) in enumerate(zip(self.blocks, tables, strict=True)):
+            x = block(x, table, rows, rotary, kept, slot, refresh)
+            if kept is not None:
+                mx.eval(x, kept[slot])
         x = self.final_layer.norm_out(x, final, timestep_rows).astype(mx.float32)
         return self.final_layer.video_out(x)[:, video_rows], self.final_layer.audio_out(x)[:, audio_rows]

@@ -185,6 +185,10 @@ def main():
     parser.add_argument("--audio-shift", type=float, default=None, help="sigma shift of the audio schedule (released: 3)")
     parser.add_argument("--upscale-vae", help="safetensors of a packed-head (2x) video decoder; frames come out larger")
     parser.add_argument("--crop", help="WxH: centre-crop the decoded frames before the MP4 is written")
+    parser.add_argument("--step-cache", type=float, default=0.0,
+                        help="reuse the last velocity while the summed relative move stays under this (0.05)")
+    parser.add_argument("--attention-every", type=int, default=0,
+                        help="compute attention every N-th middle step and reuse it otherwise (2)")
     parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
                         help="after the run, denoise the audio again in STEPS steps with the model without adapters")
     parser.add_argument("--revoice-exact", action="store_true", help="re-voice with whole-sequence forwards")
@@ -238,7 +242,8 @@ def main():
                       release=not args.keep_adaln, condition=condition,
                       keyframes=("first",) if condition is not None else (),
                       on_step=lambda i, n, s: print(f"[tensorfold] step {i}/{n} {s:.2f}s", flush=True),
-                      audio_shift=args.audio_shift)
+                      audio_shift=args.audio_shift, step_cache=args.step_cache,
+                      attention_every=args.attention_every)
     denoise_seconds = time.perf_counter() - started
     revoice_seconds = 0.0
     if args.revoice:
@@ -280,6 +285,7 @@ def main():
     print(f"[tensorfold] mux {time.perf_counter() - mux_started:.2f}s", flush=True)
     decode_seconds = time.perf_counter() - started
     report = {"output": args.output, "rows": latents.packed.rows, "forwards": len(latents.step_seconds),
+              "attention_reused": latents.reused_steps, "skipped": latents.skipped_steps,
               "text_s": round(text_seconds, 1), "load_s": round(load_seconds, 1),
               "denoise_s": round(denoise_seconds, 1), "revoice_s": round(revoice_seconds, 1), "decode_s": round(decode_seconds, 1),
               "per_forward_s": round(float(np.median(latents.step_seconds)), 2),
