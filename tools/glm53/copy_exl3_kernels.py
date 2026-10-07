@@ -38,7 +38,9 @@ def vec_ok(k2: int) -> int:
 
 
 def strip_includes(lines: list[str]) -> list[str]:
-    return [ln for ln in lines if not ln.startswith(("#include <ATen", "#include <c10"))]
+    """ATen / c10 includes cut; <cstdint> added (torch's headers brought uint32_t / int64_t in transitively)."""
+    kept = [ln for ln in lines if not ln.startswith(("#include <ATen", "#include <c10"))]
+    return (["#include <cstdint>"] if "#include <cstdint>" not in kept else []) + kept
 
 
 def linear_cu(src: str) -> str:
