@@ -37,6 +37,9 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--decode", help="prefix of the raw float32 rows to decode into --mp4")
     parser.add_argument("--mp4")
+    parser.add_argument("--crop", help="with --decode: WxH, centre-crop the decoded frames before the MP4 is written")
+    parser.add_argument("--no-reference", action="store_true",
+                        help="skip the reference forward (its velocities are written as zeros): for renders, not parity")
     args = parser.parse_args()
 
     import mlx.core as mx
@@ -68,6 +71,10 @@ def main() -> int:
         frames, wave, rate = tool.decode(args.model_dir, root, latents, h3.DiTConfig.from_checkpoint(args.model_dir))
         from minimax_h3_mlx.media import save_mp4
 
+        if args.crop:
+            crop_w, crop_h = (int(v) for v in args.crop.lower().split("x"))
+            top, left = (frames.shape[1] - crop_h) // 2, (frames.shape[2] - crop_w) // 2
+            frames = np.ascontiguousarray(frames[:, top : top + crop_h, left : left + crop_w])
         save_mp4(args.mp4, frames, h3.FPS, audio=wave, sample_rate=rate)
         print(json.dumps({"mp4": args.mp4, "frames": int(frames.shape[0])}))
         return 0
@@ -115,11 +122,14 @@ def main() -> int:
         case[f"tables.{index}"] = mx.stack(block.adaln_proj.tables(temb)).astype(mx.bfloat16)   # (6, lines, hidden)
     mx.eval(*case.values())
     mark = time.perf_counter()
-    first = dit(video[None], audio[None], text, table, plan[0], packed.tags, packed.position_ids, packed.video_rows,
-                packed.audio_rows, packed.text_rows)
-    mx.eval(*first)
-    case["video_velocity"] = first[0][0].astype(mx.float32)
-    case["audio_velocity"] = first[1][0].astype(mx.float32)
+    if args.no_reference:
+        case["video_velocity"], case["audio_velocity"] = mx.zeros_like(video), mx.zeros_like(audio)
+    else:
+        first = dit(video[None], audio[None], text, table, plan[0], packed.tags, packed.position_ids,
+                    packed.video_rows, packed.audio_rows, packed.text_rows)
+        mx.eval(*first)
+        case["video_velocity"] = first[0][0].astype(mx.float32)
+        case["audio_velocity"] = first[1][0].astype(mx.float32)
     mx.save_safetensors(str(out / "case.safetensors"), case)
     print(json.dumps({"rows": packed.rows, "text": int(packed.text_rows.shape[0]), "audio": int(packed.audio_rows.shape[0]),
                       "video": int(packed.video_rows.shape[0]), "timesteps": int(table.shape[0]),
