@@ -179,8 +179,9 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
         zig build test-glm53 --summary all || rc=10
         zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe --prefix /out/zig-out -j8 fatbins tf-glm53-generate || rc=\$((rc + 20))
         exit \$rc'" > "$LOCAL/build-r$r.log" 2>&1 &
+    bpid[$r]=$!
   done
-  brc=0; for r in 0 1 2 3; do wait -n || brc=1; done
+  brc=0; for r in 0 1 2 3; do wait "${bpid[$r]}" || brc=1; done
   for r in 0 1 2 3; do
     rsh "${NODES[$r]}" "test -x $WORK/zig-out/bin/tf-glm53-generate" || { say "build failed on ${NODES[$r]}: $(tail -5 "$LOCAL/build-r$r.log" | tr '\n' ' ' | cut -c1-300)"; brc=1; }
   done
