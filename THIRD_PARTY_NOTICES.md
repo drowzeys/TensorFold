@@ -140,6 +140,19 @@ below. Ports keep each source's license; Apache-2.0 text: `LICENSES/Apache-2.0.t
     windows padded to a captured width), with a hashed index of our own;
   - `src/tensorfold/cuda/sampling.py`: the nucleus union test of 0034;
   - `multi.py`: sealed rank messages and the watchdog of 0065; the dual-rail setup (CHANGELOG v1.3.3 #30).
+- **MiaAI-Lab, [GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)**
+  (Apache-2.0, Copyright 2026 Mia's AI Lab (MiaAI-Lab); its NOTICE asks that changes be stated: the code below was
+  moved onto this family's four-rank layout, ring and runner). The DSpark drafter
+  (`families/glm_moe_dsa/cuda/dspark.py`, `dspark_host.py`) is adapted from its patches 0114-glm-full-dspark
+  (`_block_attn_kernel`, **code**, over our ring; the loader's per-rank slices and the block pass's candidates and
+  confidence words in one pinned read), 0117-glm-full-dspark-sampling (the sampled-draft filter `target_kept`, **code**), 0125-glm-full-dspark-host-markov
+  (the bf16 Markov rows read through NumPy, **code**), 0140's `best_depth` and 0116's measured round costs (the cost
+  cut, re-implemented).
+- **[vllm-project/speculators](https://github.com/vllm-project/speculators)** (Apache-2.0, Copyright vLLM Project
+  contributors) @ 36a19ca: the DSpark model the drafter computes (`models/dspark`: the vanilla Markov head, the
+  confidence head and its Markov features, the prev-token alignment of `sample_from_anchor`; `models/dflash`: the
+  anchored block, its attention mask and the Qwen3 DFlash layer), re-implemented. The speculator itself,
+  `RedHatAI/GLM-5.3-speculator.dspark`, is under the GLM-5.3 license (as the base model); users download it.
 - **Jay Leaton, [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark)** (Apache-2.0,
   Copyright 2026 Jay Leaton): MiaAI-Lab's 0046 (L2 prefetch, from its patch 0460) and 0047 (16-byte trellis loads,
   from its patch 0580) are adapted from that project, so `l2pf.cu` and the experts' load path carry its notice too.
@@ -156,4 +169,5 @@ below. Ports keep each source's license; Apache-2.0 text: `LICENSES/Apache-2.0.t
 
 No model weights are included. GLM-5.3 is Z.ai's (its license on the model card). The default drafter is GLM-5.3's
 own MTP layer. The optional DFlash2 drafter, `incoai/GLM-5.3-DFlash2`, is CC BY-NC-ND 4.0 (non-commercial, no
-derivatives): users download it themselves; it is never redistributed.
+derivatives): users download it themselves; it is never redistributed. The optional DSpark drafter,
+`RedHatAI/GLM-5.3-speculator.dspark`, is under GLM-5.3's own license; it is never redistributed either.

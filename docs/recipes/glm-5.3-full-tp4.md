@@ -57,6 +57,19 @@ DFlash2 drafts: add `DOCKER_ENV="-e TF_GLM53_DFLASH=/models/GLM-5.3-DFlash2"` (e
 `"normed/normed"` (MTP, default), `"dflash"`, or `"auto"` (MTP or DFlash2 each round, whichever is emitting faster).
 `~/tf-glm53/DFLASH_CFG` on every node (`{"depth": 7, "confidence": 0.4}`) tunes DFlash2 at run time.
 
+DSpark drafts (not yet measured on this engine): add `-e TF_GLM53_DSPARK=/models/GLM-5.3-speculator.dspark`
+([RedHatAI/GLM-5.3-speculator.dspark](https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark), GLM-5.3's
+license); requests choose `"tf_mtp": "dspark"` (or `TF_GLM53_MTP=dspark` makes it the default). A 3-layer block
+drafter over the target's layers 2/20/39/58/75 inputs: up to 8 drafts a round (9-row verify windows), a Markov bias
+over each slot's top-64 candidates and a learned confidence that cuts the block where the expected tokens per ms of
+the startup's measured round times peak (`TF_GLM53_DSPARK_POLICY=cost`; `confidence` with
+`TF_GLM53_DSPARK_CONFIDENCE=0.3` cuts at a survival product, `fixed` never). ~0.5 GB a rank (4-bit weights, its ring,
+the Markov tables on the host) plus ~0.75 GB of prompt-chunk taps; one stream (`--parallel 1`). It can be loaded
+beside DFlash2 (both keep their contexts; the taps are the union). Other knobs: `TF_GLM53_DSPARK_DEPTH` (8), `_TOPK`
+(64), `_NOISE` (0.7) and `_FILTER` (1) for sampled drafts, `_QUANT` (q4 | bf16), `_COSTS` (round ms with 0..8
+drafts instead of the measurement), `_ROW_COST`; `DSPARK_CFG` beside `DFLASH_CFG` overrides depth / policy /
+confidence at run time. MiaAI-Lab measured 29.1-30.2 prose / 39.5-40.4 code tok/s with it on three Sparks.
+
 Concurrent requests: `tools/tp4_run.sh serve --context 32768 --parallel 4` decodes up to four requests together
 (each in its own cache slot of `--context` tokens: 94 KiB a token a rank, so 4 x 32K = 11.8 GiB a rank), their
 [token + MTP drafts] windows sharing each round's forward; every reply is token-identical to the same request alone.
@@ -90,5 +103,8 @@ Node settings that matter on GB10:
 - `runner.py`: prompt chunks (equal sizes up to 4096 rows), then MTP rounds whose cache refresh merges with the first
   draft, DFlash2 rounds, or auto; every decode graph captured at startup.
 - `dflash.py`: `glm5_next`'s DFlash2 drafter over this family (a bf16 vocabulary-share head).
+- `dspark.py` / `dspark_host.py`: the DSpark drafter (after vllm-project/speculators and MiaAI-Lab's 3-Spark port):
+  its block pass on the device (heads and MLP split over the ranks as DFlash2's), the Markov chain, confidences and
+  cut on the host, every rank alike.
 
 Design notes and the history of each measurement: `docs/design/glm-moe-dsa-tp4.md`.

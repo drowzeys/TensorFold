@@ -71,9 +71,39 @@ def _dattn_ring(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.constex
     tl.store(OUT + qr[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
 
 from . import fused, headq
+from .dspark_host import tap_runs
 
 
-class GlmDrafter(Drafter):
+class TapColumns:
+    """``add_taps`` over the target's taps buffer when it holds more drafters' layers than this one's (DFlash2 and
+    DSpark loaded together: ``dspark_host.tap_plan``): ``tap_cols`` this drafter's column blocks of ``Buffers.taps`` in
+    its own layer order (None: the buffer's own order, one copy as before). Same arithmetic, same passes."""
+
+    tap_cols: tuple[int, ...] | None = None
+
+    @torch.no_grad()
+    def add_taps(self, taps: torch.Tensor) -> None:
+        """Committed rows' taps [n, slots * D] (bf16) at positions context_end, context_end + 1, ..."""
+        D, most = self.D, self.tap_in.shape[0]
+        for start in range(0, taps.shape[0], most):
+            part = taps[start:start + most]
+            n = part.shape[0]
+            if self.context_end + n > self.capacity:
+                raise ValueError("drafter context past its capacity")
+            if self.tap_cols is None:
+                self.tap_in[:n].copy_(part)
+            else:
+                for j, s, w in tap_runs(self.tap_cols):  # contiguous runs: one copy each
+                    self.tap_in[:n, j * D:(j + w) * D].copy_(part[:, s * D:(s + w) * D])
+            g = self.tap_graphs.get(n)
+            if g is not None:
+                g.replay()
+            else:
+                self._taps_compute(n)
+            self.context_end += n
+
+
+class GlmDrafter(TapColumns, Drafter):
     def __init__(self, draft_dir: str | Path, w: fused.Weights, capacity: int) -> None:
         shim = SimpleNamespace(device=w.device, rank=w.rank, world=w.world, comm=w.comm, embed=w.embed, head=None,
                                draft_head=None, vocab_offset=w.vocab_off)

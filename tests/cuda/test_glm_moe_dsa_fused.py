@@ -169,7 +169,7 @@ def test_runner_drafted_equals_serial_with_mtp():
         cfg, r, (embed, norm, head), layers = _parts(rank, 4)
         w = fused.Weights(cfg, rank, 4, comm, embed, norm, head, layers, load_mtp(r, cfg))
         out = {}
-        for mode in [m for m in fused.MTP_MODES if m not in ("dflash", "auto")]:
+        for mode in [m for m in fused.MTP_MODES if m not in fused.DRAFTER_MODES]:
             for k in (0, 2):
                 run_ = Runner(w, 512, 2, graphs=False)
                 st = run_.generate(prompt, 24, None, lambda t: False, lambda new: None, k, mode)
@@ -177,7 +177,7 @@ def test_runner_drafted_equals_serial_with_mtp():
         return out
 
     for out in run_ranks(run, 4):
-        for mode in [m for m in fused.MTP_MODES if m not in ("dflash", "auto")]:
+        for mode in [m for m in fused.MTP_MODES if m not in fused.DRAFTER_MODES]:
             assert out[(mode, 2)][0] == out[(mode, 0)][0], f"{mode}: drafted != serial"
 
 

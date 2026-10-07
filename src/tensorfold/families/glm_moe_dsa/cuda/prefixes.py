@@ -389,6 +389,31 @@ def load_rows(st, e: Kept, dcp: int = 1) -> None:
     e.rows = e.saved = None                             # live again (states sharing the copy keep it)
 
 
+def _drafters(rn) -> list:
+    """The runner's drafters (``Runner.drafters``: DFlash2, then DSpark; a runner without it: its ``drafter``)."""
+    drs = getattr(rn, "drafters", None)
+    if drs is None:
+        drs = [rn.drafter] if getattr(rn, "drafter", None) is not None else []
+    return list(drs)
+
+
+def drafter_windows(rn, n: int) -> list | None:
+    """``ring_window`` of every drafter the runner holds (DFlash2, then DSpark), one list (None: no drafter)."""
+    drs = _drafters(rn)
+    if not drs:
+        return None
+    return [t for dr in drs for t in ring_window(dr, n)]
+
+
+def put_drafter_windows(rn, n: int, rows: list) -> None:
+    """``drafter_windows``' rows back into each drafter (empty: positions only)."""
+    at = 0
+    for dr in _drafters(rn):
+        k = 2 * len(dr.kc)
+        put_ring_window(dr, n, rows[at:at + k] if rows else [])
+        at += k
+
+
 def ring_window(dr, n: int) -> list:
     """DFlash2's context rows a later block pass at n (or past it) reads: positions [n - window - 1, n) of every draft
     layer's ring (slot p % RING). Decode overwrites slot p % RING once it passes p + RING, so they are copied."""
@@ -418,9 +443,15 @@ def put_ring_window(dr, n: int, rows: list) -> None:
     dr.pos_dev.fill_(n)
 
 
+DRAFTER_MODES = ("dflash", "auto", "dspark")      # fused.DRAFTER_MODES (this module stays torch-free)
+
+
 def mode_key(mode: str | None, default: str) -> str:
-    """The MTP input a request's prompt rows are made with (``Runner.set_mode``: DFlash2 / auto use the default)."""
-    m = mode if mode and mode not in ("dflash", "auto") else default
+    """The MTP input a request's prompt rows are made with (``Runner.set_mode``: DFlash2 / auto / DSpark use the
+    default's, normed/normed when the default is itself a drafter mode)."""
+    m = mode if mode and mode not in DRAFTER_MODES else default
+    if m in DRAFTER_MODES:
+        m = "normed/normed"
     return m.partition(":")[0].split("/")[0]
 
 
@@ -519,8 +550,8 @@ class PromptReuse:
                     if copy is not None and e.saved is copy and e.n <= begin:
                         e.rows = e.saved = None
             rn.carry.copy_(hit.carry)
-            if rn.drafter is not None:
-                put_ring_window(rn.drafter, begin, hit.ring or [])
+            if _drafters(rn):
+                put_drafter_windows(rn, begin, hit.ring or [])
             store.touch(hit)
         store.live = arr[:begin]                         # rows past it are about to change (a failed request: the
         self._trim()                                     # states past ``begin`` stay unusable, ``usable``)
@@ -534,7 +565,7 @@ class PromptReuse:
             if n == L and not keep_end and n not in renewed:
                 return
             e = Kept(arr[:n].copy(), mode, carry=rn.carry.clone(),
-                     ring=ring_window(rn.drafter, n) if rn.drafter is not None else None,
+                     ring=drafter_windows(rn, n),
                      head=head.clone() if head is not None and n == L else None,
                      shared=named.get(n, False) or renewed.get(n, False))
             if store.remember(e, protect=(hit,) if hit is not None else ()):    # replaces a state of the same ids

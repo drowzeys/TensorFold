@@ -177,23 +177,28 @@ class GraphSet:
 
 
 class Runner:
-    def __init__(self, w: fused.Weights, capacity: int, k: int, graphs: bool = True, slots: int = 1) -> None:
-        """``slots`` > 1: caches for that many concurrent streams (multi.GlmMultiDecoder drives them)."""
+    def __init__(self, w: fused.Weights, capacity: int, k: int, graphs: bool = True, slots: int = 1,
+                 draft_rows: int = 0, extra_bytes: int = 0) -> None:
+        """``slots`` > 1: caches for that many concurrent streams (multi.GlmMultiDecoder drives them).
+        ``draft_rows``: verify windows a drafter attached later needs (DSpark: its block + 1 = 9 rows);
+        ``extra_bytes``: what that drafter will hold on this rank (``_check_cache_fits`` counts it)."""
         self.w, self.k = w, k
         self.capacity = capacity
         c = w.cfg
         self.topk = c.index_topk
         cols = fused.bucket(capacity, self.topk) or 0
         self.cols = max(cols, 1)
-        self._check_cache_fits(w, capacity, slots)
+        self._check_cache_fits(w, capacity, slots, extra_bytes)
         self.st = fused.State(w, capacity, slots)
         self.drafter = None                              # DFlash2 (engine attaches; set_drafter)
+        self.dspark = None                               # DSpark (dspark.SparkDrafter; engine attaches)
+        self.round_ms: tuple[float, ...] | None = None   # DSpark's cost cut: ms of a round of 0, 1, .. drafts
         self.cap = None                                  # DFlash2 training capture (rank 0, TF_GLM53_CAPTURE_DIR)
         if os.environ.get("TF_GLM53_CAPTURE_DIR") and w.rank == 0 and w.tap_slot:
             from .capture import Capture
 
             self.cap = Capture(os.environ["TF_GLM53_CAPTURE_DIR"], len(w.tap_slot), w.cfg.hidden_size)
-        self.vrows = max(k + 1, int(os.environ.get("TF_GLM53_VERIFY_ROWS", "8")) if w.tap_slot else 1)
+        self.vrows = max(k + 1, int(os.environ.get("TF_GLM53_VERIFY_ROWS", "8")) if w.tap_slot else 1, draft_rows)
         # copy drafts (copies.py, TF_GLM53_COPY_*; MiaAI-Lab 0007 / 0032, Apache-2.0): up to copy_max drafts a round,
         # in windows of the drafters' widths or of the copy widths (8 and copy_max + 1 rows; _copied pads up to them),
         # so one or two widths more are captured - not every width up to copy_max + 1
@@ -223,7 +228,13 @@ class Runner:
         self.profiler = RoundProfiler(w.rank)
         # TF_GLM53_MTP_REUSE: draft steps 2.. attend step 1's selection (an MTP layer with its own indexer)
         self.reuse = fused.MTP_REUSE if k and w.mtp is not None and w.mtp.layer.indexer is not None else 0
-        self.set_mode(fused.MTP_MODE)
+        self.set_mode(fused.MTP_INPUT)
+
+    @property
+    def drafters(self) -> list:
+        """Every loaded drafter (DFlash2, then DSpark): each takes every prompt chunk's and kept row's taps, whichever
+        drafts a round, so either can draft the next request (and prompt reuse keeps both windows)."""
+        return [d for d in (self.drafter, self.dspark) if d is not None]
 
     # ------------------------------------------------------------------------------------------------ prompt ---
     def _T(self, end: int) -> int | None:
@@ -264,6 +275,8 @@ class Runner:
                     if self.reuse and T is not None:
                         self._mtp(1, j, 0, T, self.reuse)
         torch.cuda.synchronize()
+        if self.dspark is not None and self.round_ms is None:
+            self._calibrate_dspark()                     # every rank together (gathers)
         print(f"[tensorfold] rank {self.w.rank}: {len(self.G.graphs)} decode graphs captured in "
               f"{time.perf_counter() - t0:.1f}s (key buckets {buckets})", flush=True)
 
@@ -273,10 +286,14 @@ class Runner:
         self.mode = mode
         self.dflash = mode == "dflash"
         self.auto = mode == "auto"
+        self.spark = mode == "dspark"
+        if self.spark and self.dspark is None:
+            raise ValueError("no DSpark drafter loaded (TF_GLM53_DSPARK)")
         if self.dflash or self.auto:
             if self.drafter is None:
                 raise ValueError("no DFlash2 drafter loaded (TF_GLM53_DFLASH)")
-            mode = fused.MTP_MODE
+        if mode in fused.DRAFTER_MODES:
+            mode = fused.MTP_INPUT
         base, _, head = mode.partition(":")
         self.hid_normed, self.chain_normed = (part == "normed" for part in base.split("/"))
         self.draft_full = head == "full"
@@ -336,8 +353,8 @@ class Runner:
         toks = torch.tensor(prompt, dtype=torch.long, device=w.device)
         logits = None
         if begin == 0:
-            if self.drafter is not None:
-                self.drafter.reset()
+            for dr in self.drafters:
+                dr.reset()
             if self.cap is not None:
                 self.cap.reset()
         elif self.cap is not None:
@@ -352,19 +369,21 @@ class Runner:
         return logits
 
     @staticmethod
-    def _check_cache_fits(w, capacity: int, slots: int) -> None:
+    def _check_cache_fits(w, capacity: int, slots: int, extra: int = 0) -> None:
         """Refuse a context x streams whose latent caches leave under TF_GLM53_CACHE_RESERVE_GB (default 6) free: on
         GB10's unified memory an overcommitted cache does not fail, it swaps the node until its watchdog reboots it
-        (10-02: --parallel 4 x 140K context = ~50 GB a rank on top of 65 GB of weights rebooted all four Sparks)."""
+        (10-02: --parallel 4 x 140K context = ~50 GB a rank on top of 65 GB of weights rebooted all four Sparks).
+        ``extra``: bytes a drafter loaded after the caches will take (DSpark's weights, ring, host tables, taps)."""
         c = w.cfg
         local = -(-capacity // w.dcp) + 1
         row = len(w.layers) * (c.kv_lora_rank + c.qk_rope_head_dim) * 2         # bf16 latent rows, every layer
-        need = row * local * slots
+        need = row * local * slots + int(extra)
         free = torch.cuda.mem_get_info()[0]
         spare = Runner._reserve(free)
         if need > free - spare:
-            fit = max(0, int((free - spare) // (row * slots)) * w.dcp)
-            raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
+            fit = max(0, int((free - spare - int(extra)) // (row * slots)) * w.dcp)
+            raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank"
+                               f"{f' (drafter {extra / 2**30:.2f} GiB included)' if extra else ''}, "
                                f"{free / 2**30:.1f} GiB is free (keeping {spare / 2**30:.0f} GiB spare): use --context "
                                f"<= {fit} with --parallel {slots}, or fewer streams")
 
@@ -434,8 +453,9 @@ class Runner:
         if hi < len(w.layers):
             return None
         self.halves = None
-        if taps and self.drafter is not None:            # the drafter's context: this chunk's committed taps
-            self.drafter.add_taps(b.taps[:R])
+        if taps:                                         # the drafters' contexts: this chunk's committed taps
+            for dr in self.drafters:
+                dr.add_taps(b.taps[:R])
         if taps and self.cap is not None:
             self.cap.add_taps(b.taps[:R])
         if taps and CAPTURE_LABEL:
@@ -617,11 +637,13 @@ class Runner:
         return {"copy_rounds": rounds, "copy_drafted": drafted, "copy_accepted": accepted}
 
     def _add_taps(self, n: int) -> None:
-        """DFlash2's context: the verify window's first n (kept) rows' taps, a block at most a call - the drafter's
-        captured tap passes (a copied round keeps up to TF_GLM53_COPY_MAX + 1 rows; wider calls would run eagerly)."""
-        dr, vb = self.drafter, self.vb
-        for a in range(0, n, dr.block):
-            dr.add_taps(vb.taps[a:min(n, a + dr.block)])
+        """The drafters' contexts: the verify window's first n (kept) rows' taps, a block at most a call - each
+        drafter's captured tap passes (a copied round keeps up to TF_GLM53_COPY_MAX + 1 rows; wider calls would run
+        eagerly)."""
+        vb = self.vb
+        for dr in self.drafters:
+            for a in range(0, n, dr.block):
+                dr.add_taps(vb.taps[a:min(n, a + dr.block)])
 
     def _mtp_flush(self, m: int, P: int) -> int:
         """Write an MTP backlog of m rows (positions P - m .. P - 1) without drafting from it (its draft lands in
@@ -758,21 +780,85 @@ class Runner:
                 "stopped": on_tokens.agreed, **self._copy_stats(copies, c_rounds, c_drafted, c_accepted),
                 "graphs": len(self.G.graphs), "capture_s": round(self.G.capture_s, 1), "out": out}
 
+    def _dspark_cfg(self) -> dict:
+        """DSpark's settings for a request: the startup's (TF_GLM53_DSPARK_*), or a runtime override in DSPARK_CFG next
+        to the profile flag (a JSON object of the same keys; the same file on every node)."""
+        from . import dspark_host
+
+        try:
+            override = open(os.path.dirname(PROFILE_FLAG) + "/DSPARK_CFG").read()
+        except OSError:
+            return self.dspark.settings
+        return dspark_host.settings(self.dspark.block, override)
+
+    def _calibrate_dspark(self) -> None:
+        """DSpark's cost cut (policy "cost"): ms of a round with k = 0 .. block drafts - the verify window of k + 1 rows
+        (fastest of 7 graph replays, made non-decreasing) plus the block pass - the ranks' slowest, so every rank cuts
+        alike (MiaAI-Lab 0116's "raw" calibration). TF_GLM53_DSPARK_COSTS replaces the measurement. Startup only
+        (prewarm: the caches hold scratch rows)."""
+        from . import dspark_host
+
+        dr, w = self.dspark, self.w
+        env = dspark_host.costs_env()
+        if env is not None:
+            self.round_ms = env
+            return
+        widths = list(range(1, dr.block + 2))
+        if any(R not in self.widths for R in widths):
+            return
+        self.st.pos.fill_(0)
+        mine = []
+        for R in widths:
+            best = float("inf")
+            for _ in range(7):
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                self._verify(R, 0, None, "argmax")
+                torch.cuda.synchronize()
+                best = min(best, time.perf_counter() - t0)
+            mine.append(1e3 * best)
+        dr.reset()
+        mine.append(dr.block_ms())
+        dr.reset()
+        t = torch.tensor(mine, dtype=torch.float32, device=w.device)
+        if w.world > 1:
+            every = torch.empty((w.world * t.numel(),), dtype=torch.float32, device=w.device)
+            w.comm.all_gather(t, every)
+            t = every.view(w.world, -1).max(dim=0).values
+        got = t.tolist()
+        verify = []
+        for y in got[:-1]:
+            verify.append(max(verify[-1], y) if verify else y)
+        self.round_ms = tuple(round(v + got[-1], 3) for v in verify)
+        if w.rank == 0:
+            print(f"[tensorfold] DSpark cost cut: round ms with 0..{dr.block} drafts "
+                  f"{[round(v, 2) for v in self.round_ms]} (block pass {got[-1]:.2f} ms)", flush=True)
+
     def _generate_dflash(self, prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s, sampling,
                          copies=None):
         """DFlash2 rounds: the drafter proposes up to its block - 1 tokens after the pending one, the target verifies
-        [pending, drafts] in one window (graph), the kept rows' taps extend the drafter's context."""
-        vb, dr = self.vb, self.drafter
-        cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
-               "confidence": float(os.environ.get("TF_GLM53_DFLASH_CONFIDENCE", "0.3"))}
-        try:                                             # runtime override (the same file on every node)
-            import json as _json
+        [pending, drafts] in one window (graph), the kept rows' taps extend the drafter's context. DSpark rounds
+        (``self.spark``) alike: up to its block (8) drafts after the pending one, cut by its learned confidences."""
+        vb = self.vb
+        kw: dict[str, Any] = {}
+        if self.spark:
+            dr = self.dspark
+            cfg = self._dspark_cfg()
+            depth_max = min(dr.block, self.vrows - 1, int(cfg["depth"]))
+            conf = float(cfg["confidence"])
+            kw = {"policy": cfg["policy"], "round_ms": self.round_ms if cfg["policy"] == "cost" else None}
+        else:
+            dr = self.drafter
+            cfg = {"depth": int(os.environ.get("TF_GLM53_DFLASH_DEPTH", "7")),
+                   "confidence": float(os.environ.get("TF_GLM53_DFLASH_CONFIDENCE", "0.3"))}
+            try:                                         # runtime override (the same file on every node)
+                import json as _json
 
-            cfg.update(_json.loads(open(os.path.dirname(PROFILE_FLAG) + "/DFLASH_CFG").read()))
-        except (OSError, ValueError):
-            pass
-        depth_max = min(dr.block - 1, self.vrows - 1, int(cfg["depth"]))
-        conf = float(cfg["confidence"])
+                cfg.update(_json.loads(open(os.path.dirname(PROFILE_FLAG) + "/DFLASH_CFG").read()))
+            except (OSError, ValueError):
+                pass
+            depth_max = min(dr.block - 1, self.vrows - 1, int(cfg["depth"]))
+            conf = float(cfg["confidence"])
         t_draft = t_verify = t_taps = 0.0
         rounds = drafted = accepted = 0
         c_rounds = c_drafted = c_accepted = 0
@@ -790,7 +876,7 @@ class Runner:
                 drafts = copied
             else:
                 room = max(0, min(depth_max, max_tokens - len(out) - 1, self.capacity - P - 1))
-                drafts = dr.propose(tok, room, sampling, conf) if room else []
+                drafts = dr.propose(tok, room, sampling, conf, **kw) if room else []
             ta = time.perf_counter()
             R = 1 + len(drafts)
             vb.ids[:R].copy_(torch.tensor([tok] + drafts, dtype=torch.long), non_blocking=True)
@@ -852,7 +938,8 @@ class Runner:
                 "tokens_per_round": round((len(out) - 1) / max(rounds, 1), 3),
                 "accept": round(accepted / drafted, 3) if drafted else None,
                 "tok_s": round((len(out) - 1) / dec, 2) if dec > 0 and len(out) > 1 else 0.0,
-                "round_ms": _pct(round_ms), "mtp_mode": "dflash", "depth": depth_max, "confidence": conf,
+                "round_ms": _pct(round_ms), "mtp_mode": self.mode, "depth": depth_max, "confidence": conf,
+                **({"policy": kw["policy"]} if self.spark else {}),
                 "stopped": on_tokens.agreed, **self._copy_stats(copies, c_rounds, c_drafted, c_accepted),
                 "ms_per_round": {k: round(1e3 * v / max(rounds, 1), 2) for k, v in
                                  (("draft", t_draft), ("verify", t_verify), ("taps", t_taps))},
@@ -883,7 +970,8 @@ class Runner:
             if keep is not None:
                 keep(L0, lg)
         cx = None                                        # the prompt's copy index: built while the GPU ends prefill
-        if copies and self.copy_on and ((self.dflash and self.drafter is not None) or (k and not self.dflash)):
+        if copies and self.copy_on and ((self.dflash and self.drafter is not None) or self.spark
+                                        or (k and not self.dflash)):
             cx = copy_drafts.CopyIndex(prompt, self.copy_match, self.copy_max)
         if self.cap is not None and sample is not None:
             self.cap.add_logits(L0 - 1, lg[0])
@@ -900,7 +988,7 @@ class Runner:
         if k:
             mb.hin[:1].copy_(self.carry)
             mb.ids[:1].fill_(tok)
-        if self.dflash:
+        if self.dflash or self.spark:
             return self._generate_dflash(prompt, out, tok, P, max_tokens, sample, stop, on_tokens, prefill_s,
                                          sampling, cx)
         if self.auto and k:

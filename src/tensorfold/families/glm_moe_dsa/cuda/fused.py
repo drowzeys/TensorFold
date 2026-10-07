@@ -59,7 +59,12 @@ RB = 16                  # rows a program in the absorb / expand kernels (wide w
 MTP_MODE = os.environ.get("TF_GLM53_MTP", "normed/normed")
 MTP_MODES = ("raw/raw", "raw/normed", "normed/raw", "normed/normed",
              "raw/raw:full", "raw/normed:full", "normed/raw:full", "normed/normed:full",   # ":full": full-vocab drafts
-             "dflash", "auto")                    # DFlash2 drafter (dflash.py); auto: MTP or DFlash2 each round
+             "dflash", "auto",                    # DFlash2 drafter (dflash.py); auto: MTP or DFlash2 each round
+             "dspark")                            # DSpark drafter (dspark.py, TF_GLM53_DSPARK)
+DRAFTER_MODES = ("dflash", "auto", "dspark")      # modes whose drafts are not the MTP head's alone
+# the MTP input a drafter mode's prompt rows are made with: the default mode's, or normed/normed when the default is
+# itself a drafter mode (TF_GLM53_MTP=dspark: every request without "tf_mtp" drafts with DSpark)
+MTP_INPUT = MTP_MODE if MTP_MODE not in DRAFTER_MODES else "normed/normed"
 FAST_ROWS = 16           # windows up to this many rows reduce over RoCE (when available); prompt chunks use NCCL
 DECODE_ROWS = 32         # widest decode window (Buffers(decode=True)): concurrent DFlash2 rounds, 4 streams x 8 rows
 DRAFT_VOCAB = int(os.environ.get("TF_GLM53_DRAFT_VOCAB", "32768"))  # draft head: the lowest ids (BPE: most frequent)

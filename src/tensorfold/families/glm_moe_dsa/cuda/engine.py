@@ -110,8 +110,23 @@ class Glm53Engine:
                 spans = [(rank * q, (rank + 1) * q)] + ([(V - fused.SPECIALS, V)] if rank == WORLD - 1 else [])
                 fw.set_draft_head(torch.cat([sl[a:b] for a, b in spans]).cuda(),
                                   torch.cat([torch.arange(a, b) for a, b in spans]).cuda())
+            from . import dspark_host
+
+            spath = os.environ.get("TF_GLM53_DSPARK", "")
+            scfg = sset = None                           # DSpark (dspark.py): its config and settings, every rank
+            squant = "q4"
+            if spath:
+                if self.parallel > 1:
+                    raise ValueError("TF_GLM53_DSPARK drafts one stream at a time: --parallel 1 (concurrent streams "
+                                     "draft with the MTP head or DFlash2)")
+                if os.environ.get("TF_GLM53_CAPTURE_DIR"):
+                    raise ValueError("TF_GLM53_CAPTURE_DIR records DFlash2's taps: run it without TF_GLM53_DSPARK")
+                scfg = dspark_host.DSparkConfig.read(spath)
+                dspark_host.check(scfg, WORLD, hidden=cfg.hidden_size, vocab=cfg.vocab_size,
+                                  layers=cfg.num_hidden_layers)
+                sset, squant = dspark_host.settings(scfg.block), dspark_host.quant()
             r.drop()
-            headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH")))   # TF_GLM53_DRAFT_HEAD,
+            headq.prepare(fw, drafts=bool(self.k or os.environ.get("TF_GLM53_DFLASH") or spath))  # TF_GLM53_DRAFT_HEAD,
             head = None                                  # TF_GLM53_VERIFY_HEAD (fp8 may free the bf16 share)
             if ROCE and comm.__class__.__name__ == "NCCL":
                 fast = None
@@ -130,12 +145,16 @@ class Glm53Engine:
             if WORLD > 1:                                # settings that change which windows / collectives a round
                 from . import copies, depth              # runs: a rank on its own would hang the others
                 mine = torch.tensor([fused.MTP_REUSE, int(depth.COST * 1e6), depth.LOW, int(depth.RATE * 1e6),
-                                     *copies.SETTINGS], dtype=torch.int32, device="cuda")
+                                     *copies.SETTINGS, *dspark_host.words(scfg, sset, squant),
+                                     fused.MTP_MODES.index(fused.MTP_MODE) if fused.MTP_MODE in fused.MTP_MODES
+                                     else -1],
+                                    dtype=torch.int32, device="cuda")
                 every = torch.empty((WORLD, mine.numel()), dtype=torch.int32, device="cuda")
                 comm.all_gather(mine, every)
                 if not bool((every == every[0]).all()):
                     raise RuntimeError("the ranks were started with different TF_GLM53_MTP_REUSE / "
-                                       "TF_GLM53_DEPTH_POLICY / _MIN / _RATE / TF_GLM53_COPY_DRAFTS / _MIN / _MAX "
+                                       "TF_GLM53_DEPTH_POLICY / _MIN / _RATE / TF_GLM53_COPY_DRAFTS / _MIN / _MAX / "
+                                       "TF_GLM53_DSPARK (its config.json) / TF_GLM53_DSPARK_* / TF_GLM53_MTP "
                                        f"(rank rows: {every.tolist()}); give every rank the same environment")
             if WORLD > 1 and os.environ.get("TF_GLM53_TUNE_SHARED", "1") != "0":
                 n = fused.share_tiles(fw, comm)             # rank 0's tiles everywhere: one pick paces every layer
@@ -159,10 +178,23 @@ class Glm53Engine:
             del r                                        # host memory is device memory; a 1M cache needs it all)
             _trim_host()
             dpath = os.environ.get("TF_GLM53_DFLASH", "")
+            dlayers = None
             if dpath:                                    # DFlash2: the target taps its layers before buffers exist
                 dcfg = json.loads((Path(dpath) / "config.json").read_text())
-                fw.tap_slot = {int(i): s for s, i in enumerate(dcfg["dflash_config"]["target_layer_ids"])}
-            self.runner = Runner(fw, self.limit + self.k + 1, self.k, graphs=GRAPHS, slots=self.parallel)
+                dlayers = [int(i) for i in dcfg["dflash_config"]["target_layer_ids"]]
+            # the taps of every loaded drafter's layers (DFlash2's own layout first; DSpark's further layers after)
+            fw.tap_slot, (dcols, scols) = dspark_host.tap_plan([dlayers, scfg.tap_layers if scfg else None])
+            srows = sextra = 0
+            if scfg is not None:                         # verify windows of block + 1 rows; what it will hold
+                from .dflash import RING
+
+                mem = dspark_host.memory(scfg, WORLD, quant=squant, ring=RING)
+                more = len(fw.tap_slot) - len(dlayers or ())          # tap columns DSpark adds to every Buffers
+                rows = fused.PROMPT_ROWS * 3 // 2 + 2 * fused.DECODE_ROWS     # prompt halves, verify and MTP
+                sextra = mem["total"] + more * cfg.hidden_size * 2 * rows
+                srows = scfg.block + 1
+            self.runner = Runner(fw, self.limit + self.k + 1, self.k, graphs=GRAPHS, slots=self.parallel,
+                                 draft_rows=srows, extra_bytes=sextra)
             if rank == 0 and self.runner.copy_on:
                 rn = self.runner
                 print(f"[tensorfold] copy drafts: a reply whose last {rn.copy_match} tokens occurred before verifies "
@@ -172,11 +204,25 @@ class Glm53Engine:
                 from .dflash import GlmDrafter
 
                 dr = GlmDrafter(dpath, fw, capacity=self.limit + 16)
+                dr.tap_cols = dcols
                 if GRAPHS and self.parallel == 1:        # concurrent: multi.MultiDrafter captures its own passes
                     dr.capture()
                 self.runner.drafter = dr
                 print(f"[tensorfold] rank {rank}: DFlash2 drafter {Path(dpath).name} (block {dr.block}, taps "
                       f"{dr.tap_layers}) - per request \"tf_mtp\": \"dflash\"", flush=True)
+            if scfg is not None:
+                from .dspark import SparkDrafter
+
+                sd = SparkDrafter(spath, fw, capacity=self.limit + 16, settings=sset, quant=squant, tap_cols=scols)
+                if GRAPHS:
+                    sd.capture()
+                self.runner.dspark = sd
+                _trim_host()
+                print(f"[tensorfold] rank {rank}: DSpark drafter {Path(spath).name} (block {sd.block}, taps after "
+                      f"layers {sd.tap_layers}, {squant} weights {sd.nbytes() / 2**20:.0f} MiB + Markov tables "
+                      f"{sd.host_bytes() / 2**20:.0f} MiB, estimate {sextra / 2**30:.2f} GiB with taps; cut "
+                      f"{sset['policy']}, depth {sset['depth']}, confidence {sset['confidence']}) - per request "
+                      f"\"tf_mtp\": \"dspark\"", flush=True)
         else:
             self.model = RankModel(cfg, rank, WORLD, comm, embed=embed, final_norm=norm, lm_head=head, layers=layers)
             self.caches = [torch.zeros((self.limit, cfg.latent_width), dtype=torch.bfloat16, device="cuda")
@@ -425,6 +471,8 @@ class Glm53Engine:
                 return on_tokens(new)
             s = sampling if sampling is not None and sampling.temperature > 0 else None
             mode = mtp_mode if mtp_mode in fused.MTP_MODES else CONC_MODE or fused.MTP_MODE
+            if mode == "dspark":
+                raise ValueError("mtp mode 'dspark' drafts one stream at a time (--parallel 1)")
             if mode in ("dflash", "auto") and self.multi.dr is None:
                 raise ValueError(f"mtp mode {mode!r}: no DFlash2 drafter loaded (TF_GLM53_DFLASH)")
             want = (mode if mode in ("dflash", "auto") else bool(self.k)) if draft else False   # multi._mode
@@ -443,6 +491,8 @@ class Glm53Engine:
         k = self.k if draft else 0
         modes = fused.MTP_MODES
         mi = modes.index(mtp_mode) + 1 if mtp_mode in modes else 0          # 0: the default mode
+        if (mtp_mode if mi else fused.MTP_MODE) == "dspark" and self.runner is not None and self.runner.dspark is None:
+            raise ValueError("mtp mode 'dspark': no DSpark drafter loaded (TF_GLM53_DSPARK)")
         # prompt reuse: rank 0 picks the kept state to resume (drafted requests only: "draft": false is the cold
         # reference, cut at the same keep points, never resumed and keeping no new state - kept states it rewrites at
         # its cut points it keeps again from its own rows, prefixes.PromptReuse.run) and the states to keep
