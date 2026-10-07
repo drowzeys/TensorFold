@@ -240,26 +240,26 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
 // ---- host tests (no GPU): variant choice from an aot.json as aot_pack.py writes it ----
 
 const test_set =
-    \{"kernels": [
-    \ {"fn": "_attn", "hash": "a", "name": "_attn", "num_warps": 4, "num_stages": 2,
-    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
-    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
-    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
-    \ {"fn": "_attn", "hash": "b", "name": "_attn", "num_warps": 8, "num_stages": 2,
-    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
-    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
-    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
-    \ {"fn": "_attn", "hash": "c", "name": "_attn", "num_warps": 8, "num_stages": 1,
-    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
-    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
-    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
-    \ {"fn": "_attn", "hash": "d", "name": "_attn", "num_warps": 4, "num_stages": 2,
-    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false}],
-    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "R": {"int": 1}, "BASE": {"none": true}}},
-    \ {"fn": "_norm", "hash": "e", "name": "_norm", "num_warps": 8,
-    \  "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}],
-    \  "consts": {"D": {"int": 6144}}}
-    \]}
+    \\{"kernels": [
+    \\ {"fn": "_attn", "hash": "a", "name": "_attn", "num_warps": 4, "num_stages": 2,
+    \\  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \\             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \\  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \\ {"fn": "_attn", "hash": "b", "name": "_attn", "num_warps": 8, "num_stages": 2,
+    \\  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \\             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \\  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \\ {"fn": "_attn", "hash": "c", "name": "_attn", "num_warps": 8, "num_stages": 1,
+    \\  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \\             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \\  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \\ {"fn": "_attn", "hash": "d", "name": "_attn", "num_warps": 4, "num_stages": 2,
+    \\  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false}],
+    \\  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "R": {"int": 1}, "BASE": {"none": true}}},
+    \\ {"fn": "_norm", "hash": "e", "name": "_norm", "num_warps": 8,
+    \\  "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}],
+    \\  "consts": {"D": {"int": 6144}}}
+    \\]}
 ;
 
 fn parseTestSet() !std.json.Parsed(SetJson) {

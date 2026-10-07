@@ -291,7 +291,7 @@ const Loader = struct {
 
     /// weights.load_experts + experts.prepare: per-expert trellises (gate, up: output tiles; down: input tiles),
     /// int64 pointer tables, int32 widths, stacked fp16 scales; digests in prepare's order (gate, up, down).
-    fn experts(L: *Loader, layer: usize, key: []const u8, c: Config) !Experts {
+    fn experts(L: *Loader, li: usize, key: []const u8, c: Config) !Experts {
         const E = c.experts;
         const D = c.hidden;
         const I = c.expert_width / L.o.world;
@@ -315,7 +315,7 @@ const Loader = struct {
         var hi_d: usize = 0;
         var cbk: ?exl3.Codebook = null;
         for (projs, 0..) |pj, j| for (0..E) |e| {
-            const pre = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj", .{ layer, e, pj });
+            const pre = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj", .{ li, e, pj });
             if (cbk == null) cbk = try L.codebook(pre);
             var tb: [256]u8 = undefined;
             const tname = try std.fmt.bufPrint(&tb, "{s}.trellis", .{pre});
@@ -383,7 +383,7 @@ const Loader = struct {
             const buf = try L.gpa.alloc(u8, E * st.n * 2);
             defer L.gpa.free(buf);
             for (0..E) |e| {
-                const name = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj.{s}", .{ layer, e, st.proj, st.part });
+                const name = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj.{s}", .{ li, e, st.proj, st.part });
                 const t = try L.ck.get(name);
                 if (t.dtype != .f16) return error.UnsupportedScales; // .half() of fp16: as stored
                 var shape: [core.safetensors.max_rank]usize = undefined;
