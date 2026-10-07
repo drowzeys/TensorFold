@@ -55,7 +55,7 @@ for p in "$TF/build.zig" "$PYSRC/src/tensorfold/families/glm_moe_dsa/cuda/fused.
   [ -e "$p" ] || summary FAIL "missing $p" 3
 done
 gpu() { if [ -n "${GPU_LOCK:-}" ]; then flock "$GPU_LOCK" "$@"; else "$@"; fi; }
-COMMON=(--rm --label "$LABEL" --network none --ipc host -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1)
+COMMON=(--rm --label "$LABEL" --network none --ipc host --user "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1)
 
 # ---- 0. the image's versions and the kernel copies against the champion source (host, no GPU) ----------------
 say "image versions"
