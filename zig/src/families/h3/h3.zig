@@ -59,6 +59,9 @@ const Quant = struct { w: mtl.Buffer, s: mtl.Buffer };
 
 const Block = struct { q: Quant, k: Quant, v: Quant, compress: Quant, out: Quant, fc_gate: Quant, fc_value: Quant, fc2: Quant, norm1: Ref, norm2: Ref, norm_q: Ref, norm_k: Ref, tables: Ref };
 
+/// Kernel shapes under test; `defines` goes ahead of the kernels' source.
+pub const Options = struct { swiglu_rows: usize = 128, defines: []const u8 = "" };
+
 pub const Timing = struct { wall: f64, gpu: f64 };
 
 /// Where a profiled forward's GPU time went.
@@ -146,6 +149,8 @@ pub const Model = struct {
     audio_velocity: mtl.Buffer,
     /// Every query tile attends to every tile and the pooled branch is left out (not what the checkpoint was trained for).
     dense: bool = false,
+    /// Rows one threadgroup of the SwiGLU's first product owns.
+    swiglu_rows: usize = 128,
     profile: bool = false,
     spent: [stages.len]f64 = @splat(0),
 
@@ -163,7 +168,7 @@ pub const Model = struct {
     }
 
     /// `checkpoint_dir`: the FastH3 transformer folder of `shards` files. `case`: tools/zig/h3_case.py's output.
-    pub fn load(gpa: std.mem.Allocator, checkpoint_dir: []const u8, shards: usize, case: *Tensors) !*Model {
+    pub fn load(gpa: std.mem.Allocator, checkpoint_dir: []const u8, shards: usize, case: *Tensors, options: Options) !*Model {
         const device = try mtl.Device.init();
         if (!device.tensorUnits()) return error.NeedsTensorUnits;
         const self = try gpa.create(Model);
@@ -172,6 +177,7 @@ pub const Model = struct {
         self.queue = try device.queue();
         self.case = case;
         self.dense = false;
+        self.swiglu_rows = options.swiglu_rows;
         self.profile = false;
         self.spent = @splat(0);
         self.checkpoint = try Checkpoint.open(gpa, device, checkpoint_dir, shards);
@@ -206,7 +212,7 @@ pub const Model = struct {
         const times = (case.names.get("final") orelse return error.MissingTensor).shape[0];
 
         // the kernels take the model's sizes as compile-time values
-        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, kernels.source });
+        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n#define H3_SWT {d}\n{s}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, options.swiglu_rows, options.defines, kernels.source });
         defer gpa.free(source);
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -511,7 +517,7 @@ pub const Model = struct {
             self.lap(&pass, "attention out");
             self.norm(enc.*, b.norm2, b.tables, gate_a, b.tables, scale_m, shift_m);
             self.lap(&pass, "norms");
-            enc.setPipeline(self.pipeline("qi_i8_swiglu"));
+            enc.setPipeline(if (self.swiglu_rows == tile) self.pipeline("qi_i8_swiglu") else self.pipeline("h3_i8_swiglu"));
             enc.setBuffer(self.q8, 0, 0);
             enc.setBuffer(self.xs, 0, 1);
             enc.setBuffer(b.fc_gate.w, 0, 2);
@@ -519,7 +525,7 @@ pub const Model = struct {
             enc.setBuffer(b.fc_value.w, 0, 4);
             enc.setBuffer(b.fc_value.s, 0, 5);
             enc.setBuffer(self.wide, 0, 6);
-            enc.dispatchGroups(mtl.Size.of(self.mlp / tile, (rows + tile - 1) / tile, 1), mtl.Size.of(product_threads, 1, 1));
+            enc.dispatchGroups(mtl.Size.of(self.mlp / tile, (rows + self.swiglu_rows - 1) / self.swiglu_rows, 1), mtl.Size.of(product_threads, 1, 1));
             self.lap(&pass, "mlp in");
             self.quantRows(enc.*, self.wide, self.w8, self.wxs, self.mlp, wide_group);
             self.lap(&pass, "quantize");

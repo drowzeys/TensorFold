@@ -50,7 +50,7 @@ fn advance(x: []f32, velocity: []const f32, seen: f32, ratio: f32) void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 5 and args.len != 6) {
-        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense]\n", .{});
+        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | DEFINE, ...]\n", .{});
         return error.BadArguments;
     }
     const gpa = init.gpa;
@@ -58,8 +58,23 @@ pub fn main(init: std.process.Init) !void {
     var case = try h3.Tensors.open(gpa, device, args[3]);
     defer case.deinit();
     const loading = mtl.clock.seconds();
-    const model = try h3.Model.load(gpa, args[1], try std.fmt.parseInt(usize, args[2], 10), &case);
-    model.dense = args.len == 6;
+    // the optional last argument names kernel shapes to try: "dense", "swiglu64", or defines such as "H3_HALF_EXP"
+    var options = h3.Options{};
+    var defines: [256]u8 = undefined;
+    var used: usize = 0;
+    var dense = false;
+    if (args.len == 6) {
+        var it = std.mem.splitScalar(u8, args[5], ',');
+        while (it.next()) |word| {
+            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else {
+                const text = try std.fmt.bufPrint(defines[used..], "#define {s}\n", .{word});
+                used += text.len;
+            }
+        }
+    }
+    options.defines = defines[0..used];
+    const model = try h3.Model.load(gpa, args[1], try std.fmt.parseInt(usize, args[2], 10), &case, options);
+    model.dense = dense;
     const steps = (case.names.get("video_step") orelse return error.MissingTensor).shape[0];
     const nv = model.video * model.video_in;
     const na = model.audio * model.audio_in;
@@ -75,7 +90,8 @@ pub fn main(init: std.process.Init) !void {
 
     const vv = try gpa.alloc(f32, nv);
     const av = try gpa.alloc(f32, na);
-    for (0..steps) |step| {
+    const quick = args.len == 6 and std.mem.indexOf(u8, args[5], "H3_KO") != null;
+    for (0..if (quick) 0 else steps) |step| {
         const took = try model.forward(video, audio, step, vv, av);
         if (step == 0) {
             const m = match(vv, expect_video, model.video_in);
