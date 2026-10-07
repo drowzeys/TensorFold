@@ -186,7 +186,8 @@ def main():
     parser.add_argument("--upscale-vae", help="safetensors of a packed-head (2x) video decoder; frames come out larger")
     parser.add_argument("--crop", help="WxH: centre-crop the decoded frames before the MP4 is written")
     parser.add_argument("--fasth3", help="a FastH3 checkpoint folder: its transformer, schedule and routed attention")
-    parser.add_argument("--vsa-impl", default="reference", choices=("reference", "simd"))
+    parser.add_argument("--vsa-impl", default="tensor", choices=("tensor", "reference", "simd"),
+                        help="routed attention: our int8 tile kernel, or FastVideo's reference or SIMD-group forms")
     parser.add_argument("--dense", action="store_true", help="with --fasth3: dense attention instead of routed")
     parser.add_argument("--step-cache", type=float, default=0.0,
                         help="reuse the last velocity while the summed relative move stays under this (0.05)")

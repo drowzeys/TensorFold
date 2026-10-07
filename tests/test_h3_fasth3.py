@@ -129,3 +129,31 @@ def test_sparse_routing_with_gates_runs_and_differs():
     assert not np.allclose(np.asarray(sparse.video_rows), np.asarray(dense.video_rows))
     geometry = hook(sparse.packed, sparse.latent_frames, sparse.latent_height, sparse.latent_width)
     assert geometry.total_seq_length == sparse.packed.rows and geometry.num_video_tiles >= 2
+
+
+def test_tile_kernel_routed_attention_matches_fastvideos_reference():
+    from types import SimpleNamespace
+
+    from tensorfold.families.h3.vendor import fastvideo_vsa as vsa
+    from tensorfold.kernels.minimax.h3.v1 import attention_tiles_int8 as tiles
+
+    if not tiles.available():
+        pytest.skip("no M5 tensor units")
+    heads, dim, segments, shape = 2, 128, (70, 30), (8, 8, 9)      # ragged prefix chunks and ragged video tiles
+    geometry = vsa.build_h3_tile_geometry(segments, shape, 64)
+    rows = geometry.total_seq_length
+    mx.random.seed(11)
+    q, k, v, gate = (mx.random.normal((rows, heads, dim)) for _ in range(4))
+    theirs = vsa.h3_vsa_attention(q, k, v, geometry, sparsity=0.6, exempt=True, gate_compress=gate, impl="reference")
+
+    def mix(q, k, v):
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=dim ** -0.5, mask=None)
+        return out.transpose(0, 2, 1, 3).reshape(1, out.shape[2], heads * dim)
+
+    head_major = [x.transpose(1, 0, 2)[None] for x in (q, k, v)]
+    ours = fasth3._tensor_routed(vsa, tiles, SimpleNamespace(mix=mix), *head_major, geometry, 0.6, gate)
+    assert ours.shape == (1, rows, heads * dim)
+    a, b = np.asarray(ours.astype(mx.float32)).reshape(-1), np.asarray(theirs.astype(mx.float32)).reshape(-1)
+    assert np.dot(a, b) / np.sqrt(np.dot(a, a) * np.dot(b, b)) > 0.9995       # int8 scores and values, not exact
+    prefix = geometry.prefix_length * heads * dim                             # dense rows carry only the gate term
+    np.testing.assert_allclose(a[:prefix], b[:prefix], atol=2e-3, rtol=2e-3)

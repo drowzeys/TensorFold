@@ -145,8 +145,9 @@ def load_fasth3(checkpoint_dir, blocks: int | None = None):
 def route(model, gates: dict, sparsity: float, tile: int = 64, impl: str = "reference"):
     """Wire routed attention into ``model``; returns the ``prepare`` hook the sampler calls with the layout.
 
-    ``impl`` is FastVideo's ``reference`` (gather and batched attention) or ``simd`` (its Metal kernel, for tiles
-    of 64 and heads of 128; falls back to reference on failure).
+    ``impl`` is ``tensor`` (our int8 tile kernel on the M5 tensor units, for tiles of 64 and heads of 128; anything
+    else falls back to reference), FastVideo's ``reference`` (gather and batched attention) or its ``simd`` Metal
+    kernel.
     """
 
     import mlx.core as mx
@@ -156,6 +157,13 @@ def route(model, gates: dict, sparsity: float, tile: int = 64, impl: str = "refe
     cfg = model.config
     heads, dim = cfg.num_attention_heads, cfg.attention_head_dim
     state = {"geometry": None}
+    tiles = None
+    if impl == "tensor":
+        from ...kernels.minimax.h3.v1 import attention_tiles_int8 as tiles
+
+        if tile != tiles.TILE or dim != tiles.DIM or sparsity <= 0 or not tiles.available():
+            tiles = None
+        impl = "reference"
     for index, block in enumerate(model.blocks):
         gate = gates.get(index)
 
@@ -165,6 +173,8 @@ def route(model, gates: dict, sparsity: float, tile: int = 64, impl: str = "refe
             if geometry is None or geometry.total_seq_length != rows:
                 return attention.mix(q, k, v)
             compress = None if gate is None else (x[0] @ gate.T.astype(x.dtype)).reshape(rows, heads, dim)
+            if tiles is not None and vsa.compute_topk(sparsity, geometry.num_video_tiles) < geometry.num_video_tiles:
+                return _tensor_routed(vsa, tiles, attention, q, k, v, geometry, sparsity, compress)
             out = vsa.h3_vsa_attention(q[0].transpose(1, 0, 2), k[0].transpose(1, 0, 2), v[0].transpose(1, 0, 2),
                                        geometry, sparsity=sparsity, exempt=True, gate_compress=compress, impl=impl)
             return out.reshape(1, rows, heads * dim)
@@ -182,3 +192,40 @@ def route(model, gates: dict, sparsity: float, tile: int = 64, impl: str = "refe
         return state["geometry"]
 
     return prepare
+
+
+def _tensor_routed(vsa, tiles, attention, q, k, v, geometry, sparsity: float, compress):
+    """FastVideo's routing with the video tiles on our kernel. q, k, v: (1, heads, rows, dim), head-major.
+
+    Text, keyframe and audio queries stay dense, as in FastVideo; they are a few hundred rows.
+    """
+
+    import mlx.core as mx
+
+    _, heads, rows, dim = q.shape
+    size, prefix = geometry.tile_elems, geometry.prefix_length
+    counts = mx.array(geometry.variable_block_sizes, dtype=mx.float32)
+    pad = mx.zeros((heads, 1, dim), dtype=q.dtype)
+
+    def tiled(x):
+        return mx.concatenate([x[0], pad], axis=1)[:, geometry.tile_gather_index]
+
+    def pooled(x):
+        return x.astype(mx.float32).reshape(heads, geometry.num_tiles, size, dim).sum(axis=2) / counts[None, :, None]
+
+    qt, kt, vt = tiled(q), tiled(k), tiled(v)
+    scores = (pooled(qt) @ pooled(kt).transpose(0, 2, 1)) / (dim ** 0.5)
+    chosen, _ = vsa._block_indices_from_scores(scores, geometry.num_prefix_tiles, geometry.num_video_tiles, sparsity,
+                                               True)
+    video = tiles.attention(qt, kt, vt, chosen, mx.array(geometry.variable_block_sizes, dtype=mx.int32),
+                            geometry.num_prefix_tiles, dim ** -0.5).astype(q.dtype)
+    where = geometry.untile_index[prefix:] - geometry.num_prefix_tiles * size
+    parts = [video[where]]
+    if prefix:
+        parts.insert(0, attention.mix(q[:, :, :prefix], k, v)[0])
+    out = mx.concatenate(parts, axis=0)
+    if compress is not None:
+        coarse = (mx.softmax(scores, axis=-1) @ pooled(vt)).transpose(1, 0, 2)          # (tiles, heads, dim)
+        gated = coarse[geometry.untile_index // size] * compress.astype(mx.float32)
+        out = out + gated.reshape(rows, heads * dim).astype(out.dtype)
+    return out[None]
