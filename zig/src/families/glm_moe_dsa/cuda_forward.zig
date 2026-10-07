@@ -16,8 +16,11 @@
 //! into the routed combine. Selection always goes through the radix select (topk.top_columns over _index_scores'
 //! 4-byte order words): the same keys as torch.topk + sort, which the champion uses for decode-sized windows (the
 //! oracle checks the two agree).
+//! Phase 2b: the device head (`headDevice`: fused.head "argmax" / "local" / "draft" with no host step, so a window
+//! replays as a CUDA graph), ids on the device (b.ids, torch.index_select's rows), the MTP layer (`mtpCompute`,
+//! fused.mtp_compute with TF_GLM53_MTP_REUSE's keep / reuse) and the decode-class buffers (`BufOpts.decode`).
 //! TODO(P3): the RoCE one-shot / exact reduce-scatter exchanges, prompt chunks over 128 rows (x3prefill GEMM, bmm
-//! absorb/expand), DCP, int8/int4 latent caches, CUDA graphs, the MTP layer, sampling.
+//! absorb/expand), DCP, int8/int4 latent caches.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -25,6 +28,7 @@ const exl3 = @import("exl3.zig");
 const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
 const W = @import("cuda_weights.zig");
+const smp = @import("sampling.zig");
 
 /// The widest TP world the head's exchange records hold.
 pub const max_world: usize = 16;
@@ -42,6 +46,18 @@ pub const Pick = struct {
 pub const fast_rows: usize = 16;
 /// fused.MAX_ROWS: the widest window of the row-invariant EXL3 linear (this port's limit for now).
 pub const max_rows: usize = 128;
+/// fused.DECODE_ROWS: the widest decode-class buffer set.
+pub const decode_rows: usize = 32;
+
+pub const BufOpts = struct {
+    /// fused.Buffers(decode=True): verify and MTP windows
+    decode: bool = false,
+    /// the MTP layer's scratch (hin, me, mh, mcat, mx32, eh_proj partials)
+    mtp: bool = false,
+};
+
+/// What a window's head computes (fused.head's modes; `none`: no head).
+pub const HeadMode = enum { none, argmax, local, draft };
 
 /// fused.Buffers: scratch for windows of up to `rows` rows (sliced [:R]); `score_cols` the widest index range.
 pub const Buffers = struct {
@@ -88,6 +104,22 @@ pub const Buffers = struct {
     hpart: u64 = 0, // fp32 [ROUTER_KS, head_rows, vocab_part] (glue.router's partials)
     amax: u64 = 0, // fp32 [head_rows, 4]: [max logit, global id, 0, 0] a row
     amax_all: u64 = 0, // fp32 [world, head_rows, 4]
+    // Phase 2b: device ids, the hidden rows the MTP layer reads and writes, its scratch, the device head
+    ids: u64 = 0, // int64 [rows]
+    hin: u64 = 0, // bf16 [rows, D]: the hidden rows the MTP layer reads
+    hidden: u64 = 0, // bf16 [rows, D]: the window's final (target) or chain (MTP) hidden rows
+    ht: u64 = 0, // bf16 [rows, D]: target_hidden_for_mtp of a prompt chunk
+    me: u64 = 0, // bf16 [rows, D]
+    mh: u64 = 0,
+    mcat: u64 = 0, // bf16 [rows, 2 D]
+    mx32: u64 = 0, // fp32 [rows, D]
+    epart: u64 = 0, // fp32 [ROUTER_KS, rows, D]: eh_proj's router partials
+    argmax: u64 = 0, // int64 [head_rows]
+    gsum: u64 = 0, // fp32 [head_rows, D / 64]: the draft head's input group sums
+    head_v: usize = 0, // b.lg holds head_rows rows of up to this many logits (max(vocab_part, draft rows))
+    cand_words: usize = 0, // words a rank sends for sampled candidates: head_rows * 2 * max_candidates + 1
+    cand_send: u64 = 0, // fp32 [cand_words]
+    cand_all: u64 = 0, // fp32 [world * cand_words]
     lin: kern.LinearScratch = undefined,
     xs: ?kern.ExpertScratch = null,
 
@@ -100,9 +132,16 @@ pub const Buffers = struct {
     }
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, rows: usize, score_cols: usize) !Buffers {
+        return initWith(gpa, d, w, rows, score_cols, .{});
+    }
+
+    /// `opts.decode` (fused.Buffers(decode=True)): every window these buffers serve is a decode / verify window,
+    /// whatever its width: the decode attention tiling and head rows up to max(rows, FAST_ROWS).
+    pub fn initWith(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, rows: usize, score_cols: usize, opts: BufOpts) !Buffers {
         const c = w.config;
         if (rows > max_rows) return error.WindowTooWide;
-        var b: Buffers = .{ .d = d, .gpa = gpa, .rows = rows, .score_cols = score_cols, .small = fast_rows };
+        if (opts.decode and rows > decode_rows) return error.WindowTooWide;
+        var b: Buffers = .{ .d = d, .gpa = gpa, .rows = rows, .score_cols = score_cols, .small = if (opts.decode) @max(rows, fast_rows) else fast_rows };
         errdefer b.deinit();
         const D = c.hidden;
         const H = w.heads;
@@ -143,13 +182,30 @@ pub const Buffers = struct {
         b.gath = try b.alloc(w.world * rows * D * 4);
         if (w.lm_head != 0) {
             const hr = @min(rows, b.small);
-            const V = w.vocab_part;
+            const V = @max(w.vocab_part, if (w.draft) |dh| dh.n else 0);
             b.head_rows = hr;
+            b.head_v = V;
             b.fnormed = try b.alloc(hr * D * 2);
             b.lg = try b.alloc(hr * V * 4);
             b.hpart = try b.alloc(tri.router_ks * hr * V * 4);
             b.amax = try b.alloc(hr * 4 * 4);
             b.amax_all = try b.alloc(w.world * hr * 4 * 4);
+            b.argmax = try b.alloc(hr * 8);
+            b.gsum = try b.alloc(hr * (D / 64) * 4);
+            b.cand_words = hr * 2 * smp.max_candidates + 1;
+            b.cand_send = try b.alloc(b.cand_words * 4);
+            b.cand_all = try b.alloc(w.world * b.cand_words * 4);
+        }
+        b.ids = try b.alloc(rows * 8);
+        b.hidden = try b.alloc(rows * D * 2);
+        if (opts.mtp) {
+            b.hin = try b.alloc(rows * D * 2);
+            b.ht = try b.alloc(rows * D * 2);
+            b.me = try b.alloc(rows * D * 2);
+            b.mh = try b.alloc(rows * D * 2);
+            b.mcat = try b.alloc(rows * 2 * D * 2);
+            b.mx32 = try b.alloc(rows * D * 4);
+            b.epart = try b.alloc(tri.router_ks * rows * D * 4);
         }
         // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N]
         const ext = w.linearExtents();
@@ -205,6 +261,9 @@ pub const State = struct {
     kc: []u64, // per layer: bf16 [capacity + 1, latent]
     ic: []u64, // per layer: bf16 [capacity + 1, index_dim], 0 on layers without an indexer
     pos: u64, // int32 [1]
+    mkc: u64 = 0, // the MTP layer's latent rows (0: no MTP layer)
+    mic: u64 = 0, // the MTP layer's index keys (0: no indexer there)
+    mpos: u64 = 0, // int32 [1]: the MTP window's first position
     mem: std.ArrayList(cuda.DeviceBuffer) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize) !State {
@@ -217,7 +276,21 @@ pub const State = struct {
             s.ic[i] = if (L.indexer != null) try s.zeros(rows * c.index_dim * 2) else 0;
         }
         s.pos = try s.zeros(4);
+        if (w.mtp) |*m| {
+            s.mkc = try s.zeros(rows * c.latentWidth() * 2);
+            s.mic = if (m.layer.indexer != null) try s.zeros(rows * c.index_dim * 2) else 0;
+            s.mpos = try s.zeros(4);
+        }
         return s;
+    }
+
+    /// fused.State.bytes_for: what the caches of `capacity` tokens take (the cache guard's figure).
+    pub fn bytesFor(w: *const W.Weights, capacity: usize) usize {
+        const c = w.config;
+        var per: usize = 0;
+        for (w.layers) |*L| per += c.latentWidth() * 2 + (if (L.indexer != null) c.index_dim * 2 else 0);
+        if (w.mtp) |*m| per += c.latentWidth() * 2 + (if (m.layer.indexer != null) c.index_dim * 2 else 0);
+        return per * (capacity + 1);
     }
 
     /// A fresh request: every cache row and the position zeroed (fused.State's torch.zeros).
@@ -277,12 +350,17 @@ pub const Forward = struct {
 
     /// fused.layer for layer `li` over rows b.x[:R] at st.pos ..; `T`: the index range (null: no row selects).
     pub fn layer(f: *const Forward, b: *const Buffers, st: *const State, li: usize, R: usize, T: ?usize) !void {
+        return f.layerWith(b, &f.w.layers[li], st.kc[li], st.ic[li], st.pos, R, T, 0);
+    }
+
+    /// fused.layer for any layer (the MTP layer too): its caches kc / ic (0: no indexer), positions from `pos`;
+    /// `reuse` (TF_GLM53_MTP_REUSE, one-row MTP draft steps): attend b.tok[0] instead of selecting.
+    pub fn layerWith(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, T: ?usize, reuse: u32) !void {
         const c = f.w.config;
-        const L = &f.w.layers[li];
         const D = c.hidden;
         const t_ = f.t();
         try t_.rmsnorm(b.x, D, L.input_norm, b.normed, D, R, D, c.eps);
-        try f.attentionPart(b, st, L, li, R, T);
+        try f.attentionPart(b, L, kc, ic, pos, R, T, reuse);
         try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
         try t_.rmsnorm(b.x, D, L.post_attn_norm, b.normed, D, R, D, c.eps);
         try f.ffnPart(b, L, R);
@@ -306,39 +384,152 @@ pub const Forward = struct {
         return b.gath;
     }
 
-    /// fused.attention_part (side "" and reuse 0) and attention_core: this rank's fp32 partial in b.part[:R].
-    fn attentionPart(f: *const Forward, b: *const Buffers, st: *const State, L: *const W.Layer, li: usize, R: usize, T: ?usize) !void {
+    /// fused.attention_part (side "") and attention_core: this rank's fp32 partial in b.part[:R]. `reuse` 1 / 2
+    /// (an MTP draft step after its chain's first, one row): no index key written, no selection; the row attends
+    /// b.tok[0] (mode 1 puts its own position in the list's last slot).
+    fn attentionPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, T: ?usize, reuse: u32) !void {
         const c = f.w.config;
         const o = f.ops();
         const t_ = f.t();
         const m = f.mla();
         const D = c.hidden;
+        if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
         try o.linears(&.{ &L.q_a, &L.kv_a }, b.normed, .bf16, &.{ b.qa, b.kva }, &.{ .bf16, .bf16 }, R, b.lin);
         try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
-        // keys(False): the latent and rope key, and on indexer layers the index key
-        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, st.kc[li], st.pos, f.inv, c.eps, R, m);
+        // keys(False): the latent and rope key, and on indexer layers (not under reuse) the index key
+        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, m);
         if (L.indexer) |*ix| {
-            try t_.router(b.normed, D, ix.wk, b.ik, b.rpart, R, D, c.index_dim);
-            try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, st.ic[li], st.pos, R, c.index_dim, c.rope);
+            if (reuse == 0) {
+                try t_.router(b.normed, D, ix.wk, b.ik, b.rpart, R, D, c.index_dim);
+                try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope);
+            }
         }
+        if (reuse == 1 and T != null) try o.copy(b.tok + (c.index_topk - 1) * 4, pos, 4); // b.tok[0, K-1:] = pos
         var q_done = false;
         if (L.indexer) |*ix| {
             if (T) |tt| {
-                try t_.router(b.normed, D, ix.weights_proj, b.iw, b.rpart, R, D, c.index_heads);
-                try o.linears(&.{ &ix.wq_b, &L.q_b }, b.qn, .bf16, &.{ b.iq, b.q }, &.{ .bf16, .bf16 }, R, b.lin);
-                q_done = true;
-                try t_.iqRope(b.iq, f.inv, st.pos, R, c.index_heads, c.index_dim, c.rope);
-                try f.select(b, st.ic[li], st.pos, R, tt);
+                if (reuse == 0) {
+                    try t_.router(b.normed, D, ix.weights_proj, b.iw, b.rpart, R, D, c.index_heads);
+                    try o.linears(&.{ &ix.wq_b, &L.q_b }, b.qn, .bf16, &.{ b.iq, b.q }, &.{ .bf16, .bf16 }, R, b.lin);
+                    q_done = true;
+                    try t_.iqRope(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
+                    try f.select(b, ic, pos, R, tt);
+                }
             }
         }
         // attention_core
         if (!q_done) try o.linear(&L.q_b, b.qn, .bf16, b.q, .bf16, R, b.lin);
-        if (R > max_rows) return error.WindowTooWide; // TODO(P2): prompt chunks' bmm absorb / expand
-        try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, st.pos, R, m);
+        if (R > max_rows) return error.WindowTooWide; // TODO(P3): prompt chunks' bmm absorb / expand
+        try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
-        try t_.attention(b.qlat, b.qrot, st.kc[li], b.tok, st.pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
+        try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
         try t_.expand(b.ol, L.wv, b.o, R, m);
         try o.linear(&L.o_proj, b.o, .bf16, b.part, .f32, R, b.lin);
+    }
+
+    // ------------------------------------------------------------------------------- Phase 2b: device windows ---
+
+    /// fused.compute for rows b.ids[:R] (device ids) at st.pos ..: the target's caches written, its final hidden in
+    /// b.hidden[:R], then `head` over every row (`last`: only row R - 1, as logits="last"). No host step: capturable.
+    pub fn compute(f: *const Forward, b: *const Buffers, st: *const State, R: usize, T: ?usize, head: HeadMode, last: bool) !void {
+        const c = f.w.config;
+        const D = c.hidden;
+        const o = f.ops();
+        try o.embedRows(f.w.embed, b.ids, D, b.x, R, false);
+        for (0..f.w.layers.len) |li| try f.layer(b, st, li, R, T);
+        try o.copy(b.hidden, b.x, R * D * 2);
+        if (head == .none) return;
+        if (last) return f.headDevice(b, b.x + (R - 1) * D * 2, f.w.final_norm, 1, head);
+        return f.headDevice(b, b.x, f.w.final_norm, R, head);
+    }
+
+    /// fused.head on n rows from `x` (bf16, row stride D) normed with `norm`: "local" leaves this rank's logits in
+    /// b.lg[:n] ([n, vocab_part], contiguous); "argmax" / "draft" leave the token in b.argmax[:n] (int64) after exchanging
+    /// each rank's first maximum ([value, id, -, -] records, b.amax_all) and taking the lowest rank among the equal
+    /// maxima. "draft": the 4-bit draft head over the reduced vocabulary (headq q4), ids through its table.
+    pub fn headDevice(f: *const Forward, b: *const Buffers, x: u64, norm: u64, n: usize, mode: HeadMode) !void {
+        const c = f.w.config;
+        const D = c.hidden;
+        const o = f.ops();
+        const t_ = f.t();
+        const world = f.w.world;
+        if (f.w.lm_head == 0 or b.lg == 0) return error.NoHead;
+        if (n > b.head_rows) return error.WindowTooWide;
+        try t_.rmsnorm(x, D, norm, b.fnormed, D, n, D, c.eps);
+        const V = f.w.vocab_part;
+        switch (mode) {
+            .none => return,
+            .local => return t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, n, D, V),
+            .argmax => {
+                try t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, n, D, V);
+                try o.argmaxRec(b.lg, V, V, 0, f.w.vocab_off, b.amax, n);
+            },
+            .draft => {
+                const dh = f.w.draft orelse return error.NoDraftHead;
+                try t_.groupSums(b.fnormed, D, b.gsum, n, D);
+                try o.q4Head(b.fnormed, b.gsum, dh.w, dh.scales, dh.biases, dh.n, dh.npad, dh.k, dh.sk, b.lg, n);
+                try o.argmaxRec(b.lg, dh.n, dh.n, dh.ids, 0, b.amax, n);
+            },
+        }
+        if (f.comm) |cm| {
+            try cm.allGather(b.amax, b.amax_all, n * 4, .f32, f.s.handle);
+        } else if (world > 1) {
+            try o.fill32(b.amax_all, 0, world * n * 4);
+            try o.copy(b.amax_all + f.w.rank * n * 16, b.amax, n * 16);
+        } else {
+            try o.copy(b.amax_all, b.amax, n * 16);
+        }
+        try o.pickRank(b.amax_all, world, n, b.argmax);
+    }
+
+    /// The MTP head's mode: the reduced 4-bit draft vocabulary when loaded, else the full share's argmax.
+    pub fn draftMode(f: *const Forward) HeadMode {
+        return if (f.w.draft != null) .draft else .argmax;
+    }
+
+    pub const MtpOpts = struct {
+        /// head on the last row (logits="last"); false: logits="none" (prompt rows)
+        head: bool = true,
+        /// position 0's embedding zeroed (the first prompt chunk)
+        zero_first: bool = false,
+        /// TF_GLM53_MTP "x/normed": the chain passes on shared_head-normed rows
+        chain_normed: bool = true,
+        /// a chain's first step keeps its last row's selection in b.tok[0]
+        keep_sel: bool = false,
+        /// later one-row steps attend b.tok[0] (TF_GLM53_MTP_REUSE 1 / 2)
+        reuse: u32 = 0,
+    };
+
+    /// fused.mtp_compute: rows (b.hin[:n] = the previous position's hidden, b.ids[:n] = the token) through the MTP
+    /// layer at st.mpos ..; b.hidden[:n] the chain's rows; with `head` the last row's draft in b.argmax[0].
+    pub fn mtpCompute(f: *const Forward, b: *const Buffers, st: *const State, n: usize, T: ?usize, opts: MtpOpts) !void {
+        const c = f.w.config;
+        const D = c.hidden;
+        const o = f.ops();
+        const t_ = f.t();
+        const m = f.w.mtp orelse return error.NoMtpLayer;
+        if (b.mcat == 0) return error.NoMtpScratch;
+        try o.embedRows(f.w.embed, b.ids, D, b.me, n, opts.zero_first);
+        try t_.rmsnorm(b.me, D, m.enorm, b.mh, D, n, D, c.eps);
+        try t_.rmsnorm(b.hin, D, m.hnorm, b.normed, D, n, D, c.eps);
+        try t_.cat2(b.mh, b.normed, b.mcat, n, D);
+        try t_.router(b.mcat, 2 * D, m.eh_proj, b.mx32, b.epart, n, 2 * D, D);
+        try o.f32ToBf16(b.mx32, b.x, n * D);
+        try f.layerWith(b, &f.w.mtp.?.layer, st.mkc, st.mic, st.mpos, n, T, opts.reuse);
+        if (opts.keep_sel and T != null and n > 1) try o.copy(b.tok, b.tok + (n - 1) * c.index_topk * 4, c.index_topk * 4);
+        if (opts.chain_normed) {
+            try t_.rmsnorm(b.x, D, m.head_norm, b.hidden, D, n, D, c.eps);
+        } else {
+            try o.copy(b.hidden, b.x, n * D * 2);
+        }
+        if (opts.head) try f.headDevice(b, b.x + (n - 1) * D * 2, m.head_norm, 1, f.draftMode());
+    }
+
+    /// fused.target_hidden_for_mtp (normed): rmsnorm(src.hidden[row0 .. row0 + n], final_norm) into `out` rows.
+    pub fn targetHidden(f: *const Forward, src: *const Buffers, row0: usize, n: usize, out: u64) !void {
+        const c = f.w.config;
+        const D = c.hidden;
+        try f.t().rmsnorm(src.hidden + row0 * D * 2, D, f.w.final_norm, out, D, n, D, c.eps);
     }
 
     /// fused.select (DCP 1) through the radix select for every window size: b.tok[:R] ascending.

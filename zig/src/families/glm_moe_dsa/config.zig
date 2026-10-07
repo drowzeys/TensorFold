@@ -27,6 +27,7 @@ pub const Config = struct {
     full_index: [max_layers]bool = @splat(false), // indexer_types[i] == "full"
     eps: f32, // rms_norm_eps
     vocab: usize,
+    mtp_layers: usize = 0, // num_nextn_predict_layers: the MTP layer sits at index `layers`
 
     /// One token's MLA cache row: the kv latent and the shared RoPE key (576).
     pub fn latentWidth(self: Config) usize {
@@ -81,6 +82,7 @@ pub const Config = struct {
             .index_topk = try int(o, "index_topk"),
             .eps = @floatCast(try float(o, "rms_norm_eps")),
             .vocab = try int(o, "vocab_size"),
+            .mtp_layers = try optInt(o, "num_nextn_predict_layers", 0),
         };
         // rope_parameters (or rope_scaling) .rope_theta, else rope_theta; only the default rope type
         const rope_obj = o.get("rope_parameters") orelse o.get("rope_scaling");

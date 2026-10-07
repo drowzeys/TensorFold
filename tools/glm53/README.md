@@ -101,3 +101,47 @@ all-gather exchange for prompt windows too (the champion uses NCCL's bf16 ring a
 Zig port does not reproduce yet), no RoCE one-shot, no MTP layer. RoPE: `glm53_rope.cu` computes fused.inv_freq with
 the same libdevice powf torch's kernel calls; the tool checks it against the reference's `inv_freq.bin` (and uses the
 reference bytes, saying so, if they ever differ).
+
+# Phase 2b: MTP drafts, keyed sampling, CUDA graphs, the fast load - token parity with the Python Runner
+
+Gate: full GLM-5.3 + the MTP layer at TP4 (.1 .2 .3 .5), the Zig engine against the Python engine's own `Runner`
+(runner.py) on the same prompts: (a) MTP drafts k=2 (normed/normed, TF_GLM53_MTP_REUSE=2, the q4 draft head over
+TF_GLM53_DRAFT_VOCAB=32768) verified in windows of 3 rows; (b) keyed sampled decoding at generation_config.json's
+temperature 1.0 / top_p 0.95 - top_k 20 (the server's default: each rank's top 28 of its vocabulary share gathered,
+Runner._sample_local) and top_k 0 (Glm53Engine._sample's torch.topk(264) rule) - plus greedy; every token IDENTICAL
+to Python's, and drafted == serial in both engines; (c) the decode windows (1..3 rows, every key bucket, both heads,
+the MTP steps) captured as CUDA graphs and prewarmed as Runner.prewarm does; (d) the weights read with O_DIRECT through
+io_uring a layer ahead (cuda_source.zig); (e) decode tok/s, tokens a round and acceptance of both engines side by
+side, the 32K prose prompt (tfbench's beekeeper task over context-32k.txt, seed 1729) included.
+
+## One command, from .4 (free the cluster first; it stops nothing it did not start)
+
+```sh
+bash ~/zig-port/run_phase2b_cluster.sh        # last line: PHASE2B PASS|FAIL ... work=~/zig-port/runs/p2b-<utc>
+```
+
+Same preflight refusals, memory caps and page-cache drops as 2a. Steps: sync -> prompts (reference2b.py
+--make-prompts: the 2a prompts with runs `g:2,g:0,s20:2,s20:0,s0:2,s0:0` x 256 picks, prose32k with `s20:2,s20:0` x 512)
+-> build -> **sampler check** (sampler_cases.py: 1,500 draws + 200 seeds from exact_sampling; `tf-glm53-generate
+--sampler-check`; a FAIL stops the run before any GPU work) -> reference2b.py at TP4 (records the Triton AOT set) ->
+`tf-glm53-generate --mode 2b` at TP4 -> compare_phase2b.py. CONTEXT is the longest prompt + its picks rounded up to
+1024 (both engines: Runner capacity CONTEXT + k + 1). Knobs at the top of the script (RUNS, RUNS_LONG, TOKENS,
+TOKENS_LONG, CONTEXT32K, FAST_LOAD, PREWARM, GRAPHS, SKIP_* / REUSE as in 2a).
+
+| file | what |
+|---|---|
+| `reference2b.py` | the Python Runner, frozen: TF_GLM53_PROMPT_ROWS(_SHORT)=128 (row-invariant prompt chunks), all-gather-only comm (no ring all-reduce, no RoCE), copy drafts off, MTP/draft-head defaults; caches zeroed before every run; `ref-r<R>.json` |
+| `zig/tests/cuda/glm53_generate.zig --mode 2b` | the Zig side (`glm.Runner`), `gen-r<R>.json` in the same format |
+| `sampler_cases.py` | generated draws for `--sampler-check` (sampling.zig against exact_sampling, bit for bit: picks, nucleus sizes, seed_for) |
+| `compare_phase2b.py` | tokens, drafted == serial, rank agreement, seeds; the speed table; `PHASE2B PASS|FAIL` |
+| `run_phase2b_cluster.sh` | the cluster run (a copy lives at ~/zig-port/run_phase2b_cluster.sh) |
+
+Zig pieces: `cuda_runner.zig` (rounds, graphs, prewarm, the sampled head's candidate exchange), `sampling.zig`
+(seed_for, splitmix uniform, choose_rows with numpy's pairwise sum and glibc exp/log), `cuda_forward.zig` (device ids,
+`headDevice` argmax / local / draft, `mtpCompute`), `cuda_weights.zig` (MTP layer, q4 draft head: quantize4 + shared
+qmm.pack on the host), `cuda_source.zig` (the O_DIRECT prefetcher), `glm53_head.cu` (argmax records, rank resolve,
+embedding rows, fp32 -> bf16), `qmm_group.cu` (+ the fp32-out tile-2 instantiation the draft head launches).
+
+Not in 2b (both engines run without them, so speeds compare like with like): the RoCE one-shot (P3), copy drafts,
+DFlash2, the depth policy, prompt reuse, prompt chunks over 128 rows (x3prefill GEMM / bmm absorb), side streams.
+Candidates of sampled rows are selected on the host from each rank's downloaded logits (P3: a device top-k).

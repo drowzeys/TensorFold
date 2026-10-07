@@ -33,6 +33,8 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_exl3_experts", .flags = &.{ "-O3", "-lineinfo" } },
     // ours: fused.inv_freq's float32 bytes (torch computes them on the GPU with powf; torch's default nvcc flags)
     .{ .name = "glm53_rope", .flags = &.{"-O3"} },
+    // ours: the torch steps of a decode window (argmax records, the rank resolve, embedding rows, fp32 -> bf16)
+    .{ .name = "glm53_head", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

@@ -1,5 +1,6 @@
 //! GLM-5.3's CUDA kernels: the EXL3 linear and routed-expert fatbins (our device-only copies of cuda/exl3) with the
-//! Python launchers' geometry, and the captured Triton set (tools/glm53/oracle.py --record).
+//! Python launchers' geometry, and the captured Triton set (tools/glm53/oracle.py --record). Phase 2b: glm53_head.cu
+//! (the torch steps of a decode window on the device) and qmm_group's fp32-out tile for the 4-bit draft head.
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = @import("exl3.zig");
@@ -21,6 +22,14 @@ pub const Kernels = struct {
     grouped: [3]cuda.Function,
     rope_mod: cuda.Module,
     inv_freq: cuda.Function, // glm53_rope.cu: fused.inv_freq as torch computes it
+    head_mod: cuda.Module,
+    argmax_rec: cuda.Function,
+    pick_rank: cuda.Function,
+    embed_rows: cuda.Function,
+    f32_bf16: cuda.Function,
+    qmm_mod: cuda.Module,
+    q4_group: cuda.Function, // qmm_group tile 2 with fp32 out: the draft head (headq q4)
+    gb10: bool, // sm_121: qmm_group launches with programmatic dependent launch (qmm_group_cuda's `early`)
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
@@ -46,12 +55,25 @@ pub const Kernels = struct {
         k.rope_mod = try cuda.Module.load(d, cuda.kernels.glm53_rope);
         errdefer k.rope_mod.unload();
         k.inv_freq = try k.rope_mod.function("glm53_inv_freq");
+        k.head_mod = try cuda.Module.load(d, cuda.kernels.glm53_head);
+        errdefer k.head_mod.unload();
+        k.argmax_rec = try k.head_mod.function("glm53_argmax_rec");
+        k.pick_rank = try k.head_mod.function("glm53_pick_rank");
+        k.embed_rows = try k.head_mod.function("glm53_embed_rows");
+        k.f32_bf16 = try k.head_mod.function("glm53_f32_bf16");
+        k.qmm_mod = try cuda.Module.load(d, cuda.kernels.qmm_group);
+        errdefer k.qmm_mod.unload();
+        k.q4_group = try k.qmm_mod.function(q4_group_symbol);
+        try k.q4_group.allowDynamicShared(q4_group_smem);
+        k.gb10 = (try ctx.capability()) == 121;
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.qmm_mod.unload();
+        k.head_mod.unload();
         k.rope_mod.unload();
         k.experts_mod.unload();
         k.linear_mod.unload();
@@ -87,6 +109,19 @@ pub const Kernels = struct {
         return k.grouped[2];
     }
 };
+
+/// qmm_group.cu's group_kernel<64, 16, 64, 1, 4, 8, F32 = true> (tile 2, the instantiation added for the draft head).
+pub const q4_group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+/// LaneTile<64, 16, 64, 1, 4, 8>::SMEM (Nemotron's group_smem: the same tile).
+pub const q4_group_smem: u32 = 35328;
+
+/// qmm_group.cu's Part and Parts, passed by value (Nemotron's cuda_kernels.zig has the same layout).
+pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int };
+pub const Parts = extern struct { p: [4]Part, count: c_int };
+
+comptime {
+    std.debug.assert(@sizeOf(Part) == 56 and @sizeOf(Parts) == 232);
+}
 
 /// Device scratch the EXL3 launches write before they read it (fresh torch.empty tensors in Python).
 pub const LinearScratch = struct {
@@ -282,6 +317,73 @@ pub const Ops = struct {
         a.add(ep);
         const f = o.k.groupedFn(k2r[0], k2r[1]);
         try cuda.launch.launch(f, .{ .grid = .{ .x = u(maxu), .y = u(N / (16 * t.nt)), .z = u(mats * t.sk * mt) }, .block = .{ .x = u(t.w * 32) } }, o.s, &a);
+    }
+
+    /// glm53_argmax_rec: rows x [V] fp32 (row stride ld floats) -> amax [rows, 4] records (value, float id); ids
+    /// are idmap[i] (int64 table) when idmap != 0, else i + off.
+    pub fn argmaxRec(o: Ops, lg: u64, V: usize, ld: usize, idmap: u64, off: usize, amax: u64, rows: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(lg);
+        a.add(int(V));
+        a.add(int(ld));
+        a.add(idmap);
+        a.add(@as(i64, @intCast(off)));
+        a.add(amax);
+        try cuda.launch.launch(o.k.argmax_rec, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 1024 } }, o.s, &a);
+    }
+
+    /// glm53_pick_rank: g [world, rows, 4] -> out int64 [rows] (the lowest rank among equal maxima).
+    pub fn pickRank(o: Ops, g: u64, world: usize, rows: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(g);
+        a.add(int(world));
+        a.add(int(rows));
+        a.add(out);
+        try cuda.launch.launch(o.k.pick_rank, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, o.s, &a);
+    }
+
+    /// glm53_embed_rows: out[r] = table[ids[r]] (bf16 rows of D) for r < rows; zero_first: row 0 zeroed.
+    pub fn embedRows(o: Ops, table: u64, ids: u64, D: usize, out: u64, rows: usize, zero_first: bool) !void {
+        var a: cuda.Args = .{};
+        a.add(table);
+        a.add(ids);
+        a.add(int(D));
+        a.add(out);
+        a.add(@as(c_int, @intFromBool(zero_first)));
+        try cuda.launch.launch(o.k.embed_rows, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_f32_bf16: y[:n] = bfloat16(x[:n]) (Tensor.copy_).
+    pub fn f32ToBf16(o: Ops, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(int(n));
+        try cuda.launch.launch(o.k.f32_bf16, .{ .grid = .{ .x = u((n + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// shared qmm.matmul on sm_12x for the draft head (qmm_group_cuda, tile 2, f32): x [rows <= 16, K] bf16 with its
+    /// 64-input group sums xs -> out [rows, n] fp32; a cluster of `sk` CTAs a 64-column tile.
+    pub fn q4Head(o: Ops, x: u64, xs: u64, w: u64, scales: u64, biases: u64, n: usize, npad: usize, K: usize, sk: usize, out: u64, rows: usize) !void {
+        if (rows > 16) return error.WindowTooWide;
+        const tiles = (n + 63) / 64;
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 1;
+        parts.p[0] = .{ .w = w, .scales = scales, .biases = biases, .out = out, .n = int(n), .npad = int(npad), .sk = int(sk), .tiles = int(tiles), .first = 0 };
+        const rows_t = (rows + 15) / 16;
+        const clusters = rows_t * tiles; // C == sk: one tile a cluster
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xs);
+        a.add(parts);
+        for ([_]usize{ rows, K, K, rows_t, sk }) |v| a.add(int(v)); // M, K, ldx (contiguous rows), row tiles, C
+        try cuda.launch.launch(o.k.q4_group, .{
+            .grid = .{ .x = u(clusters * sk) },
+            .block = .{ .x = 128 },
+            .shared = q4_group_smem,
+            .cluster = if (sk > 1) .{ .x = u(sk) } else null,
+            .pdl = o.k.gb10,
+        }, o.s, &a);
     }
 
     pub fn copy(o: Ops, dst: u64, src: u64, bytes: usize) !void {

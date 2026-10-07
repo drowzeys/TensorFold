@@ -7,8 +7,12 @@
 //! load fits GB10's unified memory beside the caches. Device tensors come from 256 MiB arena chunks (512-byte
 //! aligned like torch's caching allocator) instead of one cuMemAlloc each; each MoE layer's expert trellises are one
 //! allocation per projection.
-//! TODO(P3): O_DIRECT + io_uring streaming (nemotron/cuda_source.zig) instead of mapped reads; the cuda-exl3 shared
-//! stacks (experts_cx) for prompt chunks; the MTP layer.
+//! Phase 2b: `Options.fast` reads each layer's bytes with O_DIRECT through io_uring a layer ahead (cuda_source.zig)
+//! instead of through the mapping; `Options.mtp` adds the MTP layer (index num_hidden_layers: a full decoder layer,
+//! eh_proj, enorm, hnorm, shared_head.norm) and `Options.draft_vocab` the 4-bit draft head over the reduced draft
+//! vocabulary (headq q4 + fused.DRAFT_VOCAB: lm_head rows rank * V/4 .. of the first V ids, rank world-1 also the
+//! last 128; glm5_next qmm.quantize4, shared qmm.pack - computed on the host with torch's float32 rounding).
+//! TODO(P3): the cuda-exl3 shared stacks (experts_cx) for prompt chunks.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -16,8 +20,10 @@ const Config = @import("config.zig").Config;
 const exl3 = @import("exl3.zig");
 const split = @import("split.zig");
 const kern = @import("cuda_kernels.zig");
+const source = @import("cuda_source.zig");
 
 const Tensor = core.checkpoint.Tensor;
+const config_max_layers = @import("config.zig").max_layers;
 pub const Experts = kern.Experts;
 
 pub const Mlp = struct { gate: exl3.Linear, up: exl3.Linear, down: exl3.Linear };
@@ -49,6 +55,27 @@ pub const Layer = struct {
     mlp: Mlp, // the dense MLP (layers < first_k_dense_replace) or the shared expert
 };
 
+/// The MTP layer (weights.MtpHead): a full decoder layer, its input projection and norms; its head is lm_head.
+pub const Mtp = struct {
+    layer: Layer,
+    eh_proj: u64, // bf16 [D, 2 D]: [enorm(embedding) ; hnorm(hidden)] -> hidden
+    enorm: u64,
+    hnorm: u64,
+    head_norm: u64, // shared_head.norm
+};
+
+/// headq's q4 copy of this rank's reduced draft vocabulary (qmm.Q4 packed by shared qmm.pack) and its global ids.
+pub const DraftHead = struct {
+    w: u64, // int32 [npad / 64, K / 64, 8, 32, 2]
+    scales: u64, // bf16 [K / 64, npad]
+    biases: u64,
+    ids: u64, // int64 [n]: global token ids
+    n: usize,
+    npad: usize,
+    k: usize,
+    sk: usize, // glm5_next qmm.split_k(n, k)
+};
+
 pub const Weights = struct {
     gpa: std.mem.Allocator,
     config: Config,
@@ -61,12 +88,17 @@ pub const Weights = struct {
     vocab_part: usize = 0,
     vocab_off: usize = 0,
     layers: []Layer = &.{},
+    mtp: ?Mtp = null,
+    draft: ?DraftHead = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     chunk: u64 = 0, // the arena chunk being filled (0: none yet)
     chunk_used: usize = 0,
     device_bytes: usize = 0, // bytes handed out (tensors, not chunk slack)
     digest_checked: usize = 0,
     digest_bad: usize = 0,
+    read_bytes: u64 = 0, // bytes the fast loader read (0: mapped reads)
+    read_fallbacks: u64 = 0,
+    direct_files: usize = 0,
 
     /// Arena chunks: small tensors share them; anything over a quarter chunk gets its own allocation.
     pub const chunk_bytes: usize = 256 << 20;
@@ -106,7 +138,17 @@ pub const Weights = struct {
     pub fn linearExtents(w: *const Weights) struct { k: usize, zn: usize } {
         var k: usize = 0;
         var zn: usize = 0;
+        var all: [config_max_layers + 1]*const Layer = undefined;
+        var n: usize = 0;
         for (w.layers) |*L| {
+            all[n] = L;
+            n += 1;
+        }
+        if (w.mtp) |*m| {
+            all[n] = &m.layer;
+            n += 1;
+        }
+        for (all[0..n]) |L| {
             const lins = [_]*const exl3.Linear{ &L.q_a, &L.kv_a, &L.q_b, &L.o_proj, &L.mlp.gate, &L.mlp.up, &L.mlp.down };
             for (lins) |l| {
                 k = @max(k, l.k);
@@ -132,6 +174,12 @@ pub const Options = struct {
     log_every: usize = 0,
     /// weights_sha256 of the oracle's meta.json: each prepared tensor's bytes are checked against it when given
     digests: ?*const std.json.ObjectMap = null,
+    /// O_DIRECT + io_uring reads a layer ahead (cuda_source.zig); false: the mapped reads of Phases 1 and 2a
+    fast: bool = false,
+    /// the MTP layer (needs config num_nextn_predict_layers >= 1)
+    mtp: bool = false,
+    /// fused.DRAFT_VOCAB: the 4-bit draft head over this many lowest ids (+ the last 128); 0: none
+    draft_vocab: usize = 0,
 };
 
 /// libc calls std does not wrap on every target: dropping a mapped file's pages from this process and the page cache.
@@ -161,6 +209,7 @@ const Loader = struct {
     host2: std.ArrayList(u8) = .empty,
     touched: []bool = &.{}, // per checkpoint file: read since the last release
     dropped: usize = 0, // file drops so far
+    batch: ?*const source.Batch = null, // the unit being loaded, prefetched (Options.fast)
 
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
@@ -238,24 +287,31 @@ const Loader = struct {
         return list.items;
     }
 
-    /// This rank's part of a checkpoint tensor (split.rule): the mapped bytes themselves when whole or a row range,
-    /// else (second-axis cuts) a copy in the host2 staging buffer.
+    /// A whole tensor's bytes: the prefetched copy when the unit's plan read it whole, else the mapping.
+    fn whole(L: *Loader, name: []const u8, t: Tensor) []const u8 {
+        if (L.batch) |b| if (source.Prefetch.lookup(b, name)) |f| if (!f.partial and f.bytes.len == t.bytes.len) return f.bytes;
+        return t.bytes;
+    }
+
+    /// This rank's part of a checkpoint tensor (split.rule): the prefetched or mapped bytes themselves when whole or a
+    /// row range, else (second-axis cuts) a copy in the host2 staging buffer.
     fn part(L: *Loader, name: []const u8, shape_out: *[core.safetensors.max_rank]usize) ![]const u8 {
         const t = try L.get(name);
         const kind = try split.rule(name);
         shape_out.* = t.shape;
         const shape = t.shape[0..t.rank];
-        if (kind == .rep or L.o.world == 1) return t.bytes;
+        if (kind == .rep or L.o.world == 1) return L.whole(name, t);
         try split.checkCut(name, kind, shape, L.o.world);
         const axis: usize = if (kind == .row) 0 else 1;
         shape_out[axis] /= L.o.world;
         if (kind == .row) {
             const per = t.bytes.len / shape[0];
             const n = shape[0] / L.o.world;
-            return t.bytes[L.o.rank * n * per ..][0 .. n * per];
+            if (L.batch) |b| if (source.Prefetch.lookup(b, name)) |f| if (f.partial and f.bytes.len == n * per) return f.bytes;
+            return L.whole(name, t)[L.o.rank * n * per ..][0 .. n * per];
         }
         const out = try staging(&L.host2, L.gpa, t.bytes.len / L.o.world);
-        try split.cutBytes(out, t.bytes, shape, t.dtype.size(), kind, L.o.rank, L.o.world);
+        try split.cutBytes(out, L.whole(name, t), shape, t.dtype.size(), kind, L.o.rank, L.o.world);
         return out;
     }
 
@@ -438,7 +494,7 @@ const Loader = struct {
                 if (shape[2] % 8 != 0) return error.UnsupportedExl3Width;
                 const k2 = shape[2] / 8;
                 if (k2 < 2 or k2 > 16) return error.UnsupportedExl3Width;
-                hash.update(raw);
+                if (L.o.digests != null) hash.update(raw); // the oracle digest only (Phase 1)
                 if (off + raw.len > total) return error.UnexpectedTensor;
                 try L.upload(base + off, raw);
                 ptrs[j][e] = base + off;
@@ -522,6 +578,130 @@ const Loader = struct {
         };
     }
 
+    /// Unit 0: the embedding (o.embed) and, with o.head, the final norm and this rank's lm_head share
+    /// (fused.Weights: lm_head [V / world, D] split.rule rows, vocab_off = rank * V / world).
+    fn globals(L: *Loader, c: Config) !void {
+        const w = L.w;
+        if (L.o.embed) {
+            const t = try L.ck.expect("model.embed_tokens.weight", .bf16, &.{ c.vocab, c.hidden });
+            _ = try L.get("model.embed_tokens.weight");
+            w.embed = try L.put("embed", L.whole("model.embed_tokens.weight", t));
+        }
+        if (L.o.head) {
+            w.final_norm = try L.bf16("model.norm.weight", "final_norm");
+            if (c.vocab % L.o.world != 0) return error.UnevenVocab;
+            const t = try L.get("lm_head.weight");
+            if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != c.vocab or t.shape[1] != c.hidden) return error.UnexpectedTensor;
+            var shape: [core.safetensors.max_rank]usize = undefined;
+            const raw = try L.part("lm_head.weight", &shape);
+            w.vocab_part = shape[0];
+            w.vocab_off = L.o.rank * shape[0];
+            w.lm_head = try L.put("lm_head", raw);
+        }
+    }
+
+    /// weights.load_mtp: layer `num_hidden_layers` (a full decoder layer) and its eh_proj / enorm / hnorm /
+    /// shared_head.norm (replicated).
+    fn mtpHead(L: *Loader, c: Config) !Mtp {
+        var nb: [128]u8 = undefined;
+        var kb: [64]u8 = undefined;
+        const i = c.layers;
+        var out: Mtp = undefined;
+        out.layer = try L.layer(i, c);
+        const parts = [_][]const u8{ "eh_proj", "enorm", "hnorm", "shared_head.norm" };
+        var ptrs: [4]u64 = undefined;
+        for (parts, &ptrs) |name, *dst| {
+            const full = try std.fmt.bufPrint(&nb, "model.layers.{d}.{s}.weight", .{ i, name });
+            dst.* = try L.bf16(full, try std.fmt.bufPrint(&kb, "mtp.{s}", .{name}));
+        }
+        const eh = try L.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.eh_proj.weight", .{i}));
+        if (eh.rank != 2 or eh.shape[0] != c.hidden or eh.shape[1] != 2 * c.hidden) return error.UnexpectedTensor;
+        out.eh_proj = ptrs[0];
+        out.enorm = ptrs[1];
+        out.hnorm = ptrs[2];
+        out.head_norm = ptrs[3];
+        return out;
+    }
+
+    /// Glm53Engine's reduced draft vocabulary + headq.prepare (q4): lm_head rows [rank q, (rank + 1) q) with
+    /// q = draft_vocab / world, and on the last rank also the vocabulary's last fused.SPECIALS (128) rows; quantized
+    /// and packed on the host, uploaded with their global ids.
+    fn draftHead(L: *Loader, c: Config, pre: ?*source.Prefetch) !DraftHead {
+        const world = L.o.world;
+        const rank = L.o.rank;
+        const specials: usize = 128;
+        if (L.o.draft_vocab % world != 0 or L.o.draft_vocab > c.vocab) return error.BadDraftVocab;
+        const q = L.o.draft_vocab / world;
+        const extra: usize = if (rank == world - 1) specials else 0;
+        const n = q + extra;
+        const k = c.hidden;
+        if (k % 64 != 0) return error.BadDraftVocab;
+        const t = try L.get("lm_head.weight");
+        if (t.dtype != .bf16 or t.shape[0] != c.vocab or t.shape[1] != k) return error.UnexpectedTensor;
+        const rows = try L.gpa.alloc(u16, n * k);
+        defer L.gpa.free(rows);
+        const row_bytes = k * 2;
+        const spans = [_][2]usize{ .{ rank * q, (rank + 1) * q }, .{ c.vocab - extra, c.vocab } };
+        var at: usize = 0;
+        for (spans) |sp| {
+            if (sp[1] <= sp[0]) continue;
+            const dst = std.mem.sliceAsBytes(rows[at * k ..][0 .. (sp[1] - sp[0]) * k]);
+            if (pre) |p| {
+                // the file and offset of the rows: the header's entry (the mapping is not read)
+                var fi: usize = 0;
+                var off: u64 = 0;
+                var found = false;
+                for (L.ck.files.items, 0..) |*f, i| if (f.names.get("lm_head.weight")) |e| {
+                    fi = i;
+                    off = f.data + e.begin;
+                    found = true;
+                    break;
+                };
+                if (!found) return error.MissingTensor;
+                try p.readNow(fi, off + sp[0] * row_bytes, dst);
+            } else {
+                @memcpy(dst, t.bytes[sp[0] * row_bytes ..][0..dst.len]);
+            }
+            at += sp[1] - sp[0];
+        }
+        const kg = k / 64;
+        const npad = (n + 127) / 128 * 128;
+        const words = try L.gpa.alloc(u32, n * k / 8);
+        defer L.gpa.free(words);
+        const sc = try L.gpa.alloc(u16, n * kg);
+        defer L.gpa.free(sc);
+        const bi = try L.gpa.alloc(u16, n * kg);
+        defer L.gpa.free(bi);
+        quantize4(rows, n, k, words, sc, bi);
+        const packed_w = try L.gpa.alloc(u32, npad / 64 * kg * 8 * 32 * 2);
+        defer L.gpa.free(packed_w);
+        const so = try L.gpa.alloc(u16, kg * npad);
+        defer L.gpa.free(so);
+        const bo = try L.gpa.alloc(u16, kg * npad);
+        defer L.gpa.free(bo);
+        pack4(words, sc, bi, n, k, packed_w, so, bo);
+        const ids = try L.gpa.alloc(i64, n);
+        defer L.gpa.free(ids);
+        var j: usize = 0;
+        for (spans) |sp| {
+            var v = sp[0];
+            while (v < sp[1]) : (v += 1) {
+                ids[j] = @intCast(v);
+                j += 1;
+            }
+        }
+        return .{
+            .w = try L.put("draft.w", std.mem.sliceAsBytes(packed_w)),
+            .scales = try L.put("draft.scales", std.mem.sliceAsBytes(so)),
+            .biases = try L.put("draft.biases", std.mem.sliceAsBytes(bo)),
+            .ids = try L.put("draft.ids", std.mem.sliceAsBytes(ids)),
+            .n = n,
+            .npad = npad,
+            .k = k,
+            .sk = q4SplitK(n, k),
+        };
+    }
+
     /// weights.load_layer for layer i.
     fn layer(L: *Loader, i: usize, c: Config) !Layer {
         var nb: [256]u8 = undefined;
@@ -574,10 +754,13 @@ const Loader = struct {
 };
 
 /// Layers 0..o.layers-1 of rank o.rank of o.world (and the embedding; with o.head the final norm and this rank's
-/// lm_head share), from the checkpoint folder `dir`. Each layer's files leave the page cache once it is on the GPU.
+/// lm_head share; with o.mtp the MTP layer; with o.draft_vocab the 4-bit draft head), from the checkpoint folder
+/// `dir`. Mapped reads: each layer's files leave the page cache once it is on the GPU. o.fast: the units' bytes are
+/// read with O_DIRECT a unit ahead (cuda_source.zig) and the mapping is only used for the headers.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config, o: Options) !Weights {
     if (c.heads % o.world != 0) return error.UnevenHeads;
     if (o.layers > c.layers) return error.TooManyLayers;
+    if (o.mtp and c.mtp_layers == 0) return error.NoMtpLayer;
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
     var w: Weights = .{ .gpa = gpa, .config = c, .rank = o.rank, .world = o.world, .heads = c.heads / o.world };
@@ -586,40 +769,202 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
     defer L.deinit();
     L.touched = try gpa.alloc(bool, ck.files.items.len);
     @memset(L.touched, false);
+    var pre: ?*source.Prefetch = null;
+    if (o.fast) pre = source.Prefetch.init(gpa, &ck, o.rank, o.world) catch |e| blk: {
+        std.log.warn("glm53: O_DIRECT prefetch unavailable ({t}); mapped reads", .{e});
+        break :blk null;
+    };
+    defer if (pre) |p| p.deinit();
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-    if (o.embed) {
-        _ = try L.get("model.embed_tokens.weight");
-        const t = try ck.expect("model.embed_tokens.weight", .bf16, &.{ c.vocab, c.hidden });
-        w.embed = try L.put("embed", t.bytes);
+
+    // units in load order: 0 (embedding, final norm, lm_head), 1 + i (layer i), 1 + c.layers (the MTP layer)
+    var units: [config_max_layers + 2]usize = undefined;
+    var nu: usize = 0;
+    if (o.embed or o.head or o.draft_vocab > 0) {
+        units[nu] = 0;
+        nu += 1;
     }
-    if (o.head) {
-        // fused.Weights: final_norm, lm_head [V / world, D] (split.rule: rows), vocab_off = rank * V / world
-        w.final_norm = try L.bf16("model.norm.weight", "final_norm");
-        if (c.vocab % o.world != 0) return error.UnevenVocab;
-        const t = try L.get("lm_head.weight");
-        if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != c.vocab or t.shape[1] != c.hidden) return error.UnexpectedTensor;
-        var shape: [core.safetensors.max_rank]usize = undefined;
-        const raw = try L.part("lm_head.weight", &shape);
-        w.vocab_part = shape[0];
-        w.vocab_off = o.rank * shape[0];
-        w.lm_head = try L.put("lm_head", raw);
+    for (0..o.layers) |i| {
+        units[nu] = i + 1;
+        nu += 1;
     }
-    L.release();
+    if (o.mtp) {
+        units[nu] = c.layers + 1;
+        nu += 1;
+    }
     const layers = try gpa.alloc(Layer, o.layers);
+    var made: usize = 0;
     errdefer gpa.free(layers);
-    for (layers, 0..) |*l, i| {
-        l.* = try L.layer(i, c);
+    if (pre) |p| for (0..@min(nu, 2)) |k| try p.request(k, units[k]);
+    for (units[0..nu], 0..) |u, ui| {
+        if (pre) |p| L.batch = try p.wait(ui, u);
+        if (u == 0) {
+            try L.globals(c);
+        } else if (u <= c.layers and u - 1 < o.layers) {
+            layers[u - 1] = try L.layer(u - 1, c);
+            made += 1;
+        } else {
+            w.mtp = try L.mtpHead(c);
+        }
+        L.batch = null;
+        if (pre) |p| {
+            p.release(ui);
+            if (ui + 2 < nu) try p.request(ui + 2, units[ui + 2]);
+        }
         L.release();
-        const last = i + 1 == layers.len;
+        if (u == 0 or u > c.layers) continue;
+        const i = u - 1;
+        const last = i + 1 == o.layers;
         if (o.log_every == 0) {
             std.log.info("glm53: layer {d} loaded", .{i});
         } else if ((i + 1) % o.log_every == 0 or last) {
             const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
             const gib = @as(f64, @floatFromInt(w.device_bytes)) / (1 << 30);
-            std.log.info("glm53 rank {d}: {d} of {d} layers loaded ({d:.0} s, {d:.1} GiB of weights on the device)", .{ o.rank, i + 1, layers.len, secs, gib });
+            const rd = if (pre) |p| @as(f64, @floatFromInt(p.read_bytes.load(.monotonic))) / (1 << 30) else 0;
+            std.log.info("glm53 rank {d}: {d} of {d} layers loaded ({d:.0} s, {d:.1} GiB of weights on the device, {d:.1} GiB read direct)", .{ o.rank, i + 1, o.layers, secs, gib, rd });
         }
     }
+    if (made != o.layers) return error.Invalid;
+    if (o.draft_vocab > 0) w.draft = try L.draftHead(c, pre);
     L.releaseAll();
+    if (pre) |p| {
+        w.read_bytes = p.read_bytes.load(.monotonic);
+        w.read_fallbacks = p.fallbacks.load(.monotonic);
+        w.direct_files = p.direct_files;
+    }
     w.layers = layers;
     return w;
+}
+
+// --------------------------------------------------------------------------------------- the draft head (host) ---
+
+/// torch's float -> bfloat16 on the device (__float2bfloat16: round to nearest even; NaN -> 0x7FFF).
+pub fn bf16Bits(f: f32) u16 {
+    if (std.math.isNan(f)) return 0x7FFF;
+    const u: u32 = @bitCast(f);
+    return @truncate((u +% (0x7FFF + ((u >> 16) & 1))) >> 16);
+}
+
+fn bf16Value(bits: u16) f32 {
+    return @bitCast(@as(u32, bits) << 16);
+}
+
+/// torch.round (nearbyint: halves to even) for the small non-negative-ish values quantize4 rounds.
+pub fn roundEven(x: f32) f32 {
+    const fl = @floor(x);
+    const diff = x - fl;
+    if (diff > 0.5) return fl + 1;
+    if (diff < 0.5) return fl;
+    return if (@mod(fl, 2.0) == 0) fl else fl + 1;
+}
+
+/// glm5_next qmm.split_k: K slices of an (n, k) 4-bit weight, from its shape alone.
+pub fn q4SplitK(n: usize, k: usize) usize {
+    const forced = [_]struct { n: usize, k: usize, sk: usize }{
+        .{ .n = 12576, .k = 4096, .sk = 4 }, .{ .n = 4096, .k = 4096, .sk = 2 }, .{ .n = 2048, .k = 4096, .sk = 4 },
+        .{ .n = 8192, .k = 1536, .sk = 4 },  .{ .n = 8192, .k = 512, .sk = 4 },  .{ .n = 4096, .k = 8192, .sk = 8 },
+    };
+    for (forced) |f| if (f.n == n and f.k == k) return f.sk;
+    const tiles = (n + 63) / 64;
+    const groups = k / 64;
+    var sk: usize = 1;
+    while (sk < 8 and tiles * sk < 192 and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
+    return sk;
+}
+
+/// qmm.quantize4 of bf16 rows `w` [n, k]: words [n, k / 8] (nibble j of word i = input 8 i + j), bf16 scales and
+/// biases [n, k / 64], with torch's float32 steps (amin / amax, (hi - lo) / 15 clamped at 1e-8 then rounded to bf16,
+/// round((x - bias) / scale) halves to even, clamped to 0..15).
+pub fn quantize4(w: []const u16, n: usize, k: usize, words: []u32, scales: []u16, biases: []u16) void {
+    const kg = k / 64;
+    const tiny: f32 = @floatCast(@as(f64, 1e-8));
+    for (0..n) |r| {
+        for (0..kg) |g| {
+            const vals = w[r * k + g * 64 ..][0..64];
+            var lo: f32 = bf16Value(vals[0]);
+            var hi: f32 = lo;
+            for (vals[1..]) |b| {
+                const v = bf16Value(b);
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+            var sc: f32 = (hi - lo) / 15.0;
+            if (sc < tiny) sc = tiny;
+            const sb = bf16Bits(sc);
+            const bb = bf16Bits(lo);
+            scales[r * kg + g] = sb;
+            biases[r * kg + g] = bb;
+            const sf = bf16Value(sb);
+            const bf = bf16Value(bb);
+            for (0..8) |wi| {
+                var word: u32 = 0;
+                for (0..8) |j| {
+                    const x = bf16Value(vals[wi * 8 + j]);
+                    var q = roundEven((x - bf) / sf);
+                    q = @min(@max(q, 0.0), 15.0);
+                    word |= @as(u32, @intFromFloat(q)) << @intCast(4 * j);
+                }
+                words[r * (k / 8) + g * 8 + wi] = word;
+            }
+        }
+    }
+}
+
+/// shared qmm.OFFSETS: nibble slot p of a lane's word holds input 32 v + 2 (lane % 4) + OFFSETS[p] of its group.
+const q4_offsets = [8]usize{ 0, 8, 16, 24, 1, 9, 17, 25 };
+
+/// shared qmm.pack (gs 64): words [n, k / 8] -> out [npad / 64, k / 64, 8, 32, 2] int32 (npad = n rounded up to 128,
+/// zero columns past n); scales / biases [n, k / 64] -> [k / 64, npad] (zeros past n).
+pub fn pack4(words: []const u32, scales: []const u16, biases: []const u16, n: usize, k: usize, out: []u32, s_out: []u16, b_out: []u16) void {
+    const kg = k / 64;
+    const npad = (n + 127) / 128 * 128;
+    @memset(out, 0);
+    @memset(s_out, 0);
+    @memset(b_out, 0);
+    for (0..n) |c| {
+        const T = c / 64;
+        const j = (c % 64) / 8;
+        const r = c % 8;
+        for (0..kg) |g| {
+            s_out[g * npad + c] = scales[c * kg + g];
+            b_out[g * npad + c] = biases[c * kg + g];
+            for (0..2) |v| for (0..4) |c4| {
+                var word: u32 = 0;
+                for (q4_offsets, 0..) |o, p| {
+                    const idx = g * 64 + 32 * v + 2 * c4 + o; // the input within the row
+                    const nib = (words[c * (k / 8) + idx / 8] >> @intCast(4 * (idx % 8))) & 0xF;
+                    word |= nib << @intCast(4 * p);
+                }
+                out[(((T * kg + g) * 8 + j) * 32 + (r * 4 + c4)) * 2 + v] = word;
+            };
+        }
+    }
+}
+
+test "quantize4 + pack4: shapes, a constant group, round halves to even" {
+    try std.testing.expectEqual(@as(f32, 2), roundEven(2.5));
+    try std.testing.expectEqual(@as(f32, 4), roundEven(3.5));
+    try std.testing.expectEqual(@as(f32, 3), roundEven(2.6));
+    try std.testing.expectEqual(@as(u16, 0x3F80), bf16Bits(1.0));
+    try std.testing.expectEqual(@as(usize, 2), q4SplitK(8192, 6144));
+    try std.testing.expectEqual(@as(usize, 2), q4SplitK(8320, 6144));
+    const n = 3;
+    const k = 128;
+    var w: [n * k]u16 = undefined;
+    for (&w, 0..) |*x, i| x.* = bf16Bits(@floatFromInt(i % 16));
+    var words: [n * k / 8]u32 = undefined;
+    var sc: [n * 2]u16 = undefined;
+    var bi: [n * 2]u16 = undefined;
+    quantize4(&w, n, k, &words, &sc, &bi);
+    // inputs 0..15 in each group: lo 0, scale 1, codes = the values
+    try std.testing.expectEqual(bf16Bits(1.0), sc[0]);
+    try std.testing.expectEqual(@as(u32, 0x76543210), words[0]);
+    var out: [128 / 64 * 2 * 8 * 32 * 2]u32 = undefined;
+    var so: [2 * 128]u16 = undefined;
+    var bo: [2 * 128]u16 = undefined;
+    pack4(&words, &sc, &bi, n, k, &out, &so, &bo);
+    // column 0, group 0, lane 0 (j 0, r 0, c4 0), v 0: inputs 0, 8, 16, 24, 1, 9, 17, 25 -> 0, 8, 0, 8, 1, 9, 1, 9
+    try std.testing.expectEqual(@as(u32, 0x91918080), out[0]);
+    try std.testing.expectEqual(sc[1], so[128 + 0]);
+    try std.testing.expectEqual(@as(u16, 0), so[5]);
 }

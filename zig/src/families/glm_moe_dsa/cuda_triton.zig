@@ -144,6 +144,16 @@ pub const Tri = struct {
         try t.run("_expand", .{ m.heads, m.vd / 16, cdiv(rows, rbk) }, &.{ p("OL", "*bf16", ol), p("WV", "*bf16", wv), p("OUT", "*bf16", out), int("R", rows) }, &.{ ci("H", m.heads), ci("DV", m.vd), ci("LW", m.lw), ci("BN", 16), ci("RBK", rbk) }, .{ .num_warps = 4 });
     }
 
+    /// fused._cat2: OUT[r] = [A[r] ; B[r]] (bf16 rows of D each), the MTP layer's [enorm(embedding) ; hnorm(hidden)].
+    pub fn cat2(t: Tri, a: u64, b: u64, out: u64, rows: usize, d: usize) !void {
+        try t.run("_cat2", .{ rows, d / 1024, 1 }, &.{ p("A", "*bf16", a), p("B", "*bf16", b), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("BLOCK", 1024) }, .{ .num_warps = 4 });
+    }
+
+    /// glm5_next qmm.group_sums: XS[m, g] = fp32 sum of x[m, 64 g .. 64 g + 63] (the draft head's input sums).
+    pub fn groupSums(t: Tri, x: u64, x_stride: usize, xs: u64, rows: usize, k: usize) !void {
+        try t.run("_group_sums", .{ rows, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) }, .{ .num_warps = 2 });
+    }
+
     /// fused._swiglu2: bf16(bf16(silu(g)) * u) for separate gate and up rows of `width`.
     pub fn swiglu2(t: Tri, g: u64, up: u64, out: u64, rows: usize, width: usize) !void {
         const blk = std.math.gcd(@as(usize, 512), width);

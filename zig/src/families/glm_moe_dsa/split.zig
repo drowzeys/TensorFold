@@ -57,6 +57,14 @@ fn partRule(part: []const u8, out_split: bool) Kind {
 
 /// split.rule: rep | row (leading axis) | dim1 (second axis) for one checkpoint tensor.
 pub fn rule(name: []const u8) !Kind {
+    return known(name) orelse {
+        if (!@import("builtin").is_test) std.log.err("{s}: no split rule (or more than one)", .{name}); // the test expects it
+        return error.NoSplitRule;
+    };
+}
+
+/// `rule` without the error log: null for a tensor no rule covers (the prefetcher leaves those to the mapped path).
+pub fn known(name: []const u8) ?Kind {
     if (exl3Proj(name)) |x| {
         if (std.mem.eql(u8, x.proj, "q_a_proj") or std.mem.eql(u8, x.proj, "kv_a_proj_with_mqa") or std.mem.eql(u8, x.proj, "wq_b")) return .rep;
         const out_split = std.mem.eql(u8, x.proj, "gate") or std.mem.eql(u8, x.proj, "up") or std.mem.eql(u8, x.proj, "q_b_proj");
@@ -66,10 +74,7 @@ pub fn rule(name: []const u8) !Kind {
     const rep_suffix = [_][]const u8{ "_layernorm.weight", ".mlp.gate.weight", ".mlp.gate.e_score_correction_bias", ".self_attn.indexer.wk.weight", ".self_attn.indexer.weights_proj.weight", ".self_attn.indexer.k_norm.weight", ".self_attn.indexer.k_norm.bias", ".eh_proj.weight", ".enorm.weight", ".hnorm.weight", ".shared_head.norm.weight" };
     var rep = std.mem.startsWith(u8, name, "model.embed_tokens.") or std.mem.eql(u8, name, "model.norm.weight");
     for (rep_suffix) |s| rep = rep or std.mem.endsWith(u8, name, s);
-    if (row == rep) {
-        if (!@import("builtin").is_test) std.log.err("{s}: no split rule (or more than one)", .{name}); // the test expects it
-        return error.NoSplitRule;
-    }
+    if (row == rep) return null;
     return if (row) .row else .rep;
 }
 
