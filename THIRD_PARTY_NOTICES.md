@@ -137,3 +137,12 @@ Apache-2.0, Copyright 2026 The Qwen Team and The HuggingFace Team.
 
 Qwen-Image-2.1 weights are under the Qwen Research License Agreement (non-commercial); TensorFold ships no model
 weights.
+
+`src/tensorfold/families/h3/vendor/fastvideo_vsa.py` and `fastvideo_vsa_simd.py` are the MLX routed attention for
+MiniMax H3 from FastVideo, https://github.com/hao-ai-lab/FastVideo, revision 33d8173, Apache-2.0, with the logger and
+one import changed. `src/tensorfold/families/h3/fasth3.py` follows that runtime's checkpoint contract and schedule.
+FastH3 weights are derivatives of MiniMax H3 under the MiniMax H3 Community License.
+
+The velocity cache and attention reuse in `src/tensorfold/families/h3/sampler.py` follow the fast recipe of
+mlx-serve, https://github.com/ddalcu/mlx-serve (its thresholds and step gates); no source is included.
+

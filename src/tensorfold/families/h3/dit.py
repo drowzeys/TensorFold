@@ -92,7 +92,13 @@ class Attention(nn.Module):
         return out.transpose(0, 2, 1, 3).reshape(batch, rows, self.heads * self.head_dim)
 
     def __call__(self, x: mx.array, rotary=None) -> mx.array:
-        return self.out_proj(self.mix(*self.qkv(x, rotary)).astype(x.dtype)).astype(x.dtype)
+        sparse = getattr(self, "sparse", None)
+        if sparse is not None and rotary is not None:
+            # a distilled checkpoint's routed attention (see fasth3.py); the refiner blocks stay dense
+            mixed = sparse(self, x, *self.qkv(x, rotary))
+        else:
+            mixed = self.mix(*self.qkv(x, rotary))
+        return self.out_proj(mixed.astype(x.dtype)).astype(x.dtype)
 
 
 class FeedForward(nn.Module):

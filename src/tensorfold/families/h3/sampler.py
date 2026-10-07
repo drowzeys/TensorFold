@@ -84,7 +84,8 @@ def attention_refresh(index: int, steps: int, every: int) -> bool:
 def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: int, seed: int = 0,
             subset: tuple[int, ...] | None = None, on_step=None, forward=None, release: bool = False,
             condition: mx.array | None = None, keyframes: tuple[str, ...] = (),
-            audio_shift: float | None = None, step_cache: float = 0.0, attention_every: int = 0) -> Latents:
+            audio_shift: float | None = None, step_cache: float = 0.0, attention_every: int = 0,
+            nodes: tuple[float, ...] | None = None, video_shift: float | None = None, prepare=None) -> Latents:
     """Denoise one clip. ``points`` is the number of sigma points, so ``points - 1`` forwards (fewer with
     ``subset``). ``forward`` replaces the plain DiT call. The AdaLN tables for the whole run are projected once
     up front; ``release`` then frees the projection weights. ``condition`` holds the encoded keyframe rows for
@@ -96,7 +97,11 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     velocity while the summed relative move ``|d sigma| mean|v| / mean|x|`` since the last forward stays under it;
     never on the first steps or the last, and at most twice running. ``attention_every`` (2 there) computes
     attention only on every that-many-th step between the opening and closing steps and reuses each block's
-    attention output otherwise. Both change the result; neither suits a few-step adapter, whose steps are large."""
+    attention output otherwise. Both change the result; neither suits a few-step adapter, whose steps are large.
+
+    ``nodes`` are a distilled model's own unshifted sigma rungs (``points`` is then ignored) and ``video_shift``
+    its video shift. ``prepare(packed, latent_frames, latent_height, latent_width)`` is called once the sequence
+    layout is known, before the first forward."""
 
     config = dit.config
     latent_frames = h3.latent_frames(frames)
@@ -112,8 +117,10 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     check_noise("video", video_rows[held:])
     check_noise("audio", audio_rows)
 
-    video_schedule = Schedule(VIDEO_SHIFT, points, subset)
-    audio_schedule = Schedule(AUDIO_SHIFT if audio_shift is None else audio_shift, points, subset)
+    if prepare is not None:
+        prepare(packed, latent_frames, latent_height, latent_width)
+    video_schedule = Schedule(VIDEO_SHIFT if video_shift is None else video_shift, points, subset, nodes)
+    audio_schedule = Schedule(AUDIO_SHIFT if audio_shift is None else audio_shift, points, subset, nodes)
     table, plan = timestep_plan(packed, video_schedule.timesteps, audio_schedule.timesteps)
     text = text.astype(mx.bfloat16)
     dit.cache_modulation(table, release=release)

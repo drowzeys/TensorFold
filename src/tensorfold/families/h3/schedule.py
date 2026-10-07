@@ -28,7 +28,17 @@ def _linspace(points: int) -> np.ndarray:
 class Schedule:
     """``sigma' = s sigma / (1 + (s - 1) sigma)`` over ``linspace(1, 0, points)``; N sigmas give N - 1 forwards."""
 
-    def __init__(self, shift: float, points: int, subset: tuple[int, ...] | None = None):
+    def __init__(self, shift: float, points: int, subset: tuple[int, ...] | None = None,
+                 nodes: tuple[float, ...] | None = None):
+        if nodes is not None:
+            # a distilled model's own rungs: unshifted sigmas falling towards 0, which is appended. Shifted in
+            # float64 and cast once, as FastVideo does for its FastH3 checkpoints.
+            raw = np.asarray([*nodes, 0.0], dtype=np.float64)
+            if subset is not None or raw.size < 2 or np.any(np.diff(raw) >= 0) or raw[0] > 1.0:
+                raise ValueError("nodes must fall from at most 1 towards 0, and take no subset")
+            self.sigmas = (shift * raw / (1.0 + (shift - 1.0) * raw)).astype(np.float32)
+            self.timesteps = (np.float32(1.0) - self.sigmas[:-1]).astype(np.float32)
+            return
         if points < 2:
             raise ValueError(f"a schedule needs at least 2 points, got {points}")
         base = _linspace(points)

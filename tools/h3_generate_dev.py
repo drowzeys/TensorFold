@@ -185,6 +185,9 @@ def main():
     parser.add_argument("--audio-shift", type=float, default=None, help="sigma shift of the audio schedule (released: 3)")
     parser.add_argument("--upscale-vae", help="safetensors of a packed-head (2x) video decoder; frames come out larger")
     parser.add_argument("--crop", help="WxH: centre-crop the decoded frames before the MP4 is written")
+    parser.add_argument("--fasth3", help="a FastH3 checkpoint folder: its transformer, schedule and routed attention")
+    parser.add_argument("--vsa-impl", default="reference", choices=("reference", "simd"))
+    parser.add_argument("--dense", action="store_true", help="with --fasth3: dense attention instead of routed")
     parser.add_argument("--step-cache", type=float, default=0.0,
                         help="reuse the last velocity while the summed relative move stays under this (0.05)")
     parser.add_argument("--attention-every", type=int, default=0,
@@ -218,7 +221,15 @@ def main():
     print(f"[tensorfold] text: {text.shape[1]} rows in {text_seconds:.1f}s", flush=True)
 
     started = time.perf_counter()
-    dit = load_dit(args.model_dir)
+    fast = None
+    if args.fasth3:
+        from tensorfold.families.h3 import fasth3
+
+        dit, gates, fast = fasth3.load_fasth3(args.fasth3)
+        print(f"[tensorfold] FastH3: {fast.forwards} forwards, video shift {fast.video_shift}, sparsity "
+              f"{fast.sparsity}, tile {fast.tile}, task {fast.task}", flush=True)
+    else:
+        dit = load_dit(args.model_dir)
     for spec in args.lora:
         path, _, strength = spec.partition(":")
         print(f"[tensorfold] {merge(dit, path, float(strength or 1.0))}", flush=True)
@@ -237,13 +248,20 @@ def main():
     points, subset = args.points, None
     if args.subset:
         points, subset = parse_subset(args.subset)
+    schedule = {}
+    if fast is not None:
+        schedule = {"nodes": fast.nodes, "video_shift": fast.video_shift}
+        if args.audio_shift is None:
+            args.audio_shift = fast.audio_shift
+        if fast.sparsity > 0 and not args.dense:
+            schedule["prepare"] = fasth3.route(dit, gates, fast.sparsity, fast.tile, args.vsa_impl)
     started = time.perf_counter()
     latents = denoise(dit, text, tags, args.width, args.height, args.frames, points, args.seed, subset,
                       release=not args.keep_adaln, condition=condition,
                       keyframes=("first",) if condition is not None else (),
                       on_step=lambda i, n, s: print(f"[tensorfold] step {i}/{n} {s:.2f}s", flush=True),
                       audio_shift=args.audio_shift, step_cache=args.step_cache,
-                      attention_every=args.attention_every)
+                      attention_every=args.attention_every, **schedule)
     denoise_seconds = time.perf_counter() - started
     revoice_seconds = 0.0
     if args.revoice:
