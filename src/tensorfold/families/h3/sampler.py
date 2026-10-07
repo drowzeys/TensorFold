@@ -63,21 +63,26 @@ def check_noise(name: str, rows: mx.array) -> None:
         raise ValueError(f"{name} start is not unit noise (mean {mean:.3f}, std {std:.3f})")
 
 
-def scaled_gate(steps: int, at_30: int) -> int:
-    """A window ``at_30`` steps wide on a 30-step schedule, scaled to ``steps``: at least 1, never wider."""
+def default_gates(steps: int) -> tuple[int, int, int]:
+    """(opening steps that always compute attention, closing steps that do, steps before the cache may skip).
 
-    return max(1, min(at_30, steps * at_30 // 30))
+    4, 2 and 2 from 16 steps up, as mlx-serve uses at 30. Scaling them down with the step count, as it does for
+    shorter runs, left a 20-step run with one full forward in its first six steps and a murky, soft picture; kept
+    at full width the same run is 1.9 times faster than plain and as sharp. Below 16 steps they shrink.
+    """
+
+    return max(1, min(4, steps // 4)), max(1, min(2, steps // 8)), max(1, min(2, steps // 8))
 
 
-def attention_refresh(index: int, steps: int, every: int) -> bool:
+def attention_refresh(index: int, steps: int, every: int, gates: tuple[int, int, int] | None = None) -> bool:
     """Whether step ``index`` computes attention afresh under reuse every ``every`` steps.
 
-    The first steps (4 of 30) and the last (2 of 30) always do; in between, every ``every``-th one.
+    The first 4 steps and the last 2 always do (fewer on short runs); in between, every ``every``-th one.
     """
 
     if every <= 1:
         return True
-    warmup, tail = scaled_gate(steps, 4), scaled_gate(steps, 2)
+    warmup, tail = (default_gates(steps) if gates is None else gates)[:2]
     return index < warmup or index + tail >= steps or (index - warmup) % every == 0
 
 
@@ -85,7 +90,8 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
             subset: tuple[int, ...] | None = None, on_step=None, forward=None, release: bool = False,
             condition: mx.array | None = None, keyframes: tuple[str, ...] = (),
             audio_shift: float | None = None, step_cache: float = 0.0, attention_every: int = 0,
-            nodes: tuple[float, ...] | None = None, video_shift: float | None = None, prepare=None) -> Latents:
+            nodes: tuple[float, ...] | None = None, video_shift: float | None = None, prepare=None,
+            gates: tuple[int, int, int] | None = None) -> Latents:
     """Denoise one clip. ``points`` is the number of sigma points, so ``points - 1`` forwards (fewer with
     ``subset``). ``forward`` replaces the plain DiT call. The AdaLN tables for the whole run are projected once
     up front; ``release`` then frees the projection weights. ``condition`` holds the encoded keyframe rows for
@@ -100,7 +106,8 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     attention output otherwise. Both change the result; neither suits a few-step adapter, whose steps are large.
 
     ``nodes`` are a distilled model's own unshifted sigma rungs (``points`` is then ignored) and ``video_shift``
-    its video shift. ``prepare(packed, latent_frames, latent_height, latent_width)`` is called once the sequence
+    its video shift. ``gates`` are (opening steps that always compute attention, closing steps that do, steps before
+    the velocity cache may skip), in place of the widths scaled from a 30-step run. ``prepare(packed, latent_frames, latent_height, latent_width)`` is called once the sequence
     layout is known, before the first forward."""
 
     config = dit.config
@@ -133,8 +140,8 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     for index in range(steps):
         started = time.perf_counter()
         skip = False
-        if step_cache > 0 and last_video is not None and index >= scaled_gate(steps, 2) and index + 1 < steps \
-                and running < 2:
+        hold = (default_gates(steps) if gates is None else gates)[2]
+        if step_cache > 0 and last_video is not None and index >= hold and index + 1 < steps and running < 2:
             jump = abs(float(video_schedule.sigmas[index + 1] - video_schedule.sigmas[index]))
             size = max(float(mx.mean(mx.abs(video_rows[held:])).item()), 1e-8)
             move = jump * float(mx.mean(mx.abs(last_video)).item()) / size
@@ -146,7 +153,7 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
             running += 1
             skipped += 1
         else:
-            refresh = attention_refresh(index, steps, attention_every)
+            refresh = attention_refresh(index, steps, attention_every, gates)
             extra = {} if kept is None else {"kept": kept, "refresh": refresh}
             out_video, out_audio = run(video_rows[None], audio_rows[None], text, table, plan[index], packed.tags,
                                        packed.position_ids, packed.video_rows, packed.audio_rows, packed.text_rows,

@@ -192,6 +192,9 @@ def main():
                         help="reuse the last velocity while the summed relative move stays under this (0.05)")
     parser.add_argument("--attention-every", type=int, default=0,
                         help="compute attention every N-th middle step and reuse it otherwise (2)")
+    parser.add_argument("--fast-gates", help="A,B,C: opening and closing steps that always compute attention, and "
+                                             "steps before the velocity cache may skip")
+    parser.add_argument("--save-frames", help="also write the decoded frames to this .npy file, for comparisons")
     parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
                         help="after the run, denoise the audio again in STEPS steps with the model without adapters")
     parser.add_argument("--revoice-exact", action="store_true", help="re-voice with whole-sequence forwards")
@@ -261,7 +264,8 @@ def main():
                       keyframes=("first",) if condition is not None else (),
                       on_step=lambda i, n, s: print(f"[tensorfold] step {i}/{n} {s:.2f}s", flush=True),
                       audio_shift=args.audio_shift, step_cache=args.step_cache,
-                      attention_every=args.attention_every, **schedule)
+                      attention_every=args.attention_every,
+                      gates=tuple(int(v) for v in args.fast_gates.split(",")) if args.fast_gates else None, **schedule)
     denoise_seconds = time.perf_counter() - started
     revoice_seconds = 0.0
     if args.revoice:
@@ -289,6 +293,8 @@ def main():
     frames, wave, rate = decode(args.model_dir, root, latents, h3.DiTConfig.from_checkpoint(args.model_dir),
                                 int8=not args.float_vae, upscale_decoder=args.upscale_vae,
                                 hard_clip=args.audio_hard_clip)
+    if args.save_frames:
+        np.save(args.save_frames, frames[::8])
     if args.crop:
         crop_w, crop_h = (int(v) for v in args.crop.lower().split("x"))
         full_h, full_w = frames.shape[1:3]

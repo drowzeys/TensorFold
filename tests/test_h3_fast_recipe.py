@@ -5,7 +5,7 @@ import numpy as np
 
 from tensorfold.families.h3.config import DiTConfig
 from tensorfold.families.h3.dit import H3DiT
-from tensorfold.families.h3.sampler import attention_refresh, denoise, scaled_gate
+from tensorfold.families.h3.sampler import attention_refresh, default_gates, denoise
 
 SMALL = DiTConfig(hidden_size=32, num_layers=2, token_refiner_num_layers=1, num_attention_heads=2,
                   attention_head_dim=16, ffn_hidden_size=48, latents_dim=24, audio_latents_dim=32, text_dim=20,
@@ -20,9 +20,9 @@ def small_model(seed=0):
     return model
 
 
-def test_gates_scale_with_the_run_and_never_vanish():
-    assert [scaled_gate(30, 4), scaled_gate(30, 2), scaled_gate(50, 4)] == [4, 2, 4]
-    assert [scaled_gate(20, 4), scaled_gate(20, 2), scaled_gate(4, 4), scaled_gate(4, 2)] == [2, 1, 1, 1]
+def test_gates_keep_full_width_from_sixteen_steps_and_never_vanish():
+    assert default_gates(30) == (4, 2, 2) and default_gates(20) == (4, 2, 2) and default_gates(16) == (4, 2, 2)
+    assert default_gates(8) == (2, 1, 1) and default_gates(4) == (1, 1, 1) and default_gates(2) == (1, 1, 1)
 
 
 def test_attention_refresh_schedule_at_thirty_steps():
@@ -52,6 +52,9 @@ def test_velocity_cache_skips_at_most_two_running_and_never_the_ends():
     out = denoise(model, text, [1, 1, 1], 64, 64, 22, points=11, seed=1, step_cache=0.05)
     # 10 steps: step 0 runs, then skip, skip, run, skip, skip, run, skip, skip, and the last always runs
     assert model.calls == 4 and out.skipped_steps == 6 and out.reused_steps == 0
+    held = Still()
+    late = denoise(held, text, [1, 1, 1], 64, 64, 22, points=11, seed=1, step_cache=0.05, gates=(4, 2, 5))
+    assert late.skipped_steps < 6 and held.calls > 4
     plain = Still()
     denoise(plain, text, [1, 1, 1], 64, 64, 22, points=11, seed=1)
     assert plain.calls == 10
