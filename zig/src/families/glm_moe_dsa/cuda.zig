@@ -2,7 +2,9 @@
 //! indexer, EXL3 dense linears and routed experts), its kernels and layouts, so each layer matches it bit for bit.
 //! Phase 1: the first N layers on one GB10 as rank 0 of world 4 with the other ranks absent (identity comm: own
 //! partial, zeros elsewhere), zig/tests/cuda/glm53_layers.zig against tools/glm53/oracle.py.
-//! Not yet a native family (native/cuda.zig's registry): no engine, runner, graphs, sampling or TP4 here.
+//! Phase 2a: the full model at TP over NCCL (Forward.comm), the vocabulary-sharded argmax head (Forward.head), greedy,
+//! zig/tests/cuda/glm53_generate.zig against tools/glm53/reference.py.
+//! Not yet a native family (native/cuda.zig's registry): no engine, runner, graphs, sampling or MTP here.
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");

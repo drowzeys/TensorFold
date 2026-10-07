@@ -1,9 +1,14 @@
 //! GLM-5.3 layer slices on the GPU in the Python engine's layouts (cuda/weights.py load_layer + fused.Weights):
 //! EXL3 linears in the strips layout, kv_b cut into the absorb (wk) and expand (wv) blocks, the indexer's bf16 parts,
 //! the router, and the routed experts as experts.prepare tables (TF_GLM53_EXPERTS=tf: one trellis a matrix).
-//! Reads go through mapped safetensors (core.Checkpoint), each rank's part cut as split.rule says (Phase 1: rank 0 of 4).
-//! TODO(P2): O_DIRECT + io_uring streaming (nemotron/cuda_source.zig) instead of mapped reads; the cuda-exl3 shared
-//! stacks (experts_cx) for prompt chunks.
+//! Reads go through mapped safetensors (core.Checkpoint), each rank's part cut as split.rule says. Phase 2a: every
+//! layer, the final norm and this rank's vocabulary share of lm_head, in O(1) host memory: after each layer the files
+//! it read leave the page cache (madvise + posix_fadvise DONTNEED, as weights.RankReader.release does), so a 4-rank
+//! load fits GB10's unified memory beside the caches. Device tensors come from 256 MiB arena chunks (512-byte
+//! aligned like torch's caching allocator) instead of one cuMemAlloc each; each MoE layer's expert trellises are one
+//! allocation per projection.
+//! TODO(P3): O_DIRECT + io_uring streaming (nemotron/cuda_source.zig) instead of mapped reads; the cuda-exl3 shared
+//! stacks (experts_cx) for prompt chunks; the MTP layer.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -51,10 +56,44 @@ pub const Weights = struct {
     world: usize,
     heads: usize, // this rank's attention heads
     embed: u64 = 0, // bf16 [V, D]
+    final_norm: u64 = 0, // bf16 [D] (model.norm)
+    lm_head: u64 = 0, // bf16 [V / world, D]: this rank's vocabulary share (rows vocab_off ..)
+    vocab_part: usize = 0,
+    vocab_off: usize = 0,
     layers: []Layer = &.{},
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    chunk: u64 = 0, // the arena chunk being filled (0: none yet)
+    chunk_used: usize = 0,
+    device_bytes: usize = 0, // bytes handed out (tensors, not chunk slack)
     digest_checked: usize = 0,
     digest_bad: usize = 0,
+
+    /// Arena chunks: small tensors share them; anything over a quarter chunk gets its own allocation.
+    pub const chunk_bytes: usize = 256 << 20;
+    /// torch's caching allocator rounds every block to 512 bytes: the same alignment for every pointer the kernels see.
+    pub const alignment: usize = 512;
+
+    /// `bytes` of device memory that lives as long as the weights (not zeroed).
+    pub fn alloc(w: *Weights, d: *const cuda.Driver, bytes: usize) !u64 {
+        const n = std.mem.alignForward(usize, @max(bytes, 1), alignment);
+        w.device_bytes += n;
+        if (n > chunk_bytes / 4) {
+            var b = try cuda.DeviceBuffer.alloc(d, n);
+            errdefer b.free();
+            try w.buffers.append(w.gpa, b);
+            return b.ptr;
+        }
+        if (w.chunk == 0 or w.chunk_used + n > chunk_bytes) {
+            var b = try cuda.DeviceBuffer.alloc(d, chunk_bytes);
+            errdefer b.free();
+            try w.buffers.append(w.gpa, b);
+            w.chunk = b.ptr;
+            w.chunk_used = 0;
+        }
+        const ptr = w.chunk + w.chunk_used;
+        w.chunk_used += n;
+        return ptr;
+    }
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
@@ -87,9 +126,30 @@ pub const Options = struct {
     world: usize = 1,
     layers: usize, // load layers 0..layers-1
     embed: bool = true,
+    /// the final norm and this rank's lm_head share (Phase 2a: the vocabulary-sharded argmax head)
+    head: bool = false,
+    /// log progress every this many layers (0: a line every layer, as Phase 1 did)
+    log_every: usize = 0,
     /// weights_sha256 of the oracle's meta.json: each prepared tensor's bytes are checked against it when given
     digests: ?*const std.json.ObjectMap = null,
 };
+
+/// libc calls std does not wrap on every target: dropping a mapped file's pages from this process and the page cache.
+const libc = struct {
+    const madvise = @extern(*const fn (?*anyopaque, usize, c_int) callconv(.c) c_int, .{ .name = "madvise" });
+    const posix_fadvise = @extern(*const fn (c_int, i64, i64, c_int) callconv(.c) c_int, .{ .name = "posix_fadvise" });
+    const malloc_trim = @extern(*const fn (usize) callconv(.c) c_int, .{ .name = "malloc_trim" });
+    const MADV_DONTNEED: c_int = 4;
+    const POSIX_FADV_DONTNEED: c_int = 4;
+};
+
+/// A mapped checkpoint file's pages out of this process (madvise) and out of the page cache (posix_fadvise): clean
+/// pages only, so a later read simply reads the disk again (weights.drop_page_cache).
+fn dropFile(f: *core.safetensors.File) void {
+    const mem = f.map.memory;
+    if (mem.len > 0) _ = libc.madvise(@ptrCast(@constCast(mem.ptr)), mem.len, libc.MADV_DONTNEED);
+    _ = libc.posix_fadvise(f.file.handle, 0, 0, libc.POSIX_FADV_DONTNEED);
+}
 
 const Loader = struct {
     gpa: std.mem.Allocator,
@@ -99,15 +159,45 @@ const Loader = struct {
     o: Options,
     host: std.ArrayList(u8) = .empty,
     host2: std.ArrayList(u8) = .empty,
+    touched: []bool = &.{}, // per checkpoint file: read since the last release
+    dropped: usize = 0, // file drops so far
 
     fn deinit(L: *Loader) void {
         L.host.deinit(L.gpa);
         L.host2.deinit(L.gpa);
+        L.gpa.free(L.touched);
     }
 
     fn has(L: *Loader, name: []const u8) bool {
         for (L.ck.files.items) |*f| if (f.names.get(name) != null) return true;
         return false;
+    }
+
+    /// Checkpoint.get, noting which file the bytes come from (release drops its pages).
+    fn get(L: *Loader, name: []const u8) !core.checkpoint.Tensor {
+        for (L.ck.files.items, 0..) |*f, i| if (f.names.get(name) != null) {
+            L.touched[i] = true;
+            break;
+        };
+        return L.ck.get(name);
+    }
+
+    /// weights.RankReader.release: every file read since the last call leaves this process and the page cache, and
+    /// the freed host heap goes back to the OS (on GB10 host memory is the memory the GPU allocations need).
+    fn release(L: *Loader) void {
+        for (L.ck.files.items, L.touched) |*f, *t| {
+            if (!t.*) continue;
+            t.* = false;
+            dropFile(f);
+            L.dropped += 1;
+        }
+        _ = libc.malloc_trim(0);
+    }
+
+    /// Every file's pages dropped (end of the load: files read outside a layer too).
+    fn releaseAll(L: *Loader) void {
+        for (L.touched) |*t| t.* = true;
+        L.release();
     }
 
     /// The oracle's digest of a prepared tensor, compared with these bytes (a mismatch is logged and counted).
@@ -127,18 +217,20 @@ const Loader = struct {
 
     fn put(L: *Loader, key: []const u8, bytes: []const u8) !u64 {
         L.check(key, bytes);
-        var b = try cuda.DeviceBuffer.fromHost(L.d, bytes);
-        errdefer b.free();
-        try L.w.buffers.append(L.gpa, b);
-        return b.ptr;
+        const p = try L.w.alloc(L.d, bytes.len);
+        try L.upload(p, bytes);
+        return p;
+    }
+
+    fn upload(L: *Loader, dst: u64, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try L.d.check(L.d.api.cuMemcpyHtoD_v2(dst, bytes.ptr, bytes.len), "cuMemcpyHtoD");
     }
 
     fn zeros(L: *Loader, bytes: usize) !u64 {
-        var b = try cuda.DeviceBuffer.alloc(L.d, bytes);
-        errdefer b.free();
-        try b.fill8(0, null);
-        try L.w.buffers.append(L.gpa, b);
-        return b.ptr;
+        const p = try L.w.alloc(L.d, bytes);
+        try L.d.check(L.d.api.cuMemsetD8_v2(p, 0, std.mem.alignForward(usize, @max(bytes, 1), Weights.alignment)), "cuMemsetD8");
+        return p;
     }
 
     fn staging(list: *std.ArrayList(u8), gpa: std.mem.Allocator, n: usize) ![]u8 {
@@ -146,9 +238,10 @@ const Loader = struct {
         return list.items;
     }
 
-    /// This rank's part of a checkpoint tensor (split.rule): the mapped bytes themselves when whole, else a copy.
+    /// This rank's part of a checkpoint tensor (split.rule): the mapped bytes themselves when whole or a row range,
+    /// else (second-axis cuts) a copy in the host2 staging buffer.
     fn part(L: *Loader, name: []const u8, shape_out: *[core.safetensors.max_rank]usize) ![]const u8 {
-        const t = try L.ck.get(name);
+        const t = try L.get(name);
         const kind = try split.rule(name);
         shape_out.* = t.shape;
         const shape = t.shape[0..t.rank];
@@ -156,6 +249,11 @@ const Loader = struct {
         try split.checkCut(name, kind, shape, L.o.world);
         const axis: usize = if (kind == .row) 0 else 1;
         shape_out[axis] /= L.o.world;
+        if (kind == .row) {
+            const per = t.bytes.len / shape[0];
+            const n = shape[0] / L.o.world;
+            return t.bytes[L.o.rank * n * per ..][0 .. n * per];
+        }
         const out = try staging(&L.host2, L.gpa, t.bytes.len / L.o.world);
         try split.cutBytes(out, t.bytes, shape, t.dtype.size(), kind, L.o.rank, L.o.world);
         return out;
@@ -163,7 +261,7 @@ const Loader = struct {
 
     /// weights.as_bf16: bf16 as stored; fp16 only when every value is exactly a bf16 value.
     fn bf16(L: *Loader, name: []const u8, key: []const u8) !u64 {
-        const t = try L.ck.get(name);
+        const t = try L.get(name);
         if (t.dtype == .bf16) {
             var shape: [core.safetensors.max_rank]usize = undefined;
             return L.put(key, try L.part(name, &shape));
@@ -187,7 +285,7 @@ const Loader = struct {
 
     /// `.float()` of a bf16 / fp32 vector (the router's score-correction bias).
     fn f32vec(L: *Loader, name: []const u8, key: []const u8) !u64 {
-        const t = try L.ck.get(name);
+        const t = try L.get(name);
         var shape: [core.safetensors.max_rank]usize = undefined;
         const raw = try L.part(name, &shape);
         if (t.dtype == .f32) return L.put(key, raw);
@@ -203,11 +301,11 @@ const Loader = struct {
     fn codebook(L: *Loader, prefix: []const u8) !exl3.Codebook {
         var buf: [256]u8 = undefined;
         if (L.has(try std.fmt.bufPrint(&buf, "{s}.mul1", .{prefix}))) {
-            _ = try L.ck.get(try std.fmt.bufPrint(&buf, "{s}.mul1", .{prefix}));
+            _ = try L.get(try std.fmt.bufPrint(&buf, "{s}.mul1", .{prefix}));
             return .mul1;
         }
         if (L.has(try std.fmt.bufPrint(&buf, "{s}.mcg", .{prefix}))) {
-            _ = try L.ck.get(try std.fmt.bufPrint(&buf, "{s}.mcg", .{prefix}));
+            _ = try L.get(try std.fmt.bufPrint(&buf, "{s}.mcg", .{prefix}));
             return .mcg;
         }
         return .@"3inst";
@@ -215,7 +313,7 @@ const Loader = struct {
 
     /// fp16 scales of `size` values (packed sign words are not in GLM-5.3's packs: refused).
     fn scales(L: *Loader, name: []const u8, key: []const u8, size: usize) !u64 {
-        const t = try L.ck.get(name);
+        const t = try L.get(name);
         if (t.dtype != .f16) {
             std.log.err("{s}: {t} scales (packed sign words are not implemented)", .{ name, t.dtype });
             return error.UnsupportedScales;
@@ -231,7 +329,7 @@ const Loader = struct {
         var nb: [256]u8 = undefined;
         var kb: [256]u8 = undefined;
         const tname = try std.fmt.bufPrint(&nb, "{s}.trellis", .{prefix});
-        const t = try L.ck.get(tname);
+        const t = try L.get(tname);
         if (t.dtype != .i16 or t.rank != 3) return error.UnexpectedTensor;
         var shape: [core.safetensors.max_rank]usize = undefined;
         const raw = try L.part(tname, &shape);
@@ -262,7 +360,7 @@ const Loader = struct {
 
     /// fused.Weights: kv_b [H (nope + v), kv_lora] -> wk [H, nope, kv_lora] and wv [H, v, kv_lora], contiguous.
     fn kvB(L: *Loader, name: []const u8, key: []const u8, c: Config, heads: usize) ![2]u64 {
-        const t = try L.ck.get(name);
+        const t = try L.get(name);
         if (t.dtype != .bf16) return error.UnexpectedTensor;
         var shape: [core.safetensors.max_rank]usize = undefined;
         const raw = try L.part(name, &shape);
@@ -314,35 +412,47 @@ const Loader = struct {
         var lo_d: usize = 99;
         var hi_d: usize = 0;
         var cbk: ?exl3.Codebook = null;
-        for (projs, 0..) |pj, j| for (0..E) |e| {
-            const pre = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj", .{ li, e, pj });
-            if (cbk == null) cbk = try L.codebook(pre);
-            var tb: [256]u8 = undefined;
-            const tname = try std.fmt.bufPrint(&tb, "{s}.trellis", .{pre});
-            const t = try L.ck.get(tname);
-            if (t.dtype != .i16 or t.rank != 3) return error.UnexpectedTensor;
-            var shape: [core.safetensors.max_rank]usize = undefined;
-            const raw = try L.part(tname, &shape);
-            const want_k = if (j == 2) I else D;
-            const want_n = if (j == 2) D else I;
-            if (shape[0] * 16 != want_k or shape[1] * 16 != want_n) return error.UnexpectedTensor;
-            if (shape[2] % 8 != 0) return error.UnsupportedExl3Width;
-            const k2 = shape[2] / 8;
-            if (k2 < 2 or k2 > 16) return error.UnsupportedExl3Width;
-            hash.update(raw);
-            var b = try cuda.DeviceBuffer.fromHost(L.d, raw);
-            errdefer b.free();
-            try L.w.buffers.append(L.gpa, b);
-            ptrs[j][e] = b.ptr;
-            k2s[j][e] = @intCast(k2);
-            if (j < 2) {
-                lo_gu = @min(lo_gu, k2);
-                hi_gu = @max(hi_gu, k2);
-            } else {
-                lo_d = @min(lo_d, k2);
-                hi_d = @max(hi_d, k2);
+        for (projs, 0..) |pj, j| {
+            // one device allocation for the projection's E trellises (each at a 512-byte boundary, as torch places
+            // its tensors): sizes first, then each expert's part uploaded at its offset
+            var total: usize = 0;
+            for (0..E) |e| {
+                var tb: [256]u8 = undefined;
+                const t = try L.get(try std.fmt.bufPrint(&tb, "model.layers.{d}.mlp.experts.{d}.{s}_proj.trellis", .{ li, e, pj }));
+                total += std.mem.alignForward(usize, t.bytes.len / L.o.world, Weights.alignment);
             }
-        };
+            const base = try L.w.alloc(L.d, total);
+            var off: usize = 0;
+            for (0..E) |e| {
+                const pre = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj", .{ li, e, pj });
+                if (cbk == null) cbk = try L.codebook(pre);
+                var tb: [256]u8 = undefined;
+                const tname = try std.fmt.bufPrint(&tb, "{s}.trellis", .{pre});
+                const t = try L.get(tname);
+                if (t.dtype != .i16 or t.rank != 3) return error.UnexpectedTensor;
+                var shape: [core.safetensors.max_rank]usize = undefined;
+                const raw = try L.part(tname, &shape);
+                const want_k = if (j == 2) I else D;
+                const want_n = if (j == 2) D else I;
+                if (shape[0] * 16 != want_k or shape[1] * 16 != want_n) return error.UnexpectedTensor;
+                if (shape[2] % 8 != 0) return error.UnsupportedExl3Width;
+                const k2 = shape[2] / 8;
+                if (k2 < 2 or k2 > 16) return error.UnsupportedExl3Width;
+                hash.update(raw);
+                if (off + raw.len > total) return error.UnexpectedTensor;
+                try L.upload(base + off, raw);
+                ptrs[j][e] = base + off;
+                off += std.mem.alignForward(usize, raw.len, Weights.alignment);
+                k2s[j][e] = @intCast(k2);
+                if (j < 2) {
+                    lo_gu = @min(lo_gu, k2);
+                    hi_gu = @max(hi_gu, k2);
+                } else {
+                    lo_d = @min(lo_d, k2);
+                    hi_d = @max(hi_d, k2);
+                }
+            }
+        }
         if (cbk.? != .mul1) return error.UnsupportedExpertCodebook; // the copy instantiates mul1 (CB 2) only
         if (L.o.digests) |dg| {
             if (dg.get(try std.fmt.bufPrint(&kb, "{s}.experts.trellis", .{key}))) |want| {
@@ -384,7 +494,7 @@ const Loader = struct {
             defer L.gpa.free(buf);
             for (0..E) |e| {
                 const name = try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.experts.{d}.{s}_proj.{s}", .{ li, e, st.proj, st.part });
-                const t = try L.ck.get(name);
+                const t = try L.get(name);
                 if (t.dtype != .f16) return error.UnsupportedScales; // .half() of fp16: as stored
                 var shape: [core.safetensors.max_rank]usize = undefined;
                 const raw = try L.part(name, &shape);
@@ -463,25 +573,53 @@ const Loader = struct {
     }
 };
 
-/// Layers 0..o.layers-1 of rank o.rank of o.world (and the embedding), from the checkpoint folder `dir`.
+/// Layers 0..o.layers-1 of rank o.rank of o.world (and the embedding; with o.head the final norm and this rank's
+/// lm_head share), from the checkpoint folder `dir`. Each layer's files leave the page cache once it is on the GPU.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config, o: Options) !Weights {
     if (c.heads % o.world != 0) return error.UnevenHeads;
+    if (o.layers > c.layers) return error.TooManyLayers;
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
     var w: Weights = .{ .gpa = gpa, .config = c, .rank = o.rank, .world = o.world, .heads = c.heads / o.world };
     errdefer w.deinit();
     var L: Loader = .{ .gpa = gpa, .d = d, .ck = &ck, .w = &w, .o = o };
     defer L.deinit();
+    L.touched = try gpa.alloc(bool, ck.files.items.len);
+    @memset(L.touched, false);
+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
     if (o.embed) {
+        _ = try L.get("model.embed_tokens.weight");
         const t = try ck.expect("model.embed_tokens.weight", .bf16, &.{ c.vocab, c.hidden });
         w.embed = try L.put("embed", t.bytes);
     }
+    if (o.head) {
+        // fused.Weights: final_norm, lm_head [V / world, D] (split.rule: rows), vocab_off = rank * V / world
+        w.final_norm = try L.bf16("model.norm.weight", "final_norm");
+        if (c.vocab % o.world != 0) return error.UnevenVocab;
+        const t = try L.get("lm_head.weight");
+        if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != c.vocab or t.shape[1] != c.hidden) return error.UnexpectedTensor;
+        var shape: [core.safetensors.max_rank]usize = undefined;
+        const raw = try L.part("lm_head.weight", &shape);
+        w.vocab_part = shape[0];
+        w.vocab_off = o.rank * shape[0];
+        w.lm_head = try L.put("lm_head", raw);
+    }
+    L.release();
     const layers = try gpa.alloc(Layer, o.layers);
     errdefer gpa.free(layers);
     for (layers, 0..) |*l, i| {
         l.* = try L.layer(i, c);
-        std.log.info("glm53: layer {d} loaded", .{i});
+        L.release();
+        const last = i + 1 == layers.len;
+        if (o.log_every == 0) {
+            std.log.info("glm53: layer {d} loaded", .{i});
+        } else if ((i + 1) % o.log_every == 0 or last) {
+            const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
+            const gib = @as(f64, @floatFromInt(w.device_bytes)) / (1 << 30);
+            std.log.info("glm53 rank {d}: {d} of {d} layers loaded ({d:.0} s, {d:.1} GiB of weights on the device)", .{ o.rank, i + 1, layers.len, secs, gib });
+        }
     }
+    L.releaseAll();
     w.layers = layers;
     return w;
 }

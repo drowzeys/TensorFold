@@ -67,3 +67,37 @@ $OUT/zig-out/bin/tf-glm53-layers $MODEL $OUT/aot $OUT/fixtures --layers 4      #
 `aot_pack.py` (zig/tests/cuda/nemotron) now records `num_stages` per variant and writes a `None` constexpr (e.g.
 `BASE=None`) as `{"none": true}`; `zig/src/cuda/aot.zig` keys variants on `num_warps` / `num_stages` when the call
 site pins them (`Set.runWith(..., .{ .num_warps = 8, .num_stages = 2 })`) and refuses an ambiguous pick.
+
+# Phase 2a: full GLM-5.3 at TP4 over NCCL, greedy, token parity with the Python engine
+
+Gate: all 78 layers + final norm + the vocabulary-sharded argmax head on the four GB10 nodes (.1 .2 .3 .5 = rank
+0..3, RoCE), greedy without drafts, the SAME tokens as the Python engine for fixed prompts (3 chat prompts + one
+~4,500-token prompt past index_topk, chat template with thinking on, 128 picks each) and, per pick, the same gathered
+head records (each rank's max logit and id, fp32 bits).
+
+## One command, from .4 (free the cluster first; it stops nothing it did not start)
+
+```sh
+bash ~/zig-port/run_phase2a_cluster.sh        # last line: PHASE2A PASS|FAIL ... work=~/zig-port/runs/p2a-<utc>
+```
+
+It refuses to start while any node has < 100 GB MemAvailable, runs a tf-glm53* container, has GPU compute apps
+(`ALLOW_GPU_BUSY=1` overrides) or holds a leftover `zp2a-*` container. Then: rsync ~/zig-port (keeping the nodes'
+runs/ and cache/) and the champion source (-> zig-port/pysrc) to the four nodes; prompts rendered once on rank 0's
+node; `zig build test-glm53` + `fatbins tf-glm53-generate` on every node in the image (CPU, `--memory 24g`); the Python
+reference at TP4 (`zp2a-ref-r*`, which also records each node's Triton AOT set); `tf-glm53-generate` at TP4
+(`zp2a-gen-r*`); compare on rank 0's node. Knobs (TOKENS, CONTEXT, LAYERS, SKIP_BUILD / SKIP_REF with REUSE=<stamp>,
+MEM_CAP, ...) are listed at the top of the script.
+
+| file | what |
+|---|---|
+| `reference.py` | the Python engine (fused path) at TP: one process a rank, NCCL (`tensorfold.cuda.comm.NCCL`) shown as all_gather-only so fused.gather takes the all-gather + rank-order-sum branch for every window; prompt in windows of 128 rows, the last row's pick through `fused.head` "argmax", then one-row decode windows; `--record` packs this schedule's Triton set into `ref/aot`; writes `ref-r<R>.json`, `inv_freq.bin` (torch's bytes), `nccl.txt` (the libnccl it opened). `--make-prompts` renders the chat template |
+| `zig/tests/cuda/glm53_generate.zig` | `tf-glm53-generate`: the same schedule in Zig (TCP rendezvous for the NCCL id, ncclCommInitRank, the weights layer by layer, `Forward.head`), `gen-r<R>.json` in the same format |
+| `compare_phase2a.py` | tokens and records against the reference, the four Zig ranks against each other; `PHASE2A PASS|FAIL` |
+| `run_phase2a_cluster.sh` | the cluster run above (a copy lives at ~/zig-port/run_phase2a_cluster.sh) |
+
+Frozen beyond Phase 1's set: `TF_GLM53_RADIX_MIN_ROWS=1` (radix select for every window, the Zig side's), the
+all-gather exchange for prompt windows too (the champion uses NCCL's bf16 ring all-reduce for prompt chunks, which the
+Zig port does not reproduce yet), no RoCE one-shot, no MTP layer. RoPE: `glm53_rope.cu` computes fused.inv_freq with
+the same libdevice powf torch's kernel calls; the tool checks it against the reference's `inv_freq.bin` (and uses the
+reference bytes, saying so, if they ever differ).

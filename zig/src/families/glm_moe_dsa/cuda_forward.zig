@@ -1,19 +1,23 @@
 //! GLM-5.3's fused forward for windows of 1 to 128 rows (fused.compute / layer / attention_part / attention_core /
-//! ffn_part), one stream, one rank of the TP world (Phase 1: rank 0 of 4 with the other ranks ABSENT).
+//! ffn_part / head), one stream, one rank of the TP world.
 //!
-//! Phase 1 communicator semantics (identical to tools/glm53/oracle.py's LocalComm): fused.gather's all-gather branch
-//! with only this rank present - b.gath [world, R, D] fp32 is zeroed, this rank's partial copied into its slot, and
-//! glue.residual_add sums the world slots in rank order (WORLD = world). The outputs are this rank's alone, not the
-//! full model's. TODO(P2): replace `gather` with NCCL all-gather (or b12x one-shot) of the real partials. Every kernel computes each row alone, so a row's bits never depend on
-//! the window: the per-layer outputs match the Python engine's bit for bit when the kernels and their launches do.
+//! Exchanges (fused.gather's all-gather branch): every rank's fp32 partial [world, R, D] in rank order, then
+//! glue.residual_add sums the world slots in rank order (WORLD = world), so every rank gets the same bits.
+//! Phase 2a: `Forward.comm` set - NCCL all-gather of the real partials on the compute stream (the Python engine's
+//! all-gather path for every window: tools/glm53/reference.py gives its engine a communicator without all_reduce /
+//! all_to_all, so prompt windows too take this branch). `comm` null - the Phase 1 identity communicator (oracle.py's
+//! LocalComm): b.gath zeroed, this rank's partial in its slot. Every kernel computes each row alone, so a row's bits
+//! never depend on the window: the outputs match the Python engine's bit for bit when the kernels and launches do.
+//! The head (fused.head mode "argmax"): this rank's logits over its vocabulary share (glue.router), its first
+//! maximum (host: torch.argmax's rule), the [value, id, 0, 0] records all-gathered, the lowest rank of the maxima.
 //!
 //! Frozen as tools/glm53/oracle.py freezes the Python side: bf16 latent cache, DCP 1, one stream (TF_GLM53_SIDE=0:
 //! the side stream gives the same bits), x3linear.plan tiles, TensorFold's expert layout, the shared expert folded
 //! into the routed combine. Selection always goes through the radix select (topk.top_columns over _index_scores'
 //! 4-byte order words): the same keys as torch.topk + sort, which the champion uses for decode-sized windows (the
 //! oracle checks the two agree).
-//! TODO(P2): TP4 (all-gather + rank-order sum or the exact reduce-scatter between attention / FFN and the residual),
-//! prompt chunks over 128 rows (x3prefill GEMM, bmm absorb/expand), DCP, int8/int4 latent caches, CUDA graphs.
+//! TODO(P3): the RoCE one-shot / exact reduce-scatter exchanges, prompt chunks over 128 rows (x3prefill GEMM, bmm
+//! absorb/expand), DCP, int8/int4 latent caches, CUDA graphs, the MTP layer, sampling.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -21,6 +25,18 @@ const exl3 = @import("exl3.zig");
 const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
 const W = @import("cuda_weights.zig");
+
+/// The widest TP world the head's exchange records hold.
+pub const max_world: usize = 16;
+
+/// One head pick: the token, this rank's local argmax and the gathered [world, 4] fp32 records (bit-compared with
+/// the Python engine's b.amax_all).
+pub const Pick = struct {
+    token: u32 = 0,
+    local: usize = 0,
+    world: usize,
+    gathered: [max_world * 4]f32 = @splat(0),
+};
 
 /// fused.FAST_ROWS: windows up to this many rows use the decode attention tiling (non-decode Buffers).
 pub const fast_rows: usize = 16;
@@ -65,6 +81,13 @@ pub const Buffers = struct {
     sy: u64 = 0, // fp32 [rows, D]
     part: u64 = 0, // fp32 [rows, D]
     gath: u64 = 0, // fp32 [world * rows * D]: every rank's partial in rank order (fused.gather)
+    // the head (allocated when the weights hold one): fused.Buffers fnormed / lpart / amax / amax_all
+    head_rows: usize = 0, // min(rows, small)
+    fnormed: u64 = 0, // bf16 [head_rows, D]
+    lg: u64 = 0, // fp32 [head_rows, vocab_part]
+    hpart: u64 = 0, // fp32 [ROUTER_KS, head_rows, vocab_part] (glue.router's partials)
+    amax: u64 = 0, // fp32 [head_rows, 4]: [max logit, global id, 0, 0] a row
+    amax_all: u64 = 0, // fp32 [world, head_rows, 4]
     lin: kern.LinearScratch = undefined,
     xs: ?kern.ExpertScratch = null,
 
@@ -118,6 +141,16 @@ pub const Buffers = struct {
         b.sy = try b.alloc(rows * D * 4);
         b.part = try b.alloc(rows * D * 4);
         b.gath = try b.alloc(w.world * rows * D * 4);
+        if (w.lm_head != 0) {
+            const hr = @min(rows, b.small);
+            const V = w.vocab_part;
+            b.head_rows = hr;
+            b.fnormed = try b.alloc(hr * D * 2);
+            b.lg = try b.alloc(hr * V * 4);
+            b.hpart = try b.alloc(tri.router_ks * hr * V * 4);
+            b.amax = try b.alloc(hr * 4 * 4);
+            b.amax_all = try b.alloc(w.world * hr * 4 * 4);
+        }
         // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N]
         const ext = w.linearExtents();
         b.lin.xh_bytes = rows * ext.k * 2;
@@ -187,6 +220,11 @@ pub const State = struct {
         return s;
     }
 
+    /// A fresh request: every cache row and the position zeroed (fused.State's torch.zeros).
+    pub fn reset(s: *State) !void {
+        for (s.mem.items) |*m| try m.fill8(0, null);
+    }
+
     fn zeros(s: *State, bytes: usize) !u64 {
         var m = try cuda.DeviceBuffer.alloc(s.d, bytes);
         errdefer m.free();
@@ -208,7 +246,9 @@ pub const Forward = struct {
     w: *const W.Weights,
     k: *const kern.Kernels,
     s: cuda.Stream,
-    inv: u64, // fp32 [rope / 2]: fused.inv_freq (the oracle's bytes in Phase 1)
+    inv: u64, // fp32 [rope / 2]: fused.inv_freq (Phase 1: the oracle's bytes; Phase 2a: Kernels.invFreq's)
+    /// the world's NCCL communicator (rank and world as the weights' cut); null: the identity exchange of Phase 1
+    comm: ?*const cuda.nccl.Communicator = null,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -249,12 +289,17 @@ pub const Forward = struct {
         try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
     }
 
-    /// fused.gather: [world, R, D] fp32 partials in rank order for residual_add. World 1: b.part itself. Phase 1
-    /// (other ranks absent, LocalComm): zeros in every slot but this rank's, which holds b.part[:R].
+    /// fused.gather: [world, R, D] fp32 partials in rank order for residual_add. World 1: b.part itself. NCCL:
+    /// comm.all_gather(b.part[:R], b.gath[:world R D]) on the compute stream. Phase 1 (other ranks absent,
+    /// LocalComm): zeros in every slot but this rank's, which holds b.part[:R].
     pub fn gather(f: *const Forward, b: *const Buffers, R: usize) !u64 {
         const world = f.w.world;
         if (world == 1) return b.part;
         const D = f.w.config.hidden;
+        if (f.comm) |c| {
+            try c.allGather(b.part, b.gath, R * D, .f32, f.s.handle);
+            return b.gath;
+        }
         const o = f.ops();
         try o.fill32(b.gath, 0, world * R * D);
         try o.copy(b.gath + f.w.rank * R * D * 4, b.part, R * D * 4);
@@ -312,6 +357,45 @@ pub const Forward = struct {
         }
     }
 
+    /// fused.head(x, final_norm, R, slice(R - 1, R), mode="argmax") for the window's last row: the final RMSNorm,
+    /// this rank's logits over its vocabulary share (glue.router into b.lg), its first maximum (on the host, from
+    /// b.lg: torch.argmax's rule), the [value, global id, 0, 0] record all-gathered (b.amax_all) and the lowest rank
+    /// among the equal maxima. `host`: at least vocab_part floats. Synchronizes the stream (the pick goes to the host).
+    pub fn head(f: *const Forward, b: *const Buffers, R: usize, host: []f32) !Pick {
+        const c = f.w.config;
+        const D = c.hidden;
+        const V = f.w.vocab_part;
+        const world = f.w.world;
+        if (f.w.lm_head == 0 or b.lg == 0) return error.NoHead;
+        if (host.len < V or world > max_world) return error.Invalid;
+        const t_ = f.t();
+        const o = f.ops();
+        try t_.rmsnorm(b.x + (R - 1) * D * 2, D, f.w.final_norm, b.fnormed, D, 1, D, c.eps);
+        try t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, 1, D, V);
+        try o.download(std.mem.sliceAsBytes(host[0..V]), b.lg);
+        try f.s.synchronize();
+        const i = argmaxFirst(host[0..V]);
+        const rec: [4]f32 = .{ host[i], @floatFromInt(i + f.w.vocab_off), 0, 0 };
+        try o.upload(b.amax, std.mem.asBytes(&rec));
+        if (f.comm) |cm| {
+            try cm.allGather(b.amax, b.amax_all, 4, .f32, f.s.handle);
+        } else {
+            try o.fill32(b.amax_all, 0, world * 4);
+            try o.copy(b.amax_all + f.w.rank * 16, b.amax, 16);
+        }
+        var p: Pick = .{ .world = world };
+        try o.download(std.mem.sliceAsBytes(p.gathered[0 .. world * 4]), b.amax_all);
+        try f.s.synchronize();
+        var vals: [max_world]f32 = undefined;
+        for (0..world) |r| vals[r] = p.gathered[r * 4];
+        const best = argmaxFirst(vals[0..world]);
+        const id = p.gathered[best * 4 + 1];
+        if (!(id >= 0 and id < @as(f32, @floatFromInt(c.vocab)))) return error.BadPick;
+        p.token = @intFromFloat(id);
+        p.local = i;
+        return p;
+    }
+
     /// fused.ffn_part: the dense MLP, or the router, the shared expert (folded) and the routed experts.
     fn ffnPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
         const c = f.w.config;
@@ -340,12 +424,32 @@ pub const Forward = struct {
     }
 };
 
-/// fused.inv_freq on the host (diagnostic: Phase 1 uploads the oracle's bytes, which torch computes on the GPU).
+/// fused.inv_freq on the host: a diagnostic only. torch's bytes come from libdevice's powf on the GPU, which this
+/// does not reproduce exactly; Kernels.invFreq runs the same powf (glm53_rope.cu) and is what the engine uses.
 pub fn invFreq(out: []f32, dim: usize, theta: f64) void {
     for (out, 0..) |*v, i| {
-        const x: f32 = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(dim));
-        v.* = 1.0 / std.math.pow(f32, @floatCast(theta), x);
+        const x: f32 = @as(f32, @floatFromInt(2 * i)) * (@as(f32, 1.0) / @as(f32, @floatFromInt(dim)));
+        const p: f32 = @floatCast(std.math.pow(f64, @as(f64, @as(f32, @floatCast(theta))), @as(f64, x)));
+        v.* = 1.0 / p;
     }
+}
+
+/// torch.argmax's choice over one row: the first maximum, NaN above every number (the first NaN wins).
+pub fn argmaxFirst(v: []const f32) usize {
+    var best: usize = 0;
+    for (v, 0..) |x, i| {
+        if (i == 0) continue;
+        if (std.math.isNan(v[best])) break;
+        if (std.math.isNan(x) or x > v[best]) best = i;
+    }
+    return best;
+}
+
+test "argmax: first maximum, NaN first" {
+    try std.testing.expectEqual(@as(usize, 1), argmaxFirst(&.{ 1, 3, 3, 2 }));
+    try std.testing.expectEqual(@as(usize, 2), argmaxFirst(&.{ 1, 3, std.math.nan(f32), std.math.nan(f32) }));
+    try std.testing.expectEqual(@as(usize, 0), argmaxFirst(&.{ 0.0, -0.0 }));
+    try std.testing.expectEqual(@as(usize, 0), argmaxFirst(&.{5}));
 }
 
 test "inv_freq's first entries" {

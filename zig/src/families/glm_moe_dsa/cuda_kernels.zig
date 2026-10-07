@@ -19,6 +19,8 @@ pub const Kernels = struct {
     gateup_epilogue: cuda.Function,
     /// grouped_kernel<2, 8, 4, 1, 1, LO, HI> for (8, 8), (2, 10), (2, 16)
     grouped: [3]cuda.Function,
+    rope_mod: cuda.Module,
+    inv_freq: cuda.Function, // glm53_rope.cu: fused.inv_freq as torch computes it
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
@@ -41,14 +43,31 @@ pub const Kernels = struct {
         for ([_][2]usize{ .{ 8, 8 }, .{ 2, 10 }, .{ 2, 16 } }, 0..) |r, i| {
             k.grouped[i] = try k.experts_mod.function(try exl3.groupedSymbol(&buf, .mul1, r[0], r[1]));
         }
+        k.rope_mod = try cuda.Module.load(d, cuda.kernels.glm53_rope);
+        errdefer k.rope_mod.unload();
+        k.inv_freq = try k.rope_mod.function("glm53_inv_freq");
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.rope_mod.unload();
         k.experts_mod.unload();
         k.linear_mod.unload();
+    }
+
+    /// fused.inv_freq(dim, theta): fp32 [dim / 2] into `out` on `s`, the bytes torch computes on the GPU
+    /// (glm53_rope.cu: 1 / powf(theta, 2i * (1 / dim))).
+    pub fn invFreq(k: *const Kernels, s: cuda.Stream, out: u64, dim: usize, theta: f64) !void {
+        const half = dim / 2;
+        var a: cuda.Args = .{};
+        a.add(out);
+        a.add(int(half));
+        a.add(int(dim));
+        a.add(@as(f32, 1.0) / @as(f32, @floatFromInt(dim)));
+        a.add(@as(f32, @floatCast(theta)));
+        try cuda.launch.launch(k.inv_freq, .{ .grid = .{ .x = u((half + 127) / 128) }, .block = .{ .x = 128 } }, s, &a);
     }
 
     fn linearFn(k: *const Kernels, k2: usize, wk: usize, g: usize) !cuda.Function {

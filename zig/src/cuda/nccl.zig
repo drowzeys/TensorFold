@@ -69,3 +69,41 @@ pub const Library = struct {
         return v;
     }
 };
+
+/// One rank's NCCL communicator (ncclCommInitRank) and the collectives the GLM-5.3 engine runs on its compute stream:
+/// every call is enqueued on `stream` (stream order is the only ordering; nothing here synchronizes).
+pub const Communicator = struct {
+    lib: *const Library,
+    comm: Comm,
+    rank: usize,
+    world: usize,
+
+    /// Rank 0 makes the id (ncclGetUniqueId) and hands its 128 bytes to the other ranks (rendezvous.zig).
+    pub fn uniqueId(lib: *const Library) Error!UniqueId {
+        var id: UniqueId = undefined;
+        try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
+        return id;
+    }
+
+    /// Joins the world: blocks until every rank has called it with the same id (the CUDA context must be current).
+    pub fn init(lib: *const Library, id: UniqueId, rank: usize, world: usize) Error!Communicator {
+        var c: Comm = null;
+        try lib.check(lib.api.ncclCommInitRank(&c, @intCast(world), id, @intCast(rank)), "ncclCommInitRank");
+        return .{ .lib = lib, .comm = c, .rank = rank, .world = world };
+    }
+
+    pub fn deinit(self: *Communicator) void {
+        _ = self.lib.api.ncclCommDestroy(self.comm);
+        self.* = undefined;
+    }
+
+    /// recv [world * count] <- every rank's send [count] in rank order (comm.NCCL.all_gather).
+    pub fn allGather(self: *const Communicator, send: D, recv: D, count: usize, dt: DataType, stream: abi.Stream) Error!void {
+        try self.lib.check(self.lib.api.ncclAllGather(send, recv, count, dt, self.comm, stream), "ncclAllGather");
+    }
+
+    /// recv <- the sum of every rank's send (NCCL's ring: ranks alike, the order depends on the size).
+    pub fn allReduce(self: *const Communicator, send: D, recv: D, count: usize, dt: DataType, op: RedOp, stream: abi.Stream) Error!void {
+        try self.lib.check(self.lib.api.ncclAllReduce(send, recv, count, dt, op, self.comm, stream), "ncclAllReduce");
+    }
+};

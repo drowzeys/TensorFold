@@ -31,6 +31,8 @@ const kernels = [_]Kernel{
     // extensions' extra_cuda_cflags (tensorfold_exl3_linear_v5, tensorfold_exl3_experts_v4)
     .{ .name = "glm53_exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
     .{ .name = "glm53_exl3_experts", .flags = &.{ "-O3", "-lineinfo" } },
+    // ours: fused.inv_freq's float32 bytes (torch computes them on the GPU with powf; torch's default nvcc flags)
+    .{ .name = "glm53_rope", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -118,6 +120,13 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     glm_tool.addImport("glm53", mods.glm53);
     const glm_exe = b.addExecutable(.{ .name = "tf-glm53-layers", .root_module = glm_tool });
     b.step("tf-glm53-layers", "GLM-5.3's first N layers against the Python oracle's fixtures (CUDA)").dependOn(&b.addInstallArtifact(glm_exe, .{}).step);
+    // tf-glm53-generate: full GLM-5.3 at TP over NCCL, greedy, one process a rank (Phase 2a)
+    const gen_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_generate.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    gen_tool.addImport("cuda", cuda);
+    gen_tool.addImport("core", mods.core);
+    gen_tool.addImport("glm53", mods.glm53);
+    const gen_exe = b.addExecutable(.{ .name = "tf-glm53-generate", .root_module = gen_tool });
+    b.step("tf-glm53-generate", "Full GLM-5.3 at tensor parallelism over NCCL, greedy, one process a rank (CUDA)").dependOn(&b.addInstallArtifact(gen_exe, .{}).step);
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
 }
 
