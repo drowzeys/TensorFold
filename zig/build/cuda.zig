@@ -27,6 +27,10 @@ const kernels = [_]Kernel{
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+    // GLM-5.3's EXL3 kernels: device-only copies of cuda/exl3 (tools/glm53/copy_exl3_kernels.py), the Python
+    // extensions' extra_cuda_cflags (tensorfold_exl3_linear_v5, tensorfold_exl3_experts_v4)
+    .{ .name = "glm53_exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } },
+    .{ .name = "glm53_exl3_experts", .flags = &.{ "-O3", "-lineinfo" } },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -57,7 +61,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, glm53: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -67,7 +71,11 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer };
+    // full GLM-5.3 (glm_moe_dsa) on CUDA: Phase 1, the layer slice against the Python engine (not a native family yet)
+    const glm53 = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_moe_dsa/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm53.addImport("cuda", cuda);
+    glm53.addImport("core", core);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .glm53 = glm53 };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -103,6 +111,13 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+    // tf-glm53-layers: GLM-5.3's first layers against tools/glm53/oracle.py's fixtures, bit for bit (Phase 1)
+    const glm_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm53_layers.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm_tool.addImport("cuda", cuda);
+    glm_tool.addImport("core", mods.core);
+    glm_tool.addImport("glm53", mods.glm53);
+    const glm_exe = b.addExecutable(.{ .name = "tf-glm53-layers", .root_module = glm_tool });
+    b.step("tf-glm53-layers", "GLM-5.3's first N layers against the Python oracle's fixtures (CUDA)").dependOn(&b.addInstallArtifact(glm_exe, .{}).step);
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
 }
 
@@ -148,6 +163,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const mods = family(b, host, .debug, cuda, draft_ids);
     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // `zig build test-glm53`: the CUDA runtime's tests (aot variant keys among them) and the GLM-5.3 family's, host
+    // only (kept out of `test` while the family is a Phase 1 port)
+    const glm_step = b.step("test-glm53", "Host-side tests of the CUDA runtime (Triton AOT keys) and the GLM-5.3 CUDA family (no GPU)");
+    for ([_]*std.Build.Module{ cuda, mods.glm53 }) |m| glm_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);

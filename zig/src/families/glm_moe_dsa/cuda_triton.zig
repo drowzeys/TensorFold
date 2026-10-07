@@ -1,0 +1,173 @@
+//! GLM-5.3's Triton kernels from the captured cubins: each launch has the Python call site's grid, constexprs and
+//! launch options (fused.py, glm5_next glue.py / latent.py, topk.py). Only constexprs the call site passes are
+//! matched (defaults it leaves out are not: aot.find ignores constexprs a launch does not name).
+const std = @import("std");
+const cuda = @import("cuda");
+const aot = cuda.aot;
+
+const p = aot.ptr;
+
+fn int(name: []const u8, v: usize) aot.Arg {
+    return aot.int(name, @intCast(v));
+}
+
+fn ci(name: []const u8, v: usize) aot.Const {
+    return aot.ci(name, @intCast(v));
+}
+
+fn cb(name: []const u8, v: bool) aot.Const {
+    return aot.ci(name, @intFromBool(v));
+}
+
+fn u(x: usize) u32 {
+    return @intCast(x);
+}
+
+pub fn cdiv(a: usize, b: usize) usize {
+    return (a + b - 1) / b;
+}
+
+pub fn pow2(n: usize) usize {
+    return std.math.ceilPowerOfTwo(usize, n) catch unreachable;
+}
+
+/// A Python float constexpr as Triton stores it: the fp32 nearest the fp64 value.
+pub fn f32of(x: f64) f32 {
+    return @floatCast(x);
+}
+
+/// fused.ATTN_DECODE / ATTN_PROMPT: (keys a chunk program, keys a tile, warps, stages) by window class.
+pub const AttnTiling = struct { chk: usize, kt: usize, nw: u32, ns: u32 };
+pub const attn_decode: AttnTiling = .{ .chk = 256, .kt = 32, .nw = 4, .ns = 2 };
+pub const attn_prompt: AttnTiling = .{ .chk = 2048, .kt = 64, .nw = 8, .ns = 2 };
+
+/// fused.RB: rows a program in the absorb / expand kernels for wide windows.
+pub const rb: usize = 16;
+/// fused.BT: keys a scoring program.
+pub const bt: usize = 128;
+/// glue.ROUTER_KS: the router's K slices.
+pub const router_ks: usize = 8;
+
+/// The MLA shapes every attention launch compiles in (this rank's heads).
+pub const Mla = struct { heads: usize, nope: usize, rope: usize, lw: usize, vd: usize, topk: usize };
+
+pub const Tri = struct {
+    set: *const aot.Set,
+    s: cuda.Stream,
+
+    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const, opts: aot.Launch) !void {
+        try t.set.runWith(t.s, name, .{ u(grid[0]), u(grid[1]), u(grid[2]) }, args, consts, opts);
+    }
+
+    /// glue.rmsnorm (no group sums): out = bf16(w * bf16(x * rinv)).
+    pub fn rmsnorm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, o_stride: usize, rows: usize, d: usize, eps: f32) !void {
+        const block = pow2(d);
+        try t.run("_rmsnorm", .{ rows, 1, 1 }, &.{ p("X", "*bf16", x), int("x_stride", x_stride), p("W", "*bf16", w), p("OUT", "*bf16", out), int("o_stride", o_stride), p("XS", "*bf16", out), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", block), cb("SUMS", false) }, .{ .num_warps = if (block <= 2048) 4 else 8 });
+    }
+
+    /// glue.router: OUT[m, e] = fp32 x[m] . w[e] over ROUTER_KS K slices, the slices added in order. `part`: fp32
+    /// scratch of ROUTER_KS * m * ne.
+    pub fn router(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
+        if (d % (router_ks * 64) != 0) return error.RouterUnsliced; // TODO: glue's single-pass _router branch
+        const bm: usize = if (m <= 16) 16 else if (m <= 32) 32 else if (m <= 64) 64 else 128;
+        try t.run("_router_part", .{ cdiv(m, bm), cdiv(ne, 32), router_ks }, &.{ p("X", "*bf16", x), p("W", "*bf16", w), p("PART", "*fp32", part), int("M", m), int("x_stride", x_stride) }, &.{ ci("D", d), ci("NE", ne), ci("BM", bm), ci("BLOCK_E", 32), ci("BK", 64), ci("KS", router_ks) }, .{ .num_warps = 4, .num_stages = 3 });
+        const total = m * ne;
+        try t.run("_router_sum", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", "*fp32", part), p("OUT", "*fp32", out), int("total", total) }, &.{ ci("KS", router_ks), ci("BLOCK", 1024) }, .{ .num_warps = 4 });
+    }
+
+    /// fused.route's glue._topk: sigmoid scores + bias pick TOPK experts (lower id on ties), weights normalized and
+    /// scaled; SLOTS = TOPK (no shared slot).
+    pub fn topk(t: Tri, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, ne: usize, k: usize, scale: f32, norm: bool) !void {
+        try t.run("_topk", .{ rows, 1, 1 }, &.{ p("L", "*fp32", logits), p("BIAS", "*fp32", bias), p("PICK", "*i32", pick), p("WTS", "*fp32", wts), aot.float("scale", scale) }, &.{ ci("NE", ne), ci("TOPK", k), ci("SLOTS", k), ci("BLOCK", pow2(ne + 1)), ci("SLOTP", pow2(k + 1)), cb("NORM", norm) }, .{ .num_warps = 4 });
+    }
+
+    /// glue.residual_add: X = bf16(X + bf16(the world partials summed rank 0 first)); g [world, rows, d] fp32.
+    pub fn residualAdd(t: Tri, x: u64, g: u64, rows: usize, d: usize, world: usize) !void {
+        const block = @min(1024, d);
+        try t.run("_residual_add", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", x), p("G", "*fp32", g), int("RS", rows * d) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", block) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._kv_write (bf16 cache, DCP 1, one stream): row r's latent RMSNorm and rotated key into cache row POS + r.
+    pub fn kvWrite(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, inv: u64, eps: f32, rows: usize, m: Mla) !void {
+        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", 1), ci("RANK", 0), cb("ROWS", false) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._ik_write: the index key's LayerNorm (fp32, bias) and RoPE on its first RD dims into IC[POS + r].
+    pub fn ikWrite(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, rows: usize, d: usize, rd: usize) !void {
+        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", 1), ci("RANK", 0), cb("ROWS", false) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._iq_rope: the index query's first RD dims rotated in place.
+    pub fn iqRope(t: Tri, q: u64, inv: u64, pos: u64, rows: usize, nh: usize, d: usize, rd: usize) !void {
+        try t.run("_iq_rope", .{ rows, nh, 1 }, &.{ p("Q", "*bf16", q), p("INV", "*fp32", inv), p("POS", "*i32", pos) }, &.{ ci("NH", nh), ci("D", d), ci("RD", rd), cb("ROWS", false) }, .{ .num_warps = 1 });
+    }
+
+    /// fused._index_scores with PACK False (the radix select's 4-byte order words; later keys 0): OUT [n, T] int32.
+    pub fn indexScores(t: Tri, q: u64, w: u64, ic: u64, pos: u64, out: u64, T: usize, r0: usize, n: usize, nh: usize, d: usize) !void {
+        const ws = f32of(std.math.pow(f64, @floatFromInt(nh), -0.5));
+        const qs = f32of(std.math.pow(f64, @floatFromInt(d), -0.5));
+        try t.run("_index_scores", .{ n, cdiv(T, bt), 1 }, &.{ p("Q", "*bf16", q), p("W", "*fp32", w), p("IC", "*bf16", ic), p("POS", "*i32", pos), p("OUT", "*i32", out), int("T", T), int("R0", r0) }, &.{ ci("NH", nh), ci("D", d), ci("BTT", bt), aot.cf("WSCALE", ws), aot.cf("QSCALE", qs), ci("DCP", 1), ci("RANK", 0), cb("PACK", false), cb("ROWS", false) }, .{ .num_warps = 2, .num_stages = 2 });
+    }
+
+    /// topk.top_columns over int32 order words: row r's K best columns, ascending, ties to the lower column.
+    pub fn selectKeys(t: Tri, sc: u64, out: u64, nc: usize, rows: usize, k: usize) !void {
+        try t.run("_select_keys", .{ rows, 1, 1 }, &.{ p("S", "*i32", sc), p("OUT", "*i32", out), int("NC", nc) }, &.{ ci("K", k), ci("BLOCK", 1024), cb("KEYS", false), cb("U32", true) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._absorb: QA[r, h] = q_nope[r, h] . WK[h] and the rotated q_rot (row-block grid).
+    pub fn absorb(t: Tri, q: u64, wk: u64, inv: u64, qa: u64, qr: u64, pos: u64, rows: usize, m: Mla) !void {
+        const rbk = if (rows > rb) rb else rows;
+        try t.run("_absorb", .{ m.heads, m.lw / 32, cdiv(rows, rbk) }, &.{ p("Q", "*bf16", q), p("WK", "*bf16", wk), p("INV", "*fp32", inv), p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("POS", "*i32", pos), int("R", rows) }, &.{ ci("H", m.heads), ci("QD", m.nope + m.rope), ci("NOPE", m.nope), ci("NOPE_P", pow2(m.nope)), ci("RD", m.rope), ci("LW", m.lw), ci("BN", 32), ci("RBK", rbk), cb("ROWS", false) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._attention_local (bf16 cache, one stream): one pass straight into `ol` when one chunk covers index_topk
+    /// keys, else chunk partials and latent._merge.
+    pub fn attention(t: Tri, qa: u64, qr: u64, cache: u64, tok: u64, pos: u64, po: u64, pm: u64, pl: u64, ol: u64, dummy: u64, rows: usize, m: Mla, tl: AttnTiling) !void {
+        const nch = @max(1, m.topk / tl.chk);
+        const scale = f32of(std.math.pow(f64, @floatFromInt(m.nope + m.rope), -0.5));
+        const opts: aot.Launch = .{ .num_warps = tl.nw, .num_stages = tl.ns };
+        const common = [_]aot.Const{ ci("H", m.heads), ci("LW", m.lw), ci("RD", m.rope), ci("K", m.topk), ci("CHK", tl.chk), ci("KTT", tl.kt), aot.cf("SCALE", scale), cb("ROWS", false) };
+        if (nch == 1) {
+            var direct: [common.len + 1]aot.Const = undefined;
+            @memcpy(direct[0..common.len], &common);
+            direct[common.len] = cb("DIRECT", true);
+            try t.run("_attn_chunks", .{ rows, 1, 1 }, &.{ p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("POS", "*i32", pos), p("PO", "*bf16", ol), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows) }, &direct, opts);
+            return;
+        }
+        try t.run("_attn_chunks", .{ rows, nch, 1 }, &.{ p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("POS", "*i32", pos), p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows) }, &common, opts);
+        try t.run("_merge", .{ rows, m.heads, 1 }, &.{ p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), p("OUT", "*bf16", ol), p("CNT", "*i32", dummy), int("R", rows) }, &.{ ci("H", m.heads), ci("LW", m.lw), ci("NCH", nch), cb("SPARSE", false) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._expand: OUT[r, h, n] = sum_k OL[r, h, k] WV[h, n, k].
+    pub fn expand(t: Tri, ol: u64, wv: u64, out: u64, rows: usize, m: Mla) !void {
+        const rbk = if (rows > rb) rb else rows;
+        try t.run("_expand", .{ m.heads, m.vd / 16, cdiv(rows, rbk) }, &.{ p("OL", "*bf16", ol), p("WV", "*bf16", wv), p("OUT", "*bf16", out), int("R", rows) }, &.{ ci("H", m.heads), ci("DV", m.vd), ci("LW", m.lw), ci("BN", 16), ci("RBK", rbk) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._swiglu2: bf16(bf16(silu(g)) * u) for separate gate and up rows of `width`.
+    pub fn swiglu2(t: Tri, g: u64, up: u64, out: u64, rows: usize, width: usize) !void {
+        const blk = std.math.gcd(@as(usize, 512), width);
+        try t.run("_swiglu2", .{ rows, width / blk, 1 }, &.{ p("G", "*bf16", g), p("U", "*bf16", up), p("OUT", "*bf16", out) }, &.{ ci("W", width), ci("BLOCK", blk) }, .{ .num_warps = 4 });
+    }
+};
+
+/// fused.bucket: the indexer's key range for a window whose last row sits at t - 1 (INDEX_SPLIT 1); null while
+/// t <= topk (no selection).
+pub fn bucket(t: usize, topk: usize) ?usize {
+    if (t <= topk) return null;
+    const pw = std.math.ceilPowerOfTwo(usize, t) catch unreachable; // 1 << (t - 1).bit_length()
+    return @max(2 * topk, pw);
+}
+
+test "index buckets as fused.bucket (INDEX_SPLIT 1)" {
+    try std.testing.expectEqual(@as(?usize, null), bucket(2048, 2048));
+    try std.testing.expectEqual(@as(?usize, 4096), bucket(2049, 2048));
+    try std.testing.expectEqual(@as(?usize, 32768), bucket(20001, 2048));
+    try std.testing.expectEqual(@as(?usize, 32768), bucket(32768, 2048));
+    try std.testing.expectEqual(@as(?usize, 65536), bucket(32769, 2048));
+}
+
+test "constexpr floats: the fp32 nearest Python's float" {
+    try std.testing.expectEqual(@as(u32, 0x3d800000), @as(u32, @bitCast(f32of(std.math.pow(f64, 256.0, -0.5)))));
+    try std.testing.expectEqual(@as(u32, 0x3e3504f3), @as(u32, @bitCast(f32of(std.math.pow(f64, 32.0, -0.5)))));
+}
