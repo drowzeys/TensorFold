@@ -36,8 +36,8 @@ fn match(ours: []const f32, theirs: []const f32, width: usize) Match {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 4) {
-        std.debug.print("usage: tf-qwen-image-dit weights.safetensors case.safetensors latents.out\n", .{});
+    if (args.len != 4 and args.len != 5) {
+        std.debug.print("usage: tf-qwen-image-dit weights.safetensors case.safetensors latents.out [float | int8-float-attention]\n", .{});
         return error.BadArguments;
     }
     const gpa = init.gpa;
@@ -57,7 +57,9 @@ pub fn main(init: std.process.Init) !void {
     const final = try case.copy(f32, gpa, try case.at("final", .f32, count), count);
 
     const loading = mtl.clock.seconds();
-    const model = try qi.Model.load(gpa, args[1], rows, text);
+    const int8 = args.len == 4 or !std.mem.eql(u8, args[4], "float");
+    const model = try qi.Model.load(gpa, args[1], rows, text, int8);
+    if (args.len == 5 and std.mem.eql(u8, args[4], "int8-float-attention")) model.attention8 = false;
     const half = rows * qi.head_dim / 2;
     model.setRotary(try case.copy(f32, gpa, try case.at("cos", .f32, half), half), try case.copy(f32, gpa, try case.at("sin", .f32, half), half));
     var name: [32]u8 = undefined;
@@ -71,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(vals);
         model.setPrompt(i, keys, vals);
     }
-    std.debug.print("{s}: {d} image rows after {d} prompt rows, {d} steps, loaded in {d:.2} s\n", .{ device.name(), rows, text, steps, mtl.clock.seconds() - loading });
+    std.debug.print("{s}: {d} image rows after {d} prompt rows, {d} steps, {s} projections, loaded in {d:.2} s\n", .{ device.name(), rows, text, steps, if (int8) "int8" else "float", mtl.clock.seconds() - loading });
 
     const x = try gpa.alloc(f32, count);
     defer gpa.free(x);
