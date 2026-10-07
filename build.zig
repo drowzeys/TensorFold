@@ -368,6 +368,18 @@ fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         b.step(p.name, p.about).dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    // Qwen-Image-2.1's transformer: the image rows' denoising forward against a Python case (M5 tensor units).
+    const qi_kernels = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/qwen_image/kernels.zig") });
+    const qi_tensors = b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target, .optimize = optimize });
+    const qi_mod = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen_image/qwen_image.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "safetensors", .module = qi_tensors }, .{ .name = "qwen_image_kernels", .module = qi_kernels } } });
+    const qi_dit = b.addExecutable(.{ .name = "tf-qwen-image-dit", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/qwen_image_dit.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "qwen_image", .module = qi_mod } },
+    }) });
+    b.step("tf-qwen-image-dit", "Qwen-Image-2.1's native transformer against a Python case: velocity, every step, timings").dependOn(&b.addInstallArtifact(qi_dit, .{}).step);
     // The core row projection (chips without tensor units) on synthetic matrices; runs on any Mac's GPU
     const row_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/row_projection.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } });
     const row_check = b.addExecutable(.{ .name = "tf-row-check", .root_module = b.createModule(.{
