@@ -67,7 +67,7 @@ pub fn rule(name: []const u8) !Kind {
     var rep = std.mem.startsWith(u8, name, "model.embed_tokens.") or std.mem.eql(u8, name, "model.norm.weight");
     for (rep_suffix) |s| rep = rep or std.mem.endsWith(u8, name, s);
     if (row == rep) {
-        std.log.err("{s}: no split rule (or more than one)", .{name});
+        if (!@import("builtin").is_test) std.log.err("{s}: no split rule (or more than one)", .{name}); // the test expects it
         return error.NoSplitRule;
     }
     return if (row) .row else .rep;
