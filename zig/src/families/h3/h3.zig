@@ -60,7 +60,9 @@ const Quant = struct { w: mtl.Buffer, s: mtl.Buffer };
 const Block = struct { q: Quant, k: Quant, v: Quant, compress: Quant, out: Quant, fc_gate: Quant, fc_value: Quant, fc2: Quant, norm1: Ref, norm2: Ref, norm_q: Ref, norm_k: Ref, tables: Ref };
 
 /// Kernel shapes under test; `defines` goes ahead of the kernels' source.
-pub const Options = struct { swiglu_rows: usize = 128, defines: []const u8 = "" };
+/// `tile_scales` rounds k and v with one scale a (tile, head) rather than one a row: 0.09 s a forward less at
+/// 864x480x124f, the attention kernel reading two scales a key tile instead of 128.
+pub const Options = struct { swiglu_rows: usize = 128, tile_scales: bool = true, defines: []const u8 = "" };
 
 pub const Timing = struct { wall: f64, gpu: f64 };
 
@@ -149,6 +151,8 @@ pub const Model = struct {
     audio_velocity: mtl.Buffer,
     /// Every query tile attends to every tile and the pooled branch is left out (not what the checkpoint was trained for).
     dense: bool = false,
+    /// One k and one v scale a key tile instead of one a key (the kernels' H3_TILE_SCALES).
+    tile_scales: bool = false,
     /// Rows one threadgroup of the SwiGLU's first product owns.
     swiglu_rows: usize = 128,
     profile: bool = false,
@@ -178,6 +182,7 @@ pub const Model = struct {
         self.case = case;
         self.dense = false;
         self.swiglu_rows = options.swiglu_rows;
+        self.tile_scales = options.tile_scales;
         self.profile = false;
         self.spent = @splat(0);
         self.checkpoint = try Checkpoint.open(gpa, device, checkpoint_dir, shards);
@@ -212,7 +217,7 @@ pub const Model = struct {
         const times = (case.names.get("final") orelse return error.MissingTensor).shape[0];
 
         // the kernels take the model's sizes as compile-time values
-        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n#define H3_SWT {d}\n{s}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, options.swiglu_rows, options.defines, kernels.source });
+        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n#define H3_SWT {d}\n{s}{s}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, options.swiglu_rows, if (options.tile_scales) "#define H3_TILE_SCALES\n" else "", options.defines, kernels.source });
         defer gpa.free(source);
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -394,6 +399,28 @@ pub const Model = struct {
         enc.dispatchGroups(mtl.Size.of(width, count, 1), mtl.Size.of(32, 1, 1));
     }
 
+    /// q, k and v into tile order as int8; `mode` as the kernel's P[3].
+    fn headsLayout(self: *const Model, enc: mtl.ComputeEncoder, b: *const Block, mode: i32) void {
+        enc.setPipeline(self.pipeline("h3_heads_q8"));
+        enc.setBuffer(self.qr, 0, 0);
+        enc.setBuffer(self.kr, 0, 1);
+        enc.setBuffer(self.vr, 0, 2);
+        enc.setBuffer(b.norm_q.buffer, b.norm_q.offset, 3);
+        enc.setBuffer(b.norm_k.buffer, b.norm_k.offset, 4);
+        enc.setBuffer(self.cos.buffer, self.cos.offset, 5);
+        enc.setBuffer(self.sin.buffer, self.sin.offset, 6);
+        enc.setBuffer(self.slot.buffer, self.slot.offset, 7);
+        enc.setValue([4]i32{ @intCast(self.rows), @intCast(self.heads), @intCast(self.rot), mode }, 8);
+        enc.setValue([1]f32{eps}, 9);
+        enc.setBuffer(self.tq8, 0, 10);
+        enc.setBuffer(self.tqs, 0, 11);
+        enc.setBuffer(self.tk8, 0, 12);
+        enc.setBuffer(self.tks, 0, 13);
+        enc.setBuffer(self.tv8, 0, 14);
+        enc.setBuffer(self.tvs, 0, 15);
+        enc.dispatchGroups(mtl.Size.of(self.rows, self.heads, 1), mtl.Size.of(32, 1, 1));
+    }
+
     fn attend(self: *const Model, enc: mtl.ComputeEncoder, list: mtl.Buffer, queries: usize, keys: usize, first: usize, per_query: bool) void {
         enc.setPipeline(self.pipeline("h3_attention_tiles"));
         enc.setBuffer(self.tq8, 0, 0);
@@ -443,24 +470,17 @@ pub const Model = struct {
             self.product(enc.*, "h3_i8_in", self.q8, self.xs, b.v, self.vr, self.inner);
             if (!self.dense) self.product(enc.*, "h3_i8_in", self.q8, self.xs, b.compress, self.cr, self.inner);
             self.lap(&pass, "q k v gate");
-            enc.setPipeline(self.pipeline("h3_heads_q8"));
-            enc.setBuffer(self.qr, 0, 0);
-            enc.setBuffer(self.kr, 0, 1);
-            enc.setBuffer(self.vr, 0, 2);
-            enc.setBuffer(b.norm_q.buffer, b.norm_q.offset, 3);
-            enc.setBuffer(b.norm_k.buffer, b.norm_k.offset, 4);
-            enc.setBuffer(self.cos.buffer, self.cos.offset, 5);
-            enc.setBuffer(self.sin.buffer, self.sin.offset, 6);
-            enc.setBuffer(self.slot.buffer, self.slot.offset, 7);
-            enc.setValue([3]i32{ @intCast(rows), @intCast(heads), @intCast(self.rot) }, 8);
-            enc.setValue([1]f32{eps}, 9);
-            enc.setBuffer(self.tq8, 0, 10);
-            enc.setBuffer(self.tqs, 0, 11);
-            enc.setBuffer(self.tk8, 0, 12);
-            enc.setBuffer(self.tks, 0, 13);
-            enc.setBuffer(self.tv8, 0, 14);
-            enc.setBuffer(self.tvs, 0, 15);
-            enc.dispatchGroups(mtl.Size.of(rows, heads, 1), mtl.Size.of(32, 1, 1));
+            if (self.tile_scales) {
+                self.headsLayout(enc.*, b, 1);
+                enc.barrier();
+                enc.setPipeline(self.pipeline("h3_tile_scales"));
+                enc.setBuffer(self.tks, 0, 0);
+                enc.setBuffer(self.tvs, 0, 1);
+                enc.setBuffer(self.sizes.buffer, self.sizes.offset, 2);
+                enc.dispatchGroups(mtl.Size.of(self.tiles, heads, 1), mtl.Size.of(32, 1, 1));
+                enc.barrier();
+                self.headsLayout(enc.*, b, 2);
+            } else self.headsLayout(enc.*, b, 0);
             self.lap(&pass, "heads");
             if (self.dense) {
                 self.attend(enc.*, self.all_tiles, self.tiles, self.tiles, 0, false);

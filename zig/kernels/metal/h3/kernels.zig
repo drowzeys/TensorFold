@@ -1,4 +1,4 @@
 //! MiniMax H3's kernels: Qwen-Image's source (the int8 products) followed by this family's, compiled at load.
 const qi = @import("qwen_image_kernels");
 pub const source = qi.source ++ @embedFile("h3.metal");
-pub const names = [_][:0]const u8{ "h3_quant_weight_t", "h3_rows_in", "h3_norm_q8", "h3_gate_add", "h3_heads_q8", "h3_pool", "h3_tile_scores", "h3_topk", "h3_coarse", "h3_attention_tiles", "h3_gate_mix", "h3_i8_in", "h3_i8_out", "h3_final_norm", "h3_rows_out", "qi_quant_rows", "qi_i8_linear_wide", "qi_i8_swiglu", "h3_i8_swiglu" };
+pub const names = [_][:0]const u8{ "h3_quant_weight_t", "h3_rows_in", "h3_norm_q8", "h3_gate_add", "h3_heads_q8", "h3_tile_scales", "h3_pool", "h3_tile_scores", "h3_topk", "h3_coarse", "h3_attention_tiles", "h3_gate_mix", "h3_i8_in", "h3_i8_out", "h3_final_norm", "h3_rows_out", "qi_quant_rows", "qi_i8_linear_wide", "qi_i8_swiglu", "h3_i8_swiglu" };
