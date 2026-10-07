@@ -1,4 +1,7 @@
 //! A captured set of Triton cubins (aot.json + cubins/): each launch picks the variant Triton itself would have picked.
+//! Variants of one function with the same constexprs and specialization but other launch options (num_warps,
+//! num_stages: Python passes them per call site, e.g. GLM-5.3's decode vs prompt attention tilings) are told apart by
+//! the caller's `Launch`; a launch that leaves them open while captured variants differ in them is refused.
 
 const std = @import("std");
 const abi = @import("abi.zig");
@@ -14,6 +17,7 @@ const KernelJson = struct {
     hash: []const u8,
     name: []const u8,
     num_warps: u32,
+    num_stages: u32 = 0, // 0: not recorded (sets packed before num_stages was kept); such a variant matches any pin
     num_ctas: u32 = 1,
     shared: u32 = 0,
     global_scratch: u32 = 0,
@@ -53,6 +57,38 @@ pub fn ci(name: []const u8, v: i64) Const {
 }
 pub fn cf(name: []const u8, v: f32) Const {
     return .{ .name = name, .f32 = v };
+}
+
+/// The launch options Python passes beside the arguments (`num_warps=`, `num_stages=`); null: whatever was captured.
+pub const Launch = struct {
+    num_warps: ?u32 = null,
+    num_stages: ?u32 = null,
+
+    fn admits(self: Launch, k: KernelJson) bool {
+        if (self.num_warps) |w| if (k.num_warps != w) return false;
+        if (self.num_stages) |s| if (k.num_stages != 0 and k.num_stages != s) return false;
+        return true;
+    }
+};
+
+pub const PickError = error{ MissingTritonVariant, AmbiguousTritonVariant };
+
+/// Index into `specs` of `function`'s variant for this launch: constexprs, specialization and the launch options.
+/// Several matches that differ in num_warps or num_stages are refused unless `opts` pins the one meant (the first
+/// match is no answer: it is whichever sorted first in aot.json).
+pub fn pick(specs: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) PickError!usize {
+    var found: ?usize = null;
+    for (specs, 0..) |k, i| {
+        if (!std.mem.eql(u8, k.@"fn", function)) continue;
+        if (!opts.admits(k) or !matches(k, args, consts)) continue;
+        if (found) |f| {
+            const a = specs[f];
+            if (a.num_warps != k.num_warps or a.num_stages != k.num_stages) return error.AmbiguousTritonVariant;
+            continue;
+        }
+        found = i;
+    }
+    return found orelse error.MissingTritonVariant;
 }
 
 const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
@@ -98,13 +134,20 @@ pub const Set = struct {
         self.* = undefined;
     }
 
-    /// The variant of `function` compiled for these constexprs and these arguments' specialization.
+    /// The variant of `function` compiled for these constexprs, this specialization and these launch options.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
-        for (self.variants) |*v| {
-            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+        return self.findWith(function, args, consts, .{});
+    }
+
+    pub fn findWith(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) !*const Variant {
+        // variants[i] was loaded from parsed.value.kernels[i]
+        if (pick(self.parsed.value.kernels, function, args, consts, opts)) |i| return &self.variants[i] else |e| {
+            if (e == error.AmbiguousTritonVariant) {
+                std.log.err("several captured Triton variants of {s} match; pin num_warps/num_stages (Launch)", .{function});
+                return e;
+            }
         }
-        std.log.err("no captured Triton variant of {s} for this launch:", .{function});
+        std.log.err("no captured Triton variant of {s} for this launch (warps {?d}, stages {?d}):", .{ function, opts.num_warps, opts.num_stages });
         for (args) |a| switch (a.value) {
             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
             .i32 => |x| std.log.err("  {s}: i32 {d}", .{ a.name, x }),
@@ -127,7 +170,12 @@ pub const Set = struct {
 
     /// Launches `function` on `grid` as Triton's launcher would: runtime arguments in the variant's order, scratch null.
     pub fn run(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const) !void {
-        const v = try self.find(function, args, consts);
+        return self.runWith(stream, function, grid, args, consts, .{});
+    }
+
+    /// `run` with the call site's launch options (num_warps / num_stages) pinned.
+    pub fn runWith(self: *const Set, stream: Stream, function: []const u8, grid: [3]u32, args: []const Arg, consts: []const Const, opts: Launch) !void {
+        const v = try self.findWith(function, args, consts, opts);
         var packed_args: launch.Args = .{};
         for (v.spec.params) |p| {
             const a = lookup(args, p.name).?;
@@ -187,4 +235,77 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
         runtime += 1;
     }
     return runtime == k.params.len;
+}
+
+// ---- host tests (no GPU): variant choice from an aot.json as aot_pack.py writes it ----
+
+const test_set =
+    \{"kernels": [
+    \ {"fn": "_attn", "hash": "a", "name": "_attn", "num_warps": 4, "num_stages": 2,
+    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \ {"fn": "_attn", "hash": "b", "name": "_attn", "num_warps": 8, "num_stages": 2,
+    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \ {"fn": "_attn", "hash": "c", "name": "_attn", "num_warps": 8, "num_stages": 1,
+    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false},
+    \             {"name": "R", "type": "i32", "div16": false, "nospec": false}],
+    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "BASE": {"none": true}}},
+    \ {"fn": "_attn", "hash": "d", "name": "_attn", "num_warps": 4, "num_stages": 2,
+    \  "params": [{"name": "Q", "type": "*bf16", "div16": true, "nospec": false}],
+    \  "consts": {"CHK": {"int": 256}, "SCALE": {"f32": 1031798784}, "R": {"int": 1}, "BASE": {"none": true}}},
+    \ {"fn": "_norm", "hash": "e", "name": "_norm", "num_warps": 8,
+    \  "params": [{"name": "X", "type": "*bf16", "div16": true, "nospec": false}],
+    \  "consts": {"D": {"int": 6144}}}
+    \]}
+;
+
+fn parseTestSet() !std.json.Parsed(SetJson) {
+    return std.json.parseFromSlice(SetJson, std.testing.allocator, test_set, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+test "variants that differ only in num_warps / num_stages are told apart by the launch options" {
+    const parsed = try parseTestSet();
+    defer parsed.deinit();
+    const ks = parsed.value.kernels;
+    const args = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 3) };
+    const consts = [_]Const{ ci("CHK", 256), cf("SCALE", 0.0625) };
+    try std.testing.expectEqual(@as(usize, 0), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 2 }));
+    try std.testing.expectEqual(@as(usize, 2), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 1 }));
+    // warps alone: 4 has one variant here, 8 has two (stages 2 and 1)
+    try std.testing.expectEqual(@as(usize, 0), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 4 }));
+    try std.testing.expectError(error.AmbiguousTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 8 }));
+    // no pin at all: the old first-match answer is refused
+    try std.testing.expectError(error.AmbiguousTritonVariant, pick(ks, "_attn", &args, &consts, .{}));
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 2 }));
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 3 }));
+}
+
+test "the specialization still decides: R == 1 folds to a constexpr, a wrong constexpr misses" {
+    const parsed = try parseTestSet();
+    defer parsed.deinit();
+    const ks = parsed.value.kernels;
+    const consts = [_]Const{ ci("CHK", 256), cf("SCALE", 0.0625) };
+    const one = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 1) };
+    try std.testing.expectEqual(@as(usize, 3), try pick(ks, "_attn", &one, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    const unaligned = [_]Arg{ ptr("Q", "*bf16", 0x1008), int("R", 3) };
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &unaligned, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    const other = [_]Const{ ci("CHK", 2048), cf("SCALE", 0.0625) };
+    const three = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 3) };
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &three, &other, .{ .num_warps = 4, .num_stages = 2 }));
+}
+
+test "a single captured variant needs no pin, and a set without num_stages matches any stage pin" {
+    const parsed = try parseTestSet();
+    defer parsed.deinit();
+    const ks = parsed.value.kernels;
+    const x = [_]Arg{ptr("X", "*bf16", 0x2000)};
+    const d = [_]Const{ci("D", 6144)};
+    try std.testing.expectEqual(@as(usize, 4), try pick(ks, "_norm", &x, &d, .{}));
+    try std.testing.expectEqual(@as(usize, 4), try pick(ks, "_norm", &x, &d, .{ .num_warps = 8, .num_stages = 3 }));
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_norm", &x, &d, .{ .num_warps = 4 }));
+    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_nope", &x, &d, .{}));
 }
