@@ -50,7 +50,7 @@ fn advance(x: []f32, velocity: []const f32, seen: f32, ratio: f32) void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 5 and args.len != 6) {
-        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | DEFINE, ...]\n", .{});
+        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | row-scales | DEFINE, ...]\n", .{});
         return error.BadArguments;
     }
     const gpa = init.gpa;
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var case = try h3.Tensors.open(gpa, device, args[3]);
     defer case.deinit();
     const loading = mtl.clock.seconds();
-    // the optional last argument names kernel shapes to try: "dense", "swiglu64", or defines such as "H3_HALF_EXP"
+    // the optional last argument names kernel shapes to try: "dense", "swiglu64", "row-scales", or defines such as "H3_ATT_FIXED"
     var options = h3.Options{};
     var defines: [256]u8 = undefined;
     var used: usize = 0;
@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 6) {
         var it = std.mem.splitScalar(u8, args[5], ',');
         while (it.next()) |word| {
-            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else {
+            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else if (std.mem.eql(u8, word, "row-scales")) options.tile_scales = false else {
                 const text = try std.fmt.bufPrint(defines[used..], "#define {s}\n", .{word});
                 used += text.len;
             }

@@ -120,6 +120,8 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
 // with a scale each and land at the row's slot in tile order.
 // QR, KR, VR: (R, H * 128) bf16. NQ, NK: (128). COS, SIN: (R, ROT) float. SLOT: (R). P: R, H, ROT. E: eps.
 // Q8, K8, V8: (H, H3_SLOTS, 128); QS, KS, VS: (H, H3_SLOTS). Threadgroups [R, H, 1] of [32, 1, 1].
+// P[3]: 0 rounds k and v with a scale a row; 1 only writes each row's k and v scales, for h3_tile_scales to widen
+// to the tile; 2 rounds k and v with the scales it finds there. q always takes a scale a row.
 [[kernel]] void h3_heads_q8(
   const device bfloat* QR [[buffer(0)]],
   const device bfloat* KR [[buffer(1)]],
@@ -172,16 +174,42 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
   const float ktop = max(simd_max(max(max(ak.x, ak.y), max(ak.z, ak.w))), 1e-12f);
   const float vtop = max(simd_max(max(max(av.x, av.y), max(av.z, av.w))), 1e-12f);
   const long at = long(head) * H3_SLOTS + SLOT[row];
-  if (lane == 0) {
-    QS[at] = qtop / 127.0f;
+  const int mode = P[3];
+  if (lane == 0 && mode != 2) {
     KS[at] = ktop / 127.0f;
     VS[at] = vtop / 127.0f;
   }
-  const float qv = 127.0f / qtop, kv = 127.0f / ktop, vv = 127.0f / vtop;
+  if (mode == 1) return;
+  if (lane == 0) QS[at] = qtop / 127.0f;
+  const float qv = 127.0f / qtop, kv = mode == 2 ? 1.0f / KS[at] : 127.0f / ktop, vv = mode == 2 ? 1.0f / VS[at] : 127.0f / vtop;
   for (int j = 0; j < 4; j++) {
     Q8[at * 128 + c0 + j] = int8_t(clamp(int(rint(q[j] * qv)), -127, 127));
     K8[at * 128 + c0 + j] = int8_t(clamp(int(rint(k[j] * kv)), -127, 127));
     V8[at * 128 + c0 + j] = int8_t(clamp(int(rint(v[j] * vv)), -127, 127));
+  }
+}
+
+// One k scale and one v scale a (tile, head): the largest of its real rows', written to all 64 slots, so the
+// attention kernel reads a scale a key tile instead of one a key. KS, VS: (H, H3_SLOTS). SIZES: (tiles).
+// Threadgroups [tiles, H, 1] of [32, 1, 1].
+[[kernel]] void h3_tile_scales(
+  device float* KS [[buffer(0)]],
+  device float* VS [[buffer(1)]],
+  const device int32_t* SIZES [[buffer(2)]],
+  uint lane [[thread_index_in_simdgroup]],
+  uint3 tg [[threadgroup_position_in_grid]]) {
+  const int size = SIZES[tg.x];
+  const long first = long(tg.y) * H3_SLOTS + long(tg.x) * 64;
+  float k = 0.0f, v = 0.0f;
+  for (int s = int(lane); s < size; s += 32) {
+    k = max(k, KS[first + s]);
+    v = max(v, VS[first + s]);
+  }
+  k = max(simd_max(k), 1e-12f / 127.0f);
+  v = max(simd_max(v), 1e-12f / 127.0f);
+  for (int s = int(lane); s < 64; s += 32) {
+    KS[first + s] = k;
+    VS[first + s] = v;
   }
 }
 
@@ -299,7 +327,8 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
 
 // softmax(q k^T scale) v over each query tile's key tiles, int8 scores and values with an online softmax
 // (qi_attention_i8 with a key list): one threadgroup owns one 64-row query tile of one head and walks its tiles,
-// read in place; a tile's rows past its size are padding and take no weight.
+// read in place; a tile's rows past its size are padding and take no weight. With H3_TILE_SCALES the k and v
+// scales are one a (tile, head), read once a key tile: reading one a key cost 0.12 s of 1.55 s a forward.
 // Q, K, V: (H, H3_SLOTS, 128) int8 in tile order. QS, KS, VS: (H, H3_SLOTS). IDX: key tiles, one list per (head,
 // query tile) when P[3], else one list for all. SIZES: (tiles). ROWOF: (H3_SLOTS) the row at a slot, or -1.
 // P: query tiles, keys per list, first query tile, lists per query. SC: scale. Y: (R, H * 128) bf16.
@@ -368,6 +397,9 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
   for (int sel = 0; sel < KSEL; sel++) {
     const int tile = list[sel];
     const int k0 = tile * KEYS, size = SIZES[tile];
+#ifdef H3_TILE_SCALES
+    const float ks = KS[hb + k0], vs = VS[hb + k0];
+#endif
     QI_UNROLL
     for (ushort i = 0; i < C1; i++) acc[i] = 0;
     auto b = k.slice<D, KEYS>(0, k0);
@@ -376,7 +408,11 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
 #endif
     QI_UNROLL
     for (ushort i = 0; i < C1; i++) {
+#ifdef H3_TILE_SCALES
+      const float score = scol[i] < size ? float(acc[i]) * qsc[srow[i]] * ks : -60000.0f;
+#else
       const float score = scol[i] < size ? float(acc[i]) * qsc[srow[i]] * KS[hb + k0 + scol[i]] : -60000.0f;
+#endif
       pt[srow[i] * KEYS + scol[i]] = half(score);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -403,7 +439,11 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
       const float weight = exp(s[j] - next);
 #endif
       total += weight;
+#ifdef H3_TILE_SCALES
+      pt[mine + j] = half(weight * vs * LIFT);
+#else
       pt[mine + j] = half(weight * VS[hb + k0 + first + j] * LIFT);
+#endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     QI_UNROLL
