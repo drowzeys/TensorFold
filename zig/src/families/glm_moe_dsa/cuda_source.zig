@@ -268,6 +268,9 @@ pub const Prefetch = struct {
     /// A read that returned `got` of its `need` bytes: the rest through the plain descriptor (EOF tails, errors).
     fn finish(p: *Prefetch, b: *Batch, rd: Read, got: usize) !void {
         _ = p.read_bytes.fetchAdd(@min(got, rd.need), .monotonic);
+        // a file system without O_DIRECT read through the page cache: those pages go again at once (GB10's
+        // page cache is the memory the weights need)
+        if (!p.direct[rd.file].direct) _ = libc.posix_fadvise(p.plain[rd.file].fd, @intCast(rd.lo), @intCast(rd.len), 4);
         if (got >= rd.need) return;
         _ = p.fallbacks.fetchAdd(1, .monotonic);
         var done = got;
