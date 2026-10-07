@@ -49,8 +49,17 @@ def contract(checkpoint_dir) -> Contract:
     with open(Path(checkpoint_dir) / CONTRACT) as handle:
         raw = json.load(handle)
     sparse = raw.get("attention_backend") == "VIDEO_SPARSE_ATTN_H3"
-    return Contract(tuple(step / 1000.0 for step in raw["dmd_denoising_steps"]), float(raw["video_scheduler_shift"]),
-                    float(raw["audio_scheduler_shift"]), float(raw.get("vsa_sparsity", 0.0)) if sparse else 0.0,
+
+    def shift(key: str, folder: str) -> float:
+        # the preview checkpoints leave the shifts to their scheduler folders
+        if key in raw:
+            return float(raw[key])
+        with open(Path(checkpoint_dir) / folder / "scheduler_config.json") as handle:
+            return float(json.load(handle)["shift"])
+
+    return Contract(tuple(step / 1000.0 for step in raw["dmd_denoising_steps"]),
+                    shift("video_scheduler_shift", "scheduler"), shift("audio_scheduler_shift", "audio_scheduler"),
+                    float(raw.get("vsa_sparsity", 0.0)) if sparse else 0.0,
                     int(raw.get("vsa_tile_size", 64)), str(raw.get("task", "")))
 
 
