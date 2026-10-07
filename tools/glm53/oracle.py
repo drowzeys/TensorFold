@@ -305,6 +305,9 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
         meta["tiles"] = tiles_table(w)
+        meta["tiles_are_plan"] = all(t["split"] == t["plan"] for t in meta["tiles"] if "split" in t)
+        if not meta["tiles_are_plan"]:          # the Zig side runs x3linear.plan's tiles
+            print("[oracle] WARNING: some linears do not run x3linear.plan's tiles (TF_GLM53_TUNE / TILES?)", flush=True)
         common = {"inv": w.inv.clone()}
 
         # -- short chain: prompt 24 rows, then decode 1 and 3 rows -----------------------------------------------

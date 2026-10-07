@@ -80,6 +80,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, model: []const u8, aot_dir: []const u
     if ((try jint(mo.get("world") orelse return error.BadMeta)) != 1) return error.OnlyWorldOne;
     if (mo.get("triton")) |v| if (v == .string) std.debug.print("oracle: torch {s}, triton {s}\n", .{ (mo.get("torch") orelse v).string, v.string });
     if (mo.get("radix_equal")) |v| if (v == .bool and !v.bool) std.debug.print("WARN the oracle's radix and torch.topk selections differ (meta.radix_differs)\n", .{});
+    if (mo.get("tiles_are_plan")) |v| if (v == .bool and !v.bool) std.debug.print("WARN the oracle ran EXL3 tiles other than x3linear.plan's (meta.tiles)\n", .{});
 
     var driver = try cuda.Driver.open();
     defer driver.close();

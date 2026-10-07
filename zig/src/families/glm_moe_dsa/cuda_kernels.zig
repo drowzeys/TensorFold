@@ -136,9 +136,13 @@ pub const Ops = struct {
         if (m < 1 or m > 128) return error.WindowTooWide;
         if (!exl3.groupable(lins)) {
             // x3linear.group falls back to one call a linear
-            for (lins, outs, ys) |l, out, y| try o.linears(&.{l}, x, x_dtype, &.{out}, &.{y}, m, sc);
+            for (lins, outs, ys) |l, out, y| try o.launchGroup(&.{l}, x, x_dtype, &.{out}, &.{y}, m, sc);
             return;
         }
+        try o.launchGroup(lins, x, x_dtype, outs, ys, m, sc);
+    }
+
+    fn launchGroup(o: Ops, lins: []const *const exl3.Linear, x: u64, x_dtype: exl3.DType, outs: []const u64, ys: []const exl3.DType, m: usize, sc: LinearScratch) !void {
         const a = lins[0];
         const kk = a.k;
         const pdl = ((exl3.linear_loads >> 5) & 1) == 1;
