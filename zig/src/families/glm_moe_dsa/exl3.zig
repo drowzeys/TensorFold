@@ -195,7 +195,7 @@ pub const gateup_epilogue_symbol = "_ZN10tf_exl3x_k22gateup_epilogue_kernelEPKfP
 /// experts.py ACT_F32: fused.experts_part calls routed() with the default fp32 SwiGLU, no limit.
 pub const act_f32: c_int = 1;
 
-test "x3linear.plan for GLM-5.3's dense shapes at world 1" {
+test "x3linear.plan for GLM-5.3's dense shapes at world 1 and per rank of world 4" {
     const T = struct { k: usize, n: usize, want: [2]usize };
     const cases = [_]T{
         .{ .k = 6144, .n = 2048, .want = .{ 8, 4 } }, // q_a, shared expert gate/up
@@ -206,6 +206,13 @@ test "x3linear.plan for GLM-5.3's dense shapes at world 1" {
         .{ .k = 6144, .n = 12288, .want = .{ 1, 8 } }, // dense gate/up
         .{ .k = 12288, .n = 6144, .want = .{ 4, 4 } }, // dense down
         .{ .k = 2048, .n = 6144, .want = .{ 4, 4 } }, // shared expert down
+        // one rank of world 4 (Phase 1 and serving): 16 heads, quarter MLP / expert widths
+        .{ .k = 2048, .n = 4096, .want = .{ 4, 4 } }, // q_b (16 heads x 256)
+        .{ .k = 4096, .n = 6144, .want = .{ 4, 4 } }, // o_proj
+        .{ .k = 6144, .n = 3072, .want = .{ 8, 4 } }, // dense gate/up
+        .{ .k = 3072, .n = 6144, .want = .{ 4, 4 } }, // dense down
+        .{ .k = 6144, .n = 512, .want = .{ 8, 4 } }, // shared expert gate/up
+        .{ .k = 512, .n = 6144, .want = .{ 1, 4 } }, // shared expert down
     };
     for (cases) |c| try std.testing.expectEqual(c.want, plan(c.k, c.n));
 }

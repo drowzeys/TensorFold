@@ -1,7 +1,7 @@
 //! GLM-5.3 layer slices on the GPU in the Python engine's layouts (cuda/weights.py load_layer + fused.Weights):
 //! EXL3 linears in the strips layout, kv_b cut into the absorb (wk) and expand (wv) blocks, the indexer's bf16 parts,
 //! the router, and the routed experts as experts.prepare tables (TF_GLM53_EXPERTS=tf: one trellis a matrix).
-//! Reads go through mapped safetensors (core.Checkpoint), each rank's part cut as split.rule says (world 1: whole).
+//! Reads go through mapped safetensors (core.Checkpoint), each rank's part cut as split.rule says (Phase 1: rank 0 of 4).
 //! TODO(P2): O_DIRECT + io_uring streaming (nemotron/cuda_source.zig) instead of mapped reads; the cuda-exl3 shared
 //! stacks (experts_cx) for prompt chunks.
 const std = @import("std");

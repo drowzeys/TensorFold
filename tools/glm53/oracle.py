@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """GLM-5.3's Python CUDA engine (families/glm_moe_dsa, the fused path) as the Zig port's oracle, Phase 1.
 
-One GB10, world 1 (the whole layer on one GPU; fused.gather / head take their world == 1 branches), the first N
+One GB10, rank 0 of world 4 (the serving shapes of one rank: 16 heads, a quarter of each MLP / expert width; the
+replicated q_a / kv_a / indexer), with an IDENTITY communicator (``LocalComm``): no other rank exists, so every
+exchange carries this rank's partial only. fused.gather takes its all-gather branch (the comm has no all_reduce /
+all_to_all), and LocalComm.all_gather writes this rank's slot and ZEROS in the other ranks' slots; glue.residual_add
+then sums [own, 0, 0, 0] in rank order (WORLD 4). The per-layer outputs are therefore rank 0's alone, not the full
+model's: a Phase 1 oracle of one rank's arithmetic, which the Zig side reproduces with the same zero slots. The first N
 layers (default 4: dense 0-2, MoE 3). Two chains of windows over fixed random tokens, the window shapes the Zig
 gate runs:
 
@@ -95,13 +100,22 @@ def sha(t) -> str:
     return hashlib.sha256(raw.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
-class SoloComm:
-    """world 1: nothing to exchange (fused takes its world == 1 branches; this only guards stray calls)."""
+class LocalComm:
+    """One rank of ``world`` with the others absent (an identity communicator). Deliberately no all_reduce and no
+    all_to_all, so fused.gather always takes the all-gather + rank-order-sum branch; all_gather puts this rank's
+    words in its own slot and zeros in every other slot (the absent ranks contribute nothing). The Zig port's
+    forward does exactly the same (zeroed [world, R, D] buffer, own slot copied, residual_add WORLD = world)."""
 
-    rank, world = 0, 1
+    def __init__(self, rank: int, world: int) -> None:
+        self.rank, self.world = rank, world
 
     def all_gather(self, send, recv):
-        recv.view(-1).copy_(send.reshape(-1))
+        n = send.numel()
+        if recv.numel() != n * self.world:
+            raise ValueError("all_gather: recv must hold world x send")
+        flat = recv.view(-1)
+        flat.zero_()
+        flat[self.rank * n:(self.rank + 1) * n].copy_(send.reshape(-1))
 
     def barrier(self):
         pass
@@ -156,8 +170,8 @@ class Taps:
             o[f"{p}.diag.{name}.{i}"] = getattr(b, name).view(-1)[:R * width].clone()
 
 
-def load_engine(model: Path, n_layers: int):
-    """fused.Weights for layers 0..n-1 at world 1 (rank 0 of 1: every tensor whole)."""
+def load_engine(model: Path, n_layers: int, rank: int, world: int):
+    """fused.Weights for layers 0..n-1 of rank ``rank`` of ``world`` (RankReader's cut, as the engine loads)."""
     import torch
 
     from tensorfold.families.glm_moe_dsa.config import Config
@@ -165,7 +179,7 @@ def load_engine(model: Path, n_layers: int):
     from tensorfold.families.glm_moe_dsa.cuda.weights import RankReader, load_layer
 
     cfg = Config.from_dict(json.loads((model / "config.json").read_text()))
-    r = RankReader(model, 0, 1)
+    r = RankReader(model, rank, world)
     embed = r.get("model.embed_tokens.weight", "cuda")
     norm = r.get("model.norm.weight", "cuda")
     head = torch.zeros((128, cfg.hidden_size), dtype=torch.bfloat16, device="cuda")   # logits="none": never read
@@ -173,7 +187,9 @@ def load_engine(model: Path, n_layers: int):
     for i in range(n_layers):
         layers.append(load_layer(r, cfg, i))
         r.release()
-    w = fused.Weights(cfg, 0, 1, SoloComm(), embed, norm, head, layers, None)
+    w = fused.Weights(cfg, rank, world, LocalComm(rank, world), embed, norm, head, layers, None)
+    if w.dcp != 1 or w.fast is not None or w.l2pf is not None:
+        raise SystemExit("oracle: DCP 1, no RoCE one-shot and no L2 prefetch expected")
     return cfg, w
 
 
@@ -249,6 +265,8 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--world", type=int, default=4, help="the TP world whose cut is loaded (serving: 4)")
+    ap.add_argument("--rank", type=int, default=0, help="the rank whose cut is loaded; the others are absent")
     ap.add_argument("--long", type=int, default=LONG_PREFIX, help="the long chain's prefix length (0: skip it)")
     ap.add_argument("--record", action="store_true", help="record launches; pack aot.json + cubins into OUT/aot")
     ap.add_argument("--fixtures", action="store_true", help="write OUT/fixtures/{meta.json,*.safetensors}")
@@ -283,7 +301,7 @@ def main() -> int:
     t0 = time.time()
     with torch.no_grad():
         with phase("load"):
-            cfg, w = load_engine(model, a.layers)
+            cfg, w = load_engine(model, a.layers, a.rank, a.world)
         if rec is not None:
             from tensorfold.cuda.exl3 import experts as x3experts
             from tensorfold.cuda.exl3 import linear as x3linear
@@ -295,7 +313,8 @@ def main() -> int:
         taps = Taps()
         taps.install()
         topk = cfg.index_topk
-        meta: dict = {"generator": "tools/glm53/oracle.py", "layers": a.layers, "world": 1, "rank": 0, "env": env,
+        meta: dict = {"generator": "tools/glm53/oracle.py", "layers": a.layers, "world": a.world, "rank": a.rank,
+                      "comm": "local: own slot, zeros for the absent ranks (all-gather branch only)", "env": env,
                       "model": str(model), "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
                       "diag": list(DIAG) + ["g", "u", "act"], "chains": {}}
         try:

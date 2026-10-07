@@ -1,7 +1,7 @@
 //! Full GLM-5.3 over `world` ranks (the Python engine's cuda/split.py): which part of each checkpoint tensor a rank
 //! holds. EXL3 linears are cut along whole 16x16 tiles and whole 128-wide Hadamard blocks: output-split linears
 //! (gate/up, q_b) take tile columns and svh, input-split linears (down, o_proj) take tile rows and suh; q_a, kv_a and
-//! the indexer's wq_b are replicated. Phase 1 runs world 1 (every cut is the whole tensor); TP4 uses the same rules.
+//! the indexer's wq_b are replicated. Phase 1 loads rank 0 of world 4 with these cuts.
 const std = @import("std");
 
 pub const Kind = enum { rep, row, dim1 };

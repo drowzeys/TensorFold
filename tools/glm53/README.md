@@ -20,11 +20,18 @@ apps hold the GPU (`ALLOW_GPU_BUSY=1` overrides the last). Defaults: `PYSRC=~/ch
 
 | file | what |
 |---|---|
-| `oracle.py` | the Python engine at world 1 (rank 0 of 1, fused path), the first N layers loaded through `weights.RankReader` / `load_layer`; two chains of windows (below); `--record` and/or `--fixtures` |
+| `oracle.py` | the Python engine as rank 0 of world 4 (fused path), the first N layers loaded through `weights.RankReader` / `load_layer` at that cut; two chains of windows (below); `--record` and/or `--fixtures` |
 | `capture_aot.py` | `oracle.py --record`: Triton AOT capture only |
 | `dump_fixtures.py` | `oracle.py --fixtures`: fixtures only |
 | `copy_exl3_kernels.py` | regenerates `zig/kernels/cuda/glm53_exl3_{linear,experts}.cu` + `glm53/*.cuh` (device-only copies of `cuda/exl3`); `--check` compares |
 | `expected_symbols.txt` | the kernel symbols `cuda_kernels.zig` resolves (the script checks the built fatbins list them) |
+
+**Rank 0 of 4, other ranks absent.** World 1 is not a served shape (all 64 heads on one GPU: `_attn_chunks` needs
+152 KiB of shared memory, GB10 has 99 KiB), so Phase 1 runs one rank's serving shapes (16 heads, quarter MLP /
+expert widths, replicated q_a / kv_a / indexer) with an identity communicator on both sides: `LocalComm` has only
+`all_gather`, so `fused.gather` always takes the all-gather branch; it writes this rank's partial in its slot and
+zeros in the other three, and `residual_add` sums the four slots in rank order. Every per-layer output is rank 0's
+alone (not the full model's) and must still match bit for bit; the Zig forward (`Forward.gather`) does the same.
 
 Windows (the shapes the Zig side runs, so every specialization they need is captured):
 
@@ -42,11 +49,11 @@ Frozen knobs (`oracle.FROZEN`, recorded in meta.json): `TF_GLM53_TUNE=0` (x3line
 
 ```sh
 # oracle: capture + fixtures (GPU). TRITON_CACHE_DIR must be fresh: the cubins are packed from it.
-docker run --rm --gpus all --network none --memory 64g --entrypoint python \
+docker run --rm --gpus all --network none --memory 64g --entrypoint python3 \
   -v $MODEL:/model:ro -v ~/champion-ft8-src/src:/opt/tensorfold/src:ro -v ~/zig-port/tf:/tf:ro -v $OUT:/out \
   -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/out/triton -e TORCH_EXTENSIONS_DIR=/out/torch_ext \
   -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $IMAGE \
-  -B /tf/tools/glm53/oracle.py --model /model --out /out --record --fixtures --layers 4 --long 20000 --tools /tf
+  -B /tf/tools/glm53/oracle.py --model /model --out /out --record --fixtures --layers 4 --world 4 --rank 0 --long 20000 --tools /tf
 # -> /out/launches.json, jit.json, manifest.json, aot/{aot.json,cubins/,variants.txt}, fixtures/{meta.json,*.safetensors}
 
 # Zig build (CPU; zig 0.17.0 at /opt/z), host tests first

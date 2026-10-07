@@ -1,6 +1,7 @@
 //! Full GLM-5.3 (glm_moe_dsa) on CUDA in Zig: the Python glm_moe_dsa engine's fused path (MLA latent attention, the DSA
 //! indexer, EXL3 dense linears and routed experts), its kernels and layouts, so each layer matches it bit for bit.
-//! Phase 1: the first N layers on one GB10 at world 1 (zig/tests/cuda/glm53_layers.zig against tools/glm53/oracle.py).
+//! Phase 1: the first N layers on one GB10 as rank 0 of world 4 with the other ranks absent (identity comm: own
+//! partial, zeros elsewhere), zig/tests/cuda/glm53_layers.zig against tools/glm53/oracle.py.
 //! Not yet a native family (native/cuda.zig's registry): no engine, runner, graphs, sampling or TP4 here.
 
 pub const Config = @import("config.zig").Config;

@@ -1,6 +1,6 @@
 #!/bin/bash
 # GLM-5.3 Zig port, Phase 1 gate on ONE GB10 node: build the Zig engine in the TP4 image, capture the Triton AOT set
-# and the fixtures from the Python engine (first 4 layers, world 1), run tf-glm53-layers against them, and print one
+# and the fixtures from the Python engine (first 4 layers, rank 0 of world 4 with the other ranks absent), run tf-glm53-layers against them, and print one
 # summary line:  PHASE1 PASS|FAIL ...
 #
 # Run on a node (never on .4), in a scheduled window, from a copy of ~/zig-port:
@@ -14,7 +14,7 @@
 #   IMAGE    the TP4 image (Triton 3.7.1, torch, CUDA 13)            [ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05]
 #   ZIG_DIR  folder holding the zig 0.17.0 binary (mounted /opt/z)   [$HOME/opt/zig]
 #   WORK     this run's output folder                                [$PORT/runs/<utc stamp>]
-#   LAYERS   [4]   LONG  the long chain's prefix [20000]   GPU_LOCK  a flock file wrapped around GPU steps [none]
+#   LAYERS   [4]   WORLD [4]  RANK [0] (the cut loaded; the other ranks are absent)   LONG  the long chain's prefix [20000]   GPU_LOCK  a flock file wrapped around GPU steps [none]
 #   ALLOW_GPU_BUSY=1   start even while other compute apps hold the GPU (default: refuse)
 #   SKIP_BUILD=1 / SKIP_ORACLE=1   reuse WORK's zig-out / aot + fixtures from an earlier run (set WORK to it)
 set -u
@@ -26,6 +26,8 @@ ZIG_DIR="${ZIG_DIR:-$HOME/opt/zig}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 WORK="${WORK:-$PORT/runs/$STAMP}"
 LAYERS="${LAYERS:-4}"
+WORLD="${WORLD:-4}"
+RANK="${RANK:-0}"
 LONG="${LONG:-20000}"
 TF="$PORT/tf"
 CACHE="$PORT/cache"
@@ -59,7 +61,7 @@ COMMON=(--rm --label "$LABEL" --network none --ipc host --user "$(id -u):$(id -g
 
 # ---- 0. the image's versions and the kernel copies against the champion source (host, no GPU) ----------------
 say "image versions"
-docker run "${COMMON[@]}" --memory 8g --entrypoint python "$IMAGE" -c \
+docker run "${COMMON[@]}" --memory 8g --entrypoint python3 "$IMAGE" -c \
   "import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__)" 2>&1 | tee "$WORK/versions.txt" | tee -a "$LOG"
 grep -q 'triton 3\.7' "$WORK/versions.txt" || say "WARNING: the AOT launcher copies Triton 3.7's (zig/src/cuda/triton.zig); this image has $(cat "$WORK/versions.txt")"
 say "EXL3 kernel copies vs $PYSRC (tools/glm53/copy_exl3_kernels.py --check)"
@@ -99,13 +101,13 @@ fi
 if [ "${SKIP_ORACLE:-0}" != 1 ]; then
   rm -rf "$WORK/triton" "$WORK/aot" "$WORK/fixtures"
   mkdir -p "$WORK/triton"
-  say "oracle: $LAYERS layers at world 1, long prefix $LONG (record + fixtures; docker --memory 64g)"
+  say "oracle: $LAYERS layers, rank $RANK of world $WORLD (others absent), long prefix $LONG (record + fixtures; docker --memory 64g)"
   gpu timeout 3600 docker run "${COMMON[@]}" --gpus all --memory 64g --memory-swap 64g \
     -v "$MODEL:/model:ro" -v "$PYSRC/src:/opt/tensorfold/src:ro" -v "$TF:/tf:ro" -v "$WORK:/out" -v "$CACHE:/cache" \
     -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/out/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_ext \
     -e CUDA_CACHE_PATH=/cache/cuda_cache -e TORCH_CUDA_ARCH_LIST=12.1 -w /tmp \
-    --entrypoint python "$IMAGE" -B /tf/tools/glm53/oracle.py --model /model --out /out --record --fixtures \
-    --layers "$LAYERS" --long "$LONG" --tools /tf > "$WORK/oracle.log" 2>&1
+    --entrypoint python3 "$IMAGE" -B /tf/tools/glm53/oracle.py --model /model --out /out --record --fixtures \
+    --layers "$LAYERS" --world "$WORLD" --rank "$RANK" --long "$LONG" --tools /tf > "$WORK/oracle.log" 2>&1
   orc=$?
   grep '\[oracle\]' "$WORK/oracle.log" | tee -a "$LOG"
   [ "$orc" = 0 ] || { tail -30 "$WORK/oracle.log"; summary FAIL "oracle rc=$orc (oracle.log)" 1; }
@@ -125,7 +127,7 @@ if [ -d "$CACHE/torch_ext/tensorfold_exl3_linear_v5" ]; then
     cuobjdump -sass /out/zig-out/fatbin/glm53_exl3_linear.fatbin > /out/sass-zig-linear.txt
     cuobjdump -sass /out/zig-out/fatbin/glm53_exl3_experts.fatbin > /out/sass-zig-experts.txt
     for x in linear experts; do
-      echo "--- $x"; python -B /tf/zig/tests/cuda/nemotron/sass_compare.py /out/sass-python-$x.txt /out/sass-zig-$x.txt || bad=1
+      echo "--- $x"; python3 -B /tf/zig/tests/cuda/nemotron/sass_compare.py /out/sass-python-$x.txt /out/sass-zig-$x.txt || bad=1
     done
     exit $bad' > "$WORK/sass.log" 2>&1 && sass="equal" || sass="DIFFERS(sass.log)"
   grep -c "SASS-EQUAL" "$WORK/sass.log" >/dev/null 2>&1 && say "sass: $(grep -c SASS-EQUAL "$WORK/sass.log") equal, $(grep -c SASS-DIFFER "$WORK/sass.log") differ"

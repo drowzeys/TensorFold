@@ -1,5 +1,10 @@
 //! GLM-5.3's fused forward for windows of 1 to 128 rows (fused.compute / layer / attention_part / attention_core /
-//! ffn_part), one stream, world 1 (Phase 1). Every kernel computes each row alone, so a row's bits never depend on
+//! ffn_part), one stream, one rank of the TP world (Phase 1: rank 0 of 4 with the other ranks ABSENT).
+//!
+//! Phase 1 communicator semantics (identical to tools/glm53/oracle.py's LocalComm): fused.gather's all-gather branch
+//! with only this rank present - b.gath [world, R, D] fp32 is zeroed, this rank's partial copied into its slot, and
+//! glue.residual_add sums the world slots in rank order (WORLD = world). The outputs are this rank's alone, not the
+//! full model's. TODO(P2): replace `gather` with NCCL all-gather (or b12x one-shot) of the real partials. Every kernel computes each row alone, so a row's bits never depend on
 //! the window: the per-layer outputs match the Python engine's bit for bit when the kernels and their launches do.
 //!
 //! Frozen as tools/glm53/oracle.py freezes the Python side: bf16 latent cache, DCP 1, one stream (TF_GLM53_SIDE=0:
@@ -59,6 +64,7 @@ pub const Buffers = struct {
     rpart: u64 = 0, // fp32 router partials [ROUTER_KS, rows, max(E, index_dim)]
     sy: u64 = 0, // fp32 [rows, D]
     part: u64 = 0, // fp32 [rows, D]
+    gath: u64 = 0, // fp32 [world * rows * D]: every rank's partial in rank order (fused.gather)
     lin: kern.LinearScratch = undefined,
     xs: ?kern.ExpertScratch = null,
 
@@ -111,6 +117,7 @@ pub const Buffers = struct {
         b.rpart = try b.alloc(tri.router_ks * rows * @max(c.experts, c.index_dim) * 4);
         b.sy = try b.alloc(rows * D * 4);
         b.part = try b.alloc(rows * D * 4);
+        b.gath = try b.alloc(w.world * rows * D * 4);
         // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N]
         const ext = w.linearExtents();
         b.lin.xh_bytes = rows * ext.k * 2;
@@ -236,10 +243,22 @@ pub const Forward = struct {
         const t_ = f.t();
         try t_.rmsnorm(b.x, D, L.input_norm, b.normed, D, R, D, c.eps);
         try f.attentionPart(b, st, L, li, R, T);
-        try t_.residualAdd(b.x, b.part, R, D, f.w.world);
+        try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
         try t_.rmsnorm(b.x, D, L.post_attn_norm, b.normed, D, R, D, c.eps);
         try f.ffnPart(b, L, R);
-        try t_.residualAdd(b.x, b.part, R, D, f.w.world);
+        try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
+    }
+
+    /// fused.gather: [world, R, D] fp32 partials in rank order for residual_add. World 1: b.part itself. Phase 1
+    /// (other ranks absent, LocalComm): zeros in every slot but this rank's, which holds b.part[:R].
+    pub fn gather(f: *const Forward, b: *const Buffers, R: usize) !u64 {
+        const world = f.w.world;
+        if (world == 1) return b.part;
+        const D = f.w.config.hidden;
+        const o = f.ops();
+        try o.fill32(b.gath, 0, world * R * D);
+        try o.copy(b.gath + f.w.rank * R * D * 4, b.part, R * D * 4);
+        return b.gath;
     }
 
     /// fused.attention_part (side "" and reuse 0) and attention_core: this rank's fp32 partial in b.part[:R].

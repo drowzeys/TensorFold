@@ -1,5 +1,5 @@
 //! tf-glm53-layers: GLM-5.3's first N layers in Zig against the Python engine's fixtures (tools/glm53/oracle.py),
-//! bit for bit. Usage: tf-glm53-layers <model dir> <aot dir> <fixtures dir> [--layers N] [--chain short|long]
+//! bit for bit, as rank `rank` of `world` (meta.json) with the other ranks absent (see cuda_forward.zig). Usage: tf-glm53-layers <model dir> <aot dir> <fixtures dir> [--layers N] [--chain short|long]
 //!
 //! For each chain of windows in meta.json (short: a 24-row prompt window then 1- and 3-row decode windows from an
 //! empty state; long: the oracle's 20,000-token caches loaded, then 1- and 3-row decode windows that select keys),
@@ -77,7 +77,10 @@ fn run(gpa: std.mem.Allocator, io: std.Io, model: []const u8, aot_dir: []const u
     const mo = meta.value.object;
     const meta_layers = try jint(mo.get("layers") orelse return error.BadMeta);
     const n_layers = @min(layers_arg orelse meta_layers, meta_layers);
-    if ((try jint(mo.get("world") orelse return error.BadMeta)) != 1) return error.OnlyWorldOne;
+    const world = try jint(mo.get("world") orelse return error.BadMeta);
+    const rank = try jint(mo.get("rank") orelse return error.BadMeta);
+    if (rank >= world) return error.BadMeta;
+    std.debug.print("rank {d} of world {d}, the other ranks absent (local comm: own partial, zeros elsewhere)\n", .{ rank, world });
     if (mo.get("triton")) |v| if (v == .string) std.debug.print("oracle: torch {s}, triton {s}\n", .{ (mo.get("torch") orelse v).string, v.string });
     if (mo.get("radix_equal")) |v| if (v == .bool and !v.bool) std.debug.print("WARN the oracle's radix and torch.topk selections differ (meta.radix_differs)\n", .{});
     if (mo.get("tiles_are_plan")) |v| if (v == .bool and !v.bool) std.debug.print("WARN the oracle ran EXL3 tiles other than x3linear.plan's (meta.tiles)\n", .{});
@@ -95,7 +98,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, model: []const u8, aot_dir: []const u
         if (v.* == .object) digests = &v.object;
     }
     const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-    var w = try glm.weights.load(gpa, io, &driver, model, cfg, .{ .layers = n_layers, .digests = digests });
+    var w = try glm.weights.load(gpa, io, &driver, model, cfg, .{ .layers = n_layers, .digests = digests, .rank = rank, .world = world });
     defer w.deinit();
     const load_s: f64 = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
     var tally: Tally = .{};
