@@ -371,7 +371,9 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
     QI_UNROLL
     for (ushort i = 0; i < C1; i++) acc[i] = 0;
     auto b = k.slice<D, KEYS>(0, k0);
+#ifndef H3_KO_SCORES
     op1.run(a, b, acc);
+#endif
     QI_UNROLL
     for (ushort i = 0; i < C1; i++) {
       const float score = scol[i] < size ? float(acc[i]) * qsc[srow[i]] * KS[hb + k0 + scol[i]] : -60000.0f;
@@ -395,7 +397,11 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
     top = next;
     QI_UNROLL
     for (ushort j = 0; j < C1; j++) {
+#ifdef H3_KO_EXP
+      const float weight = 1.0f + s[j] - next;
+#else
       const float weight = exp(s[j] - next);
+#endif
       total += weight;
       pt[mine + j] = half(weight * VS[hb + k0 + first + j] * LIFT);
     }
@@ -403,7 +409,9 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
     QI_UNROLL
     for (ushort i = 0; i < C2; i++) out[i] *= fac[orow[i]];
     auto vb = v.slice<D, KEYS>(0, k0);
+#ifndef H3_KO_VALUES
     op2.run(p, vb, out);
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   tops[tid] = total;
@@ -502,4 +510,53 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
   for (int k = int(lane); k < K; k += 32) sum += x[k] * w[k];
   sum = simd_sum(sum);
   if (lane == 0) Y[long(tg.y) * N + tg.x] = sum + B[tg.x];
+}
+
+// qi_i8_swiglu on tiles of H3_SWT rows: two accumulators of a 128-row tile do not fit the registers.
+#ifndef H3_SWT
+#define H3_SWT 64
+#endif
+[[kernel]] void h3_i8_swiglu(
+  const device int8_t* X [[buffer(0)]],
+  const device float* XS [[buffer(1)]],
+  const device int8_t* WG [[buffer(2)]],
+  const device float* SG [[buffer(3)]],
+  const device int8_t* WV [[buffer(4)]],
+  const device float* SV [[buffer(5)]],
+  device bfloat* H [[buffer(6)]],
+  uint3 tg [[threadgroup_position_in_grid]]) {
+  using namespace mpp::tensor_ops;
+  constexpr int T = H3_SWT, TN = QI_TN, TK = QI_TK;
+  constexpr int CAP = T * TN / QI_THREADS;
+  constexpr int M = QI_ROWS, N = QI_MLP, K = QI_HIDDEN;
+  constexpr int MP = (M + QI_T - 1) / QI_T * QI_T;
+  const int n0 = int(tg.x) * TN, r0 = int(tg.y) * T;
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> x((device int8_t*)X, dextents<int32_t, 2>(K, MP));
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> wg((device int8_t*)WG, dextents<int32_t, 2>(N, K));
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> wv((device int8_t*)WV, dextents<int32_t, 2>(N, K));
+  constexpr auto desc = matmul2d_descriptor(T, TN, TK, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<QI_SG>> op;
+  auto a0 = x.slice<TK, T>(0, r0);
+  auto b0 = wg.slice<TN, TK>(n0, 0);
+  auto gate = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), int32_t>();
+  auto value = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), int32_t>();
+  QI_UNROLL
+  for (ushort i = 0; i < CAP; i++) { gate[i] = 0; value[i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += TK) {
+    auto a = x.slice<TK, T>(k0, r0);
+    auto bg = wg.slice<TN, TK>(n0, k0);
+    auto bv = wv.slice<TN, TK>(n0, k0);
+    op.run(a, bg, gate);
+    op.run(a, bv, value);
+  }
+  QI_UNROLL
+  for (ushort i = 0; i < CAP; i++) {
+    auto ids = gate.get_multidimensional_index(i);
+    const int row = r0 + ids[1], n = n0 + ids[0];
+    if (row >= M) continue;
+    const float xs = XS[row];
+    const float g = float(gate[i]) * xs * SG[n];
+    const float v = float(value[i]) * xs * SV[n];
+    H[long(row) * N + n] = bfloat(g / (1.0f + exp(-g)) * v);
+  }
 }
