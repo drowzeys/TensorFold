@@ -18,6 +18,7 @@
 //! server's OpenAI routes, ranks 1..3 following rank 0's requests), EOS and rank 0's stop vote (cuda_runner.run),
 //! prompt reuse (cuda_reuse.zig: prefixes.PromptReuse) and its learned states on disk (--learn), decode context
 //! parallelism (cuda_dcp.zig, DCP = 4 past 200K tokens of context).
+//! Phase 4: the speculative drafters' host stages (draft_host.zig), copy drafts (copies.zig).
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -41,6 +42,8 @@ pub const reuse = @import("cuda_reuse.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const dcp = @import("cuda_dcp.zig");
 pub const coverage = @import("cuda_coverage.zig");
+pub const draft_host = @import("draft_host.zig");
+pub const copies = @import("copies.zig");
 
 test {
     _ = @import("config.zig");
@@ -61,4 +64,6 @@ test {
     _ = engine;
     _ = dcp;
     _ = coverage;
+    _ = draft_host;
+    _ = copies;
 }
