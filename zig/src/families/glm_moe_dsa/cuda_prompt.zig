@@ -203,7 +203,7 @@ pub const Sp = struct {
     ready: [2]cuda.Event,
     done: [2]cuda.Event,
     pos1: cuda.DeviceBuffer, // int32 [1]
-    spos: cuda.DeviceBuffer, // int32 [2]
+    spos: cuda.DeviceBuffer, // int32 a half, 256 bytes apart (16-aligned pointers: Triton specializes on it)
 
     pub fn init(d: *const cuda.Driver, main: *const fw.Forward, side_stream: cuda.Stream, side_wide: *const Wide) !Sp {
         var sp: Sp = .{ .main = main, .side = main.*, .comm = main.comm orelse return error.NoCommunicator, .ready = undefined, .done = undefined, .pos1 = undefined, .spos = undefined };
@@ -215,7 +215,7 @@ pub const Sp = struct {
             sp.done[i] = try cuda.Event.init(d, false);
         }
         sp.pos1 = try cuda.DeviceBuffer.alloc(d, 4);
-        sp.spos = try cuda.DeviceBuffer.alloc(d, 8);
+        sp.spos = try cuda.DeviceBuffer.alloc(d, 512); // one 256-byte slot a half: each pointer 16-aligned like b.spos
         return sp;
     }
 
@@ -232,7 +232,7 @@ pub const Sp = struct {
         const world = sp.main.w.world;
         const n = (R + world - 1) / world;
         const o = sp.main.w.rank * n;
-        return .{ .b = b, .R = R, .pos = pos, .spos = sp.spos.ptr + 4 * i, .n = n, .Rp = n * world, .o = o, .nv = if (R > o) @min(n, R - o) else 0, .i = i };
+        return .{ .b = b, .R = R, .pos = pos, .spos = sp.spos.ptr + 256 * i, .n = n, .Rp = n * world, .o = o, .nv = if (R > o) @min(n, R - o) else 0, .i = i };
     }
 
     /// One chunk of R rows starting at host position `a`: b0.ids[:R] holds its ids, st.pos = a. Leaves every row's

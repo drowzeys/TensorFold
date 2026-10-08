@@ -43,7 +43,10 @@ pub const Library = struct {
 
     /// The CUDA 13 soname first, then the unversioned link name (tools/glm53 passes the file torch loaded).
     pub fn open() Error!Library {
-        for ([_][]const u8{ "libcublas.so.13", "libcublas.so" }) |path| {
+        // absolute paths: std.DynLib without libc does not search LD_LIBRARY_PATH / ld.so.cache. torch's copy first
+        // (the same cuBLAS as the Python engine: bit identity), then the toolkit's, then the bare names.
+        for ([_][]const u8{ "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublas.so.13",
+            "/usr/local/cuda/lib64/libcublas.so.13", "libcublas.so.13", "libcublas.so" }) |path| {
             return openPath(path) catch |e| switch (e) {
                 error.LibraryUnavailable => continue,
                 else => return e,
