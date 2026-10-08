@@ -215,6 +215,9 @@ pub const Runner = struct {
     pin: cuda.HostBuffer, // page-locked staging for every host <-> device copy of a round
     graphs: std.AutoHashMapUnmanaged(u64, cuda.graph.Exec) = .empty,
     capture_s: f64 = 0,
+    // runGraph's outcomes since init: replays of a captured graph, eager runs (a miss: run, then captured)
+    graph_runs: u64 = 0,
+    eager_runs: u64 = 0,
     cands: []smp.Cand,
     // Phase 3a (Settings.served): the second micro-batch's buffers, the sequence-parallel chunk, the prompt ids on
     // the device (uploaded once a request), the RoCE health words
@@ -289,6 +292,8 @@ pub const Runner = struct {
         r.reuse = if (set.k > 0 and w.mtp.?.layer.indexer != null) set.reuse else 0;
         r.graphs = .empty;
         r.capture_s = 0;
+        r.graph_runs = 0;
+        r.eager_runs = 0;
         r.pb1 = null;
         r.sp = null;
         r.ids_dev = null;
@@ -401,7 +406,11 @@ pub const Runner = struct {
 
     /// GraphSet.run: replay `key`'s graph, or run `ctx.go()` eagerly (the step's real result) and capture it.
     pub fn runGraph(r: *Runner, key: u64, ctx: anytype) !void {
-        if (r.graphs.get(key)) |e| return e.launchOn(r.f.s);
+        if (r.graphs.get(key)) |e| {
+            r.graph_runs += 1;
+            return e.launchOn(r.f.s);
+        }
+        r.eager_runs += 1;
         try ctx.go();
         if (!r.set.graphs) return;
         const t0 = r.now();

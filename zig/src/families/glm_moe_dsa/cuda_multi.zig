@@ -428,6 +428,13 @@ pub const Stream = struct {
     t_start: i128 = 0,
     t_end: i128 = 0,
     hook: ?Hook = null,
+    // the lead's per-request timing (rank 0's done line): its rounds' applyRound time, the host time before each of
+    // them since the previous round ended (hooks, admissions, fills, the round's message), the graph replays and
+    // eager runs (misses) in its rounds
+    round_ns: u64 = 0,
+    gap_ns: u64 = 0,
+    graph_runs: u64 = 0,
+    eager_runs: u64 = 0,
 
     fn isEnd(s: *const Stream, t: u32) bool {
         return std.mem.indexOfScalar(u32, s.eos, t) != null;
@@ -473,6 +480,13 @@ pub const Choice = struct {
         gpa.free(c.stops);
         gpa.free(c.keeps);
     }
+};
+
+/// The lead's caller, told when a round's GPU work is queued and the host is about to wait for it (rank 0's server:
+/// the previous round's tokens go to the replies then, off the path between a round's picks and the next round).
+pub const Idle = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque) void,
 };
 
 /// What the lead tells the followers between its decisions (rank 0's server sends them; the CLI needs none).
@@ -590,6 +604,9 @@ pub const Multi = struct {
     widest: usize = 0,
     capture_s: f64 = 0,
     broken: bool = false,
+    // the lead: when its last round ended (0: no round since the streams went idle), and its idle hook (Idle)
+    t_round_end: i128 = 0,
+    idle: ?Idle = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, r: *rn.Runner, n: usize, set: Settings, lead: bool) !*Multi {
         const w = r.w;
@@ -642,6 +659,8 @@ pub const Multi = struct {
         mu.widest = 0;
         mu.capture_s = 0;
         mu.broken = false;
+        mu.t_round_end = 0;
+        mu.idle = null;
         mu.lay = Layout.make(rows, n, k, w.world);
         const cols = tri.bucket(r.capacity, r.topk) orelse 1;
         const shared = r.f.shared_experts;
@@ -1159,7 +1178,10 @@ pub const Multi = struct {
         var plan: Plan = .{};
         var n_live: usize = 0;
         for (mu.streams.items) |s| n_live += @intFromBool(!s.done);
-        if (n_live == 0) return;
+        if (n_live == 0) {
+            mu.t_round_end = 0;
+            return;
+        }
         plan.cut = if (n_live >= mu.set.cut_streams and mu.cut_on) mu.set.draft_cut else 0;
         const drafters = mu.md[0] != null or mu.md[1] != null;
         plan.dcut = if (n_live >= mu.set.cut_streams and drafters) mu.set.cutDFlash() else 0;
@@ -1182,9 +1204,22 @@ pub const Multi = struct {
         if (link) |l| try l.round(l.ctx, &plan);
         var res: [max_streams]Result = undefined;
         var ds: [max_streams]usize = undefined;
+        const g0 = mu.r.graph_runs;
+        const e0 = mu.r.eager_runs;
+        const t0 = mu.now();
         try mu.applyRound(&plan, &res, &ds);
+        const t1 = mu.now();
+        // the host time before this round's work since the previous round ended (the CLI: the plan; the server:
+        // also the reply hooks, the loop, admissions, fills and the round's message)
+        const gap: u64 = if (mu.t_round_end > 0 and t0 > mu.t_round_end) @intCast(t0 - mu.t_round_end) else 0;
+        const took: u64 = @intCast(@max(0, t1 - t0));
+        mu.t_round_end = t1;
         for (plan.items[0..plan.n], 0..) |it, i| {
             const s = mu.find(it.sid).?;
+            s.round_ns += took;
+            s.gap_ns += gap;
+            s.graph_runs += mu.r.graph_runs - g0;
+            s.eager_runs += mu.r.eager_runs - e0;
             const x = &res[i];
             var new: [fw.decode_rows]u32 = undefined;
             var nn: usize = 0;
@@ -1487,6 +1522,7 @@ pub const Multi = struct {
         var ranks: usize = 1;
         if (!sampled) {
             try o.download(std.mem.sliceAsBytes(amax), vb.argmax);
+            if (mu.idle) |x| x.f(x.ctx); // the window is queued: the lead's caller works while it runs
             try mu.r.f.s.synchronize();
         } else {
             if (vb.cand_cols == 0 or cnt > smp.max_candidates) return error.Invalid;
@@ -1499,6 +1535,7 @@ pub const Multi = struct {
             ranks = if (mu.r.f.comm != null or mu.r.f.fast != null) mu.world else 1;
             all = mu.pinSlice(f32, mu.play.cand, ranks * stride);
             try o.download(std.mem.sliceAsBytes(all), vb.cand_all);
+            if (mu.idle) |x| x.f(x.ctx);
             try mu.r.f.s.synchronize();
         }
         try mu.r.healthy(); // every rank: no RoCE timeout behind these picks

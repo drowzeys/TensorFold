@@ -106,6 +106,10 @@ pub const Host = struct {
     lives: std.ArrayList(*Live) = .empty,
     mseq: u64 = 0,
     streaming: u32 = 0, // rank 0: streams admitted and not finished (for /status)
+    // --parallel N: a round's tokens reach the replies once the next round's GPU work is queued (multi.Idle), not
+    // between a round's picks and the next round's message, where the followers and every GPU wait on rank 0
+    // (TF_GLM53_DEFER_EMITS=0: at once, as before)
+    defer_emits: bool = false,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -230,22 +234,48 @@ pub const Host = struct {
         sid: u32 = 0,
         sampling: ?smp.Sampling = null,
         draft: bool = true,
+        // the emitted tokens the reply has heard (Host.defer_emits: the rest wait for flush)
+        sent: usize = 0,
 
         fn tokens(ctx: *anyopaque, toks: []const u32) bool {
             const lv: *Live = @ptrCast(@alignCast(ctx));
-            if (lv.first == null) {
+            const first = lv.first == null;
+            if (first) {
                 lv.first = lv.h.now();
                 emit(lv.job, .{ .prefilled = lv.begin });
             }
-            lv.emitted.appendSlice(lv.h.gpa, toks) catch {};
-            emit(lv.job, .{ .tokens = toks });
+            if (lv.emitted.appendSlice(lv.h.gpa, toks)) {
+                // the first token at once (time to first token); later rounds' wait for Host.flushEmits
+                if (first or !lv.h.defer_emits) lv.flush();
+            } else |_| {
+                lv.flush();
+                emit(lv.job, .{ .tokens = toks });
+            }
             if (lv.job.request.stop) |s| {
                 if (s.check(s.ctx, lv.emitted.items)) lv.stop_hit = true;
             }
             if (lv.h.cancelled(lv.job.id)) lv.cancel_hit = true;
             return lv.stop_hit or lv.cancel_hit;
         }
+
+        /// The emitted tokens the reply has not heard, in one event.
+        fn flush(lv: *Live) void {
+            if (lv.emitted.items.len <= lv.sent) return;
+            emit(lv.job, .{ .tokens = lv.emitted.items[lv.sent..] });
+            lv.sent = lv.emitted.items.len;
+        }
     };
+
+    /// Rank 0 (--parallel N): every live reply's unheard tokens.
+    fn flushEmits(h: *Host) void {
+        for (h.lives.items) |lv| lv.flush();
+    }
+
+    /// multi.Idle on rank 0: a round's window is queued and the engine thread is about to wait for it.
+    fn idleFn(ctx: *anyopaque) void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        h.flushEmits();
+    }
 
     fn serveJob(h: *Host, job: Job) void {
         const r = job.request;
@@ -266,6 +296,11 @@ pub const Host = struct {
         if (st.prefill_s > 0) h.last_prefill_rate = @as(f64, @floatFromInt(r.prompt.len - st.begin)) / st.prefill_s;
         h.unlock();
         if (h.dump) |path| h.writeDump(path, job, &live, outcome, h.out.items) catch |e| std.log.warn("glm53: TF_GLM53_DUMP {s}: {t}", .{ path, e });
+        if (!@import("builtin").is_test) {
+            const ttft: f64 = if (live.first) |f| @as(f64, @floatFromInt(f - started)) / 1e9 else 0;
+            const n_out = h.out.items.len;
+            std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} sampled={s}", .{ job.id, r.prompt.len, st.begin, n_out, reason, st.tokS(n_out), ttft, st.prefill_s, st.decode_s, st.rounds, st.accepted, st.drafted, if (outcome.sampling != null) "true" else "false" });
+        }
         // --learn: the request's shared states reach the disk before its reply ends (a client that stops the server
         // right after the reply still finds them learned)
         h.afterRequest();
@@ -333,6 +368,7 @@ pub const Host = struct {
     /// waiting ones into free slots (oldest first), run a round (multi.round), end the streams that finished.
     fn loopMulti(h: *Host) void {
         const mu = h.boot.multi.?;
+        if (h.defer_emits) mu.idle = .{ .ctx = h, .f = idleFn };
         var admit_buf: [glm.multi.max_streams]Job = undefined;
         var gone_buf: [64]Job = undefined;
         while (true) {
@@ -448,6 +484,7 @@ pub const Host = struct {
         h.mseq += 1;
         var head: Head = .{ .kind = @intFromEnum(Kind.fill), .seq = h.mseq, .key = sid };
         try h.sendOne(&head, &.{});
+        h.flushEmits(); // a prompt chunk runs next: the decoding replies hear their last round first
     }
 
     fn linkRound(ctx: *anyopaque, plan: *const glm.multi.Plan) anyerror!void {
@@ -502,6 +539,8 @@ pub const Host = struct {
         }
         const reason: api.Reason = if (lv.cancel_hit) .cancelled else if (st.eos_hit or lv.stop_hit) .stop else .length;
         if (lv.first == null) emit(lv.job, .{ .prefilled = lv.begin });
+        lv.flush();
+        logMulti(lv, st, reason);
         h.lock();
         h.last_rate = st.tokS();
         if (st.prefill_s > 0) h.last_prefill_rate = @as(f64, @floatFromInt(st.prompt.len - st.begin)) / st.prefill_s;
@@ -518,12 +557,26 @@ pub const Host = struct {
         emit(lv.job, .{ .finished = .{ .reason = reason, .stats = .{ .rounds = st.rounds, .drafted = st.drafted, .accepted = st.accepted_n, .min_rows = @intCast(@max(st.min_rows, 1)), .prefill_seconds = st.prefill_s } } });
     }
 
+    /// Rank 0's line for a finished --parallel stream, as the Python server's `done req-...`: the engine's own tok/s
+    /// (tokens after the first over its decode time), TTFT from submission, and per round on rank 0 the round's time
+    /// (applyRound), the host time before it since the previous round ended (hooks, loop, admissions, fills, the
+    /// message) and the graph replays / eager runs in its rounds.
+    fn logMulti(lv: *const Live, st: *const glm.multi.Stream, reason: api.Reason) void {
+        if (@import("builtin").is_test) return;
+        const ttft: f64 = if (lv.first) |f| @as(f64, @floatFromInt(f - lv.started)) / 1e9 else 0;
+        const rounds_f: f64 = @floatFromInt(@max(st.rounds, 1));
+        const round_ms = @as(f64, @floatFromInt(st.round_ns)) / 1e6 / rounds_f;
+        const gap_ms = @as(f64, @floatFromInt(st.gap_ns)) / 1e6 / rounds_f;
+        std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} round_ms={d:.1} gap_ms={d:.2} graphs={d} eager={d} sampled={s}", .{ lv.job.id, st.prompt.len, st.begin, st.out.items.len, reason, st.tokS(), ttft, st.prefill_s, st.decodeS(), st.rounds, st.accepted_n, st.drafted, round_ms, gap_ms, st.graph_runs, st.eager_runs, if (st.sampling != null) "true" else "false" });
+    }
+
     /// Rank 0 after a failed round (multi.drop) or at shutdown: every live request ends with `reason`; the decoder
     /// forgets its streams (a failed round leaves the ranks out of step: the decoder refuses further work).
     fn endAll(h: *Host, reason: api.Reason, message: []const u8) void {
         const mu = h.boot.multi.?;
         for (h.lives.items) |lv| {
             if (lv.first == null) emit(lv.job, .{ .prefilled = 0 });
+            lv.flush();
             emit(lv.job, .{ .finished = .{ .reason = reason, .message = message } });
             lv.emitted.deinit(h.gpa);
             h.gpa.destroy(lv);
@@ -937,6 +990,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     h.flush_file = if (std.c.getenv("TF_GLM53_FLUSH_FILE")) |v| std.mem.span(v) else null;
     h.dump = if (std.c.getenv("TF_GLM53_DUMP")) |v| std.mem.span(v) else null;
+    const defer_on = if (std.c.getenv("TF_GLM53_DEFER_EMITS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    h.defer_emits = opts.parallel > 1 and defer_on;
     h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, {d} concurrent stream{s}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, opts.parallel, if (opts.parallel > 1) "s" else "", if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
     h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup };
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
