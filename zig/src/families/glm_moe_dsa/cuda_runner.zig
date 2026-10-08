@@ -230,6 +230,9 @@ pub const Runner = struct {
     vrows: usize = 1,
     mrows: usize = 1,
     copy_on: bool = false,
+    /// Phase 4c: prompt chunks feed the one-stream drafters (false while cuda_multi.zig fills a stream's chunk: the
+    /// stream's own concurrent drafter takes its taps)
+    solo_feed: bool = true,
 
     fn pinLayout(r: *const Runner) struct { lg: usize, send: usize, all: usize, ids: usize, rd: usize, vote: usize, vids: usize, total: usize } {
         const V = r.w.vocab_part;
@@ -296,6 +299,7 @@ pub const Runner = struct {
         r.vrows = vrows;
         r.mrows = mrows;
         r.copy_on = copy_on;
+        r.solo_feed = true;
         const shared = f.shared_experts;
         r.st = try fw.State.initSlots(gpa, d, w, capacity, set.dcp, set.slots);
         errdefer r.st.deinit();
@@ -834,7 +838,7 @@ pub const Runner = struct {
             try r.f.compute(&r.pb, st, R, T, if (last) head else .none, true);
             if (last) hb = &r.pb;
         }
-        try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
+        if (r.solo_feed) try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
         if (r.set.k > 0) try r.mtpPrompt(st, prompt_ids, a, e, T);
         if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
         if (r.f.prof) |p| {

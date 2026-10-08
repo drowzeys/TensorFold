@@ -75,6 +75,9 @@ pub const Kernels = struct {
     rows_gather: cuda.Function,
     rows_scatter: cuda.Function,
     cut_stats: cuda.Function,
+    // Phase 4c (glm53_draft.cu): the concurrent drafters' per-row positions and pooled-ring scatters
+    draft_rotary_rows: cuda.Function,
+    draft_scatter_rows: cuda.Function,
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
@@ -128,6 +131,8 @@ pub const Kernels = struct {
         k.rows_gather = try k.draft_mod.function("glm53_rows_gather");
         k.rows_scatter = try k.draft_mod.function("glm53_rows_scatter");
         k.cut_stats = try k.draft_mod.function("glm53_cut_stats");
+        k.draft_rotary_rows = try k.draft_mod.function("glm53_draft_rotary_rows");
+        k.draft_scatter_rows = try k.draft_mod.function("glm53_draft_scatter_rows");
         // Phase 3a: the prompt path's own kernels and the device copy of prompt_experts.cu
         k.prompt_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt);
         errdefer k.prompt_mod.unload();
@@ -715,6 +720,38 @@ pub const Ops = struct {
         a.add(lse);
         a.add(top);
         try cuda.launch.launch(o.k.cut_stats, .{ .grid = .{ .x = u(S) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    // ---- Phase 4c: --parallel N with DFlash2 / DSpark (cuda_mdraft.zig) ----------------------------------------
+
+    /// glm53_draft_rotary_rows: cos / sin [rows, half] fp32 of positions pos[r] (an int64 device table).
+    pub fn draftRotaryRows(o: Ops, pos: u64, inv: u64, half: usize, cos_out: u64, sin_out: u64, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pos);
+        a.add(inv);
+        a.add(int(half));
+        a.add(cos_out);
+        a.add(sin_out);
+        try cuda.launch.launch(o.k.draft_rotary_rows, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = u((half + 31) / 32 * 32) } }, o.s, &a);
+    }
+
+    /// glm53_draft_scatter_rows: src [heads, n, hd] bf16 into a pooled ring buffer - row r at row h * head_stride +
+    /// slot[r] * slot_stride + pos[r] % ring_rows (strides in rows of hd; int64 tables); a negative slot writes nothing.
+    pub fn draftScatterRows(o: Ops, src: u64, pool: u64, slot: u64, pos: u64, heads: usize, n: usize, hd: usize, head_stride: usize, slot_stride: usize, ring_rows: usize) !void {
+        if (n == 0 or heads == 0) return;
+        if (hd % 8 != 0) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(pool);
+        a.add(slot);
+        a.add(pos);
+        a.add(int(n));
+        a.add(int(hd));
+        a.add(@as(i64, @intCast(head_stride)));
+        a.add(@as(i64, @intCast(slot_stride)));
+        a.add(int(ring_rows));
+        try cuda.launch.launch(o.k.draft_scatter_rows, .{ .grid = .{ .x = u(n), .y = u(heads) }, .block = .{ .x = u((hd / 8 + 31) / 32 * 32) } }, o.s, &a);
     }
 
     // ---- Phase 3a: the prompt path ----------------------------------------------------------------------------

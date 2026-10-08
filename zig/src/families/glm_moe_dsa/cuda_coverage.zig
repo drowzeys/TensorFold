@@ -14,7 +14,10 @@
 //!   * DCP 1 and DCP = world with every rank's RANK constexpr;
 //!   * Phase 4b (`rows_windows` > 0, --parallel N): the concurrent decode windows of 1 .. N x (k + 1) rows with per-row
 //!     positions and cache bases (fused.Rows: _kv_write / _ik_write / _iq_rope / _absorb / _attn_chunks /
-//!     _index_scores with ROWS and a BASE table), their selections over the decode key buckets.
+//!     _index_scores with ROWS and a BASE table), their selections over the decode key buckets;
+//!   * Phase 4c (`streams` > 1 with drafters): the concurrent drafters' passes (cuda_mdraft.enumerate: context updates
+//!     of every row bucket, block passes of 1 .. N blocks - DFlash2's _dconv_seg / _dattn_seg, DSpark's per-block
+//!     _prep_kernel / _block_attn_kernel and the row-wise launches over every block).
 //! Arguments that reach a kernel only as runtime ints (rows, T, R0, strides) select a variant by class alone (the value
 //! 1, a multiple of 16, other): aot.pick's own rule, so walking every class is walking every variant. Pointers are
 //! 16-aligned here: every call site's pointer is a buffer base plus whole rows of 16-byte multiples (D, q_lora,
@@ -28,6 +31,7 @@ const exl3 = @import("exl3.zig");
 const tri = @import("cuda_triton.zig");
 const dcpm = @import("cuda_dcp.zig");
 const draft = @import("cuda_draft.zig");
+const mdraft = @import("cuda_mdraft.zig");
 
 /// The engine's own constants (cuda_forward.zig): kept equal by the test below.
 pub const max_window_rows: usize = 128; // fw.max_rows
@@ -57,8 +61,10 @@ pub const Space = struct {
     draft: bool = true,
     /// Phase 4: the loaded drafters' shapes (cuda_draft.Spec): their tap passes and block pass
     drafters: []const draft.Spec = &.{},
-    /// Phase 4b: the widest concurrent decode window (--parallel N: N x (k + 1) rows); 0: one stream
+    /// Phase 4b: the widest concurrent decode window (--parallel N: N x max(k + 1, drafter rows) rows); 0: one stream
     rows_windows: usize = 0,
+    /// Phase 4c: --parallel N (> 1): the drafters' concurrent passes for N streams too
+    streams: usize = 0,
 };
 
 const A: u64 = 1 << 20; // a 16-aligned device address (no memory is touched)
@@ -79,6 +85,7 @@ pub fn enumerate(p: *aot.Probe, sp: Space) !void {
     try selects(t, sp);
     for (1..sp.rows_windows + 1) |R| try rowsWindow(t, sp, R);
     for (sp.drafters) |ds| try draft.enumerate(p, ds);
+    if (sp.streams > 1) for (sp.drafters) |ds| try mdraft.enumerate(p, ds, sp.streams);
 }
 
 /// One window of R rows: every per-window launch of fused.layer (target and MTP layers), the head, the MTP input
@@ -354,4 +361,31 @@ test "Phase 4b: concurrent windows enumerate the ROWS launches with a BASE table
         if (std.mem.eql(u8, a.name, "BASE")) base_seen = true;
     };
     try std.testing.expect(base_seen);
+}
+
+test "Phase 4c: --parallel 4 with both drafters reaches the concurrent drafter kernels and 32-row windows" {
+    const gpa = std.testing.allocator;
+    const c = testConfig();
+    var p = aot.Probe.init(gpa);
+    defer p.deinit();
+    const drafters = [_]draft.Spec{
+        .{ .kind = .dspark, .D = 6144, .hd = 64, .H = 16, .KV = 16, .I = 3072, .layers = 3, .ntaps = 5, .block = 8, .top_k = 64, .V = c.vocab / 4, .vocab_off = 0, .eps = 1e-5, .window = 2048, .causal = true, .world = 4, .theta = 8e6, .mask_id = 154856 },
+        .{ .kind = .dflash, .D = 6144, .hd = 128, .H = 16, .KV = 2, .I = 3072, .layers = 6, .ntaps = 6, .block = 8, .top_k = 16, .V = c.vocab / 4, .vocab_off = 0, .rsel = 256, .gs = 16, .eps = 1e-5, .window = 2047, .causal = false, .world = 4, .theta = 1e6, .mask_id = 154856 },
+    };
+    const sp: Space = .{ .cfg = c, .world = 4, .heads = c.heads / 4, .vocab_part = c.vocab / 4, .kva_n = 640, .max_rows = 4, .capacity = 32779, .dcps = &.{1}, .widths = &.{}, .gemms = &.{}, .drafters = &drafters, .rows_windows = 32, .streams = 4 };
+    try enumerate(&p, sp);
+    for ([_][]const u8{ "_dconv_seg", "_dattn_seg" }) |name| {
+        var hit = false;
+        for (p.needs.values()) |n| hit = hit or std.mem.eql(u8, n.function, name);
+        try std.testing.expect(hit);
+    }
+    // the concurrent windows' ROWS absorb
+    var rows_seen = false;
+    for (p.needs.values()) |n| {
+        if (!std.mem.eql(u8, n.function, "_absorb")) continue;
+        for (n.consts) |k| if (std.mem.eql(u8, k.name, "ROWS") and (k.int orelse 0) == 1) {
+            rows_seen = true;
+        };
+    }
+    try std.testing.expect(rows_seen);
 }

@@ -33,7 +33,15 @@
 //!
 //! Roles: the lead (rank 0 of a server, every rank of tf-glm53-generate --mode 4b) decides admissions, fills, rounds
 //! and endings; a server's followers apply rank 0's messages (cuda_engine / native/glm53_cuda.zig carry them).
-//! Not here (refused at boot): DSpark / DFlash2 (one stream at a time in the Zig engine), copy drafts, DCP.
+//!
+//! Phase 4c: DFlash2 and DSpark streams (cuda_mdraft.zig; multi.py's DFLASH mode, and DSpark the same way): a drafter
+//! stream's round asks its drafter for up to min(the drafter's most, the window's share - 1, its depth setting) drafts
+//! (4 streams: 7), every drafting stream's block in one pass, each stream's host stage on its own; its window rows are
+//! [pending, drafts] from the host; after the picks every drafter stream's kept rows' taps (vb.taps) extend its slot's
+//! drafter context, and each prompt chunk's taps do too. From TF_GLM53_DRAFT_CUT_STREAMS streams their confidence floor
+//! rises to TF_GLM53_DRAFT_CUT_DFLASH (default: TF_GLM53_DRAFT_CUT). Verify windows hold N x max(k + 1, the drafters'
+//! rows) rows. Not here: auto mode (per-stream MTP / DFlash2 by rate), the drafters' kept ring windows on prompt reuse
+//! (a resumed stream's drafter context restarts at its resume point), copy drafts, DCP (refused at boot).
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
@@ -43,6 +51,8 @@ const smp = @import("sampling.zig");
 const W = @import("cuda_weights.zig");
 const rn = @import("cuda_runner.zig");
 const rz = @import("cuda_reuse.zig");
+const draft = @import("cuda_draft.zig");
+const mdraft = @import("cuda_mdraft.zig");
 
 /// The most streams a decoder takes (--parallel); decode windows hold at most fw.decode_rows rows anyway.
 pub const max_streams: usize = 16;
@@ -51,11 +61,30 @@ pub const max_k: usize = 8;
 /// Ints a round's plan carries a stream (multi.ITEM).
 pub const item_words: usize = 9;
 
-/// A stream's drafts (multi.SERIAL / MTP; DFlash2 and auto are not ported).
-pub const Mode = enum(u8) { serial = 0, mtp = 1 };
-/// A stream's drafts this round (multi.NONE / ARM_M).
+/// A stream's drafts (multi.SERIAL / MTP / DFLASH; 3 is Python's AUTO, not ported; 4: DSpark, Phase 4c's own).
+pub const Mode = enum(u8) { serial = 0, mtp = 1, dflash = 2, dspark = 4 };
+/// A stream's drafts this round (multi.NONE / ARM_M / ARM_F: its drafter's, DFlash2 or DSpark by its mode).
 pub const arm_none: u32 = 0;
 pub const arm_mtp: u32 = 1;
+pub const arm_draft: u32 = 2;
+
+/// A request's mode from the engine's draft mode (a drafted request; "draft": false is serial).
+pub fn modeOf(m: rn.Mode) Mode {
+    return switch (m) {
+        .mtp => .mtp,
+        .dflash => .dflash,
+        .dspark => .dspark,
+    };
+}
+
+/// The drafter a mode drafts with (the runner's order: 0 DFlash2, 1 DSpark); null: none.
+pub fn drafterOf(m: Mode) ?usize {
+    return switch (m) {
+        .dflash => 0,
+        .dspark => 1,
+        .serial, .mtp => null,
+    };
+}
 
 fn env(name: [:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
@@ -68,6 +97,8 @@ pub const Settings = struct {
     /// TF_GLM53_DRAFT_CUT (0: off) and TF_GLM53_DRAFT_CUT_STREAMS (at least 2)
     draft_cut: f64 = 0.6,
     cut_streams: usize = 4,
+    /// TF_GLM53_DRAFT_CUT_DFLASH: a drafter stream's confidence floor from cut_streams streams (null: draft_cut)
+    draft_cut_dflash: ?f64 = null,
     /// TF_GLM53_BATCH_FILL / TF_GLM53_QUICK_ROWS
     batch_fill: bool = true,
     quick_rows: usize = 1024,
@@ -78,6 +109,7 @@ pub const Settings = struct {
         var s: Settings = .{};
         if (env("TF_GLM53_DRAFT_CUT")) |v| s.draft_cut = std.fmt.parseFloat(f64, v) catch return error.BadSetting;
         if (env("TF_GLM53_DRAFT_CUT_STREAMS")) |v| s.cut_streams = @max(2, std.fmt.parseInt(usize, v, 10) catch return error.BadSetting);
+        if (env("TF_GLM53_DRAFT_CUT_DFLASH")) |v| s.draft_cut_dflash = std.fmt.parseFloat(f64, v) catch return error.BadSetting;
         if (env("TF_GLM53_BATCH_FILL")) |v| s.batch_fill = !std.mem.eql(u8, v, "0");
         if (env("TF_GLM53_QUICK_ROWS")) |v| s.quick_rows = std.fmt.parseInt(usize, v, 10) catch return error.BadSetting;
         if (env("TF_GLM53_PRECAPTURE")) |v| s.precapture = !std.mem.eql(u8, v, "0");
@@ -85,18 +117,39 @@ pub const Settings = struct {
         return s;
     }
 
+    /// multi.DRAFT_CUT_DFLASH: the drafter streams' confidence floor in a cut round (0: none).
+    pub fn cutDFlash(s: Settings) f64 {
+        return @max(0, s.draft_cut_dflash orelse s.draft_cut);
+    }
+
     pub fn digest(s: Settings, h: *std.hash.Wyhash) void {
-        const words = [_]u64{ @bitCast(s.draft_cut), s.cut_streams, @intFromBool(s.batch_fill), s.quick_rows, @intFromBool(s.precapture) };
+        const words = [_]u64{ @bitCast(s.draft_cut), s.cut_streams, @intFromBool(s.batch_fill), s.quick_rows, @intFromBool(s.precapture), @bitCast(s.cutDFlash()) };
         h.update(std.mem.asBytes(&words));
     }
 };
 
 /// N streams x (k + 1) rows: the widest verify window, refused past a decode window (multi.GlmMultiDecoder).
 pub fn windowRows(n: usize, k: usize) !usize {
+    return windowRowsWith(n, k, 0);
+}
+
+/// Phase 4c: N streams x max(k + 1, frows) rows (frows: the rows a drafter stream's window takes, 0: no drafter).
+pub fn windowRowsWith(n: usize, k: usize, frows: usize) !usize {
     if (n == 0 or n > max_streams or k > max_k) return error.Invalid;
-    const rows = n * (k + 1);
+    const rows = n * @max(k + 1, frows);
     if (rows > fw.decode_rows) return error.WindowTooWide;
     return rows;
+}
+
+/// Phase 4c: the rows a drafter stream's window takes with these drafters at N streams (multi.frows: the widest of
+/// them; 0 with none) - or the refusal of a drafter whose N blocks do not fit one pass.
+pub fn drafterRows(n: usize, specs: []const draft.Spec) !usize {
+    var fr: usize = 0;
+    for (specs) |sp| {
+        if (!mdraft.fits(sp, n)) return error.DrafterTooWide;
+        fr = @max(fr, mdraft.frows(sp, n));
+    }
+    return fr;
 }
 
 // --------------------------------------------------------------------------------------------- round plans ---
@@ -114,38 +167,52 @@ pub const Item = struct {
     sampled: u32,
 };
 
-/// Rank 0's round: its streams and the draft cut (0: off).
+/// Rank 0's round: its streams, the draft cut (0: off) and the drafter streams' confidence floor (0: none).
 pub const Plan = struct {
     n: usize = 0,
     cut: f64 = 0,
+    dcut: f64 = 0,
     items: [max_streams]Item = undefined,
 
-    /// The plan as words: [n, cut's low bits, cut's high bits, items x item_words].
+    /// The plan as words: [n, cut's low bits, cut's high bits, dcut's low bits, dcut's high bits, items x item_words].
     pub fn encode(p: *const Plan, out: []u32) ![]u32 {
-        const need = 3 + p.n * item_words;
+        const need = plan_head + p.n * item_words;
         if (out.len < need) return error.Invalid;
         const bits: u64 = @bitCast(p.cut);
+        const dbits: u64 = @bitCast(p.dcut);
         out[0] = @intCast(p.n);
         out[1] = @truncate(bits);
         out[2] = @truncate(bits >> 32);
+        out[3] = @truncate(dbits);
+        out[4] = @truncate(dbits >> 32);
         for (p.items[0..p.n], 0..) |it, i| {
-            const o = out[3 + i * item_words ..][0..item_words];
+            const o = out[plan_head + i * item_words ..][0..item_words];
             o.* = .{ it.sid, it.slot, it.P, it.tok, it.m, it.mode, it.arm, it.room, it.sampled };
         }
         return out[0..need];
     }
 
     pub fn decode(words: []const u32) !Plan {
-        if (words.len < 3) return error.OutOfStep;
+        if (words.len < plan_head) return error.OutOfStep;
         const n: usize = words[0];
-        if (n > max_streams or words.len != 3 + n * item_words) return error.OutOfStep;
-        var p: Plan = .{ .n = n, .cut = @bitCast(@as(u64, words[1]) | (@as(u64, words[2]) << 32)) };
+        if (n > max_streams or words.len != plan_head + n * item_words) return error.OutOfStep;
+        var p: Plan = .{ .n = n, .cut = @bitCast(@as(u64, words[1]) | (@as(u64, words[2]) << 32)), .dcut = @bitCast(@as(u64, words[3]) | (@as(u64, words[4]) << 32)) };
         for (0..n) |i| {
-            const o = words[3 + i * item_words ..][0..item_words];
+            const o = words[plan_head + i * item_words ..][0..item_words];
             p.items[i] = .{ .sid = o[0], .slot = o[1], .P = o[2], .tok = o[3], .m = o[4], .mode = o[5], .arm = o[6], .room = o[7], .sampled = o[8] };
         }
         return p;
     }
+};
+
+/// A plan's header words and the most words a plan takes (the server's ROUND message).
+pub const plan_head: usize = 5;
+pub const plan_words: usize = plan_head + max_streams * item_words;
+
+/// Phase 4c: each plan item's drafts from its drafter (arm_draft items; the host stage's, every rank alike).
+pub const Drafts = struct {
+    n: [max_streams]usize = @splat(0),
+    ids: [max_streams][fw.decode_rows]u32 = @splat(@splat(0)),
 };
 
 /// A round's host tables (multi._gpu): the verify window's rows (position, cache base, ids), each MTP step's rows
@@ -170,13 +237,19 @@ pub const Tables = struct {
     end: usize = 0, // max P + 1 + d (the verify window's key range end)
 };
 
-/// multi._gpu's tables for `plan` (k MTP drafts a round, BL backlog rows a slot, `local` cache rows a slot).
-pub fn tables(plan: *const Plan, k: usize, BL: usize, local: usize) !Tables {
+/// multi._gpu's tables for `plan` (k MTP drafts a round, BL backlog rows a slot, `local` cache rows a slot; `dd`
+/// the drafter streams' drafts, null: none).
+pub fn tables(plan: *const Plan, k: usize, BL: usize, local: usize, dd: ?*const Drafts) !Tables {
     var t: Tables = .{};
     var r: usize = 0;
     for (plan.items[0..plan.n], 0..) |it, i| {
-        const d: usize = if (it.arm == arm_mtp) it.room else 0;
-        if (d > k) return error.Invalid;
+        const d: usize = switch (it.arm) {
+            arm_mtp => it.room,
+            arm_draft => if (dd) |x| x.n[i] else 0,
+            else => 0,
+        };
+        if (it.arm == arm_mtp and d > k) return error.Invalid;
+        if (it.arm == arm_draft and d > it.room) return error.Invalid;
         if (r + 1 + d > fw.decode_rows) return error.WindowTooWide;
         t.offs[i] = r;
         t.ds[i] = d;
@@ -185,6 +258,9 @@ pub fn tables(plan: *const Plan, k: usize, BL: usize, local: usize) !Tables {
             t.vbase[r + j] = @intCast(it.slot * local);
         }
         t.vids[r] = it.tok;
+        if (it.arm == arm_draft) if (dd) |x| {
+            for (0..d) |j| t.vids[r + 1 + j] = x.ids[i][j];
+        };
         r += 1 + d;
         t.end = @max(t.end, it.P + 1 + d);
     }
@@ -485,6 +561,10 @@ pub const Multi = struct {
     lay: Layout,
     play: PinLayout,
     views: []fw.State,
+    // Phase 4c: the drafters for concurrent streams (0 DFlash2, 1 DSpark; cuda_mdraft.zig) and the rows a drafter
+    // stream's window takes (multi.frows; 0: none loaded)
+    md: [2]?*mdraft.MultiDrafter = .{ null, null },
+    frows: usize = 0,
     busy: [max_streams]bool = @splat(false),
     streams: std.ArrayList(*Stream) = .empty, // decoding, in the order they started
     filling: std.ArrayList(*Stream) = .empty, // admitted, prompt chunks left (oldest first)
@@ -505,8 +585,19 @@ pub const Multi = struct {
         const c = w.config;
         const k = r.set.k;
         if (r.set.slots != n or r.set.dcp != 1 or !r.set.served) return error.Invalid;
-        if (r.dflash != null or r.dspark != null or r.copy_on) return error.DraftersNeedOneStream;
-        const rows = try windowRows(n, k);
+        if (r.copy_on) return error.CopiesNeedOneStream;
+        if (r.dspark != null) return error.DrafterNeedsOneStream; // DSpark: one stream at a time (for now)
+        // Phase 4c: the runner's drafters serve the streams too (MultiDrafter); their rows widen the windows
+        const bases = [2]?*draft.Drafter{ r.dflash, r.dspark };
+        var specs: [2]draft.Spec = undefined;
+        var n_specs: usize = 0;
+        for (bases) |maybe| {
+            const bd = maybe orelse continue;
+            specs[n_specs] = bd.sp;
+            n_specs += 1;
+        }
+        const fr = try drafterRows(n, specs[0..n_specs]);
+        const rows = try windowRowsWith(n, k, fr);
         const mu = try gpa.create(Multi);
         errdefer gpa.destroy(mu);
         mu.* = undefined;
@@ -518,6 +609,8 @@ pub const Multi = struct {
         mu.lead = lead;
         mu.N = n;
         mu.k = k;
+        mu.frows = fr;
+        mu.md = .{ null, null };
         mu.BL = k + 1;
         mu.MR = n * (k + 1);
         mu.rows = rows;
@@ -542,7 +635,7 @@ pub const Multi = struct {
         mu.lay = Layout.make(rows, n, k, w.world);
         const cols = tri.bucket(r.capacity, r.topk) orelse 1;
         const shared = r.f.shared_experts;
-        mu.vb = try fw.Buffers.initWith(gpa, r.d, w, rows, cols, .{ .decode = true, .shared_experts = shared });
+        mu.vb = try fw.Buffers.initWith(gpa, r.d, w, rows, cols, .{ .decode = true, .shared_experts = shared, .taps = r.f.taps.n });
         errdefer mu.vb.deinit();
         mu.mb = null;
         if (k > 0) mu.mb = try fw.Buffers.initWith(gpa, r.d, w, @max(mu.MR, rows), cols, .{ .decode = true, .mtp = true, .shared_experts = shared });
@@ -581,6 +674,15 @@ pub const Multi = struct {
             mu.views[s] = try r.st.slotView(w, s);
             made += 1;
         }
+        errdefer {
+            for (mu.md) |maybe| {
+                if (maybe) |x| x.deinit();
+            }
+        }
+        for (bases, 0..) |maybe, which| {
+            const bd = maybe orelse continue;
+            mu.md[which] = try mdraft.MultiDrafter.init(gpa, r, bd, which, n);
+        }
         return mu;
     }
 
@@ -593,6 +695,9 @@ pub const Multi = struct {
         if (mu.pool) |p| {
             p.deinit();
             mu.gpa.destroy(p);
+        }
+        for (mu.md) |maybe| {
+            if (maybe) |x| x.deinit();
         }
         for (mu.views) |*v| v.freeView();
         mu.gpa.free(mu.views);
@@ -627,9 +732,36 @@ pub const Multi = struct {
         return p[0..n];
     }
 
-    /// The caches' bytes a stream holds (multi.nbytes_per_stream: the State's share).
+    /// The caches' bytes a stream holds (multi.nbytes_per_stream: the State's share, the drafters' rings).
     pub fn bytesPerStream(mu: *const Multi) usize {
-        return fw.State.bytesForDcp(mu.w, mu.r.capacity, 1);
+        var b = fw.State.bytesForDcp(mu.w, mu.r.capacity, 1);
+        for (mu.md) |maybe| {
+            if (maybe) |x| b += x.deviceBytes() / mu.N;
+        }
+        return b;
+    }
+
+    /// The concurrent drafter of a mode (null: MTP / serial, or none loaded).
+    fn mdOf(mu: *const Multi, m: Mode) ?*mdraft.MultiDrafter {
+        const which = drafterOf(m) orelse return null;
+        return mu.md[which];
+    }
+
+    /// The drafts a drafter stream may ask a round (multi._dflash_cfg's depth): the drafter's most, its window rows
+    /// less the pending token, the settings' depth (TF_GLM53_DFLASH_DEPTH / TF_GLM53_DSPARK_DEPTH).
+    fn depthOf(mu: *const Multi, which: usize) usize {
+        const x = mu.md[which] orelse return 0;
+        const b = x.base;
+        const want = if (b.sp.kind == .dspark) b.dset.depth else b.fset.depth;
+        return @min(@min(b.sp.maxDepth(), mdraft.frows(b.sp, mu.N) - 1), want);
+    }
+
+    /// A drafter stream's confidence floor this round: the settings' (TF_GLM53_DFLASH_CONFIDENCE /
+    /// TF_GLM53_DSPARK_CONFIDENCE), raised to the plan's `dcut` in a cut round.
+    fn confOf(mu: *const Multi, which: usize, dcut: f64) f64 {
+        const b = (mu.md[which] orelse return 0).base;
+        const c = if (b.sp.kind == .dspark) b.dset.confidence else b.fset.confidence;
+        return if (dcut > 0) @max(c, dcut) else c;
     }
 
     /// Streams admitted and not finished (multi.live).
@@ -801,10 +933,15 @@ pub const Multi = struct {
         const L = a.prompt.len;
         if (L == 0 or L + 1 >= mu.r.capacity - mu.k) return error.PromptTooLong;
         if (a.count == 0) return error.Invalid;
+        const mode: Mode = switch (a.mode) {
+            .serial => .serial,
+            .mtp => if (mu.k == 0) .serial else .mtp,
+            .dflash, .dspark => if (mu.mdOf(a.mode) != null) a.mode else return error.NoDrafter,
+        };
         if (a.flush) try mu.flushReuse();
         const s = try mu.gpa.create(Stream);
         errdefer mu.gpa.destroy(s);
-        s.* = .{ .sid = a.sid, .slot = a.slot, .mode = if (mu.k == 0) .serial else a.mode, .sampling = a.sampling, .count = a.count, .prompt = &.{}, .eos = &.{}, .named = &.{}, .chunks = &.{}, .begin = a.begin, .hook = a.hook, .t_admit = mu.now() };
+        s.* = .{ .sid = a.sid, .slot = a.slot, .mode = mode, .sampling = a.sampling, .count = a.count, .prompt = &.{}, .eos = &.{}, .named = &.{}, .chunks = &.{}, .begin = a.begin, .hook = a.hook, .t_admit = mu.now() };
         errdefer s.out.deinit(mu.gpa);
         s.prompt = try mu.gpa.dupe(u32, a.prompt);
         errdefer mu.gpa.free(s.prompt);
@@ -823,6 +960,8 @@ pub const Multi = struct {
         }
         errdefer mu.gpa.free(s.chunks);
         try mu.admitReuse(s, a);
+        // the stream's drafter context starts at its prompt (a resumed one at its resume point; MultiDrafter.reset)
+        if (mu.mdOf(mode)) |x| x.reset(a.slot, a.begin);
         try mu.filling.append(mu.gpa, s);
         mu.busy[a.slot] = true;
         if (a.sid >= mu.next_sid) mu.next_sid = a.sid + 1;
@@ -904,7 +1043,11 @@ pub const Multi = struct {
             try mu.ops().copy(r.carry.ptr, mu.carry0.ptr + s.slot * mu.D * 2, mu.D * 2);
             s.carry0 = false;
         }
+        const was = r.solo_feed;
+        r.solo_feed = false; // the one-stream drafters stay out of it: the stream's own drafter takes the taps
+        defer r.solo_feed = was;
         const hb = try r.prefillChunk(&mu.views[s.slot], s.prompt, a, e, s.ci, head);
+        if (mu.mdOf(s.mode)) |x| try x.feedPrompt(&r.pb, s.slot, a, e, L); // multi._chunk: dr.commit(the chunk's taps)
         s.ci += 1;
         if (mu.store != null and s.mode != .serial and (isNamed(s.named, e) or e == L)) {
             try mu.keepState(s, e, if (e == L) hb.?.lg else null);
@@ -1008,10 +1151,22 @@ pub const Multi = struct {
         for (mu.streams.items) |s| n_live += @intFromBool(!s.done);
         if (n_live == 0) return;
         plan.cut = if (n_live >= mu.set.cut_streams and mu.cut_on) mu.set.draft_cut else 0;
+        const drafters = mu.md[0] != null or mu.md[1] != null;
+        plan.dcut = if (n_live >= mu.set.cut_streams and drafters) mu.set.cutDFlash() else 0;
         for (mu.streams.items) |s| {
             if (s.done) continue;
-            const arm: u32 = if (s.mode == .mtp) arm_mtp else arm_none;
-            plan.items[plan.n] = .{ .sid = s.sid, .slot = @intCast(s.slot), .P = @intCast(s.P), .tok = s.tok, .m = @intCast(s.m), .mode = @intFromEnum(s.mode), .arm = arm, .room = if (arm == arm_mtp) @intCast(mu.k) else 0, .sampled = @intFromBool(s.sampling != null) };
+            const arm: u32 = switch (s.mode) {
+                .mtp => arm_mtp,
+                .dflash, .dspark => arm_draft,
+                .serial => arm_none,
+            };
+            // multi._round's room: MTP k; a drafter stream min(its depth, the tokens left - 1, the cache left - 1)
+            const room: usize = switch (arm) {
+                arm_mtp => mu.k,
+                arm_draft => @min(mu.depthOf(drafterOf(s.mode).?), @min(s.count -| s.out.items.len -| 1, mu.r.capacity -| s.P -| 1)),
+                else => 0,
+            };
+            plan.items[plan.n] = .{ .sid = s.sid, .slot = @intCast(s.slot), .P = @intCast(s.P), .tok = s.tok, .m = @intCast(s.m), .mode = @intFromEnum(s.mode), .arm = arm, .room = @intCast(room), .sampled = @intFromBool(s.sampling != null) };
             plan.n += 1;
         }
         if (link) |l| try l.round(l.ctx, &plan);
@@ -1088,7 +1243,9 @@ pub const Multi = struct {
     /// Every rank (multi._gpu): the tables, the MTP chain (step 1 over every MTP stream's backlog, steps 2..k one
     /// row a drafting stream), the draft cut, the verify window. Returns the round's tables (the cut applied).
     fn gpu(mu: *Multi, plan: *const Plan) !Tables {
-        var t = try tables(plan, mu.k, mu.BL, mu.local);
+        var dd: Drafts = .{};
+        try mu.propose(plan, &dd);
+        var t = try tables(plan, mu.k, mu.BL, mu.local, &dd);
         if (t.R == 0) return error.Invalid;
         try mu.upload(&t);
         const topk = mu.r.topk;
@@ -1111,6 +1268,34 @@ pub const Multi = struct {
         return t;
     }
 
+    /// Every rank (multi._gpu's dr.propose): each drafter's streams of the plan with room ask it for drafts - one
+    /// block pass a drafter, each stream's host stage with its sampling and the round's confidence floor.
+    fn propose(mu: *Multi, plan: *const Plan, dd: *Drafts) !void {
+        for (mu.md, 0..) |maybe, which| {
+            const x = maybe orelse continue;
+            var asks: [max_streams]mdraft.Ask = undefined;
+            var at: [max_streams]usize = undefined;
+            var na: usize = 0;
+            for (plan.items[0..plan.n], 0..) |it, i| {
+                if (it.arm != arm_draft or it.room == 0) continue;
+                const m = std.enums.fromInt(Mode, it.mode) orelse return error.OutOfStep;
+                if ((drafterOf(m) orelse return error.OutOfStep) != which) continue;
+                const s = mu.find(it.sid) orelse return error.OutOfStep;
+                asks[na] = .{ .slot = it.slot, .pending = it.tok, .depth = it.room, .sampling = s.sampling, .conf = mu.confOf(which, plan.dcut) };
+                at[na] = i;
+                na += 1;
+            }
+            if (na == 0) continue;
+            var got: [max_streams]mdraft.Drafted = undefined;
+            try x.propose(asks[0..na], got[0..na]);
+            for (0..na) |q| {
+                const i = at[q];
+                dd.n[i] = got[q].n;
+                @memcpy(dd.ids[i][0..got[q].n], got[q].slice());
+            }
+        }
+    }
+
     fn verifyKey(R: usize, T: ?usize, pick: fw.HeadMode) u64 {
         const pk: u64 = if (pick == .argmax) 0 else 1;
         return 5 | (@as(u64, R) << 4) | (tIndex(T) << 12) | (pk << 20);
@@ -1126,7 +1311,7 @@ pub const Multi = struct {
         const t0 = mu.now();
         var bs: [24]?usize = undefined;
         const bks = r.buckets(&bs);
-        const cap = r.capacity - mu.k - 2;
+        const cap = r.capacity - @max(mu.k, mu.frows) - 2;
         for (bks, 0..) |T, bi| {
             const prev: ?usize = if (bi > 0) bks[bi - 1] else null;
             const P: usize = if (T == null) 10 else @min((prev orelse r.topk) + 100, cap);
@@ -1146,7 +1331,7 @@ pub const Multi = struct {
                     }
                 }
             }
-            if (!mu.set.precapture) continue;
+            if (!mu.set.precapture and mu.frows == 0) continue; // drafters: every verify width, as multi.prewarm
             // multi._scratch: verify row i in slot i // width at P + i % width
             const width = mu.rows / mu.N;
             var t: Tables = .{ .R = mu.rows };
@@ -1163,6 +1348,10 @@ pub const Multi = struct {
                 }
             }
             try r.f.s.synchronize();
+        }
+        // Phase 4c: the drafters' passes (MultiDrafter.capture: every context-update bucket, the block passes)
+        for (mu.md) |maybe| {
+            if (maybe) |x| _ = try x.prewarm();
         }
         try r.f.s.synchronize();
         try r.resetState();
@@ -1336,9 +1525,30 @@ pub const Multi = struct {
         }
     }
 
+    /// Every rank (multi._commit's dr.commit): each drafter stream's kept rows' taps (vb.taps at its window rows)
+    /// into its slot's drafter context, every stream of a drafter in one stacked update.
+    fn commitTaps(mu: *Multi, plan: *const Plan, t: *const Tables, res: *const [max_streams]Result) !void {
+        const vb = &mu.vb;
+        if (vb.taps == 0) return;
+        const pitch = vb.tap_n * mu.D * 2;
+        for (mu.md, 0..) |maybe, which| {
+            const x = maybe orelse continue;
+            var items: [max_streams]mdraft.Commit = undefined;
+            var ni: usize = 0;
+            for (plan.items[0..plan.n], 0..) |it, i| {
+                const m = std.enums.fromInt(Mode, it.mode) orelse return error.OutOfStep;
+                if ((drafterOf(m) orelse continue) != which) continue;
+                items[ni] = .{ .slot = it.slot, .src = vb.taps + t.offs[i] * pitch, .n = res[i].n + 1 };
+                ni += 1;
+            }
+            if (ni > 0) try x.commit(items[0..ni], pitch);
+        }
+    }
+
     /// Every rank (multi._commit): each MTP stream's next backlog - the kept rows' target hiddens (final-normed as the
     /// MTP layer reads them) and tokens into its slot's backlog rows.
     fn commit(mu: *Multi, plan: *const Plan, t: *const Tables, res: *const [max_streams]Result) !void {
+        try mu.commitTaps(plan, t, res);
         if (mu.k == 0) return;
         const o = mu.ops();
         const l = mu.lay;
@@ -1385,12 +1595,14 @@ test "a round's plan as words and back" {
     var p: Plan = .{ .n = 2, .cut = 0.6 };
     p.items[0] = .{ .sid = 3, .slot = 1, .P = 4000, .tok = 151000, .m = 2, .mode = 1, .arm = arm_mtp, .room = 2, .sampled = 1 };
     p.items[1] = .{ .sid = 9, .slot = 0, .P = 77, .tok = 5, .m = 1, .mode = 0, .arm = arm_none, .room = 0, .sampled = 0 };
-    var buf: [3 + max_streams * item_words]u32 = undefined;
+    p.dcut = 0.45;
+    var buf: [plan_words]u32 = undefined;
     const w = try p.encode(&buf);
-    try std.testing.expectEqual(@as(usize, 3 + 2 * item_words), w.len);
+    try std.testing.expectEqual(@as(usize, plan_head + 2 * item_words), w.len);
     const q = try Plan.decode(w);
     try std.testing.expectEqual(p.n, q.n);
     try std.testing.expectEqual(p.cut, q.cut);
+    try std.testing.expectEqual(p.dcut, q.dcut);
     try std.testing.expectEqual(p.items[0], q.items[0]);
     try std.testing.expectEqual(p.items[1], q.items[1]);
     try std.testing.expectError(error.OutOfStep, Plan.decode(w[0 .. w.len - 1]));
@@ -1401,7 +1613,7 @@ test "round tables as multi._gpu builds them" {
     p.items[0] = .{ .sid = 0, .slot = 1, .P = 50, .tok = 7, .m = 2, .mode = 1, .arm = arm_mtp, .room = 2, .sampled = 0 };
     p.items[1] = .{ .sid = 1, .slot = 0, .P = 20, .tok = 9, .m = 1, .mode = 0, .arm = arm_none, .room = 0, .sampled = 0 };
     p.items[2] = .{ .sid = 2, .slot = 2, .P = 30, .tok = 5, .m = 3, .mode = 1, .arm = arm_mtp, .room = 2, .sampled = 0 };
-    const t = try tables(&p, 2, 3, 100);
+    const t = try tables(&p, 2, 3, 100, null);
     try std.testing.expectEqual(@as(usize, 7), t.R);
     try std.testing.expectEqualSlices(i32, &.{ 50, 51, 52, 20, 30, 31, 32 }, t.vpos[0..7]);
     try std.testing.expectEqualSlices(i32, &.{ 100, 100, 100, 0, 200, 200, 200 }, t.vbase[0..7]);
@@ -1428,7 +1640,7 @@ test "the draft cut keeps drafts while the chain probability holds, and the wind
     var p: Plan = .{ .n = 2 };
     p.items[0] = .{ .sid = 0, .slot = 0, .P = 10, .tok = 1, .m = 1, .mode = 1, .arm = arm_mtp, .room = 2, .sampled = 0 };
     p.items[1] = .{ .sid = 1, .slot = 1, .P = 20, .tok = 2, .m = 1, .mode = 1, .arm = arm_mtp, .room = 2, .sampled = 0 };
-    var t = try tables(&p, 2, 3, 64);
+    var t = try tables(&p, 2, 3, 64, null);
     const N = 4;
     // stream 0: p1 = exp(1.5 - (1 + ln 2)) = 0.824 (kept), p2 = 0.824 * exp(1 - (2 + ln(1 + e^-2))) = 0.267 (cut)
     // stream 1: both picks at their total: p = 1, 1 (both kept)
@@ -1477,4 +1689,52 @@ test "the device tables' offsets are 16-byte aligned and disjoint" {
     }
     try std.testing.expect(l.vbase - l.vpos >= 12 * 4);
     try std.testing.expect(l.plan_end <= l.cidx and l.commit_end <= l.lse and l.total > l.lse_all);
+}
+
+test "Phase 4c: drafter streams' windows take the host's drafts; MTP streams keep their backlog rows" {
+    var p: Plan = .{ .n = 3 };
+    p.items[0] = .{ .sid = 0, .slot = 2, .P = 40, .tok = 7, .m = 1, .mode = @intFromEnum(Mode.dflash), .arm = arm_draft, .room = 7, .sampled = 0 };
+    p.items[1] = .{ .sid = 1, .slot = 0, .P = 20, .tok = 9, .m = 2, .mode = @intFromEnum(Mode.mtp), .arm = arm_mtp, .room = 2, .sampled = 0 };
+    p.items[2] = .{ .sid = 2, .slot = 1, .P = 30, .tok = 5, .m = 1, .mode = @intFromEnum(Mode.dspark), .arm = arm_draft, .room = 3, .sampled = 1 };
+    var dd: Drafts = .{};
+    dd.n[0] = 4;
+    dd.ids[0][0..4].* = .{ 100, 101, 102, 103 };
+    dd.n[2] = 0; // its drafter declined: the pending token alone
+    const t = try tables(&p, 2, 3, 1000, &dd);
+    try std.testing.expectEqual(@as(usize, 9), t.R);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 5, 8 }, t.offs[0..3]);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 2, 0 }, t.ds[0..3]);
+    try std.testing.expectEqualSlices(i64, &.{ 7, 100, 101, 102, 103, 9, 0, 0, 5 }, t.vids[0..9]);
+    try std.testing.expectEqualSlices(i32, &.{ 40, 41, 42, 43, 44, 20, 21, 22, 30 }, t.vpos[0..9]);
+    try std.testing.expectEqualSlices(i32, &.{ 2000, 2000, 2000, 2000, 2000, 0, 0, 0, 1000 }, t.vbase[0..9]);
+    try std.testing.expectEqual(@as(usize, 45), t.end);
+    // only the MTP stream keeps a backlog: rows P - m .. P - 1 of slot 0
+    try std.testing.expectEqual(@as(usize, 2), t.M);
+    try std.testing.expectEqual(@as(usize, 1), t.S);
+    try std.testing.expectEqualSlices(i32, &.{ 18, 19 }, t.mpos[0][0..2]);
+    try std.testing.expectEqualSlices(i64, &.{6}, t.vdst[0][0..1]);
+    // more drafts than the room asked: out of step
+    dd.n[0] = 8;
+    try std.testing.expectError(error.Invalid, tables(&p, 2, 3, 1000, &dd));
+}
+
+test "Phase 4c: modes, the drafter rows and the window with drafters" {
+    try std.testing.expectEqual(Mode.dflash, modeOf(.dflash));
+    try std.testing.expectEqual(Mode.dspark, modeOf(.dspark));
+    try std.testing.expectEqual(@as(?usize, 0), drafterOf(.dflash));
+    try std.testing.expectEqual(@as(?usize, 1), drafterOf(.dspark));
+    try std.testing.expectEqual(@as(?usize, null), drafterOf(.mtp));
+    const df: draft.Spec = .{ .kind = .dflash, .D = 6144, .hd = 128, .H = 16, .KV = 2, .I = 3072, .layers = 6, .ntaps = 6, .block = 8, .top_k = 16, .V = 38720, .vocab_off = 0, .rsel = 256, .gs = 16, .eps = 1e-5, .window = 2047, .causal = false, .world = 4, .theta = 1e6, .mask_id = 154856 };
+    var ds = df;
+    ds.kind = .dspark;
+    try std.testing.expectEqual(@as(usize, 8), try drafterRows(4, &.{ df, ds }));
+    try std.testing.expectEqual(@as(usize, 0), try drafterRows(4, &.{}));
+    try std.testing.expectEqual(@as(usize, 32), try windowRowsWith(4, 2, 8)); // 4 x max(3, 8)
+    try std.testing.expectEqual(@as(usize, 12), try windowRowsWith(4, 2, 0));
+    try std.testing.expectEqual(@as(usize, 32), try windowRowsWith(8, 2, 4)); // 8 streams: 3 drafts each
+    try std.testing.expectError(error.DrafterTooWide, drafterRows(9, &.{df}));
+    var set: Settings = .{};
+    try std.testing.expectEqual(@as(f64, 0.6), set.cutDFlash());
+    set.draft_cut_dflash = 0.5;
+    try std.testing.expectEqual(@as(f64, 0.5), set.cutDFlash());
 }

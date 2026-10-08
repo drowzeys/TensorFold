@@ -52,6 +52,9 @@ MODULES = {
     "_prep_kernel": "tensorfold.families.glm5_next.cuda.dflash2",
     "_dconv_kernel": "tensorfold.families.glm5_next.cuda.dflash2",
     "_dattn_ring": "tensorfold.families.glm_moe_dsa.cuda.dflash",
+    # Phase 4c: the concurrent DFlash2 drafter (dflash.MultiDrafter's kernels)
+    "_dconv_seg": "tensorfold.families.glm_moe_dsa.cuda.dflash",
+    "_dattn_seg": "tensorfold.families.glm_moe_dsa.cuda.dflash",
     "_block_attn_kernel": "tensorfold.families.glm_moe_dsa.cuda.dspark",
 }
 FUSED = "tensorfold.families.glm_moe_dsa.cuda.fused"

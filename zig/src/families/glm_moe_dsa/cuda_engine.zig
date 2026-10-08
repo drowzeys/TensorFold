@@ -26,6 +26,7 @@ const draft = @import("cuda_draft.zig");
 const dhost = @import("draft_host.zig");
 const copies = @import("copies.zig");
 const multi = @import("cuda_multi.zig");
+const mdraft = @import("cuda_mdraft.zig");
 const dcpm = @import("cuda_dcp.zig");
 
 pub const world_default: usize = 4;
@@ -200,6 +201,10 @@ pub const Options = struct {
         o.mode = env("TF_GLM53_MTP");
         o.verify_rows = try envInt(usize, "TF_GLM53_VERIFY_ROWS", 8);
         o.parallel = @max(1, try envInt(usize, "TF_GLM53_PARALLEL", 1));
+        // Phase 4c: TF_GLM53_CONC_MODE (engine.CONC_MODE) - the drafts of concurrent requests (dflash, dspark, ...)
+        if (o.parallel > 1) if (env("TF_GLM53_CONC_MODE")) |m| {
+            o.mode = m;
+        };
         o.multi_set = multi.Settings.fromEnv() catch {
             std.log.err("TF_GLM53_DRAFT_CUT (a number), _STREAMS / TF_GLM53_QUICK_ROWS (whole numbers)", .{});
             return error.BadSetting;
@@ -399,6 +404,7 @@ pub const Boot = struct {
             b.dspark_set.digest(&dh);
         }
         b.plan = try dhost.TapPlan.make(want);
+        try checkParallelDrafters(o.parallel, if (b.dflash_cfg) |c| c.block else null, if (b.dspark_cfg) |c| c.block else null);
         const mode_word: u64 = @intFromEnum(b.mode);
         dh.update(std.mem.asBytes(&mode_word));
         try b.rdv.sync("settings", settingsDigest(o, b.dcp, dh.final()), o.timeout_s);
@@ -500,6 +506,7 @@ pub const Boot = struct {
             b.multi = try multi.Multi.init(gpa, io, &b.r, o.parallel, o.multi_set, o.rank == 0);
             const per = b.multi.?.bytesPerStream();
             std.log.info("glm53 rank {d}: {d} concurrent streams (MTP drafts {d}, windows up to {d} rows), {d:.2} GiB of caches each ({d} tokens); draft cut {d} from {d} streams", .{ o.rank, o.parallel, o.k, b.multi.?.rows, @as(f64, @floatFromInt(per)) / (1 << 30), o.context, o.multi_set.draft_cut, o.multi_set.cut_streams });
+            if (b.multi.?.frows > 0) std.log.info("glm53 rank {d}: concurrent drafters: DFlash2 {s}, DSpark {s}; up to {d} drafts a stream, confidence floor {d} from {d} streams; requests draft with {t}", .{ o.rank, if (b.dflash_dr != null) "on" else "off", if (b.dspark_dr != null) "on" else "off", b.multi.?.frows - 1, o.multi_set.cutDFlash(), o.multi_set.cut_streams, b.mode });
         }
         b.stage = 19;
         if (o.prewarm) {
@@ -569,8 +576,8 @@ pub const Boot = struct {
 };
 
 /// Glm53Engine's refusals of --parallel N > 1 (before anything loads): decode context parallelism must be off, the
-/// drafts are the MTP head's (DSpark and DFlash2 draft one stream at a time in the Zig engine), the verify window of
-/// N x (k + 1) rows must be a decode window.
+/// verify window of N x (k + 1) rows must be a decode window. Phase 4c: DSpark and DFlash2 draft concurrent streams
+/// too (cuda_mdraft.zig; the drafters' own check, N blocks in one pass, follows once their configs are read).
 pub fn checkParallel(o: Options, dcp: usize) !void {
     if (o.parallel <= 1) return;
     const quiet = @import("builtin").is_test;
@@ -578,22 +585,28 @@ pub fn checkParallel(o: Options, dcp: usize) !void {
         if (!quiet) std.log.err("--parallel {d} needs decode context parallelism off: a context of at most {d} tokens a stream (--context), TF_GLM53_DCP unset or 1", .{ o.parallel, dcp_auto });
         return error.ParallelNeedsDcpOff;
     }
-    if (o.dspark.len > 0) {
-        if (!quiet) std.log.err("TF_GLM53_DSPARK drafts one stream at a time: --parallel 1 (concurrent streams draft with the MTP head)", .{});
-        return error.DrafterNeedsOneStream;
-    }
-    if (o.dflash.len > 0) {
-        if (!quiet) std.log.err("TF_GLM53_DFLASH drafts one stream at a time in the Zig engine: --parallel 1 (concurrent streams draft with the MTP head)", .{});
-        return error.DrafterNeedsOneStream;
-    }
-    if (o.mode) |m| if (std.mem.eql(u8, m, "dspark") or std.mem.eql(u8, m, "dflash")) {
-        if (!quiet) std.log.err("TF_GLM53_MTP={s} drafts one stream at a time: --parallel 1", .{m});
-        return error.DrafterNeedsOneStream;
-    };
     _ = multi.windowRows(o.parallel, o.k) catch {
         if (!quiet) std.log.err("{d} streams x {d} rows = {d} > {d}: a window that wide is not a decode window (lower --parallel or --mtp-drafts)", .{ o.parallel, o.k + 1, o.parallel * (o.k + 1), fw.decode_rows });
         return error.WindowTooWide;
     };
+}
+
+/// Phase 4c: a loaded drafter drafts N concurrent streams when N of its blocks fit one pass (cuda_mdraft.fits:
+/// N x block <= 64 rows; block 8: up to 8 streams).
+pub fn checkParallelDrafters(parallel: usize, dflash_block: ?usize, dspark_block: ?usize) !void {
+    if (parallel <= 1) return;
+    const quiet = @import("builtin").is_test;
+    if (dspark_block != null) {
+        if (!quiet) std.log.err("TF_GLM53_DSPARK drafts one stream at a time: --parallel 1 (concurrent streams draft with the MTP head or DFlash2)", .{});
+        return error.DrafterNeedsOneStream;
+    }
+    for ([_]?usize{ dflash_block, dspark_block }, [_][]const u8{ "TF_GLM53_DFLASH", "TF_GLM53_DSPARK" }) |maybe, name| {
+        const block = maybe orelse continue;
+        if (parallel * block > mdraft.max_pass_rows or parallel > mdraft.max_streams) {
+            if (!quiet) std.log.err("{s} with --parallel {d}: {d} streams x a block of {d} rows > {d} rows a draft pass; use --parallel <= {d}", .{ name, parallel, parallel, block, mdraft.max_pass_rows, mdraft.max_pass_rows / block });
+            return error.DrafterTooWide;
+        }
+    }
 }
 
 /// --bmm-probe FILE (tf-glm53-generate's): torch.bmm's bits on fused.attention_core's wide absorb / expand shapes
@@ -1014,11 +1027,20 @@ test "the cache check refuses a context x streams that leaves less than the rese
     try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row, 1000, 1, 1, 0, 4 * gib, 6));
 }
 
-test "--parallel refusals: DCP, the drafters, a window wider than a decode window" {
+test "--parallel refusals: DCP, a window wider than a decode window; the drafters draft concurrent streams" {
     try checkParallel(.{ .parallel = 1, .dspark = "/x" }, 4);
     try checkParallel(.{ .parallel = 4, .k = 2 }, 1);
     try std.testing.expectError(error.ParallelNeedsDcpOff, checkParallel(.{ .parallel = 4 }, 4));
-    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallel(.{ .parallel = 4, .dspark = "/x" }, 1));
-    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallel(.{ .parallel = 2, .dflash = "/x" }, 1));
+    try checkParallel(.{ .parallel = 4, .dspark = "/x" }, 1);
+    try checkParallel(.{ .parallel = 2, .dflash = "/x", .mode = "dflash" }, 1);
+    try checkParallel(.{ .parallel = 4, .dspark = "/x", .mode = "dspark", .k = 0 }, 1);
     try std.testing.expectError(error.WindowTooWide, checkParallel(.{ .parallel = 16, .k = 2 }, 1));
+}
+
+test "Phase 4c: a drafter drafts N streams when N blocks fit one pass" {
+    try checkParallelDrafters(1, 64, null);
+    try checkParallelDrafters(4, 8, null);
+    try checkParallelDrafters(8, 8, null);
+    try std.testing.expectError(error.DrafterTooWide, checkParallelDrafters(9, 8, null));
+    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallelDrafters(4, null, 8));
 }

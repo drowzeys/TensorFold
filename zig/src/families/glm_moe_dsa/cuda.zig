@@ -23,6 +23,8 @@
 //! Phase 4b: concurrent streams (cuda_multi.zig: --parallel N, multi.GlmMultiDecoder - the caches' slots, shared
 //! decode rounds with per-row positions and cache bases, the batched MTP chain, the draft cut, prompt reuse in the
 //! slots).
+//! Phase 4c: the drafters for concurrent streams (cuda_mdraft.zig: DFlash2 as dflash.MultiDrafter, DSpark with the
+//! drafter's KV keyed by the stream slot and one ragged batched block pass) in cuda_multi.zig's rounds.
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -50,6 +52,7 @@ pub const draft = @import("cuda_draft.zig");
 pub const draft_host = @import("draft_host.zig");
 pub const copies = @import("copies.zig");
 pub const multi = @import("cuda_multi.zig");
+pub const mdraft = @import("cuda_mdraft.zig");
 
 test {
     _ = @import("config.zig");
@@ -74,4 +77,5 @@ test {
     _ = draft_host;
     _ = copies;
     _ = multi;
+    _ = mdraft;
 }

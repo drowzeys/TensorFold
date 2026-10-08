@@ -14,6 +14,10 @@
 //   glm53_cut_stats      the draft cut's numbers of an MTP step's S picks: this rank's log-sum-exp over its share of
 //                        the draft head's logits (torch.logsumexp; our reduction order: decisions only, never tokens)
 //                        and the picked draft's logit (the gathered maximum over the ranks' records)
+// Phase 4c (--parallel N with DFlash2 / DSpark, cuda_mdraft.zig: dflash.MultiDrafter's tables):
+//   glm53_draft_rotary_rows   MultiDrafter._rotary(pos): cos / sin of each row's own position (an int64 table)
+//   glm53_draft_scatter_rows  kc[i].index_copy_(1, idx, k) into pooled rings: row r to its slot's ring at its position
+//                             (a slot < 0 writes nothing: the padding of a captured row bucket)
 // Drafts only propose - the target verifies every row - so a step here may round differently from torch without
 // moving any reply; the steps that matter for tokens a round (rotary, the ring, the rank-order sums) are torch's.
 #include <cuda_bf16.h>
@@ -159,4 +163,31 @@ extern "C" __global__ void glm53_cut_stats(const float* __restrict__ lg, int V, 
         for (int w = 1; w < world; ++w) t = fmaxf(t, amax_all[(static_cast<size_t>(w) * S + s) * 4]);
         top[s] = t;
     }
+}
+
+// Grid (rows), block >= half: cos / sin [rows, half] fp32 of positions pos[r] (int64 table; glm53_draft_rotary's
+// arithmetic: the position as fp32, times inv_freq, cosf / sinf).
+extern "C" __global__ void glm53_draft_rotary_rows(const long long* __restrict__ pos, const float* __restrict__ inv,
+                                                   int half, float* __restrict__ cos_out, float* __restrict__ sin_out) {
+    const int r = blockIdx.x, i = threadIdx.x;
+    if (i >= half) return;
+    const float p = static_cast<float>(pos[r]);
+    const float ph = p * inv[i];
+    cos_out[static_cast<size_t>(r) * half + i] = cosf(ph);
+    sin_out[static_cast<size_t>(r) * half + i] = sinf(ph);
+}
+
+// Grid (n, heads), block hd / 8 threads (16 bytes each): src [heads, n, hd] bf16 -> pool row
+// h * head_stride + slot[r] * slot_stride + pos[r] % ring_rows (strides in rows of hd); slot[r] < 0: row r skipped.
+extern "C" __global__ void glm53_draft_scatter_rows(const uint4* __restrict__ src, uint4* __restrict__ pool,
+                                                    const long long* __restrict__ slot, const long long* __restrict__ pos,
+                                                    int n, int hd, long long head_stride, long long slot_stride,
+                                                    int ring_rows) {
+    const int r = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
+    const int w = hd / 8;  // uint4 words a row
+    if (j >= w) return;
+    const long long sl = slot[r];
+    if (sl < 0) return;
+    const long long row = static_cast<long long>(h) * head_stride + sl * slot_stride + pos[r] % ring_rows;
+    pool[static_cast<size_t>(row) * w + j] = src[(static_cast<size_t>(h) * n + r) * w + j];
 }

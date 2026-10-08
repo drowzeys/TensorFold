@@ -318,6 +318,19 @@ pub const Tri = struct {
         try t.run("_dattn_ring", .{ kvh, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", k), p("V", "*bf16", v), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("window", window), aot.float("scale", scale) }, &.{ ci("N", n), ci("G", g), ci("NH", heads), ci("HD", hd), ci("RING_", ring_rows), ci("BK", 64), cb("CAUSAL", causal) }, .{ .num_warps = 4 });
     }
 
+    /// Phase 4c: dflash._dconv_seg - _dconv_kernel over blocks of SEG rows side by side (a block's first row mixes no
+    /// row before it: one block computes the solo kernel's bits), plus the residual when `has_res`.
+    pub fn dconvSeg(t: Tri, x: u64, dyn: u64, base: u64, res: u64, out: u64, rows: usize, d: usize, gs: usize, branch: usize, has_res: bool, seg: usize) !void {
+        try t.run("_dconv_seg", .{ rows, cdiv(d, 1024), 1 }, &.{ p("X", "*bf16", x), p("DYN", "*bf16", dyn), p("BASE", "*bf16", base), p("RES", "*bf16", res), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("G", d / gs), ci("GS", gs), ci("BRANCH", branch), cb("HAS_RES", has_res), ci("BLOCK", 1024), ci("SEG", seg) }, .{ .num_warps = 4 });
+    }
+
+    /// Phase 4c: dflash._dattn_seg - _dattn_ring for `segs` blocks of N rows side by side (program 1: the block): its
+    /// queries at rows seg * N of q [heads, L, hd], its ring at slot META[St + seg] (rows slot * RING_ of the pooled
+    /// k / v [kv heads, POOL, hd]), its committed length META[2 St + seg] (int64).
+    pub fn dattnSeg(t: Tri, q: u64, k: u64, v: u64, out: u64, meta: u64, st: usize, window: usize, scale: f32, L: usize, pool: usize, n: usize, g: usize, heads: usize, hd: usize, ring_rows: usize, kvh: usize, segs: usize, causal: bool) !void {
+        try t.run("_dattn_seg", .{ kvh, segs, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", k), p("V", "*bf16", v), p("OUT", "*bf16", out), p("META", "*i64", meta), int("St", st), int("window", window), aot.float("scale", scale), int("L", L), int("POOL", pool) }, &.{ ci("N", n), ci("G", g), ci("NH", heads), ci("HD", hd), ci("RING_", ring_rows), ci("BK", 64), cb("CAUSAL", causal) }, .{ .num_warps = 4 });
+    }
+
     /// glue.residual_add with the gathered slots `rs` words apart (fused.small_gather's padded row stride).
     pub fn residualAddStride(t: Tri, x: u64, g: u64, rows: usize, d: usize, world: usize, rs: usize) !void {
         const block = @min(1024, d);

@@ -436,7 +436,7 @@ pub const Host = struct {
         @memcpy(payload[r.prompt.len + c.stops.len ..][0..c.keeps.len], c.keeps);
         @memcpy(payload[r.prompt.len + c.stops.len + c.keeps.len ..], r.eos);
         try h.sendOne(&head, payload);
-        _ = mu.admit(.{ .sid = sid, .slot = c.slot, .mode = if (draft) .mtp else .serial, .sampling = s, .count = max_tokens, .prompt = r.prompt, .eos = r.eos, .begin = c.begin, .src = c.src, .stops = c.stops, .keeps = c.keeps, .flush = false, .hook = .{ .ctx = lv, .tokens = Live.tokens } }) catch |e| {
+        _ = mu.admit(.{ .sid = sid, .slot = c.slot, .mode = if (draft) glm.multi.modeOf(h.boot.mode) else .serial, .sampling = s, .count = max_tokens, .prompt = r.prompt, .eos = r.eos, .begin = c.begin, .src = c.src, .stops = c.stops, .keeps = c.keeps, .flush = false, .hook = .{ .ctx = lv, .tokens = Live.tokens } }) catch |e| {
             mu.broken = h.boot.o.world > 1; // the followers took the admission
             return e;
         };
@@ -452,7 +452,7 @@ pub const Host = struct {
 
     fn linkRound(ctx: *anyopaque, plan: *const glm.multi.Plan) anyerror!void {
         const h: *Host = @ptrCast(@alignCast(ctx));
-        var buf: [3 + glm.multi.max_streams * glm.multi.item_words]u32 = undefined;
+        var buf: [glm.multi.plan_words]u32 = undefined;
         const w = try plan.encode(&buf);
         h.mseq += 1;
         var head: Head = .{ .kind = @intFromEnum(Kind.round), .seq = h.mseq, .at = @intCast(w.len) };
@@ -583,7 +583,7 @@ pub const Host = struct {
                 const keeps = ws[head.prompt_len + head.n_stops ..][0..head.n_keeps];
                 const eos = ws[head.prompt_len + head.n_stops + head.n_keeps ..][0..head.n_eos];
                 const s: ?smp.Sampling = if (head.flags & flag_greedy != 0) null else .{ .seed = head.seed, .temperature = head.temperature, .top_k = head.top_k, .top_p = head.top_p, .min_p = head.min_p };
-                _ = try mu.admit(.{ .sid = @intCast(head.key), .slot = head.at, .mode = if (head.flags & flag_draft != 0) .mtp else .serial, .sampling = s, .count = head.max_tokens, .prompt = prompt, .eos = eos, .begin = head.begin, .src = if (head.pad > 0) head.pad - 1 else null, .stops = stops, .keeps = keeps, .flush = head.flags & flag_flush != 0 });
+                _ = try mu.admit(.{ .sid = @intCast(head.key), .slot = head.at, .mode = if (head.flags & flag_draft != 0) glm.multi.modeOf(h.boot.mode) else .serial, .sampling = s, .count = head.max_tokens, .prompt = prompt, .eos = eos, .begin = head.begin, .src = if (head.pad > 0) head.pad - 1 else null, .stops = stops, .keeps = keeps, .flush = head.flags & flag_flush != 0 });
             },
             .fill => {
                 _ = try mu.applyFill(@intCast(head.key));

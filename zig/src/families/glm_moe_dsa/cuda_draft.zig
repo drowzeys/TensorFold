@@ -38,6 +38,8 @@ const host = @import("draft_host.zig");
 const Q4 = kern.Q4;
 pub const ring_rows: usize = host.ring;
 pub const tap_rows: usize = host.tap_rows;
+/// Phase 4c: the most blocks a concurrent block pass takes side by side (cuda_mdraft.zig: one a stream slot).
+pub const max_segs: usize = 16;
 /// glm5_next dflash2.NO_LIMIT: SwiGLU's clamp (none).
 const no_limit: f32 = 1e30;
 
@@ -576,15 +578,248 @@ pub const Drafter = struct {
 
     /// The host stage on the merged candidates: up to `depth` drafts after `pending` (slot 0's token at `first`).
     pub fn walkDrafts(dr: *Drafter, depth: usize, pending: u32, first: u64, sampling: ?smp.Sampling, out: []u32) []u32 {
+        return dr.walkConf(depth, pending, first, sampling, null, out);
+    }
+
+    /// walkDrafts with the confidence floor `conf` instead of the settings' (null: the settings'; Phase 4c: the
+    /// concurrent rounds' draft cut raises it, multi.DRAFT_CUT_DFLASH).
+    pub fn walkConf(dr: *Drafter, depth: usize, pending: u32, first: u64, sampling: ?smp.Sampling, conf: ?f64, out: []u32) []u32 {
         const sp = dr.sp;
         const ws = &dr.walk.?;
         dr.proposals += 1;
         if (sp.kind == .dspark) {
             const s = dr.dset;
             const rms: ?[]const f64 = if (dr.n_round_ms > 0) dr.round_ms[0..dr.n_round_ms] else null;
-            return dr.chain.walk(dr.tokens, dr.values, dr.extra, depth, sp.top_k, pending, first, .{ .sampling = sampling, .policy = s.policy, .confidence = s.confidence, .round_ms = rms, .noise = s.noise, .filtered = s.filter, .row_cost = s.row_cost }, ws, out);
+            return dr.chain.walk(dr.tokens, dr.values, dr.extra, depth, sp.top_k, pending, first, .{ .sampling = sampling, .policy = s.policy, .confidence = conf orelse s.confidence, .round_ms = rms, .noise = s.noise, .filtered = s.filter, .row_cost = s.row_cost }, ws, out);
         }
-        return host.selectorChain(dr.pred, dr.succ, sp.rsel, dr.tokens, dr.values, dr.extra, depth, sp.top_k, pending, first, sampling, dr.fset.confidence, ws, out);
+        return host.selectorChain(dr.pred, dr.succ, sp.rsel, dr.tokens, dr.values, dr.extra, depth, sp.top_k, pending, first, sampling, conf orelse dr.fset.confidence, ws, out);
+    }
+
+    // ------------------------------------------------------------------- Phase 4c: concurrent streams ---
+
+    /// Phase 4c (cuda_mdraft.zig, dflash.MultiDrafter): a view of this drafter for concurrent streams - its weights,
+    /// tap layout and settings, with static buffers of its own for passes of up to `rows` rows (every live stream's
+    /// block side by side, or a stacked context update), `head_rows` head rows and `send_words` words a rank sends;
+    /// `kc` / `vc` (each layer's pooled rings, owned by the caller) as its rings. The host stage stays the one-stream
+    /// drafter's (walkConf on it). Never `deinit` a view: `freeView`.
+    pub fn initView(base: *const Drafter, rows: usize, head_rows: usize, send_words: usize, kc: []u64, vc: []u64) !Drafter {
+        var v: Drafter = base.*;
+        v.mem = .empty;
+        v.pin = null;
+        v.b = .{ .inv = base.b.inv };
+        v.kc = kc;
+        v.vc = vc;
+        errdefer v.freeView();
+        try v.allocView(rows, head_rows, send_words);
+        return v;
+    }
+
+    /// A view's own device buffers and pinned staging (not the weights, rings or host tables: the base's / caller's).
+    pub fn freeView(v: *Drafter) void {
+        for (v.mem.items) |*m| m.free();
+        v.mem.deinit(v.gpa);
+        v.mem = .empty;
+        if (v.pin) |*p| p.free();
+        v.pin = null;
+    }
+
+    fn allocView(v: *Drafter, rows: usize, head_rows: usize, send_words: usize) !void {
+        const sp = v.sp;
+        const R = rows;
+        const D = sp.D;
+        const hr = head_rows;
+        if (R == 0 or R > tap_rows or hr == 0) return error.Invalid;
+        const kmax = @max(@max(sp.ntaps * D, D), @max(sp.I, sp.H * sp.hd));
+        v.b.x = try v.zeros(R * D * 2);
+        v.b.normed = try v.zeros(R * D * 2);
+        v.b.xs = try v.zeros(R * (kmax / 64) * 4);
+        v.b.t0 = try v.zeros(R * @max(D, sp.qkvN()) * 2);
+        v.b.q = try v.zeros(sp.H * R * sp.hd * 2);
+        v.b.k = try v.zeros(sp.KV * R * sp.hd * 2);
+        v.b.v = try v.zeros(sp.KV * R * sp.hd * 2);
+        v.b.att = try v.zeros(R * sp.H * sp.hd * 2);
+        v.b.part = try v.zeros(std.mem.alignForward(usize, R * D, 4) * 4);
+        v.b.gath = try v.zeros(sp.world * std.mem.alignForward(usize, R * D, 4) * 4);
+        v.b.gu = try v.zeros(R * 2 * sp.I * 2);
+        v.b.act = try v.zeros(R * sp.I * 2);
+        v.b.axs = try v.zeros(R * (sp.I / 64) * 4);
+        v.b.conv = try v.zeros(R * D * 2); // DFlash2's convolutions; both: a block pass's head rows side by side
+        if (sp.kind == .dflash) {
+            v.b.rsum = try v.zeros(R * D * 2);
+            v.b.dyn = try v.zeros(R * 4 * (D / sp.gs) * 2);
+        }
+        v.b.cos = try v.zeros(R * (sp.hd / 2) * 4);
+        v.b.sin = try v.zeros(R * (sp.hd / 2) * 4);
+        v.b.logits = try v.zeros(hr * sp.V * 4);
+        const blocks = (sp.V + kern.topk_chunk - 1) / kern.topk_chunk;
+        v.b.tsel = .{ .hist = try v.zeros(kern.TopkScratch.histBytes(hr)), .state = try v.zeros(hr * 16), .cnt = try v.zeros(hr * blocks * 8), .rows = hr, .blocks = blocks };
+        v.b.cand_cols = try v.zeros(hr * sp.top_k * 4);
+        v.b.send = try v.zeros(send_words * 4);
+        v.b.cand = try v.zeros((sp.world * send_words + hr * sp.extra()) * 4);
+        {
+            const ids = try v.gpa.alloc(i32, R);
+            defer v.gpa.free(ids);
+            @memset(ids, @intCast(sp.mask_id));
+            var m = try cuda.DeviceBuffer.fromHost(v.d.?, std.mem.sliceAsBytes(ids));
+            errdefer m.free();
+            try v.mem.append(v.gpa, m);
+            v.b.ids = m.ptr;
+        }
+        v.b.tap_in = try v.zeros(R * sp.ntaps * D * 2);
+        v.pin = try cuda.HostBuffer.alloc(v.d.?, (sp.world * send_words + hr * sp.extra()) * 4);
+    }
+
+    /// Where a concurrent pass's keys and values go: the pooled rings' layout (rows of head_dim).
+    pub const PoolLayout = struct {
+        head_stride: usize, // ring rows between two KV heads (DFlash2: slots x RING; DSpark: RING)
+        slot_stride: usize, // ring rows between two stream slots (DFlash2: RING; DSpark: KV heads x RING)
+    };
+
+    /// A concurrent block pass's blocks (cuda_mdraft.zig's tables on the device).
+    pub const Segs = struct {
+        S: usize, // blocks side by side
+        St: usize, // META's pitch (the decoder's stream slots)
+        meta: u64, // int64 [3 St]: each block's pending | slot | committed length (MultiDrafter.b_meta)
+        spos: u64, // int64 each block's committed length again, 16 bytes apart (DSpark: _block_attn_kernel's POS)
+        rpos: u64, // int64 [S block]: each row's position
+        rslot: u64, // int64 [S block]: each row's slot
+        slots: [max_segs]usize = @splat(0), // each block's slot (DSpark: its ring, baked into the graph)
+        pl: PoolLayout,
+        pool_rows: usize, // DFlash2: _dattn_seg's POOL (ring rows a KV head)
+    };
+
+    /// kc[i] / vc[i].index_copy_(1, idx, k / v) into the pooled rings: row r to slot[r]'s ring at pos[r] % RING.
+    fn scatterRows(dr: *const Drafter, dv: Dev, i: usize, rows: usize, pl: PoolLayout, slot: u64, pos: u64) !void {
+        const o = dv.o orelse return;
+        const sp = dr.sp;
+        try o.draftScatterRows(dr.b.k, dr.kc[i], slot, pos, sp.KV, rows, sp.hd, pl.head_stride, pl.slot_stride, ring_rows);
+        try o.draftScatterRows(dr.b.v, dr.vc[i], slot, pos, sp.KV, rows, sp.hd, pl.head_stride, pl.slot_stride, ring_rows);
+    }
+
+    /// MultiDrafter._taps_compute(T): b.tap_in[:T] (several streams' committed rows stacked) -> each row's context K /
+    /// V into its slot's ring at its position (int64 tables `slot` / `pos`; a negative slot: the padding of a captured
+    /// row bucket, nothing written). tapsCompute's arithmetic row by row (the passes are row-invariant).
+    pub fn tapsComputeRows(dr: *const Drafter, dv: Dev, T: usize, pl: PoolLayout, slot: u64, pos: u64) !void {
+        const sp = dr.sp;
+        if (T == 0 or T > tap_rows) return error.Invalid;
+        try dr.mm(dv, dr.b.tap_in, null, dr.fc, dr.b.t0, T, false);
+        try dr.rmsNorm(dv, dr.b.t0, dr.hidden_norm, dr.b.normed, T); // ctx (its sums unused: _mm(ctx) sums again)
+        if (dv.o) |o| try o.draftRotaryRows(pos, dr.b.inv, sp.hd / 2, dr.b.cos, dr.b.sin, T);
+        for (dr.layers, 0..) |*L, i| {
+            try dr.mm(dv, dr.b.normed, null, L.kv, dr.b.t0, T, false);
+            try dr.prepRows(dv, dr.b.t0, sp.kvN(), L, 0, T);
+            try dr.scatterRows(dv, i, T, pl, slot, pos);
+        }
+    }
+
+    /// MultiDrafter._layer for DFlash2: S blocks side by side through one layer (_dconv_seg, the pooled rings,
+    /// _dattn_seg reading each block's slot and committed length from META).
+    fn flashLayerSegs(dr: *const Drafter, dv: Dev, i: usize, sg: Segs) !void {
+        const sp = dr.sp;
+        const L = &dr.layers[i];
+        const D = sp.D;
+        const n = sp.block;
+        const R = sg.S * n;
+        try dr.rmsNorm(dv, dr.b.x, L.in_norm, dr.b.normed, R);
+        try dr.mm(dv, dr.b.normed, dr.b.xs, L.a_kp, dr.b.dyn, R, false);
+        try dv.t.dconvSeg(dr.b.normed, dr.b.dyn, L.a_base, dr.b.normed, dr.b.conv, R, D, sp.gs, 0, false, n);
+        try dr.mm(dv, dr.b.conv, null, L.qkv, dr.b.t0, R, false);
+        try dr.prepRows(dv, dr.b.t0, sp.qkvN(), L, sp.H, R);
+        try dr.scatterRows(dv, i, R, sg.pl, sg.rslot, sg.rpos);
+        try dv.t.dattnSeg(dr.b.q, dr.kc[i], dr.vc[i], dr.b.att, sg.meta, sg.St, sp.window, sp.scale(), R, sg.pool_rows, n, sp.H / sp.KV, sp.H, sp.hd, ring_rows, sp.KV, sg.S, sp.causal);
+        try dr.rowSum(dv, dr.b.att, null, L.o, R);
+        try dv.t.dconvSeg(dr.b.rsum, dr.b.dyn, L.a_base, dr.b.x, dr.b.x, R, D, sp.gs, 1, true, n);
+        try dr.rmsNorm(dv, dr.b.x, L.post_norm, dr.b.normed, R);
+        try dr.mm(dv, dr.b.normed, dr.b.xs, L.m_kp, dr.b.dyn, R, false);
+        try dv.t.dconvSeg(dr.b.normed, dr.b.dyn, L.m_base, dr.b.normed, dr.b.conv, R, D, sp.gs, 0, false, n);
+        try dr.mm(dv, dr.b.conv, null, L.gu, dr.b.gu, R, false);
+        try dv.t.swigluSums(dr.b.gu, dr.b.act, dr.b.axs, no_limit, R, sp.I);
+        try dr.rowSum(dv, dr.b.act, dr.b.axs, L.down, R);
+        try dv.t.dconvSeg(dr.b.rsum, dr.b.dyn, L.m_base, dr.b.x, dr.b.x, R, D, sp.gs, 1, true, n);
+    }
+
+    /// SparkDrafter._layer for S blocks side by side: the row-wise steps (norms, the 4-bit matmuls, the row-parallel
+    /// sums, the MLP) over every block at once; each block's attention part alone, as the one-stream pass runs it -
+    /// _prep_kernel on its rows, its keys / values into its slot's ring (slot-major pool), _block_attn_kernel over that
+    /// ring at its committed length (`spos`).
+    fn sparkLayerSegs(dr: *const Drafter, dv: Dev, i: usize, sg: Segs) !void {
+        const sp = dr.sp;
+        const L = &dr.layers[i];
+        const n = sp.block;
+        const R = sg.S * n;
+        const half = sp.hd / 2;
+        const qkv_n = sp.qkvN();
+        try dr.rmsNorm(dv, dr.b.x, L.in_norm, dr.b.normed, R);
+        try dr.mm(dv, dr.b.normed, dr.b.xs, L.qkv, dr.b.t0, R, false);
+        for (0..sg.S) |s| {
+            const r0 = s * n;
+            const q = dr.b.q + s * sp.H * n * sp.hd * 2;
+            const k = dr.b.k + s * sp.KV * n * sp.hd * 2;
+            const v = dr.b.v + s * sp.KV * n * sp.hd * 2;
+            const pos = sg.spos + s * 16;
+            const ring_at = sg.slots[s] * sg.pl.slot_stride * sp.hd * 2;
+            try dv.t.prep(dr.b.t0 + r0 * qkv_n * 2, L.q_norm, L.k_norm, dr.b.cos + r0 * half * 4, dr.b.sin + r0 * half * 4, q, k, v, n, qkv_n, sp.eps, sp.H, sp.KV, half);
+            if (dv.o) |o| {
+                try o.draftScatter(k, dr.kc[i] + ring_at, pos, sp.KV, n, sp.hd, ring_rows);
+                try o.draftScatter(v, dr.vc[i] + ring_at, pos, sp.KV, n, sp.hd, ring_rows);
+            }
+            try dv.t.blockAttn(q, dr.kc[i] + ring_at, dr.vc[i] + ring_at, dr.b.att + r0 * sp.H * sp.hd * 2, pos, sp.window, sp.scale(), n, sp.H, sp.hd, ring_rows, sp.causal);
+        }
+        try dr.rowResidual(dv, dr.b.att, null, L.o, R);
+        try dr.rmsNorm(dv, dr.b.x, L.post_norm, dr.b.normed, R);
+        try dr.mm(dv, dr.b.normed, dr.b.xs, L.gu, dr.b.gu, R, false);
+        try dv.t.swigluSums(dr.b.gu, dr.b.act, dr.b.axs, no_limit, R, sp.I);
+        try dr.rowResidual(dv, dr.b.act, dr.b.axs, L.down, R);
+    }
+
+    /// MultiDrafter._block_compute(S): S blocks [pending, mask x (block - 1)] side by side (b.ids, the caller's) at
+    /// their streams' committed lengths -> every head row's top_k of each rank's head share, gathered into b.cand
+    /// [ranks, stride] (block s's head rows at s x headRows), the rows' extra words after `send_words` words a rank.
+    /// Returns the gather's stride (words a rank).
+    pub fn blockComputeSegs(dr: *Drafter, dv: Dev, sg: Segs, send_words: usize) !usize {
+        const sp = dr.sp;
+        const D = sp.D;
+        const n = sp.block;
+        const R = sg.S * n;
+        const hr = sp.headRows();
+        const HR = sg.S * hr;
+        if (sg.S == 0 or sg.S > max_segs or R > tap_rows) return error.Invalid;
+        try dv.t.embedB16(dr.b.ids, dr.embed, dr.b.x, R, D);
+        if (dv.o) |oc| try oc.draftRotaryRows(sg.rpos, dr.b.inv, sp.hd / 2, dr.b.cos, dr.b.sin, R);
+        for (0..sp.layers) |i| {
+            if (sp.kind == .dspark) try dr.sparkLayerSegs(dv, i, sg) else try dr.flashLayerSegs(dv, i, sg);
+        }
+        var h_in = dr.b.x; // DSpark: every slot's row (sample_from_anchor)
+        if (sp.kind == .dflash) { // x.view(S, n, D)[:, 1:]: each block's rows 1.. side by side
+            if (dv.o) |oc| try oc.copyRows(dr.b.conv, hr * D * 2, dr.b.x + D * 2, n * D * 2, hr * D * 2, sg.S);
+            h_in = dr.b.conv;
+        }
+        try dr.rmsNorm(dv, h_in, dr.norm, dr.b.normed, HR);
+        try dr.mm(dv, dr.b.normed, dr.b.xs, dr.head, dr.b.logits, HR, true); // headq.logits (q4, fp32)
+        if (dv.o) |oc| {
+            try oc.topkColumns(dr.b.logits, sp.V, sp.V, HR, sp.top_k, true, dr.b.tsel, dr.b.cand_cols, sp.top_k);
+            try oc.cands(dr.b.logits, sp.V, dr.b.cand_cols, sp.top_k, sp.vocab_off, dr.b.send, HR);
+        }
+        const words = HR * 2 * sp.top_k;
+        var stride = words;
+        if (dv.f) |f| {
+            stride = try f.smallGather(dr.b.send, dr.b.cand, words);
+            dr.ranks = if (f.w.world > 1 and (f.comm != null or f.fast != null)) f.w.world else 1;
+        } else {
+            dr.ranks = sp.world;
+        }
+        const extra_at = dr.b.cand + sp.world * send_words * 4;
+        const o = dv.o orelse return stride;
+        if (sp.kind == .dspark) {
+            if (dr.conf_h != 0) {
+                try o.draftDot(dr.b.normed, dr.conf_h, D, extra_at, HR);
+            } else {
+                try o.fill32(extra_at, 0, HR);
+            }
+        } else {
+            try o.draftLinear(dr.b.normed, dr.hproj, D, sp.rsel, extra_at, HR);
+        }
+        return stride;
     }
 
     // -------------------------------------------------------------------------------------------- load ---
