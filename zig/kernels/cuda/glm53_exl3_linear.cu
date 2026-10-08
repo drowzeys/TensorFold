@@ -453,3 +453,7 @@ template __global__ void tf_exl3_linear::linear_kernel<10, 2, 4, 1, 1>(const __g
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 4, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 8, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 8, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 4, 1, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 4, 2, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 8, 1, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 8, 2, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);

@@ -137,7 +137,7 @@ pub fn linearSymbol(buf: []u8, k2: usize, cb: Codebook, wk: usize, g: usize, v: 
 pub const rot_in_symbol = "_ZN14tf_exl3_linear13rot_in_kernelEPKviNS_7RotJobsEi";
 
 /// The linear_kernel instantiations the copy exports (copy_exl3_kernels.py LINEAR_K2 x CB 2 x WK 4, 8 x G 1, 2).
-pub const linear_k2s = [_]usize{ 6, 8, 10 };
+pub const linear_k2s = [_]usize{ 6, 8, 10, 16 }; // 16: the MTP layer's 8-bit dense projections
 
 // -- routed experts (cuda/exl3/experts.py) ---------------------------------------------------------------------------
 
