@@ -632,9 +632,9 @@ fn readPrompts2b(gpa: std.mem.Allocator, io: std.Io, path: []const u8, default_t
         p.min_p = if (o.get("min_p")) |x| try jsonFloat(x) else null;
         p.eos = null;
         if (o.get("eos")) |ev| {
-            const list = ev.array.items;
-            const e = try gpa.alloc(u32, list.len);
-            for (list, e) |x, *y| y.* = @intCast(try jsonU64(x));
+            const items = ev.array.items;
+            const e = try gpa.alloc(u32, items.len);
+            for (items, e) |x, *y| y.* = @intCast(try jsonU64(x));
             p.eos = e;
         }
         const runs = if (o.get("runs")) |r| r.array.items else &[_]std.json.Value{};

@@ -952,7 +952,8 @@ test "cut_and_keep: the last stop, the system block and the fork, sorted as n * 
     const U = 9;
     const A = 7;
     const plan: Plan = .{ .ids = .{ .user = U, .assistant = A }, .gap = 2, .system_min = 2 };
-    const p = [_]u32{ 1, 2, U, 3, A, 4, 4, U, 5, A, 6, 6, U, 7, A };
+    // 8, not 7, before the last opener: token 7 is A itself (Python agrees: [..., 7, A] cuts at 14)
+    const p = [_]u32{ 1, 2, U, 3, A, 4, 4, U, 5, A, 6, 6, U, 8, A };
     const pts = try plan.points(gpa, &p);
     defer gpa.free(pts);
     try std.testing.expectEqualSlices(usize, &.{ 2, 5, 10, 15 }, pts);
