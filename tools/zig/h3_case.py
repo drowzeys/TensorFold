@@ -4,7 +4,8 @@
 Writes case.safetensors from the Python 0.6 family, float projections and FastVideo's reference routing:
   text                 the prompt's rows after the condition projection and the token refiner (they never change)
   video, audio         the starting noise rows
-  cos, sin             rotary tables for every packed row, in the order [text | audio | video]
+  condition            with --first-frame, the image's rows at the keyframe noise level; they are never stepped
+  cos, sin             rotary tables for every packed row, in the order [text | keyframe | audio | video]
   adaln, times         per step, each row's line in a block's modulation tables and in the final layer's
   tables.N, final      every block's six modulation tables for the run's timesteps, and the final layer's
   video_step, audio_step  per step (sigma seen, Euler ratio)
@@ -14,6 +15,8 @@ The block projections are read by the native tool from the checkpoint itself.
 `--decode PREFIX` instead decodes PREFIX.video.f32 and PREFIX.audio.f32 (raw rows) into --mp4.
 `--revoice N` with it first makes the audio rows again with the released model (no distillation) in N steps against
 the finished picture, as families/h3/sampler.py `revoice` does; it needs the prompt (--prompt-file) and --seed.
+`--first-frame IMAGE` starts the clip from an image: its vision tokens join the prompt's rows and its encoded rows sit
+between the text and the audio, as tools/h3_generate_dev.py --first-frame does (the image is stretched onto the canvas).
 `--steps N` exports N forwards instead of the checkpoint's own count, rungs spread evenly from its first rung.
 """
 
@@ -44,6 +47,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=0, help="forwards, when not the checkpoint's trained count")
     parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
                         help="with --decode: audio made again by the released model in this many steps")
+    parser.add_argument("--first-frame", help="image the clip starts from (image to video)")
     parser.add_argument("--no-reference", action="store_true",
                         help="skip the reference forward (its velocities are written as zeros): for renders, not parity")
     args = parser.parse_args()
@@ -104,10 +108,20 @@ def main() -> int:
         print(json.dumps({"mp4": args.mp4, "frames": int(frames.shape[0])}))
         return 0
 
-    text, tags = tool.encode_text(root, Path(args.prompt_file).read_text())
+    image, condition, keyframes = None, None, ()
+    if args.first_frame:
+        from minimax_h3_mlx.packing import prepare_keyframe_image
+        from PIL import Image
+
+        image = prepare_keyframe_image(Image.open(args.first_frame).convert("RGB"), args.height, args.width, stretch=True)
+    text, tags = tool.encode_text(root, Path(args.prompt_file).read_text(), image)
+    if image is not None:
+        condition, keyframes = tool.encode_first_frame(root, image, args.width, args.height, config.patch_size), ("first",)
     dit, gates, fast = fasth3.load_fasth3(args.fasth3)
-    packed = layout(tags, frames_l, lat_h, lat_w, audio_l, config.patch_size)
-    video, audio = start_noise(config, frames_l, lat_h, lat_w, audio_l, args.seed)
+    packed = layout(tags, frames_l, lat_h, lat_w, audio_l, config.patch_size, keyframes)
+    held = packed.condition_video_rows
+    # the keyframe's rows come first among the video rows, already at their noise level
+    video, audio = start_noise(config, frames_l, lat_h, lat_w, audio_l, args.seed, condition)
     prepare = fasth3.route(dit, gates, fast.sparsity, fast.tile, "reference")
     geometry = prepare(packed, frames_l, lat_h, lat_w)
     nodes = fast.nodes
@@ -121,7 +135,7 @@ def main() -> int:
     cos, sin = rotary_tables(config, packed.position_ids)
     lines = np.maximum(np.asarray(packed.tags), 0)
     case = {
-        "text": rows[0].astype(mx.bfloat16), "video": video.astype(mx.float32), "audio": audio.astype(mx.float32),
+        "text": rows[0].astype(mx.bfloat16), "video": video[held:].astype(mx.float32), "audio": audio.astype(mx.float32),
         "cos": cos.astype(mx.float32), "sin": sin.astype(mx.float32),
         "adaln": mx.array(np.stack([np.asarray(p) * MODALITIES + lines for p in plan]).astype(np.int32)),
         "times": mx.array(np.stack([np.asarray(p) for p in plan]).astype(np.int32)),
@@ -131,7 +145,8 @@ def main() -> int:
         "geometry": mx.array(np.asarray([geometry.num_prefix_tiles, geometry.num_video_tiles,
                                          fasth3_keep(fast.sparsity, geometry.num_video_tiles),
                                          int(packed.text_rows.shape[0]), int(packed.audio_rows.shape[0]),
-                                         int(packed.video_rows.shape[0])], dtype=np.int32)),
+                                         int(packed.video_rows.shape[0]) - held, held][: 7 if held else 6],
+                                        dtype=np.int32)),
         "video_in.weight": dit.video_patch_proj.weight.astype(mx.float32),
         "video_in.bias": dit.video_patch_proj.bias.astype(mx.float32),
         "audio_in.weight": dit.audio_patch_proj.weight.astype(mx.float32),
@@ -142,6 +157,8 @@ def main() -> int:
         "audio_out.bias": dit.final_layer.audio_out.bias.astype(mx.float32),
         "final_norm.weight": dit.final_layer.norm.weight.astype(mx.bfloat16),
     }
+    if held:
+        case["condition"] = video[:held].astype(mx.float32)
     for name, schedule in zip(("video_step", "audio_step"), schedules, strict=True):
         steps = [(float(np.float32(1.0) - schedule.timesteps[i]), float(schedule.sigmas[i + 1] / schedule.sigmas[i]))
                  for i in range(len(schedule))]
@@ -151,16 +168,16 @@ def main() -> int:
     mx.eval(*case.values())
     mark = time.perf_counter()
     if args.no_reference:
-        case["video_velocity"], case["audio_velocity"] = mx.zeros_like(video), mx.zeros_like(audio)
+        case["video_velocity"], case["audio_velocity"] = mx.zeros_like(video[held:]), mx.zeros_like(audio)
     else:
         first = dit(video[None], audio[None], text, table, plan[0], packed.tags, packed.position_ids,
                     packed.video_rows, packed.audio_rows, packed.text_rows)
         mx.eval(*first)
-        case["video_velocity"] = first[0][0].astype(mx.float32)
+        case["video_velocity"] = first[0][0, held:].astype(mx.float32)
         case["audio_velocity"] = first[1][0].astype(mx.float32)
     mx.save_safetensors(str(out / "case.safetensors"), case)
     print(json.dumps({"rows": packed.rows, "text": int(packed.text_rows.shape[0]), "audio": int(packed.audio_rows.shape[0]),
-                      "video": int(packed.video_rows.shape[0]), "timesteps": int(table.shape[0]),
+                      "video": int(packed.video_rows.shape[0]) - held, "keyframe": held, "timesteps": int(table.shape[0]),
                       "tiles": geometry.num_tiles, "prefix_tiles": geometry.num_prefix_tiles,
                       "hidden": config.hidden_size, "layers": config.num_layers,
                       "reference_forward_s": round(time.perf_counter() - mark, 1)}))
