@@ -6,11 +6,11 @@ Subcommands:
   make-conv   --context-file F --out conv.json             the 3-turn conversation (system prompt + tools, turn 1's
                                                            user message carries the 32K text; sampled, fixed seeds)
   conv        --url U --spec conv.json --out X.json [--warm 1,2,3] [--cold 2,3] [--serial 3]
-              [--flush-file /work/REUSE_FLUSH] [--history convA.json]
+              [--flush-file /work/REUSE_FLUSH] [--history convA.json] [--idle S]
               streams each turn (client TTFT = first content / reasoning delta); turn n's history is turn 1..n-1's
               replies from --history when given, else this run's own warm replies. --cold: the flush file is touched
               before each cold turn (the server forgets every kept state). --serial: the turn again with "draft": false
-  api         --url U --out api.json                       non-streaming, streaming, a tool call, a Hermes-style
+  api         --url U --out api.json [--idle S]            non-streaming, streaming, a tool call, a Hermes-style
                                                            3-request multi-turn smoke
   dump2cli    --dump D.jsonl --out prompts.json [--skip N]  the dump's finished requests as a tf-glm53-generate
                                                            --mode 3b prompts file (ids, seed, sampling, token count)
@@ -60,21 +60,29 @@ def say(*a) -> None:
 
 
 # ------------------------------------------------------------------------------------------------------- http ---
-def post(url: str, body: dict, timeout: float = 7200) -> tuple[int, dict, float]:
+# socket timeout of every request: no byte from the server for this long fails it (--idle; the run script passes
+# PROGRESS_MIN minutes) instead of a request hanging the gate (run 2, 2026-10-08)
+IDLE_S = 7200.0
+
+
+def post(url: str, body: dict, timeout: float | None = None) -> tuple[int, dict, float]:
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout or IDLE_S) as r:
             return r.status, json.load(r), time.time() - t0
     except urllib.error.HTTPError as e:
         try:
             return e.code, json.loads(e.read() or b"{}"), time.time() - t0
         except ValueError:
             return e.code, {}, time.time() - t0
+    except (urllib.error.URLError, OSError, ValueError) as e:  # refused, reset, timed out, or a broken body
+        say(f"request failed: {type(e).__name__}: {e}")
+        return 0, {"error": f"{type(e).__name__}: {e}"}, time.time() - t0
 
 
-def stream(url: str, body: dict, timeout: float = 7200) -> dict:
+def stream(url: str, body: dict, timeout: float | None = None) -> dict:
     """One streamed request: status, content, reasoning, tool call deltas, finish, usage, client TTFT, [DONE] seen."""
     body = dict(body, stream=True, stream_options={"include_usage": True})
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
@@ -83,46 +91,63 @@ def stream(url: str, body: dict, timeout: float = 7200) -> dict:
            "ttft": None, "done": False, "chunks": 0, "tensorfold": None, "error": None}
     t0 = time.time()
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
+        r = urllib.request.urlopen(req, timeout=timeout or IDLE_S)
     except urllib.error.HTTPError as e:
         out["status"] = e.code
         out["error"] = (e.read() or b"")[:500].decode("utf-8", "replace")
         return out
+    except (urllib.error.URLError, OSError) as e:   # refused, reset, or no byte for `timeout` s (socket timeout)
+        out["error"] = f"{type(e).__name__}: {e}"
+        out["seconds"] = time.time() - t0
+        return out
     out["status"] = r.status
     with r:
-        for raw in r:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                out["done"] = True
-                break
-            try:
-                ev = json.loads(data)
-            except ValueError:
-                continue
-            out["chunks"] += 1
-            if ev.get("usage"):
-                out["usage"] = ev["usage"]
-            if ev.get("tensorfold"):
-                out["tensorfold"] = ev["tensorfold"]
-            for ch in ev.get("choices") or []:
-                d = ch.get("delta") or {}
-                c, rc = d.get("content") or "", d.get("reasoning_content") or d.get("reasoning") or ""
-                if (c or rc or d.get("tool_calls")) and out["ttft"] is None:
-                    out["ttft"] = time.time() - t0
-                out["content"] += c
-                out["reasoning"] += rc
-                for tc in d.get("tool_calls") or []:
-                    slot = out["tool_calls"].setdefault(int(tc.get("index", 0)), {"name": "", "arguments": ""})
-                    fn = tc.get("function") or {}
-                    slot["name"] += fn.get("name") or ""
-                    slot["arguments"] += fn.get("arguments") or ""
-                if ch.get("finish_reason"):
-                    out["finish"] = ch["finish_reason"]
+        try:
+            lines = iter(r)
+            for raw in lines:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    out["done"] = True
+                    break
+                try:
+                    ev = json.loads(data)
+                except ValueError:
+                    continue
+                if ev.get("error"):   # the server's stream error event: the request failed
+                    err = ev["error"]
+                    out["error"] = (err.get("message") if isinstance(err, dict) else None) or str(err)
+                    break
+                out["chunks"] += 1
+                _delta(out, ev, t0)
+        except (OSError, ValueError) as e:  # a stalled stream (socket timeout) or a broken connection
+            out["error"] = f"stream broke after {out['chunks']} chunks: {type(e).__name__}: {e}"
     out["seconds"] = time.time() - t0
     return out
+
+
+def _delta(out: dict, ev: dict, t0: float) -> None:
+    """One SSE event into the stream's record."""
+    if ev.get("usage"):
+        out["usage"] = ev["usage"]
+    if ev.get("tensorfold"):
+        out["tensorfold"] = ev["tensorfold"]
+    for ch in ev.get("choices") or []:
+        d = ch.get("delta") or {}
+        c, rc = d.get("content") or "", d.get("reasoning_content") or d.get("reasoning") or ""
+        if (c or rc or d.get("tool_calls")) and out["ttft"] is None:
+            out["ttft"] = time.time() - t0
+        out["content"] += c
+        out["reasoning"] += rc
+        for tc in d.get("tool_calls") or []:
+            slot = out["tool_calls"].setdefault(int(tc.get("index", 0)), {"name": "", "arguments": ""})
+            fn = tc.get("function") or {}
+            slot["name"] += fn.get("name") or ""
+            slot["arguments"] += fn.get("arguments") or ""
+        if ch.get("finish_reason"):
+            out["finish"] = ch["finish_reason"]
 
 
 # ----------------------------------------------------------------------------------------------- conversation ---
@@ -187,6 +212,11 @@ def conv(a) -> int:
         say(f"{label}: status {r['status']} ttft {r['ttft'] if r['ttft'] is None else round(r['ttft'], 3)} s, "
             f"prompt {pt}, cached {((r['usage'] or {}).get('prompt_tokens_details') or {}).get('cached_tokens')}, "
             f"finish {r['finish']}, {len(r['content'])} + {len(r['reasoning'])} chars")
+        if r["status"] != 200 or not r["done"] or r["error"]:
+            # fail fast: the later turns depend on this one (and a failed server request may leave it wedged)
+            Path(a.out).write_text(json.dumps({"url": a.url, "requests": reqs, "history": history}, indent=1) + "\n")
+            say(f"FAILED request {label}: status {r['status']}, done {r['done']}, error {r['error']!r}")
+            raise SystemExit(1)
         return r
 
     for n in ints(a.warm):
@@ -577,9 +607,11 @@ def main() -> int:
     p.add_argument("--serial", default="")
     p.add_argument("--flush-file", default="")
     p.add_argument("--history", default="")
+    p.add_argument("--idle", type=float, default=0, help="seconds without a byte that fail a request (0: 7200)")
     p = sub.add_parser("api")
     p.add_argument("--url", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--idle", type=float, default=0, help="seconds without a byte that fail a request (0: 7200)")
     p = sub.add_parser("dump2cli")
     p.add_argument("--dump", required=True)
     p.add_argument("--out", required=True)
@@ -603,6 +635,9 @@ def main() -> int:
     p.add_argument("--py1m", type=int, default=0)
     p.add_argument("--ratio", type=float, default=0.97)
     a = ap.parse_args()
+    global IDLE_S
+    if getattr(a, "idle", None):
+        IDLE_S = float(a.idle)
     return {"make-conv": make_conv, "conv": conv, "api": api, "dump2cli": dump2cli, "make-needle": make_needle,
             "make-dcp": make_dcp, "gate": gate}[a.cmd](a)
 

@@ -40,6 +40,7 @@ pub const decode = @import("cuda_decode.zig");
 pub const reuse = @import("cuda_reuse.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const dcp = @import("cuda_dcp.zig");
+pub const coverage = @import("cuda_coverage.zig");
 
 test {
     _ = @import("config.zig");
@@ -59,4 +60,5 @@ test {
     _ = reuse;
     _ = engine;
     _ = dcp;
+    _ = coverage;
 }

@@ -52,11 +52,15 @@ pub const router_ks: usize = 8;
 pub const Mla = struct { heads: usize, nope: usize, rope: usize, lw: usize, vd: usize, topk: usize };
 
 pub const Tri = struct {
-    set: *const aot.Set,
+    set: ?*const aot.Set,
     s: cuda.Stream,
+    /// Coverage (cuda_coverage.zig, no GPU): record each launch's variant key here instead of launching.
+    probe: ?*aot.Probe = null,
 
     fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const, opts: aot.Launch) !void {
-        try t.set.runWith(t.s, name, .{ u(grid[0]), u(grid[1]), u(grid[2]) }, args, consts, opts);
+        if (t.probe) |p| return p.add(name, args, consts, opts);
+        const set = t.set orelse return error.NoTritonSet;
+        try set.runWith(t.s, name, .{ u(grid[0]), u(grid[1]), u(grid[2]) }, args, consts, opts);
     }
 
     /// glue.rmsnorm (no group sums): out = bf16(w * bf16(x * rinv)).

@@ -43,6 +43,11 @@
 //!        tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
 //!                          [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
 //!        tf-glm53-generate --sampler-check FILE
+//!        tf-glm53-generate --mode list-variants --model DIR --world 4 --context N --tiles F0,F1,.. [--aot DIR]
+//!                          [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE]
+//! --mode list-variants (no GPU): every Triton launch shape the engine can make for that configuration (cuda_coverage
+//! .zig: Tri in probe mode over every window size, index range and DCP rank) as JSON for tools/glm53/sweep_aot.py;
+//! with --aot, each marked "have" and `VARIANTS PASS|FAIL n needs, m missing` printed (exit 3 when any is missing).
 //! Prints `RESULT glm53-generate OK|FAIL ...`; exit 0 only on OK.
 
 const std = @import("std");
@@ -65,6 +70,8 @@ const usage =
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
+    \\       tf-glm53-generate --mode list-variants --model DIR --world 4 --context N --tiles F0,F1,.. [--aot DIR]
+    \\                         [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE]
     \\
 ;
 
@@ -277,6 +284,12 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         return if (good) 0 else 1;
+    }
+    if (std.mem.eql(u8, a.mode, "list-variants")) {
+        return listVariants(init.gpa, init.io, a) catch |e| {
+            std.debug.print("VARIANTS FAIL error {t}\n", .{e});
+            return 1;
+        };
     }
     if (std.mem.eql(u8, a.mode, "roce-bench")) {
         const okb = roceBench(init.gpa, init.io, a) catch |e| {
@@ -828,6 +841,82 @@ fn parseHcas(text: []const u8, out: *[2][]const u8) [][]const u8 {
         n += 1;
     }
     return out[0..n];
+}
+
+/// --mode list-variants: the Triton launches the engine can make at --world ranks, --context tokens, windows up to
+/// max(--prompt-rows, --window) rows, DCP 1 and --world (--dcp 0) or only --dcp N, the EXL3 linear shapes of the tile
+/// tables in --tiles (every rank's) - written to --out as JSON; with --aot, checked against that set (exit 3: some
+/// launch has no variant there, the first 40 listed).
+fn listVariants(gpa: std.mem.Allocator, io: std.Io, a: Args) !u8 {
+    if (a.model.len == 0 or a.world == 0) return error.Usage;
+    const cov = glm.coverage;
+    const cfg = try glm.Config.load(gpa, io, a.model);
+    if (cfg.heads % a.world != 0 or cfg.vocab % a.world != 0) return error.UnevenSplit;
+    var gemms: std.ArrayList([2]usize) = .empty;
+    defer gemms.deinit(gpa);
+    var widths: std.ArrayList(usize) = .empty;
+    defer widths.deinit(gpa);
+    var kva_n: usize = 0;
+    var tables: usize = 0;
+    if (a.tiles) |list| {
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |path| {
+            if (path.len == 0) continue;
+            const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+            defer gpa.free(text);
+            var shapes: std.ArrayList([2]usize) = .empty;
+            defer shapes.deinit(gpa);
+            try cov.tileShapes(gpa, text, &shapes);
+            if (shapes.items.len < 2) return error.BadTileTable;
+            kva_n = @max(kva_n, shapes.items[1][1]); // rows: layer 0's q_a, kv_a, ...
+            for (shapes.items) |kn| try cov.addUnique(gpa, &gemms, kn);
+            try cov.swigluWidths(shapes.items, cfg.hidden, &widths, gpa);
+            tables += 1;
+        }
+    }
+    if (tables == 0) return error.NoTileTables; // the prompt GEMM's shapes come from the reference's tables
+    // the config's own widths too (dense MLP, shared expert) when they split evenly
+    for ([_]usize{ cfg.dense_width, cfg.expert_width * cfg.shared_experts }) |w| {
+        if (w % a.world == 0 and std.mem.indexOfScalar(usize, widths.items, w / a.world) == null) try widths.append(gpa, w / a.world);
+    }
+    var dbuf: [2]usize = .{ 1, a.world };
+    const dcps: []const usize = switch (a.dcp) {
+        0 => if (a.world > 1) dbuf[0..2] else dbuf[0..1],
+        1 => dbuf[0..1],
+        else => blk: {
+            dbuf[0] = a.dcp;
+            break :blk dbuf[0..1];
+        },
+    };
+    const sp: cov.Space = .{ .cfg = cfg, .world = a.world, .heads = cfg.heads / a.world, .vocab_part = cfg.vocab / a.world, .kva_n = kva_n, .max_rows = @max(@max(a.prompt_rows, a.window), a.k + 1), .capacity = a.context, .dcps = dcps, .widths = widths.items, .gemms = gemms.items, .mtp = cfg.mtp_layers > 0, .draft = a.draft_vocab > 0 };
+    var p = cuda.aot.Probe.init(gpa);
+    defer p.deinit();
+    try cov.enumerate(&p, sp);
+    var cat: ?cuda.aot.Catalog = null;
+    defer if (cat) |*c| c.deinit();
+    if (a.aot.len > 0) cat = try cuda.aot.loadCatalog(gpa, io, a.aot);
+    const specs = if (cat) |c| c.value.kernels else null;
+    const doc = try p.json(gpa, specs);
+    defer gpa.free(doc);
+    if (a.out.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = doc });
+    std.debug.print("variants: {d} launches enumerated, {d} distinct needs (rows 1..{d}, context {d}, dcp {any}, {d} tile tables, {d} GEMM shapes, SwiGLU widths {any})\n", .{ p.calls, p.needs.count(), sp.max_rows, sp.capacity, dcps, tables, gemms.items.len, widths.items });
+    const ks = specs orelse return 0;
+    const miss = try p.missing(gpa, ks);
+    defer gpa.free(miss);
+    const needs = p.needs.values();
+    for (miss, 0..) |i, j| {
+        if (j >= 40) break;
+        const n = needs[i];
+        std.debug.print("  missing: {s} (warps {?d}, stages {?d})", .{ n.function, n.opts.num_warps, n.opts.num_stages });
+        for (n.consts) |c| if (c.int) |x| std.debug.print(" {s}={d}", .{ c.name, x });
+        for (n.args) |x| switch (x.value) {
+            .i32 => |v| std.debug.print(" {s}:{d}", .{ x.name, v }),
+            else => {},
+        };
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("VARIANTS {s} {d} needs, {d} missing (aot {s})\n", .{ if (miss.len == 0) "PASS" else "FAIL", needs.len, miss.len, a.aot });
+    return if (miss.len == 0) 0 else 3;
 }
 
 /// --mode roce-bench: the RoCE one-shot runtime alone on the TP world (no model): setup, the bit check against NCCL

@@ -30,8 +30,23 @@
 # Steps: preflight (also refuses tf-glm53* / zp* containers, swap > 2 GB) -> rsync -> prompts (3a's, made on rank 0's
 # node) and the conversation -> build (test-glm53, fatbins, tf-glm53-generate, native) -> the Python reference at TP4
 # (3a's reference3a.py --record: AOT set, tiles, inv_freq, bmm probe, BLAS; REF_FROM=<node dir> reuses a 3a run's
-# ref/) -> Zig server A (reuse; conversation + API) -> Zig servers B / C (--learn, a restart between) -> CLI served ==
-# CLI -> Python server P (TTFT) -> DCP AOT capture (or the Python 1M run) -> Zig 1M -> gate3b.py gate.
+# ref/) -> AOT coverage (below) -> Zig server A (reuse; conversation + API) -> Zig servers B / C (--learn, a restart
+# between) -> CLI served == CLI -> Python server P (TTFT) -> DCP AOT capture (or the Python 1M run) -> AOT coverage at
+# 1M (DCP 4) -> Zig 1M -> gate3b.py gate.
+#
+# AOT coverage (run 2, 2026-10-08: a resumed 41-row window wanted _router_part BM 64, which the reference's schedule
+# never launched): tf-glm53-generate --mode list-variants enumerates every Triton launch shape the Zig engine can make
+# (cuda_coverage.zig: cuda_triton.Tri in probe mode over windows of 1..8192 rows, every index-range class, DCP 1 and 4
+# with every rank) and marks which the captured set lacks; tools/glm53/sweep_aot.py compiles exactly those (warmup, no
+# launch) on rank 0's GPU, packs them and merges them with the capture into $WORK/aot-full (aot-1m for the 1M run); a
+# second list-variants must report nothing missing (VARIANTS PASS) or no Zig engine starts. Every node gets the set.
+#
+# Fail-fast: each client run (conversation, API) is watched every 15 s - the client failing, any rank of the server
+# exiting, a request error in the server's log (ZERR_PAT: MissingTritonVariant, "request N failed", stream errors,
+# panics, CUDA / NCCL errors), no change in the client's and server's logs for PROGRESS_MIN minutes or the gate's
+# timeout end the whole run at once ("PHASE3B FAIL <reason>", this run's containers removed; the Python server's
+# session only notes it). Rank jobs (references, CLI, 1M) fail the same way on errors / stalls (STALL_LONG_MIN for
+# the Python references and the 1M runs).
 #
 # Environment (defaults in brackets):
 #   NODES MODEL IMAGE PORT_DIR PYSRC ZIG_DIR ZIG_FROM MASTER IF RAILS DROP_CACHES ALLOW_GPU_BUSY: as phase 3a
@@ -43,6 +58,9 @@
 #   Zig decode knobs as 3a: ZSIDE [af] ZL2PF [1] ZL2PF_MB [8] ZMULTI_SELECT [1] ZDEVICE_CANDS [1] ZMTP_DENSE [1]
 #   ports: ZHTTP [18890] PYHTTP [18891] REF_PORT [29671] ZIG_PORT [29681] PY_MPORT [29691] CLI_PORT [29701]
 #   SKIP_SYNC SKIP_BUILD SKIP_REF SKIP_A SKIP_LEARN SKIP_CLI SKIP_PY SKIP_1M =1 (with REUSE=<stamp>: its work dir)
+#   fail-fast: PROGRESS_MIN [15] CONV_TIMEOUT [5400] API_TIMEOUT [2400] STALL_LONG_MIN [120] ZERR_PAT [see below]
+#   AOT coverage: SWEEP_TIMEOUT [10800] SWEEP_MEM [32g] PROMPT_ROWS [8192] SKIP_COVER=1 (use $WORK/aot-full as it is,
+#   else the reference's ref/aot unchecked)
 set -u
 NODES=(${NODES:-10.100.10.1 10.100.10.2 10.100.10.3 10.100.10.5})
 [ ${#NODES[@]} -eq 4 ] || { echo "NODES must list four fabric addresses, rank 0 first"; exit 2; }
@@ -86,6 +104,14 @@ RAILS=${RAILS:-2}
 MEM_CAP=${MEM_CAP:-110g}
 MEM_CAP_1M=${MEM_CAP_1M:-118g}
 DROP_CACHES=${DROP_CACHES:-1}
+PROGRESS_MIN=${PROGRESS_MIN:-15}
+CONV_TIMEOUT=${CONV_TIMEOUT:-5400}
+API_TIMEOUT=${API_TIMEOUT:-2400}
+STALL_LONG_MIN=${STALL_LONG_MIN:-120}
+SWEEP_TIMEOUT=${SWEEP_TIMEOUT:-10800}
+SWEEP_MEM=${SWEEP_MEM:-32g}
+PROMPT_ROWS=${PROMPT_ROWS:-8192}
+ZERR_PAT=${ZERR_PAT:-'MissingTritonVariant|AmbiguousTritonVariant|NoTritonSet|request [0-9]+ failed|stream error|panic: |Segmentation fault|illegal memory access|CUDA_ERROR_|unhandled cuda error|NCCL WARN .*(failed|error)'}
 STAMP=${REUSE:-$(date -u +%Y%m%d-%H%M%S)}
 RHOME=${RHOME:-$HOME}
 RPORT=$RHOME/zig-port
@@ -113,6 +139,7 @@ summary() {
 }
 watchdog_fired() { [ -e "$LOCAL/WATCHDOG" ]; }
 check_wd() { watchdog_fired && { cleanup; summary FAIL "watchdog: $(cat "$LOCAL/WATCHDOG")" 4; }; return 0; }
+fatal() { say "FATAL: $1"; cleanup; summary FAIL "$1" "${2:-1}"; }
 trap 'say "interrupted: removing this run'"'"'s containers"; cleanup; summary FAIL "interrupted" 143' TERM INT
 trap 'stop_watchdog' EXIT
 
@@ -292,18 +319,25 @@ start_ranks() {   # $1 = name prefix, $2 = function printing rank r's docker arg
   done
 }
 drop_caches() { [ "$DROP_CACHES" = 1 ] || return 0; local n; for n in "${NODES[@]}"; do rsh "$n" 'sync; sudo -n sysctl -q -w vm.drop_caches=1' >/dev/null 2>&1 & done; waitjobs; }
-wait_ranks() {    # $1 = name prefix, $2 = timeout (s); 0 when all four exited 0
-  local t=0 r st running failed
+WAIT_REASON=""
+wait_ranks() {    # $1 = name prefix, $2 = timeout (s), $3 = stall minutes [PROGRESS_MIN]; 0 when all four exited 0
+  local t=0 r st running failed errs h last="" still=0 stall=${3:-$PROGRESS_MIN}
+  WAIT_REASON=""
   while :; do
-    watchdog_fired && { say "$1: watchdog fired"; return 1; }
+    watchdog_fired && { WAIT_REASON="$1: watchdog fired"; say "$WAIT_REASON"; return 1; }
     running=0; failed=""
     for r in 0 1 2 3; do
       st=$(rsh "${NODES[$r]}" "docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' $1-r$r" 2>/dev/null)
       case "$st" in "true "*) running=$((running + 1)) ;; "false 0") ;; *) failed="$failed r$r($st)" ;; esac
     done
-    [ -n "$failed" ] && { say "$1: failed:$failed"; return 1; }
+    [ -n "$failed" ] && { WAIT_REASON="$1: failed:$failed: $(rsh "${NODES[0]}" "docker logs --tail 3 $1-r0 2>&1" | tr '\n' ' ' | cut -c1-300)"; say "$WAIT_REASON"; return 1; }
     [ $running = 0 ] && return 0
-    (( t >= $2 )) && { say "$1: still running after $2 s"; return 1; }
+    errs=$(rsh "${NODES[0]}" "docker logs $1-r0 2>&1 | grep -E '$ZERR_PAT' | head -3" 2>/dev/null)
+    [ -n "$errs" ] && { WAIT_REASON="$1: error in rank 0's log: $(tr '\n' ' ' <<<"$errs" | cut -c1-400)"; say "$WAIT_REASON"; return 1; }
+    h=$(rsh "${NODES[0]}" "docker logs --tail 50 $1-r0 2>&1 | md5sum" 2>/dev/null)
+    if [ "$h" = "$last" ]; then still=$((still + 15)); else still=0; last=$h; fi
+    (( still >= stall * 60 )) && { WAIT_REASON="$1: no output from rank 0 for $stall min"; say "$WAIT_REASON"; return 1; }
+    (( t >= $2 )) && { WAIT_REASON="$1: still running after $2 s"; say "$WAIT_REASON"; return 1; }
     drop_caches
     sleep 15; t=$((t + 15))
     (( t % 300 == 0 )) && say "$1: $running ranks running ($t s); rank 0: $(rsh "${NODES[0]}" "docker logs --tail 1 $1-r0 2>&1" | cut -c1-160)"
@@ -343,6 +377,62 @@ jstr() { grep -o "\"$1\": \"[^\"]*\"" "$2" | head -1 | cut -d'"' -f4; }
 GATE_FAIL=""
 note_fail() { GATE_FAIL="$GATE_FAIL $1"; say "FAILED: $1"; }
 
+# A watched client run (gate3b.py in a named container on rank 0's node): ends at once on the client failing, a rank of
+# the server exiting, a request error in the server's rank 0 log (ZERR_PAT), PROGRESS_MIN minutes without a change in
+# the client's or the server's log, or the gate's timeout.
+#   $1 = label  $2 = timeout (s)  $3 = server container prefix ("" none)  $4 = 1: fatal (the run ends: PHASE3B FAIL
+#   <reason>, containers removed) | 0: return 1 with WATCH_REASON set;  the rest: gate3b.py's arguments
+WATCH_REASON=""
+client_watch() {
+  local label=$1 limit=$2 srv=$3 fatal_on=$4; shift 4
+  local cname="zp3b-c-$label" t=0 last="" still=0 h="" now r st errs rc=0 cpid
+  rsh "${NODES[0]}" "docker rm -f $cname" >/dev/null 2>&1
+  rsh "${NODES[0]}" "docker run --rm --name $cname $COMMON --network host --memory 8g -v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro \
+    -v $RPORT/tf:/tf:ro -v $WORK:/work -e PYTHONPATH=/opt/tensorfold/src --entrypoint python3 $IMAGE -B /tf/tools/glm53/gate3b.py $*" \
+    > "$LOCAL/client-$label.log" 2>&1 &
+  cpid=$!
+  WATCH_REASON=""
+  while kill -0 "$cpid" 2>/dev/null; do
+    sleep 15; t=$((t + 15))
+    if watchdog_fired; then WATCH_REASON="watchdog: $(cat "$LOCAL/WATCHDOG")"; break; fi
+    if [ -n "$srv" ]; then
+      for r in 0 1 2 3; do
+        st=$(rsh "${NODES[$r]}" "docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' $srv-r$r" 2>/dev/null)
+        case "$st" in "true "*) ;; *) WATCH_REASON="$srv-r$r not running (${st:-gone}) during $label: $(rsh "${NODES[$r]}" "docker logs --tail 3 $srv-r$r 2>&1" | tr '\n' ' ' | cut -c1-300)"; break 2 ;; esac
+      done
+      errs=$(rsh "${NODES[0]}" "docker logs $srv-r0 2>&1 | grep -E '$ZERR_PAT' | head -3" 2>/dev/null)
+      [ -n "$errs" ] && { WATCH_REASON="server error during $label: $(tr '\n' ' ' <<<"$errs" | cut -c1-400)"; break; }
+      h=$(rsh "${NODES[0]}" "docker logs --tail 50 $srv-r0 2>&1 | md5sum" 2>/dev/null)
+    fi
+    now="$h $(md5sum < "$LOCAL/client-$label.log")"
+    if [ "$now" = "$last" ]; then still=$((still + 15)); else still=0; last=$now; fi
+    (( still >= PROGRESS_MIN * 60 )) && { WATCH_REASON="no progress for $PROGRESS_MIN min during $label (client and server logs unchanged)"; break; }
+    (( t >= limit )) && { WATCH_REASON="$label still running after $limit s"; break; }
+  done
+  if [ -n "$WATCH_REASON" ]; then
+    rsh "${NODES[0]}" "docker rm -f $cname" >/dev/null 2>&1
+    kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+  else
+    wait "$cpid"; rc=$?
+    if [ -n "$srv" ]; then
+      errs=$(rsh "${NODES[0]}" "docker logs $srv-r0 2>&1 | grep -E '$ZERR_PAT' | head -3" 2>/dev/null)
+      [ -n "$errs" ] && WATCH_REASON="server error during $label: $(tr '\n' ' ' <<<"$errs" | cut -c1-400)"
+    fi
+    [ -z "$WATCH_REASON" ] && [ $rc != 0 ] && WATCH_REASON="client $label failed (exit $rc): $(grep -E 'FAILED|Error|error' "$LOCAL/client-$label.log" | tail -3 | tr '\n' ' ' | cut -c1-400)"
+  fi
+  cat "$LOCAL/client-$label.log" >> "$LOG"
+  [ -z "$WATCH_REASON" ] && return 0
+  if [ "$fatal_on" = 1 ]; then
+    if [ -n "$srv" ]; then
+      collect_ranks "$srv"
+      rsh "${NODES[0]}" "cat $WORK/dump-$Z_SESSION.jsonl" > "$LOCAL/dump-$Z_SESSION.jsonl" 2>/dev/null
+    fi
+    fatal "$WATCH_REASON"
+  fi
+  say "FAILED ($label): $WATCH_REASON"
+  return 1
+}
+
 # ---- 4. the Python reference (3a's reference3a.py --record: AOT set, tiles, inv_freq, bmm probe, BLAS) ----------
 phase ref
 if [ -n "$REF_FROM" ]; then
@@ -364,10 +454,10 @@ elif [ "${SKIP_REF:-0}" != 1 ]; then
   wait_memory || summary FAIL "a node is under 100 GB MemAvailable before the reference" 1
   say "reference: Glm53Engine served configuration at TP4, context $CONTEXT (--record)"
   start_ranks zp3b-ref ref_main || { cleanup; summary FAIL "reference start failed" 1; }
-  wait_ranks zp3b-ref "${REF_TIMEOUT:-10800}"; rrc=$?
+  wait_ranks zp3b-ref "${REF_TIMEOUT:-10800}" "$STALL_LONG_MIN"; rrc=$?
   collect_ranks zp3b-ref
   check_wd
-  [ $rrc = 0 ] || { cleanup; summary FAIL "the Python reference failed (zp3b-ref-r*.log)" 1; }
+  [ $rrc = 0 ] || fatal "the Python reference failed: $WAIT_REASON (zp3b-ref-r*.log)"
 fi
 for r in 0 1 2 3; do
   rsh "${NODES[$r]}" "test -f $WORK/ref/aot/aot.json && test -f $WORK/ref/inv_freq.bin && test -s $WORK/ref/nccl.txt && test -s $WORK/ref/tiles-r$r.json && test -s $WORK/ref/bmm_probe.json && test -s $WORK/ref/blas.json" \
@@ -386,6 +476,58 @@ CUBLAS=$(jstr libcublas "$LOCAL/blas.json"); EXPERTS=$(jstr experts_impl "$LOCAL
 [ -n "$CUBLAS" ] || summary FAIL "the reference's blas.json names no libcublas" 1
 say "servers: context $CONTEXT, NCCL ${NLIB[0]}, cuBLAS $CUBLAS, experts ${EXPERTS:-shared}"
 
+# ---- AOT coverage: every launch shape the Zig engine can make has a variant, or nothing Zig starts ------------------
+# $1 = label (dir under $WORK), $2 = context, $3 = list-variants --dcp (0: 1 and 4, 1: one rank), $4 = the set the
+# needs are checked against (dir under $WORK), $5 = output set (dir under $WORK), rest: template run dirs under $WORK
+# (manifest.json + aot/: the captures whose constexprs / floats the new variants take). Fatal on any failure.
+listv() {   # $1 = label, $2 = context, $3 = dcp, $4 = aot dir, $5 = needs file (under /work)
+  rsh "${NODES[0]}" "docker run --rm $COMMON --gpus all --network none --memory 16g -v $MODEL:/model:ro -v $WORK:/work \
+    --entrypoint /work/zig-out/bin/tf-glm53-generate $IMAGE --mode list-variants --model /model --world 4 \
+    --context $2 --prompt-rows $PROMPT_ROWS --window 128 --k $K --dcp $3 \
+    --tiles /work/$1/tiles-r0.json,/work/$1/tiles-r1.json,/work/$1/tiles-r2.json,/work/$1/tiles-r3.json \
+    --aot /work/$4 --out /work/$5" > "$LOCAL/$1-listv-$(basename "$5" .json).log" 2>&1
+}
+aot_cover() {
+  local lab=$1 ctx=$2 dcp=$3 have=$4 dest=$5; shift 5
+  local tmpl="" d r rc
+  for d in "$@"; do tmpl="$tmpl --template /work/$d"; done
+  phase aot-$lab
+  rsh "${NODES[0]}" "rm -rf $WORK/$lab $WORK/$dest && mkdir -p $WORK/$lab/triton" || fatal "aot $lab: no work dir"
+  for r in 0 1 2 3; do   # every rank's tile table (the prompt GEMM's shapes) on rank 0's node
+    rsh "${NODES[$r]}" "cat $WORK/ref/tiles-r$r.json" | rsh "${NODES[0]}" "cat > $WORK/$lab/tiles-r$r.json" \
+      || fatal "aot $lab: could not copy tiles-r$r.json from ${NODES[$r]}"
+  done
+  listv "$lab" "$ctx" "$dcp" "$have" "$lab/needs.json"; rc=$?
+  grep -E '^(variants|VARIANTS|  missing)' "$LOCAL/$lab-listv-needs.log" | head -12 | tee -a "$LOG"
+  [ $rc = 0 ] || [ $rc = 3 ] || fatal "aot $lab: list-variants failed (exit $rc, $lab-listv-needs.log)"
+  say "aot $lab: compiling the missing variants (sweep_aot.py on ${NODES[0]}, templates:$tmpl)"
+  rsh "${NODES[0]}" "timeout $SWEEP_TIMEOUT docker run --rm $COMMON --gpus all --network none --memory $SWEEP_MEM --memory-swap $SWEEP_MEM \
+    -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/tf:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
+    -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/work/$lab/triton $CACHE_ENV -w /tmp --entrypoint python3 $IMAGE \
+    -B /tf/tools/glm53/sweep_aot.py --needs /work/$lab/needs.json $tmpl --out /work/$lab/sweep --merged /work/$dest" \
+    > "$LOCAL/$lab-sweep.log" 2>&1 || fatal "aot $lab: sweep_aot.py failed ($lab-sweep.log: $(grep -E 'FAILED|Error' "$LOCAL/$lab-sweep.log" | tail -2 | tr '\n' ' ' | cut -c1-300))"
+  grep '^\[sweep\]' "$LOCAL/$lab-sweep.log" | grep -v '/[0-9]* compiled (' | tail -6 | tee -a "$LOG"
+  listv "$lab" "$ctx" "$dcp" "$dest" "$lab/check.json"; rc=$?
+  grep -E '^(VARIANTS|  missing)' "$LOCAL/$lab-listv-check.log" | head -12 | tee -a "$LOG"
+  [ $rc = 0 ] || fatal "aot $lab: the merged set $dest still misses launches the Zig engine can make ($lab-listv-check.log)"
+  for r in 1 2 3; do
+    rsh "${NODES[0]}" "tar -C $WORK -c $dest" | rsh "${NODES[$r]}" "rm -rf $WORK/$dest && tar -C $WORK -x" \
+      || fatal "aot $lab: could not copy $dest to ${NODES[$r]}"
+  done
+  say "aot $lab: $dest complete for context $ctx (dcp $dcp) and on every node"
+}
+ZAOT=ref/aot
+if [ "${SKIP_COVER:-0}" != 1 ]; then
+  aot_cover cover "$CONTEXT" 1 ref/aot aot-full ref
+  ZAOT=aot-full
+  check_wd
+elif rsh "${NODES[0]}" "test -f $WORK/aot-full/aot.json"; then
+  ZAOT=aot-full
+  say "SKIP_COVER=1: using the earlier $WORK/aot-full unchecked"
+else
+  say "WARNING: SKIP_COVER=1 and no aot-full: the Zig engine runs on the reference's capture alone (run 2's failure)"
+fi
+
 # ---- the Zig server (rank 0 serves, 1..3 follow) -----------------------------------------------------------------
 Z_SESSION=A; Z_LEARN=0
 zig_env() {   # $1 = rank, $2 = aot dir under /work, $3 = MTP dense
@@ -402,17 +544,17 @@ zig_env() {   # $1 = rank, $2 = aot dir under /work, $3 = MTP dense
 zserve_args() {
   local learn=""
   [ "$Z_LEARN" = 1 ] && learn="--learn --learn-dir /learn --learn-gib $LEARN_GIB"
-  echo "-v $MODEL:/model:ro -v $WORK:/work -v $WORK/learn:/learn $(zig_env $1 ref/aot $ZMTP_DENSE) -e TF_GLM53_DUMP=/work/dump-$Z_SESSION.jsonl \
+  echo "-v $MODEL:/model:ro -v $WORK:/work -v $WORK/learn:/learn $(zig_env $1 $ZAOT $ZMTP_DENSE) -e TF_GLM53_DUMP=/work/dump-$Z_SESSION.jsonl \
     --entrypoint /work/zig-out/native/bin/tensorfold-native $IMAGE serve /model --host 0.0.0.0 --port $ZHTTP --name glm-5.3-tf \
     --context $CONTEXT --parallel 1 --no-update-check $learn"
 }
 start_zig() {     # $1 = session letter, $2 = learn 0|1
   Z_SESSION=$1; Z_LEARN=$2
-  wait_memory || { note_fail "zig-$1: a node under 100 GB MemAvailable before start"; return 1; }
+  wait_memory || fatal "zig-$1: a node under 100 GB MemAvailable before start"
   rsh "${NODES[0]}" "rm -f $WORK/dump-$1.jsonl $WORK/REUSE_FLUSH"
-  say "zig server $1 (learn $2): tensorfold-native serve at TP4, context $CONTEXT, docker --memory $MEM_CAP"
-  start_ranks zp3b-z$1 zserve_args || { collect_ranks zp3b-z$1; note_fail "zig-$1 start"; return 1; }
-  wait_http zp3b-z$1 $ZHTTP "${LOAD_TIMEOUT:-3600}" || { collect_ranks zp3b-z$1; note_fail "zig-$1 did not come up"; return 1; }
+  say "zig server $1 (learn $2): tensorfold-native serve at TP4, context $CONTEXT, AOT /work/$ZAOT, docker --memory $MEM_CAP"
+  start_ranks zp3b-z$1 zserve_args || { collect_ranks zp3b-z$1; fatal "zig-$1 start failed"; }
+  wait_http zp3b-z$1 $ZHTTP "${LOAD_TIMEOUT:-3600}" || { collect_ranks zp3b-z$1; fatal "zig-$1 did not come up (zp3b-z$1-r*.log)"; }
   grep -q . <<<"$(rsh "${NODES[1]}" "docker logs zp3b-z$1-r1 2>&1 | grep -i 'following rank 0' | head -1")" || say "WARNING: rank 1 never logged 'following rank 0'"
 }
 stop_zig() { collect_ranks "zp3b-z$1"; rsh "${NODES[0]}" "cat $WORK/dump-$1.jsonl" > "$LOCAL/dump-$1.jsonl" 2>/dev/null; check_wd; }
@@ -422,9 +564,9 @@ ZURL=http://127.0.0.1:$ZHTTP
 phase zigA
 if [ "${SKIP_A:-0}" != 1 ]; then
   if start_zig A 0; then
-    client conv --url $ZURL --spec /work/conv.json --out /work/convA.json --warm 1,2,3 --cold 2,3 --serial 3 \
-      --flush-file /work/REUSE_FLUSH >> "$LOG" 2>&1; check_wd
-    client api --url $ZURL --out /work/apiA.json >> "$LOG" 2>&1; check_wd
+    client_watch convA "$CONV_TIMEOUT" zp3b-zA 1 conv --url $ZURL --spec /work/conv.json --out /work/convA.json \
+      --warm 1,2,3 --cold 2,3 --serial 3 --flush-file /work/REUSE_FLUSH --idle $((PROGRESS_MIN * 60)); check_wd
+    client_watch apiA "$API_TIMEOUT" zp3b-zA 1 api --url $ZURL --out /work/apiA.json --idle $((PROGRESS_MIN * 60)); check_wd
     rsh "${NODES[0]}" "cat $WORK/convA.json" > "$LOCAL/convA.json" 2>/dev/null || note_fail "conversation A left no convA.json"
     rsh "${NODES[0]}" "cat $WORK/apiA.json" > "$LOCAL/apiA.json" 2>/dev/null || note_fail "API checks left no apiA.json"
     stop_zig A
@@ -436,12 +578,14 @@ phase zigB
 if [ "${SKIP_LEARN:-0}" != 1 ] && [ -s "$LOCAL/convA.json" ]; then
   for n in "${NODES[@]}"; do rsh "$n" "rm -rf $WORK/learn && mkdir -p $WORK/learn"; done
   if start_zig B 1; then
-    client conv --url $ZURL --spec /work/conv.json --out /work/convB.json --warm 1 >> "$LOG" 2>&1
+    client_watch convB "$CONV_TIMEOUT" zp3b-zB 1 conv --url $ZURL --spec /work/conv.json --out /work/convB.json --warm 1 \
+      --idle $((PROGRESS_MIN * 60))
     stop_zig B
     for r in 0 1 2 3; do say "learned on rank $r: $(rsh "${NODES[$r]}" "find $WORK/learn -type f | wc -l; du -sh $WORK/learn | cut -f1" | paste -sd' ') (files, size)"; done
     phase zigC
     if start_zig C 1; then
-      client conv --url $ZURL --spec /work/conv.json --out /work/convC.json --warm 2,3 --history /work/convA.json >> "$LOG" 2>&1
+      client_watch convC "$CONV_TIMEOUT" zp3b-zC 1 conv --url $ZURL --spec /work/conv.json --out /work/convC.json --warm 2,3 \
+        --history /work/convA.json --idle $((PROGRESS_MIN * 60))
       stop_zig C
     fi
   fi
@@ -453,7 +597,7 @@ if [ "${SKIP_CLI:-0}" != 1 ] && [ -s "$LOCAL/dump-A.jsonl" ]; then
   if client dump2cli --dump /work/dump-A.jsonl --out /work/cli-prompts.json >> "$LOG" 2>&1 && to_all cli-prompts.json; then
     cli_args() {
       echo "-v $MODEL:/model:ro -v $WORK:/work -e TF_GLM53_REUSE_GAP=$REUSE_GAP --entrypoint /work/zig-out/bin/tf-glm53-generate $IMAGE \
-        --mode 3b --rank $1 --world 4 --master $MASTER:$CLI_PORT --model /model --aot /work/ref/aot \
+        --mode 3b --rank $1 --world 4 --master $MASTER:$CLI_PORT --model /model --aot /work/$ZAOT \
         --prompts /work/cli-prompts.json --context $CONTEXT --k $K --prewarm 1 --graphs 1 --fast-load 1 \
         --draft-vocab 32768 --mtp-reuse 2 --inv-ref /work/ref/inv_freq.bin --nccl-lib ${NLIB[$1]} \
         --roce 1 --hcas ${ZHCAS[$1]} --gid ${ZGID[$1]} --roce-health 1 --tiles /work/ref/tiles-r$1.json \
@@ -463,9 +607,10 @@ if [ "${SKIP_CLI:-0}" != 1 ] && [ -s "$LOCAL/dump-A.jsonl" ]; then
         --mtp-dense $ZMTP_DENSE --stop-eos 1 --reuse 1 --dcp 0 \
         --timeout ${ZIG_RDV_TIMEOUT:-5400} --out /work/cli/gen-r$1.json"
     }
-    wait_memory || note_fail "cli: a node under 100 GB MemAvailable"
+    wait_memory || fatal "cli: a node under 100 GB MemAvailable"
     say "cli: tf-glm53-generate --mode 3b --reuse 1 --stop-eos 1 over session A's $(grep -o '"name": "req' "$LOCAL/cli-prompts.json" | wc -l) requests"
-    start_ranks zp3b-cli cli_args && wait_ranks zp3b-cli "${GEN_TIMEOUT:-10800}" || note_fail "cli run failed (zp3b-cli-r*.log)"
+    start_ranks zp3b-cli cli_args || { collect_ranks zp3b-cli; fatal "cli start failed"; }
+    wait_ranks zp3b-cli "${GEN_TIMEOUT:-10800}" || { collect_ranks zp3b-cli; fatal "cli run failed: $WAIT_REASON (zp3b-cli-r*.log)"; }
     collect_ranks zp3b-cli
     grep -h -E '^(RESULT|WARN|error)' "$LOCAL"/zp3b-cli-r*.log | tail -20 | tee -a "$LOG"
     check_wd
@@ -488,8 +633,9 @@ if [ "${SKIP_PY:-0}" != 1 ] && [ "$PYCONV" = 1 ] && [ -s "$LOCAL/convA.json" ]; 
   if wait_memory; then
     say "python server: tensorfold.cli serve --tp 4 (TF_GLM53_PROMPT_REUSE=1, slots16, copy drafts off), context $CONTEXT"
     if start_ranks zp3b-py py_args && wait_http zp3b-py $PYHTTP "${LOAD_TIMEOUT:-3600}"; then
-      client conv --url http://127.0.0.1:$PYHTTP --spec /work/conv.json --out /work/convP.json --warm 1,2,3 --cold 2,3 \
-        --flush-file /work/pyflag/REUSE_FLUSH --history /work/convA.json >> "$LOG" 2>&1
+      client_watch convP "$CONV_TIMEOUT" zp3b-py 0 conv --url http://127.0.0.1:$PYHTTP --spec /work/conv.json --out /work/convP.json \
+        --warm 1,2,3 --cold 2,3 --flush-file /work/pyflag/REUSE_FLUSH --history /work/convA.json --idle $((PROGRESS_MIN * 60)) \
+        || say "python session: $WATCH_REASON (TTFT side by side incomplete)"
     else
       say "python server did not come up (zp3b-py-r*.log): no Python TTFT"
     fi
@@ -522,14 +668,14 @@ if [ "${SKIP_1M:-0}" != 1 ]; then
   if wait_memory; then
     phase py-$REFD
     say "python $REFD: reference3b.py at context $RCTX, DCP $RDCP (-1: auto), --record (docker --memory $RCAP)"
-    if start_ranks zp3b-$REFD ref3b_args "$RCAP" && wait_ranks zp3b-$REFD "${REF1M_TIMEOUT:-14400}"; then
+    if start_ranks zp3b-$REFD ref3b_args "$RCAP" && wait_ranks zp3b-$REFD "${REF1M_TIMEOUT:-14400}" "$STALL_LONG_MIN"; then
       if rsh "${NODES[0]}" "grep -q _attn_dcp $WORK/$REFD/aot/aot.json && grep -q _dcp_combine $WORK/$REFD/aot/aot.json"; then
         AOT1M=$REFD/aot
       else
         note_fail "$REFD: the AOT set lists no _attn_dcp / _dcp_combine (the run did not use DCP)"
       fi
     else
-      note_fail "python $REFD failed (zp3b-$REFD-r*.log)"
+      note_fail "python $REFD failed: $WAIT_REASON (zp3b-$REFD-r*.log)"
     fi
     collect_ranks zp3b-$REFD
     grep -h '\[ref3b\] rank 0' "$LOCAL"/zp3b-$REFD-r0.log | tail -6 | tee -a "$LOG"
@@ -538,6 +684,19 @@ if [ "${SKIP_1M:-0}" != 1 ]; then
   else
     note_fail "$REFD: a node under 100 GB MemAvailable"
   fi
+fi
+
+# ---- 9b. AOT coverage at 1M: DCP 1 and 4, every rank, the DCP capture as a template ---------------------------------
+if [ "${SKIP_1M:-0}" != 1 ] && [ -n "$AOT1M" ] && [ "${SKIP_COVER:-0}" != 1 ]; then
+  # the needs are checked against everything captured or compiled so far (merged first, no GPU)
+  rsh "${NODES[0]}" "docker run --rm $COMMON --network none --memory 8g -v $RPORT/tf:/tf:ro -v $WORK:/work --entrypoint python3 $IMAGE \
+    -B /tf/tools/glm53/sweep_aot.py --merge-only --set /work/$ZAOT --set /work/$AOT1M --merged /work/aot-pre1m" >> "$LOG" 2>&1 \
+    || fatal "aot cover1m: could not merge $ZAOT and $AOT1M"
+  tdirs="ref $REFD"
+  rsh "${NODES[0]}" "test -f $WORK/cover/sweep/manifest.json" && tdirs="$tdirs cover/sweep"
+  aot_cover cover1m "$CTX_1M" 0 aot-pre1m aot-1m $tdirs
+  AOT1M=aot-1m
+  check_wd
 fi
 
 # ---- 10. Zig at 1M: the needle through tf-glm53-generate --mode 3b, DCP auto ------------------------------------------
@@ -557,7 +716,8 @@ if [ "${SKIP_1M:-0}" != 1 ] && [ -n "$AOT1M" ]; then
   }
   if wait_memory; then
     say "zig 1M: needle prompt at context $CTX_1M (DCP auto), docker --memory $MEM_CAP_1M"
-    start_ranks zp3b-z1m z1m_args "$MEM_CAP_1M" && wait_ranks zp3b-z1m "${GEN1M_TIMEOUT:-14400}" || note_fail "zig 1M run failed (zp3b-z1m-r*.log)"
+    start_ranks zp3b-z1m z1m_args "$MEM_CAP_1M" || { collect_ranks zp3b-z1m; fatal "zig 1M start failed"; }
+    wait_ranks zp3b-z1m "${GEN1M_TIMEOUT:-14400}" "$STALL_LONG_MIN" || { collect_ranks zp3b-z1m; fatal "zig 1M run failed: $WAIT_REASON (zp3b-z1m-r*.log)"; }
     collect_ranks zp3b-z1m
     grep -h -E '^(RESULT|WARN|error|rank 0 )' "$LOCAL"/zp3b-z1m-r*.log | tail -20 | tee -a "$LOG"
     rsh "${NODES[0]}" "cat $WORK/gen1m-r0.json" > "$LOCAL/gen1m-r0.json" 2>/dev/null

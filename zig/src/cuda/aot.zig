@@ -237,6 +237,152 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
     return runtime == k.params.len;
 }
 
+// ---- coverage (no GPU): the launches an engine can make, checked against an aot.json ----
+
+/// aot.json alone (no cubins loaded): what `pick` chooses from, for host-side coverage checks.
+pub const Catalog = std.json.Parsed(SetJson);
+
+pub fn loadCatalog(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Catalog {
+    const path = try std.fs.path.join(gpa, &.{ dir, "aot.json" });
+    defer gpa.free(path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+    defer gpa.free(text);
+    return std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+/// One launch shape an engine can request, reduced to what `pick` matches on: the function, its launch options, the
+/// constexprs it names and each runtime argument's type and specialization class (an int's value 1 / a multiple of
+/// 16 / other, a pointer's or u64's 16-byte alignment). `args` keeps the first launch seen with this key (its values
+/// are a valid representative of the class: tools/glm53/sweep_aot.py compiles the variant from them).
+pub const Need = struct {
+    function: []const u8,
+    opts: Launch,
+    args: []const Arg,
+    consts: []const Const,
+    count: usize = 1,
+};
+
+/// Collects `Need`s instead of launching (cuda_triton.Tri with .probe set): every distinct launch key once.
+pub const Probe = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    needs: std.StringArrayHashMapUnmanaged(Need) = .empty,
+    key: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator) Probe {
+        return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    pub fn deinit(p: *Probe) void {
+        p.needs.deinit(p.gpa);
+        p.key.deinit(p.gpa);
+        p.arena.deinit();
+        p.* = undefined;
+    }
+
+    fn class(x: i64) u8 {
+        if (x == 1) return '1';
+        return if (@mod(x, 16) == 0) 'D' else 'N';
+    }
+
+    /// Records one launch (what Set.runWith would have been asked for).
+    pub fn add(p: *Probe, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) !void {
+        p.calls += 1;
+        const g = p.gpa;
+        p.key.clearRetainingCapacity();
+        try p.key.print(g, "{s}|w{?d}|s{?d}", .{ function, opts.num_warps, opts.num_stages });
+        for (consts) |c| {
+            if (c.int) |x| try p.key.print(g, "|{s}=i{d}", .{ c.name, x });
+            if (c.f32) |x| try p.key.print(g, "|{s}=f{x}", .{ c.name, @as(u32, @bitCast(x)) });
+        }
+        for (args) |a| switch (a.value) {
+            .ptr => |x| try p.key.print(g, "|{s}:{s}:{c}", .{ a.name, x.ty, @as(u8, if (x.addr % 16 == 0) 'D' else 'N') }),
+            .i32 => |x| try p.key.print(g, "|{s}:i32:{c}", .{ a.name, class(x) }),
+            .f32 => try p.key.print(g, "|{s}:fp32", .{a.name}),
+            .u64 => |x| try p.key.print(g, "|{s}:u64:{c}", .{ a.name, @as(u8, if (x % 16 == 0) 'D' else 'N') }),
+        };
+        const gop = try p.needs.getOrPut(g, p.key.items);
+        if (gop.found_existing) {
+            gop.value_ptr.count += 1;
+            return;
+        }
+        const ar = p.arena.allocator();
+        gop.key_ptr.* = try ar.dupe(u8, p.key.items);
+        gop.value_ptr.* = .{ .function = try ar.dupe(u8, function), .opts = opts, .args = try ar.dupe(Arg, args), .consts = try ar.dupe(Const, consts) };
+    }
+
+    /// Indices (into `needs`) of the launches `specs` has no single variant for: missing or ambiguous.
+    pub fn missing(p: *const Probe, gpa: std.mem.Allocator, specs: []const KernelJson) ![]usize {
+        var out: std.ArrayList(usize) = .empty;
+        errdefer out.deinit(gpa);
+        for (p.needs.values(), 0..) |n, i| {
+            _ = pick(specs, n.function, n.args, n.consts, n.opts) catch {
+                try out.append(gpa, i);
+                continue;
+            };
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// The needs as JSON ({"needs": [...]}; "have": whether `specs` holds the variant, when given).
+    pub fn json(p: *const Probe, gpa: std.mem.Allocator, specs: ?[]const KernelJson) ![]u8 {
+        var o: std.ArrayList(u8) = .empty;
+        errdefer o.deinit(gpa);
+        try o.print(gpa, "{{\"generator\": \"tf-glm53-generate --mode list-variants\", \"calls\": {d}, \"needs\": [", .{p.calls});
+        for (p.needs.values(), 0..) |n, i| {
+            try o.print(gpa, "{s}\n {{\"fn\": \"{s}\", \"count\": {d}, ", .{ if (i > 0) "," else "", n.function, n.count });
+            if (n.opts.num_warps) |w| try o.print(gpa, "\"num_warps\": {d}, ", .{w}) else try o.appendSlice(gpa, "\"num_warps\": null, ");
+            if (n.opts.num_stages) |s| try o.print(gpa, "\"num_stages\": {d}, ", .{s}) else try o.appendSlice(gpa, "\"num_stages\": null, ");
+            if (specs) |ks| {
+                const have = if (pick(ks, n.function, n.args, n.consts, n.opts)) |_| true else |_| false;
+                try o.print(gpa, "\"have\": {}, ", .{have});
+            }
+            try o.appendSlice(gpa, "\"consts\": {");
+            for (n.consts, 0..) |c, j| {
+                const sep = if (j > 0) ", " else "";
+                if (c.int) |x| try o.print(gpa, "{s}\"{s}\": {{\"int\": {d}}}", .{ sep, c.name, x });
+                if (c.f32) |x| try o.print(gpa, "{s}\"{s}\": {{\"f32\": {d}}}", .{ sep, c.name, @as(u32, @bitCast(x)) });
+            }
+            try o.appendSlice(gpa, "}, \"args\": [");
+            for (n.args, 0..) |a, j| {
+                const sep = if (j > 0) ", " else "";
+                switch (a.value) {
+                    .ptr => |x| try o.print(gpa, "{s}{{\"name\": \"{s}\", \"kind\": \"ptr\", \"type\": \"{s}\", \"align16\": {}}}", .{ sep, a.name, x.ty, x.addr % 16 == 0 }),
+                    .i32 => |x| try o.print(gpa, "{s}{{\"name\": \"{s}\", \"kind\": \"i32\", \"value\": {d}}}", .{ sep, a.name, x }),
+                    .f32 => |x| try o.print(gpa, "{s}{{\"name\": \"{s}\", \"kind\": \"f32\", \"bits\": {d}}}", .{ sep, a.name, @as(u32, @bitCast(x)) }),
+                    .u64 => |x| try o.print(gpa, "{s}{{\"name\": \"{s}\", \"kind\": \"u64\", \"value\": {d}}}", .{ sep, a.name, x }),
+                }
+            }
+            try o.appendSlice(gpa, "]}");
+        }
+        try o.appendSlice(gpa, "\n]}\n");
+        return o.toOwnedSlice(gpa);
+    }
+};
+
+test "the probe keeps one need per specialization class and checks it against a set" {
+    const parsed = try parseTestSet();
+    defer parsed.deinit();
+    var p = Probe.init(std.testing.allocator);
+    defer p.deinit();
+    const consts = [_]Const{ ci("CHK", 256), cf("SCALE", 0.0625) };
+    // R 3 and 5 are one class (not 1, not a multiple of 16); R 32 another; R 1 a third
+    for ([_]i32{ 3, 5, 32, 1 }) |r| try p.add("_attn", &.{ ptr("Q", "*bf16", 0x1000), int("R", r) }, &consts, .{ .num_warps = 4, .num_stages = 2 });
+    try std.testing.expectEqual(@as(usize, 3), p.needs.count());
+    try std.testing.expectEqual(@as(usize, 2), p.needs.values()[0].count);
+    const miss = try p.missing(std.testing.allocator, parsed.value.kernels);
+    defer std.testing.allocator.free(miss);
+    // R 3: variant a; R 32: no variant with R divisible by 16 captured; R 1: variant d
+    try std.testing.expectEqual(@as(usize, 1), miss.len);
+    try std.testing.expectEqual(@as(i32, 32), p.needs.values()[miss[0]].args[1].value.i32);
+    const j = try p.json(std.testing.allocator, parsed.value.kernels);
+    defer std.testing.allocator.free(j);
+    const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, j, .{});
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 3), doc.value.object.get("needs").?.array.items.len);
+}
+
 // ---- host tests (no GPU): variant choice from an aot.json as aot_pack.py writes it ----
 
 const test_set =

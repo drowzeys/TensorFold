@@ -73,6 +73,7 @@ class Recorder:
         self.log: list[dict] = []
         self.phase = "startup"
         self.detail = False
+        self.record_warmup = False  # JITFunction.warmup compiles count as launches (tools/glm53/sweep_aot.py)
         self._seq = 0
 
     def install(self) -> "Recorder":
@@ -83,7 +84,7 @@ class Recorder:
 
         def run(fn, *args, grid, warmup, **kwargs):
             kernel = original(fn, *args, grid=grid, warmup=warmup, **kwargs)
-            if kernel is not None and not warmup:
+            if kernel is not None and (not warmup or rec.record_warmup):
                 rec._triton(fn, kernel, args, kwargs, grid)
             return kernel
 

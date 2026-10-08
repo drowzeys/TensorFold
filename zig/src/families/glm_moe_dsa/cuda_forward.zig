@@ -1041,6 +1041,12 @@ pub const Forward = struct {
                 // this rank's kk best columns ascending (b.tok's rows as scratch), then their keys
                 try o.topkColumnsMode(b.sc, Tl, Tl, n, kk, 2, b.tsel, tok, K);
                 try o.dcpCands(b.sc, Tl, tok, K, kk, K, false, b.dmine, n);
+            } else if (kk == Tl) {
+                // topk.top_keys(sc, kk) with kk == Tl (Tl <= K: short prompt chunks under DCP) keeps every key in
+                // column order - the score rows themselves, bit for bit. Copied rather than launched: _select_keys'
+                // K constexpr would be a different variant for each such Tl (none of them in a finite AOT set).
+                try o.copy(b.dsel, b.sc, n * Tl * 8);
+                try o.dcpCands(b.sc, Tl, b.dsel, kk, kk, K, true, b.dmine, n);
             } else {
                 try t_.topKeys(b.sc, b.dsel, Tl, n, kk);
                 try o.dcpCands(b.sc, Tl, b.dsel, kk, kk, K, true, b.dmine, n);
