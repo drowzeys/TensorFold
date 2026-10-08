@@ -48,6 +48,10 @@ pub const Settings = struct {
     roce_health: bool = true,
     /// the sequence-parallel chunk (its comm stream and events), owned by the caller; null: no overlap
     sp: ?*prompt.Sp = null,
+    /// Phase 3a speed: sampled windows pick each rank's candidates on the device (the multi-block top-k over the
+    /// local logits in sampling.topBetter's order, the Python engine's torch.topk) and read the gathered candidates
+    /// once; false: the whole local logits rows go to the host for sampling.selectTop (the same candidates)
+    device_cands: bool = true,
 };
 
 pub const Stats = struct {
@@ -398,10 +402,11 @@ pub const Runner = struct {
             const ids = r.ids_dev orelse return error.Invalid;
             try r.uploadIds(ids.ptr, prompt_ids);
         }
-        for (chunks) |ch| {
+        for (chunks, 0..) |ch, ci| {
             const a = ch[0];
             const e = ch[1];
             const R = e - a;
+            const t_chunk = r.now();
             const T: ?usize = if (e > r.topk) e else null;
             const last = e == L0;
             if (r.set.served) {
@@ -416,7 +421,9 @@ pub const Runner = struct {
                 try r.sp.?.chunk(&r.st, &r.pb, b1, a, R, T);
                 if (last) {
                     const hR = R / 2;
+                    const p0 = try r.f.pbegin();
                     try r.f.headDevice(b1, b1.x + (R - hR - 1) * D * 2, r.w.final_norm, 1, head);
+                    try r.f.pend(p0, .head);
                     hb = b1;
                 }
             } else {
@@ -425,6 +432,17 @@ pub const Runner = struct {
             }
             if (r.set.k > 0) try r.mtpPrompt(prompt_ids, a, e, T);
             if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
+            if (r.f.prof) |p| {
+                if (p.on) { // --prompt-prof: this chunk's phases (a sync a chunk: profiling runs only)
+                    try r.f.s.synchronize();
+                    if (r.sp) |sp| try sp.side.s.synchronize();
+                    try p.report(r.w.rank, ci, a, e, r.since(t_chunk));
+                }
+            }
+        }
+        if (r.f.prof) |p| {
+            p.total(r.w.rank, L0);
+            p.on = false; // the prompt only: decode windows are never timed (nor captured with events in them)
         }
         if (s) |smpl| {
             var pick: [1]u32 = undefined;
@@ -468,7 +486,14 @@ pub const Runner = struct {
                 try r.uploadIds(b.ids, if (first) prompt_ids[a + 1 .. e] else prompt_ids[a..e]);
             }
             try r.setI32(r.st.mpos, if (first) 0 else a - 1);
+            const p0 = try r.f.pbegin();
+            if (r.f.prof) |p| p.suspended = true;
+            defer if (r.f.prof) |p| {
+                p.suspended = false;
+            };
             try r.f.mtpCompute(b, &r.st, rows, T, .{ .head = false, .zero_first = first, .chain_normed = r.set.chain_normed });
+            if (r.f.prof) |p| p.suspended = false;
+            try r.f.pend(p0, .mtp);
         }
         try o.copy(r.carry.ptr, b.ht + (R - 1) * D * 2, D * 2);
     }
@@ -494,6 +519,22 @@ pub const Runner = struct {
         const lay = r.pinLayout();
         const o = r.ops();
         if (R > r.vb.head_rows and R > 1) return error.WindowTooWide;
+        if (r.set.device_cands and b.cand_cols != 0 and R <= b.head_rows and cnt <= smp.max_candidates) {
+            // each rank's top `cnt` of its share on the device (Runner._sample_local's torch.topk; selectTop's set:
+            // `choose` sorts the gathered candidates itself), one gather, one read
+            const words = R * 2 * cnt + 1;
+            if (words > b.cand_words) return error.Invalid;
+            try o.topkColumns(b.lg, V, V, R, cnt, true, b.tsel, b.cand_cols, cnt);
+            try o.cands(b.lg, V, b.cand_cols, cnt, r.w.vocab_off, b.cand_send, R);
+            try o.fill32(b.cand_send + (words - 1) * 4, 0, 1); // the stop vote's spare word (no stops here)
+            const stride = try r.f.smallGather(b.cand_send, b.cand_all, words);
+            const ranks = if (r.f.comm != null) world else 1;
+            const all = r.pinSlice(f32, lay.all, ranks * stride);
+            try o.download(std.mem.sliceAsBytes(all), b.cand_all);
+            try r.f.s.synchronize();
+            r.pickRows(all, ranks, stride, R, cnt, pos0, s, picks);
+            return;
+        }
         const lg = r.pinSlice(f32, lay.lg, R * V);
         try o.download(std.mem.sliceAsBytes(lg), b.lg); // head "local": [R, V] rows, contiguous
         try r.f.s.synchronize();
@@ -513,6 +554,12 @@ pub const Runner = struct {
         const all = r.pinSlice(f32, lay.all, ranks * stride);
         try o.download(std.mem.sliceAsBytes(all), b.cand_all);
         try r.f.s.synchronize();
+        r.pickRows(all, ranks, stride, R, cnt, pos0, s, picks);
+    }
+
+    /// The keyed draws of rows 0..R-1 from every rank's gathered candidates (`all`: [ranks, stride] words, a row's
+    /// [values (cnt) ; ids (cnt)] at i * 2 cnt).
+    fn pickRows(r: *Runner, all: []const f32, ranks: usize, stride: usize, R: usize, cnt: usize, pos0: usize, s: smp.Sampling, picks: []u32) void {
         for (0..R) |i| {
             var n: usize = 0;
             for (0..ranks) |k| {

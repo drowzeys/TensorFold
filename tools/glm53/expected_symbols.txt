@@ -45,3 +45,9 @@ glm53_bhx_to_hbx
 glm53_bf16_f32
 glm53_add_f32
 glm53_hadamard
+# Phase 3a speed (glm53_decode.cu): the decode-sized multi-block top-k, sampled candidates, the L2 prefetch
+glm53_topk_hist
+glm53_topk_count
+glm53_topk_write
+glm53_cands
+glm53_l2pf

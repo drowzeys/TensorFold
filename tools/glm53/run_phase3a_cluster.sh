@@ -32,6 +32,14 @@
 #   CONTEXT32K [$HOME/glm53-speed-20260920/context-32k.txt] (the 128K prompt is that text four times over)
 #   CONTEXT [auto: the longest prompt + its picks, rounded up to 1024; must stay under the DCP cut, 200,000]
 #   RATIO [0.97]   BENCH_ROWS [1,2,3,4,8,16,32]   BENCH_ITERS [200]   SPEED_DEFAULT [0]
+#   Zig decode knobs (the image's served defaults): ZSIDE [af] (TF_GLM53_SIDE)  ZL2PF [1] (TF_GLM53_L2PF: 1|0|lines|touch)
+#   ZL2PF_MB [8]  ZMULTI_SELECT [1] (decode-sized top-k over many blocks; 0: the one-program radix select)
+#   ZDEVICE_CANDS [1] (sampled windows: each rank's candidates picked on the device)
+#   PROFILE [0]: 1 = the prefill of PROFILE_PROMPT [prose32k]'s first run timed by phase in both engines (Zig:
+#     --prompt-prof, CUDA events a chunk; Python: Runner.prefill's torch.profiler table rolled up by
+#     reference3a.py --profile-prefill), printed after each engine's runs as PROMPT-PROF / PREFILL-PROF lines and kept
+#     in prefill-prof.txt. That run's prefill is slowed in both engines; the gate (unchanged) takes each prompt's best
+#     run, so give the profiled prompt two runs (prose32k has two by default)
 #   REF_PORT [29571] (TCPStore; RoCE's gloo setup at +11)  ZIG_PORT [29581]  BENCH_PORT [29591]
 #   SKIP_SYNC=1 SKIP_BUILD=1 SKIP_BENCH=1 SKIP_REF=1 (with REUSE=<stamp>: its prompts, zig-out and ref/)
 set -u
@@ -58,6 +66,13 @@ RATIO=${RATIO:-0.97}
 BENCH_ROWS=${BENCH_ROWS:-1,2,3,4,8,16,32}
 BENCH_ITERS=${BENCH_ITERS:-200}
 SPEED_DEFAULT=${SPEED_DEFAULT:-0}
+ZSIDE=${ZSIDE:-af}
+ZL2PF=${ZL2PF:-1}
+ZL2PF_MB=${ZL2PF_MB:-8}
+ZMULTI_SELECT=${ZMULTI_SELECT:-1}
+ZDEVICE_CANDS=${ZDEVICE_CANDS:-1}
+PROFILE=${PROFILE:-0}
+PROFILE_PROMPT=${PROFILE_PROMPT:-prose32k}
 REF_PORT=${REF_PORT:-29571}
 ZIG_PORT=${ZIG_PORT:-29581}
 BENCH_PORT=${BENCH_PORT:-29591}
@@ -168,7 +183,7 @@ if [ "${SKIP_SYNC:-0}" != 1 ]; then
   done
   say "synced $PORT_DIR and $PYSRC to every node"
 fi
-for n in "${NODES[@]}"; do rsh "$n" "mkdir -p $WORK/ref $RPORT/cache/zig-local $RPORT/cache/zig-global $RPORT/cache/torch_ext $RPORT/cache/cuda_cache"; done
+for n in "${NODES[@]}"; do rsh "$n" "mkdir -p $WORK/ref $RPORT/cache/zig-local $RPORT/cache/zig-global $RPORT/cache/torch_ext $RPORT/cache/cuda_cache $RPORT/cache/vllm/b12x-compile $RPORT/cache/b12x-roce $RPORT/cache/xdg"; done
 USER_FLAG='--user $(id -u):$(id -g)'
 COMMON="--label $LABEL $USER_FLAG -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1"
 RANK_FLAGS="--gpus all --network host --ipc host --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK --memory $MEM_CAP --memory-swap $MEM_CAP"
@@ -273,6 +288,7 @@ if [ "${SKIP_BENCH:-0}" != 1 ]; then
   bench_args() {
     echo "-v $WORK:/work --entrypoint /work/zig-out/bin/tf-glm53-generate $IMAGE --mode roce-bench --rank $1 --world 4 \
       --master $MASTER:$BENCH_PORT --hcas ${ZHCAS[$1]} --gid ${ZGID[$1]} --bench-rows $BENCH_ROWS --bench-iters $BENCH_ITERS \
+      --nccl-lib ${BENCH_NCCL:-/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2} \
       --dims 6144 --out /work/roce-bench-r$1.json --timeout 900"
   }
   say "roce-bench: the Zig RoCE one-shot at TP4 (rows $BENCH_ROWS)"
@@ -288,11 +304,14 @@ fi
 ref_args() {   # $1 = rank, $2 = out dir under /work, $3 = extra reference3a.py flags
   echo "-v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/tf:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
     -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/work/$2/triton -e TORCH_EXTENSIONS_DIR=/cache/torch_ext \
-    -e CUDA_CACHE_PATH=/cache/cuda_cache -e TORCH_CUDA_ARCH_LIST=12.1 -w /tmp --entrypoint python3 $IMAGE \
+    -e CUDA_CACHE_PATH=/cache/cuda_cache -e TORCH_CUDA_ARCH_LIST=12.1 \
+    -e VLLM_CACHE_ROOT=/cache/vllm -e B12X_COMPILE_CACHE_DIR=/cache/vllm/b12x-compile -e B12X_ROCE_CACHE_DIR=/cache/b12x-roce \
+    -e XDG_CACHE_HOME=/cache/xdg -w /tmp --entrypoint python3 $IMAGE \
     -B /tf/tools/glm53/reference3a.py --model /model --rank $1 --master $MASTER --port $REF_PORT \
     --prompts /work/${4:-prompts.json} --context $CONTEXT --k $K --out /work/$2 $3"
 }
-ref_main() { ref_args "$1" ref --record; }
+# PROFILE=1: Runner.prefill's torch.profiler over PROFILE_PROMPT's first run (reference3a.py --profile-prefill)
+ref_main() { ref_args "$1" ref "--record$([ "$PROFILE" = 1 ] && echo " --profile-prefill $PROFILE_PROMPT")"; }
 if [ "${SKIP_REF:-0}" != 1 ]; then
   for n in "${NODES[@]}"; do rsh "$n" "rm -rf $WORK/ref && mkdir -p $WORK/ref/triton"; done
   wait_memory || summary FAIL "a node is under 100 GB MemAvailable before the reference" 1
@@ -302,6 +321,7 @@ if [ "${SKIP_REF:-0}" != 1 ]; then
   wait_ranks zp3a-ref "${REF_TIMEOUT:-10800}"; rrc=$?
   collect_ranks zp3a-ref
   grep -h '\[ref3a\] rank 0' "$LOCAL"/zp3a-ref-r0.log | tail -40 | tee -a "$LOG"
+  grep -ah 'RoCE reduce unavailable' "$LOCAL"/zp3a-ref-r*.log | head -4 | tee -a "$LOG"
   [ $rrc = 0 ] || { cleanup; summary FAIL "the Python reference failed (zp3a-ref-r*.log: $(tail -3 "$LOCAL/zp3a-ref-r0.log" | tr '\n' ' ' | cut -c1-240))" 1; }
   say "reference: done in $(( $(date +%s) - t0 )) s"
 fi
@@ -345,6 +365,8 @@ gen_args() {
     --roce 1 --hcas ${ZHCAS[$1]} --gid ${ZGID[$1]} --roce-health 1 --tiles /work/ref/tiles-r$1.json \
     --prompt-rows 8192 --prompt-rows-short 4096 --prompt-sp 1 --experts ${EXPERTS:-shared} --pe-det slots16 \
     --cublas-lib $CUBLAS --unpack-mb 384 --bmm-probe /work/ref/bmm_probe.json \
+    --side $ZSIDE --l2pf $ZL2PF --l2pf-mb $ZL2PF_MB --multi-select $ZMULTI_SELECT --device-cands $ZDEVICE_CANDS \
+    $([ "$PROFILE" = 1 ] && echo "--prompt-prof $PROFILE_PROMPT") \
     --timeout ${ZIG_RDV_TIMEOUT:-5400} --out /work/gen-r$1.json"
 }
 say "zig: tf-glm53-generate --mode 3a at TP4 (docker --memory $MEM_CAP a rank)"
@@ -353,6 +375,13 @@ start_ranks zp3a-gen gen_args || { cleanup; summary FAIL "zig start failed" 1; }
 wait_ranks zp3a-gen "${GEN_TIMEOUT:-10800}"; grc=$?
 collect_ranks zp3a-gen
 grep -h -E '^(RESULT|WARN|bmm probe|rank 0 |error)' "$LOCAL"/zp3a-gen-r*.log | tail -60 | tee -a "$LOG"
+if [ "$PROFILE" = 1 ]; then   # both engines' prefill phases (rank 0), side by side in prefill-prof.txt
+  { echo "== python (torch.profiler, GPU time a kernel class; streams overlap) =="
+    grep -ah 'PREFILL-PROF' "$LOCAL"/zp3a-ref-r0.log
+    echo "== zig (CUDA events a phase and chunk; main / comm streams overlap) =="
+    grep -ah '^PROMPT-PROF rank 0' "$LOCAL"/zp3a-gen-r0.log; } > "$LOCAL/prefill-prof.txt"
+  tee -a "$LOG" < "$LOCAL/prefill-prof.txt"
+fi
 [ $grc = 0 ] || { cleanup; summary FAIL "tf-glm53-generate failed (zp3a-gen-r*.log: $(grep -h RESULT "$LOCAL"/zp3a-gen-r*.log | head -2 | tr '\n' ' ' | cut -c1-240))" 1; }
 say "zig: done in $(( $(date +%s) - t0 )) s"
 

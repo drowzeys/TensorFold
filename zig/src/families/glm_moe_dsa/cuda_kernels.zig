@@ -42,6 +42,13 @@ pub const Kernels = struct {
     f32_bf16: cuda.Function,
     qmm_mod: cuda.Module,
     q4_group: cuda.Function, // qmm_group tile 2 with fp32 out: the draft head (headq q4)
+    // Phase 3a speed (glm53_decode.cu): decode windows' multi-block top-k, sampled candidates, the L2 prefetch
+    decode_mod: cuda.Module,
+    topk_hist: cuda.Function,
+    topk_count: cuda.Function,
+    topk_write: cuda.Function,
+    cands: cuda.Function,
+    l2pf: cuda.Function,
     gb10: bool, // sm_121: qmm_group launches with programmatic dependent launch (qmm_group_cuda's `early`)
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
@@ -94,6 +101,13 @@ pub const Kernels = struct {
         k.pe_down = try k.pe_mod.function(exl3.pe_down_symbol);
         k.pe_slot_sum16 = try k.pe_mod.function(exl3.pe_slot_sum16_symbol);
         k.pe = try PeConsts.read(d, k.pe_mod);
+        k.decode_mod = try cuda.Module.load(d, cuda.kernels.glm53_decode);
+        errdefer k.decode_mod.unload();
+        k.topk_hist = try k.decode_mod.function("glm53_topk_hist");
+        k.topk_count = try k.decode_mod.function("glm53_topk_count");
+        k.topk_write = try k.decode_mod.function("glm53_topk_write");
+        k.cands = try k.decode_mod.function("glm53_cands");
+        k.l2pf = try k.decode_mod.function("glm53_l2pf");
         try k.pe_gateup.allowDynamicShared(k.pe.gu_smem);
         try k.pe_down.allowDynamicShared(k.pe.dn_smem);
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
@@ -102,6 +116,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.decode_mod.unload();
         k.pe_mod.unload();
         k.prompt_mod.unload();
         k.qmm_mod.unload();
@@ -242,6 +257,21 @@ pub const ExpertScratch = struct {
     dn: exl3.Tiles,
 };
 
+/// glm53_decode.cu's multi-block top-k: columns a block, and the scratch a selection of up to `rows` rows over up
+/// to `blocks` blocks of columns needs (zero at allocation; every selection leaves it zero again).
+pub const topk_chunk: usize = 2048;
+pub const TopkScratch = struct {
+    hist: u64 = 0, // uint32 [rows, 2048]
+    state: u64 = 0, // uint32 [rows, 4]
+    cnt: u64 = 0, // uint32 [rows, blocks, 2]
+    rows: usize = 0,
+    blocks: usize = 0,
+
+    pub fn histBytes(rows: usize) usize {
+        return rows * 2048 * 4;
+    }
+};
+
 fn int(x: usize) c_int {
     return @intCast(x);
 }
@@ -328,7 +358,9 @@ pub const Ops = struct {
 
     /// experts.routed with wts and sy (TF_EXL3_EXPERTS_FUSE 1, LOADS 1, PDL 0, fp32 SwiGLU, no limit):
     /// out [R, D] fp32 = the wts-weighted sum of the routed slots' outputs + sy.
-    pub fn routed(o: Ops, x: u64, x_stride: usize, pick: u64, wts: u64, ex: *const Experts, s: ExpertScratch, out: u64, sy: u64, rows: usize) !void {
+    /// `sy_wait` (TF_GLM53_SIDE "f"): the shared expert's output `sy` comes from the side stream; the compute stream
+    /// waits for this event right before the first launch that reads it (experts.routed's sy_ready).
+    pub fn routed(o: Ops, x: u64, x_stride: usize, pick: u64, wts: u64, ex: *const Experts, s: ExpertScratch, out: u64, sy: u64, rows: usize, sy_wait: ?cuda.Event) !void {
         if (rows > s.rows) return error.WindowTooWide;
         const D = ex.dims;
         const I = ex.width;
@@ -363,6 +395,7 @@ pub const Ops = struct {
         // 5. down with its epilogue and the weighted combine (+ sy) fused
         const dn = s.dn;
         if (dn.nt != 8 or dn.sk != 1) return error.UnfusedDownUnsupported; // TODO: down_combine path (other tiles)
+        if (sy_wait) |ev| try o.s.wait(ev);
         try o.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, s, 1, I, D, P, dn, maxu, maxm, ex.k2_d, .{
             .fuse = 1,
             .pick = pick,
@@ -603,6 +636,78 @@ pub const Ops = struct {
             try o.f32ToBf16(sc.acc, sc.out16, n * D);
             try o.bf16ToF32(sc.out16, out + r0 * D * 4, n * D);
         }
+    }
+
+    // ---- Phase 3a speed: decode windows ---------------------------------------------------------------------------
+
+    /// glm53_topk_*: rows x nc 32-bit keys (row stride ld words) -> out[r * out_ld .. + K] = row r's K best columns,
+    /// ascending, ties to the lower column (int32). `fmode`: keys are fp32 values in sampling.topBetter's order (else
+    /// uint32 order words). Five launches, no host step: capturable.
+    pub fn topkColumns(o: Ops, keys: u64, nc: usize, ld: usize, rows: usize, K: usize, fmode: bool, sc: TopkScratch, out: u64, out_ld: usize) !void {
+        if (rows == 0) return;
+        if (K == 0 or K > nc or rows > sc.rows) return error.Invalid;
+        const B = (nc + topk_chunk - 1) / topk_chunk;
+        if (B > sc.blocks) return error.ScratchTooSmall;
+        const cfg: cuda.Config = .{ .grid = .{ .x = u(B), .y = u(rows) }, .block = .{ .x = 256 } };
+        const fm: c_int = @intFromBool(fmode);
+        for (0..3) |pass| {
+            var a: cuda.Args = .{};
+            a.add(keys);
+            a.add(int(nc));
+            a.add(@as(i64, @intCast(ld)));
+            a.add(int(topk_chunk));
+            a.add(int(pass));
+            a.add(int(K));
+            a.add(fm);
+            a.add(sc.hist);
+            a.add(sc.state);
+            try cuda.launch.launch(o.k.topk_hist, cfg, o.s, &a);
+        }
+        var ca: cuda.Args = .{};
+        ca.add(keys);
+        ca.add(int(nc));
+        ca.add(@as(i64, @intCast(ld)));
+        ca.add(int(topk_chunk));
+        ca.add(fm);
+        ca.add(sc.state);
+        ca.add(sc.cnt);
+        try cuda.launch.launch(o.k.topk_count, cfg, o.s, &ca);
+        var wa: cuda.Args = .{};
+        wa.add(keys);
+        wa.add(int(nc));
+        wa.add(@as(i64, @intCast(ld)));
+        wa.add(int(topk_chunk));
+        wa.add(fm);
+        wa.add(sc.state);
+        wa.add(sc.cnt);
+        wa.add(out);
+        wa.add(@as(i64, @intCast(out_ld)));
+        try cuda.launch.launch(o.k.topk_write, cfg, o.s, &wa);
+    }
+
+    /// glm53_cands: send[r] = [lg[r, cols[r, j]] for j < cnt ; int32 bits of cols[r, j] + off] for r < rows.
+    pub fn cands(o: Ops, lg: u64, ld: usize, cols: u64, cnt: usize, off: usize, send: u64, rows: usize) !void {
+        if (rows == 0) return;
+        if (cnt == 0 or cnt > 1024) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(lg);
+        a.add(@as(i64, @intCast(ld)));
+        a.add(cols);
+        a.add(int(cnt));
+        a.add(@as(i64, @intCast(off)));
+        a.add(send);
+        try cuda.launch.launch(o.k.cands, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = u((cnt + 31) / 32 * 32) } }, o.s, &a);
+    }
+
+    /// glm53_l2pf: prefetch `count` (address, bytes) pieces of `table` (int64 pairs) into L2.
+    pub fn l2pf(o: Ops, table: u64, count: usize, mode: c_int, blocks: u32, threads: u32, sink: u64) !void {
+        if (count == 0) return;
+        var a: cuda.Args = .{};
+        a.add(table);
+        a.add(int(count));
+        a.add(mode);
+        a.add(sink);
+        try cuda.launch.launch(o.k.l2pf, .{ .grid = .{ .x = blocks }, .block = .{ .x = threads } }, o.s, &a);
     }
 
     pub fn copy(o: Ops, dst: u64, src: u64, bytes: usize) !void {

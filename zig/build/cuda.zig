@@ -41,6 +41,9 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_roce", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } },
     .{ .name = "glm53_prompt", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } },
     .{ .name = "glm53_prompt_experts", .flags = &.{ "-O3", "-lineinfo" } },
+    // Phase 3a speed: decode windows' multi-block top-k (indexer selection, sampled candidates) and the L2 prefetch
+    // kernel (MiaAI-Lab 0046's l2pf.cu: extra_cuda_cflags -O3)
+    .{ .name = "glm53_decode", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

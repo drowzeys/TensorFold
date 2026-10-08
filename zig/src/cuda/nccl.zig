@@ -38,7 +38,25 @@ pub const Library = struct {
         return openPath("libnccl.so.2");
     }
 
+    /// `path` as given when it names a directory; a bare file name (std.DynLib without libc does not search
+    /// LD_LIBRARY_PATH / ld.so.cache - `--mode roce-bench` failed with LibraryUnavailable on "libnccl.so.2") is tried
+    /// first in torch's wheel (the NCCL the Python engine loads: its ring sums are part of a prompt's bits), then in
+    /// the system and toolkit library directories, then bare.
     pub fn openPath(path: []const u8) Error!Library {
+        if (std.mem.indexOfScalar(u8, path, '/') == null) {
+            var buf: [512]u8 = undefined;
+            for ([_][]const u8{ "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib", "/usr/lib/aarch64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64", "/usr/local/lib" }) |dir| {
+                const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, path }) catch continue;
+                return openExact(full) catch |e| switch (e) {
+                    error.LibraryUnavailable => continue,
+                    else => return e,
+                };
+            }
+        }
+        return openExact(path);
+    }
+
+    fn openExact(path: []const u8) Error!Library {
         var lib = std.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var api: Api = undefined;

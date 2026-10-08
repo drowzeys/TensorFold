@@ -25,6 +25,13 @@ implementation), ``bmm_probe.json`` (sha256 of torch.bmm on attention_core's wid
 inputs: tf-glm53-generate --bmm-probe checks cuBLAS gives the same bits before any prompt runs) and, with --record,
 the Triton AOT set of everything the served engine launched.
 
+Profiling (run_phase3a_cluster.sh PROFILE=1): ``--profile-prefill NAME`` points TF_GLM53_PROFILE_FLAG at
+<out>/prof/PROFILE and touches its ``_PREFILL`` flag before the first run of the prompt named NAME*, so
+Runner.prefill wraps that prompt's prefill in torch.profiler (its own per-kernel table, prof/prof/
+prefill_rank<R>.txt); this tool then prints the table rolled up into the phases tf-glm53-generate --prompt-prof
+times (``[ref3a] PREFILL-PROF ...``). Only that run's prefill is profiled (and slowed): the gate takes each prompt's
+best run.
+
 Modes:
   --make-prompts OUT   (CPU) reference2b's prompts (3 chat prompts, the ~4,500-token one, the 32K prose prompt) plus
                        the 128K prefill prompt (the 32K background text four times over); runs per prompt from
@@ -107,6 +114,52 @@ def bmm_probe(heads: int, nope: int, rope: int, lw: int, vd: int) -> dict:
     return {"cases": cases}
 
 
+# torch.profiler kernel names -> the phases tf-glm53-generate --prompt-prof reports (first match wins)
+PY_PHASES = (
+    ("routed experts (prompt_experts)", ("prompt_gateup", "prompt_down", "slot_sum16", "tf_exl3p")),
+    ("MTP experts (cuda-exl3 GEMM)", ("exl3_moe", "moe_align", "cuda_exl3")),
+    ("experts, decode kernel", ("grouped_kernel", "gateup_epilogue", "tf_exl3x", "group_kernel")),
+    ("dense linears (prompt GEMM + unpack)", ("unpack_kernel", "rot_in_kernel", "tf_exl3_linear")),
+    ("attention", ("_attn_chunks", "_merge", "_attn_")),
+    ("indexer (scores, top-k, keys)", ("_index_scores", "_select_keys", "_ik_write", "_iq_rope", "topk", "sort",
+                                       "radix")),
+    ("collectives (NCCL)", ("nccl",)),
+    ("router", ("_router", "_topk")),
+    ("cuBLAS bmm (absorb / expand)", ("gemm", "cutlass", "xmma", "sm90", "sm100")),
+)
+
+
+def roll_up(path: Path) -> list[str]:
+    """Runner.prefill's profile table (wall, GPU busy, the top kernels) rolled up into PY_PHASES."""
+    lines = path.read_text().splitlines()
+    if not lines:
+        return []
+    sums: dict[str, float] = {}
+    counted = 0.0
+    for ln in lines[1:]:
+        parts = ln.split(None, 3)
+        if len(parts) < 4 or parts[1] != "s":
+            continue
+        t, name = float(parts[0]), parts[3]
+        counted += t
+        if name == "_gemm":
+            phase = "dense linears (prompt GEMM + unpack)"
+        else:
+            phase = next((ph for ph, keys in PY_PHASES if any(k in name for k in keys)), "glue (norms, adds, copies)")
+        sums[phase] = sums.get(phase, 0.0) + t
+    out = [lines[0]]
+    out += [f"{v * 1e3:10.1f} ms  {k}" for k, v in sorted(sums.items(), key=lambda kv: -kv[1])]
+    busy = None
+    for tok in lines[0].split("gpu kernels")[1:]:
+        try:
+            busy = float(tok.split()[0])
+        except (ValueError, IndexError):
+            pass
+    if busy is not None and busy > counted:
+        out.append(f"{(busy - counted) * 1e3:10.1f} ms  (kernels outside the top 40)")
+    return out
+
+
 def loaded_lib(fragment: str) -> str:
     """The file of a loaded shared library whose name contains ``fragment`` (/proc/self/maps)."""
     try:
@@ -170,6 +223,7 @@ def main() -> int:
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--speed-only", action="store_true", help="no Triton record, no probes: timing at the env given")
     ap.add_argument("--tools", default="")
+    ap.add_argument("--profile-prefill", default="", help="torch.profiler over the first run's prefill of this prompt")
     a = ap.parse_args()
     if a.make_prompts:
         return make_prompts(a)
@@ -189,6 +243,11 @@ def main() -> int:
         os.environ.pop(k, None)
     if not a.speed_only:
         os.environ["TF_GLM53_TILES"] = env["TF_GLM53_TILES"] = f"save:{out}/tiles-r{a.rank}.json"
+    prof_flag = None
+    if a.profile_prefill:                       # Runner.prefill's own profile (read once, at import: set it first)
+        (out / "prof").mkdir(parents=True, exist_ok=True)
+        prof_flag = str(out / "prof" / "PROFILE")
+        os.environ["TF_GLM53_PROFILE_FLAG"] = env["TF_GLM53_PROFILE_FLAG"] = prof_flag
     tree = Path(a.tools) if a.tools else HERE.parents[1]
     rec = None
     if a.record:
@@ -250,10 +309,14 @@ def main() -> int:
         torch.cuda.synchronize()
 
     results = []
+    profiled = False
     with torch.no_grad():
         for p in prompts:
             ids = [int(x) for x in p["ids"]]
             for run in p["runs"]:
+                prof_this = bool(prof_flag) and not profiled and p["name"].startswith(a.profile_prefill)
+                if prof_this:
+                    Path(prof_flag + "_PREFILL").touch()
                 greedy, top_k, k = parse_run(run)
                 if k > a.k:
                     raise SystemExit(f"run {run}: more drafts than --k {a.k}")
@@ -268,6 +331,14 @@ def main() -> int:
                 print(f"[ref3a] rank {a.rank} {p['name']} {run}: prompt {len(ids)} in {st['prefill_s']:.2f}s "
                       f"({pf:.0f} tok/s); {len(toks)} tokens, decode {st['tok_s']:.2f} tok/s, {st['tokens_per_round']} "
                       f"tokens/round ({st['rounds']} rounds), accept {st['accept']}; first {toks[:8]}", flush=True)
+                if prof_this:
+                    profiled = True
+                    table = Path(prof_flag).parent / "prof" / f"prefill_rank{a.rank}.txt"
+                    if table.exists():
+                        for ln in roll_up(table):
+                            print(f"[ref3a] PREFILL-PROF rank {a.rank} {p['name']} {run}: {ln}", flush=True)
+                    else:
+                        print(f"[ref3a] PREFILL-PROF rank {a.rank}: no table at {table}", flush=True)
                 results.append({"name": p["name"], "run": run, "prompt_len": len(ids), "seed": str(p["seed"]),
                                 "k": k, "greedy": greedy, "top_k": top_k, "prefill_s": round(st["prefill_s"], 3),
                                 "decode_s": round(st["decode_s"], 3), "tok_s": st["tok_s"], "rounds": st["rounds"],

@@ -181,6 +181,18 @@ with fp32 `red.add` in arrival order, so a long prompt's caches - and the tokens
 the same engine; slots16 (fp16 pair rows summed in slot order) is the image's reproducible mode (~4-6 % slower
 prefill). `SPEED_DEFAULT=1` prints the Python prefill at the default too (not gated).
 
+Speed work after run 2 (2026-10-08; every change keeps the one-stream bits): the decode side stream
+(`cuda_decode.Side`, TF_GLM53_SIDE "af": the key path and the shared expert beside the query path / routed experts),
+the L2 prefetch of the target's decode windows (`cuda_decode.L2pf`, TF_GLM53_L2PF bulk, 8 MiB a site, sites "afo",
+l2pf.py's table), decode-sized index selections through a multi-block top-k (`glm53_decode.cu`; the one-program radix
+select cost 21 indexer layers ~0.25-0.5 ms each a window at 32K-128K keys - Python takes torch.topk there), sampled
+candidates picked on the device (one read a window), the MTP layer's prompt rows in blocks of ~1360 rows (scratch inside
+the prompt buffers' idle `gath`: ~3x fewer expert weight reads than blocks of 128). Zig knobs: `ZSIDE`, `ZL2PF`,
+`ZL2PF_MB`, `ZMULTI_SELECT`, `ZDEVICE_CANDS`. `PROFILE=1` times PROFILE_PROMPT's (prose32k) first prefill by phase
+in both engines (`prefill-prof.txt`). The reference container now gets a writable b12x cache (`VLLM_CACHE_ROOT`):
+run 2's Python ran WITHOUT RoCE ("Permission denied: /root/.cache/vllm/b12x-compile"), so its decode figures were
+NCCL's.
+
 What must match bit for bit beyond Phase 2b's kernels: the prompt GEMM (`x3prefill._gemm`, Triton, captured), its
 weight decode (`unpack_kernel`) and input rotation (`rot_in`), torch.bmm (cuBLAS `GemmStridedBatchedEx` with torch's
 arguments, workspace and math mode, the library file torch loaded - `--bmm-probe` checks three shapes first), the prompt

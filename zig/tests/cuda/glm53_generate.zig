@@ -32,7 +32,8 @@
 //!                          3a: [--roce 1] [--hcas A,B] [--gid 3] [--roce-health 1] [--spin-limit N] [--tiles FILE]
 //!                          [--prompt-rows 8192] [--prompt-rows-short 4096] [--prompt-sp 1] [--experts shared|tf]
 //!                          [--pe-det slots16|0] [--cublas-lib PATH] [--cublas-ws BYTES] [--cublas-math 0]
-//!                          [--unpack-mb 384] [--bmm-probe FILE]
+//!                          [--unpack-mb 384] [--bmm-probe FILE] [--side af|0] [--l2pf 1|0|lines|touch]
+//!                          [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
 //!        tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
 //!                          [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
 //!        tf-glm53-generate --sampler-check FILE
@@ -51,7 +52,8 @@ const usage =
     \\                         3a: [--roce 1] [--hcas A,B] [--gid 3] [--roce-health 1] [--spin-limit N] [--tiles FILE]
     \\                         [--prompt-rows 8192] [--prompt-rows-short 4096] [--prompt-sp 1] [--experts shared|tf]
     \\                         [--pe-det slots16|0] [--cublas-lib PATH] [--cublas-ws BYTES] [--cublas-math 0]
-    \\                         [--unpack-mb 384] [--bmm-probe FILE]
+    \\                         [--unpack-mb 384] [--bmm-probe FILE] [--side af|0] [--l2pf 1|0|lines|touch]
+    \\                         [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
@@ -98,6 +100,14 @@ const Args = struct {
     cublas_math: c_int = 0,
     unpack_mb: usize = 384,
     bmm_probe: ?[]const u8 = null,
+    // Phase 3a speed: the served engine's decode-side defaults (image 2026-10-05: TF_GLM53_SIDE=1 -> "af",
+    // TF_GLM53_L2PF=1 -> bulk, 8 MiB a site, sites "afo"), the decode-sized top-k, device candidates, prompt timers
+    side: []const u8 = "af",
+    l2pf: []const u8 = "1",
+    l2pf_mb: f64 = 8.0,
+    multi_select: bool = true,
+    device_cands: bool = true,
+    prompt_prof: []const u8 = "", // a prompt name prefix: its first run's prefill timed (--prompt-prof prose32k)
     bench_rows: []const u8 = "1,2,3,4,8,16,32",
     bench_iters: usize = 200,
     dims: usize = 6144,
@@ -107,6 +117,15 @@ fn flag(v: []const u8) !bool {
     if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) return true;
     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) return false;
     return error.BadFlag;
+}
+
+/// TF_GLM53_L2PF: -1 off, 0 bulk, 1 lines, 2 touch (l2pf.MODES).
+fn l2pfMode(v: []const u8) !c_int {
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return -1;
+    if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "bulk")) return 0;
+    if (std.mem.eql(u8, v, "lines")) return 1;
+    if (std.mem.eql(u8, v, "touch")) return 2;
+    return error.BadL2pfMode;
 }
 
 const Prompt = struct { name: []const u8, ids: []u32 };
@@ -207,6 +226,18 @@ pub fn main(init: std.process.Init) !u8 {
             a.unpack_mb = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--bmm-probe")) {
             a.bmm_probe = v;
+        } else if (std.mem.eql(u8, k, "--side")) {
+            a.side = v;
+        } else if (std.mem.eql(u8, k, "--l2pf")) {
+            a.l2pf = v;
+        } else if (std.mem.eql(u8, k, "--l2pf-mb")) {
+            a.l2pf_mb = try std.fmt.parseFloat(f64, v);
+        } else if (std.mem.eql(u8, k, "--multi-select")) {
+            a.multi_select = try flag(v);
+        } else if (std.mem.eql(u8, k, "--device-cands")) {
+            a.device_cands = try flag(v);
+        } else if (std.mem.eql(u8, k, "--prompt-prof")) {
+            a.prompt_prof = v;
         } else if (std.mem.eql(u8, k, "--bench-rows")) {
             a.bench_rows = v;
         } else if (std.mem.eql(u8, k, "--bench-iters")) {
@@ -937,7 +968,10 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     const cfg = try glm.Config.load(gpa, io, a.model);
     const n_layers = a.layers orelse cfg.layers;
     var settings = std.hash.Wyhash.init(0x6a3a);
-    const shape = [_]usize{ a.world, n_layers, a.context, a.tokens, a.window, a.k, a.draft_vocab, a.mtp_reuse, @intFromBool(a.graphs), @intFromBool(a.prewarm), @intFromBool(a.roce), a.prompt_rows, a.prompt_rows_short, @intFromBool(a.prompt_sp), @intFromBool(shared), @intFromBool(det16), @intFromBool(a.roce_health), a.unpack_mb };
+    const letters = try glm.decode.parseSide(a.side);
+    const pf_mode = try l2pfMode(a.l2pf);
+    if (pf_mode >= 0 and !(a.l2pf_mb > 0 and a.l2pf_mb <= 64)) return error.BadL2pfBudget;
+    const shape = [_]usize{ a.world, n_layers, a.context, a.tokens, a.window, a.k, a.draft_vocab, a.mtp_reuse, @intFromBool(a.graphs), @intFromBool(a.prewarm), @intFromBool(a.roce), a.prompt_rows, a.prompt_rows_short, @intFromBool(a.prompt_sp), @intFromBool(shared), @intFromBool(det16), @intFromBool(a.roce_health), a.unpack_mb, @intFromBool(letters.a), @intFromBool(letters.w), @intFromBool(letters.f), @intCast(pf_mode + 1), @intFromFloat(a.l2pf_mb * 1024), @intFromBool(a.multi_select), @intFromBool(a.device_cands), @intFromBool(a.prompt_prof.len > 0) };
     settings.update(std.mem.asBytes(&shape));
     settings.update(prompts_text);
     try rdv.sync("settings", settings.final(), a.timeout_s);
@@ -1027,12 +1061,27 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     try stream.synchronize();
     try side_stream.synchronize();
 
-    const fwd: glm.Forward = .{ .w = &w, .k = &k, .s = stream, .inv = inv_buf.ptr, .comm = &comm, .fast = fast, .ring = true, .wide = &main_wide, .shared_experts = shared, .pe_det16 = det16 };
+    // -- Phase 3a speed: the decode side stream (TF_GLM53_SIDE), the L2 prefetch (TF_GLM53_L2PF: after the tiles, before
+    //    any capture), the prompt path's timers (--prompt-prof, on after the prewarm)
+    var side_obj: ?glm.decode.Side = null;
+    if (letters.any()) side_obj = try glm.decode.Side.init(&driver, letters);
+    defer if (side_obj) |*x| x.deinit();
+    var pf_obj: ?glm.decode.L2pf = null;
+    if (pf_mode >= 0) {
+        pf_obj = try glm.decode.L2pf.init(gpa, &driver, &w, .{ .mode = pf_mode, .mb = a.l2pf_mb });
+        var sbuf: [256]u8 = undefined;
+        std.debug.print("rank {d}: {s}\n", .{ a.rank, pf_obj.?.summary(&sbuf) });
+    }
+    defer if (pf_obj) |*x| x.deinit();
+    var prof = glm.prompt.Prof.init(gpa, &driver, stream);
+    defer prof.deinit();
+    std.debug.print("rank {d}: decode side stream {s}{s}{s}, L2 prefetch {s}, decode top-k {s}, device candidates {s}, prompt timers {s}\n", .{ a.rank, if (letters.a) "a" else "", if (letters.w) "w" else "", if (letters.f) "f" else "", a.l2pf, if (a.multi_select) "multi-block" else "radix", tf(a.device_cands), if (a.prompt_prof.len > 0) a.prompt_prof else "off" });
+    const fwd: glm.Forward = .{ .w = &w, .k = &k, .s = stream, .inv = inv_buf.ptr, .comm = &comm, .fast = fast, .ring = true, .wide = &main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (side_obj) |*x| x else null, .l2pf = if (pf_obj) |*x| x else null, .multi_select = a.multi_select, .prof = if (a.prompt_prof.len > 0) &prof else null };
     var sp: ?glm.prompt.Sp = null;
     if (a.prompt_sp and a.world > 1) sp = try glm.prompt.Sp.init(&driver, &fwd, side_stream, &side_wide);
     defer if (sp) |*x| x.deinit();
     const capacity = a.context + a.k + 1; // Glm53Engine: Runner(limit + k + 1)
-    var r = try glm.Runner.init(gpa, io, &driver, fwd, capacity, .{ .k = a.k, .graphs = a.graphs, .window = a.window, .reuse = a.mtp_reuse, .served = true, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .roce_health = a.roce_health, .sp = if (sp) |*x| x else null });
+    var r = try glm.Runner.init(gpa, io, &driver, fwd, capacity, .{ .k = a.k, .graphs = a.graphs, .window = a.window, .reuse = a.mtp_reuse, .served = true, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .roce_health = a.roce_health, .sp = if (sp) |*x| x else null, .device_cands = a.device_cands });
     defer r.deinit();
     var prewarm_s: f64 = 0;
     var prewarm_graphs: usize = 0;
@@ -1042,6 +1091,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         prewarm_s = since(io, tp);
         std.debug.print("rank {d}: {d} decode graphs captured in {d:.1} s\n", .{ a.rank, prewarm_graphs, prewarm_s });
     }
+    var profiled = false; // --prompt-prof: the first run of the named prompt only (the gate takes each prompt's best run)
     try rdv.sync("warm", prewarm_graphs, a.timeout_s);
 
     var done: std.ArrayList(Done) = .empty;
@@ -1059,7 +1109,10 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         for (p.runs, 0..) |rs, ri| {
             const s: ?glm.sampling.Sampling = if (rs.greedy) null else .{ .seed = p.seed, .temperature = sset.temperature, .top_k = rs.top_k, .top_p = sset.top_p, .min_p = sset.min_p };
             if (rs.k > a.k) return error.TooManyDrafts;
+            prof.on = a.prompt_prof.len > 0 and !profiled and std.mem.startsWith(u8, p.name, a.prompt_prof);
+            if (prof.on) profiled = true;
             const st = try r.generate(p.ids, p.tokens, s, rs.k, &toks);
+            prof.on = false;
             all_tokens.update(std.mem.sliceAsBytes(toks.items));
             const n = toks.items.len;
             try done.append(gpa, .{ .prompt = pi, .run = ri, .tokens = try gpa.dupe(u32, toks.items), .st = st, .seed_ok = seed_ok });

@@ -34,6 +34,7 @@ const W = @import("cuda_weights.zig");
 const smp = @import("sampling.zig");
 const roce = @import("cuda_roce.zig");
 const prompt = @import("cuda_prompt.zig");
+const dec = @import("cuda_decode.zig");
 
 /// The widest TP world the head's exchange records hold.
 pub const max_world: usize = 16;
@@ -55,6 +56,9 @@ pub const max_rows: usize = 128;
 pub const max_prompt_rows: usize = 8192;
 /// fused.DECODE_ROWS: the widest decode-class buffer set.
 pub const decode_rows: usize = 32;
+/// fused.RADIX_MIN_ROWS: selections of fewer rows (decode windows) take the multi-block top-k (glm53_decode.cu) - the
+/// Python engine's torch.topk + sort branch there; the same columns as the one-program radix select.
+pub const radix_min_rows: usize = 32;
 
 pub const BufOpts = struct {
     /// fused.Buffers(decode=True): verify and MTP windows
@@ -144,6 +148,15 @@ pub const Buffers = struct {
     xo: u64 = 0, // bf16 [ceil(rows / world), D]: sequence-parallel own rows of the residual stream
     xs_rows: usize = 0, // rows the decode experts' scratch holds
     pe: ?kern.PromptExpertScratch = null, // prompt experts (SharedExperts.prefill), prompt buffers of the shared impl
+    // Phase 3a speed
+    slin: kern.LinearScratch = undefined, // TF_GLM53_SIDE: the side stream's EXL3 scratch (min(rows, small) rows)
+    srpart: u64 = 0, // the side stream's router partials
+    tsel: kern.TopkScratch = .{}, // the multi-block top-k (decode-sized selections, sampled candidates)
+    cand_cols: u64 = 0, // int32 [head_rows, max_candidates]: a sampled window's candidate columns
+    /// the MTP layer's prompt rows (8-bit experts prompt_experts does not take): the decode kernel in blocks of
+    /// xs_big.rows rows, its big buffers inside b.gath (idle while the MTP layer runs: prompt chunks reduce over the
+    /// bf16 ring); null: blocks of xs_rows
+    xs_big: ?kern.ExpertScratch = null,
 
     fn alloc(b: *Buffers, bytes: usize) !u64 {
         var m = try cuda.DeviceBuffer.alloc(b.d, @max(bytes, 16));
@@ -220,6 +233,27 @@ pub const Buffers = struct {
             b.cand_send = try b.alloc(padded * 4);
             b.cand_all = try b.alloc(w.world * padded * 4);
         }
+        // TF_GLM53_SIDE: the side stream's own EXL3 and router scratch (decode windows: up to min(rows, small) rows)
+        const srows = @min(@min(rows, b.small), max_rows);
+        {
+            const sext = w.linearExtents();
+            b.slin.xh_bytes = srows * sext.k * 2;
+            b.slin.z_bytes = srows * sext.zn * 4;
+            for (0..exl3.max_jobs) |j| {
+                b.slin.xh[j] = try b.alloc(b.slin.xh_bytes);
+                b.slin.z[j] = try b.alloc(b.slin.z_bytes);
+            }
+            b.srpart = try b.alloc(tri.router_ks * srows * @max(c.experts, c.index_dim) * 4);
+        }
+        // the multi-block top-k: selections of fewer than radix_min_rows rows over score_cols keys, and the sampled
+        // candidates of the head rows over the vocabulary share
+        {
+            const trows = @max(@min(rows, radix_min_rows), b.head_rows);
+            const cols = @max(score_cols, b.head_v);
+            const tblocks = (cols + kern.topk_chunk - 1) / kern.topk_chunk;
+            b.tsel = .{ .hist = try b.alloc(kern.TopkScratch.histBytes(trows)), .state = try b.alloc(trows * 16), .cnt = try b.alloc(trows * tblocks * 8), .rows = trows, .blocks = tblocks };
+            if (b.head_rows > 0) b.cand_cols = try b.alloc(b.head_rows * smp.max_candidates * 4);
+        }
         b.red = try b.alloc(rows * D * 4);
         if (rows > b.small) {
             b.bpart = try b.alloc(rows * D * 2);
@@ -293,6 +327,47 @@ pub const Buffers = struct {
                     .acc = try b.alloc(pr * ex.dims * 4),
                     .out16 = try b.alloc(pr * ex.dims * 2),
                 };
+            }
+            // the MTP layer's prompt rows in bigger blocks of the decode kernel (row-invariant: the same bits as
+            // blocks of xs_rows), xg / xu / y / z carved out of b.gath (world * rows * D fp32); the group kernel
+            // stages a block's picks in 48 KiB of shared memory (1536 rows of 8 slots)
+            if (opts.prompt and opts.mtp and opts.shared_experts and rows > xrows and b.gath != 0) {
+                const zcols = @max(2 * gu.sk * ex.width, dn.sk * ex.dims);
+                const per_slot = std.mem.alignForward(usize, ex.dims * 2, 256) * 2 + ex.dims * 4 + zcols * 4;
+                const room = w.world * rows * D * 4;
+                var rb = room / (per_slot * c.top_k + 4 * 256);
+                rb = @min(@min(rb, rows), 49152 / (4 * c.top_k));
+                rb = rb / 16 * 16;
+                if (rb > xrows) {
+                    const Pb = rb * c.top_k;
+                    const maxub = @min(Pb, ex.count);
+                    // carved in order: xg, xu, z, y (each 256-byte aligned)
+                    var off: usize = 0;
+                    var region: [4]u64 = undefined;
+                    for ([_]usize{ Pb * ex.dims * 2, Pb * ex.dims * 2, zcols * Pb * 4, Pb * ex.dims * 4 }, 0..) |bytes, j| {
+                        region[j] = b.gath + off;
+                        off = std.mem.alignForward(usize, off + bytes, 256);
+                    }
+                    const big: kern.ExpertScratch = .{
+                        .xg = region[0],
+                        .xu = region[1],
+                        .xd = try b.alloc(Pb * ex.width * 2),
+                        .z = region[2],
+                        .y = region[3],
+                        .ids = try b.alloc(maxub * 4),
+                        .count = try b.alloc(4),
+                        .members = try b.alloc(maxub * rb * 4),
+                        .done_gu = try b.alloc(maxub * ((rb + 15) / 16) * @max(ex.width / 128, 1) * 4),
+                        .done_d = try b.alloc(rb * @max(ex.dims / 128, 1) * 4),
+                        .rows = rb,
+                        .slots = c.top_k,
+                        .gu = gu,
+                        .dn = dn,
+                    };
+                    if (off > room) return error.ScratchTooSmall;
+                    try b.d.check(b.d.api.cuMemsetD32_v2(big.members, 0xFFFFFFFF, maxub * rb), "cuMemsetD32");
+                    b.xs_big = big;
+                }
             }
             break; // one scratch serves every MoE layer (the same shapes)
         }
@@ -388,6 +463,15 @@ pub const Forward = struct {
     shared_experts: bool = false,
     /// TF_EXL3_PROMPT_DET=slots16 (reproducible prompt experts); false: fp32 red.add in arrival order (the default)
     pe_det16: bool = true,
+    /// Phase 3a speed. TF_GLM53_SIDE: the decode windows' second stream (cuda_decode.Side); null: one stream
+    side: ?*dec.Side = null,
+    /// TF_GLM53_L2PF: the L2 prefetch of the target's decode windows (cuda_decode.L2pf); null: off
+    l2pf: ?*dec.L2pf = null,
+    /// decode-sized selections (fewer than radix_min_rows rows) through the multi-block top-k; false: the
+    /// one-program radix select for every block (the same columns)
+    multi_select: bool = true,
+    /// the prompt path's per-phase timers (cuda_prompt.Prof, --prompt-prof); null: none
+    prof: ?*prompt.Prof = null,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -400,6 +484,50 @@ pub const Forward = struct {
     fn mla(f: *const Forward) tri.Mla {
         const c = f.w.config;
         return .{ .heads = f.w.heads, .nope = c.nope, .rope = c.rope, .lw = c.kv_lora, .vd = c.v_dim, .topk = c.index_topk };
+    }
+
+    /// The side stream while a decode window runs on it (fused.Buffers.side_on), else null.
+    fn sideOn(f: *const Forward) ?*dec.Side {
+        const sd = f.side orelse return null;
+        return if (sd.on) sd else null;
+    }
+
+    /// fused._fork: this Forward on the side stream, queued after everything f.s has queued so far.
+    fn forkSide(f: *const Forward, sd: *dec.Side) !Forward {
+        try sd.fork(f.s);
+        var g = f.*;
+        g.s = sd.s;
+        g.side = null;
+        g.l2pf = null;
+        g.prof = null;
+        return g;
+    }
+
+    /// `b` with the side stream's own EXL3 and router scratch (what torch's per-stream allocator gives fused).
+    fn sideBufs(b: *const Buffers) Buffers {
+        var s = b.*;
+        s.lin = b.slin;
+        s.rpart = b.srpart;
+        return s;
+    }
+
+    /// TF_GLM53_L2PF: prefetch site `name` of layer L (nothing outside the target's decode windows).
+    fn site(f: *const Forward, L: *const W.Layer, name: dec.SiteName) !void {
+        const pf = f.l2pf orelse return;
+        try pf.site(f.k, f.s, L.index, name);
+    }
+
+    /// --prompt-prof: a timing mark on this stream (null when the timers are off or suspended).
+    pub fn pbegin(f: *const Forward) !?usize {
+        const p = f.prof orelse return null;
+        return p.begin(f.s);
+    }
+
+    /// --prompt-prof: the end of the region `m` opened, counted under `ph`.
+    pub fn pend(f: *const Forward, m: ?usize, ph: prompt.Phase) !void {
+        const p = f.prof orelse return;
+        const i = m orelse return;
+        try p.end(f.s, i, ph);
     }
 
     /// torch.index_select(embed, 0, ids): the window's token rows into b.x (row copies: exact).
@@ -427,10 +555,12 @@ pub const Forward = struct {
         const t_ = f.t();
         try t_.rmsnorm(b.x, D, L.input_norm, b.normed, D, R, D, c.eps);
         try f.attentionPart(b, L, kc, ic, pos, R, T, reuse);
+        try f.site(L, .a); // the FFN's first weights, during the all-reduce
         const g1 = try f.gather(b, R);
         try t_.residualAdd(b.x, g1.ptr, R, D, g1.world);
         try t_.rmsnorm(b.x, D, L.post_attn_norm, b.normed, D, R, D, c.eps);
         try f.ffnPart(b, L, R);
+        try f.site(L, .f); // the next layer's input projections, during the all-reduce
         const g2 = try f.gather(b, R);
         try t_.residualAdd(b.x, g2.ptr, R, D, g2.world);
     }
@@ -484,26 +614,35 @@ pub const Forward = struct {
         for (ls, outs, ys) |l, out, y| try f.lin(b, l, x, R, out, y);
     }
 
-    /// fused.attention_part (side "") and attention_core: this rank's fp32 partial in b.part[:R]. `reuse` 1 / 2
-    /// (an MTP draft step after its chain's first, one row): no index key written, no selection; the row attends
-    /// b.tok[0] (mode 1 puts its own position in the list's last slot).
+    /// fused.attention_part and attention_core: this rank's fp32 partial in b.part[:R]. `reuse` 1 / 2 (an MTP draft
+    /// step after its chain's first, one row): no index key written, no selection; the row attends b.tok[0] (mode 1
+    /// puts its own position in the list's last slot). TF_GLM53_SIDE "a" / "w" inside a decode window: the key path
+    /// (keys) on the side stream beside the query path, joined before select or the attention kernels.
     fn attentionPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, T: ?usize, reuse: u32) !void {
         const c = f.w.config;
         const o = f.ops();
         const t_ = f.t();
-        const m = f.mla();
         const D = c.hidden;
         if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
-        try f.lins(b, &.{ &L.q_a, &L.kv_a }, b.normed, R, &.{ b.qa, b.kva }, &.{ .bf16, .bf16 });
-        try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
-        // keys(False): the latent and rope key, and on indexer layers (not under reuse) the index key
-        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, m);
-        if (L.indexer) |*ix| {
-            if (reuse == 0) {
-                try t_.router(b.normed, D, ix.wk, b.ik, b.rpart, R, D, c.index_dim);
-                try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope);
+        const sd = f.sideOn();
+        const side_a = if (sd) |x| x.letters.a else false;
+        const side_w = if (sd) |x| x.letters.w else false;
+        if (side_a) {
+            const g = try f.forkSide(sd.?);
+            const bs = sideBufs(b);
+            try g.lin(&bs, &L.kv_a, b.normed, R, b.kva, .bf16); // the bits of its share of the grouped launch
+            try g.keys(&bs, L, kc, ic, pos, R, reuse);
+            try f.lin(b, &L.q_a, b.normed, R, b.qa, .bf16);
+        } else {
+            try f.lins(b, &.{ &L.q_a, &L.kv_a }, b.normed, R, &.{ b.qa, b.kva }, &.{ .bf16, .bf16 });
+            if (side_w) {
+                const g = try f.forkSide(sd.?);
+                const bs = sideBufs(b);
+                try g.keys(&bs, L, kc, ic, pos, R, reuse);
             }
         }
+        try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
+        if (!side_a and !side_w) try f.keys(b, L, kc, ic, pos, R, reuse);
         if (reuse == 1 and T != null) try o.copy(b.tok + (c.index_topk - 1) * 4, pos, 4); // b.tok[0, K-1:] = pos
         var q_done = false;
         if (L.indexer) |*ix| {
@@ -513,11 +652,26 @@ pub const Forward = struct {
                     try f.lins(b, &.{ &ix.wq_b, &L.q_b }, b.qn, R, &.{ b.iq, b.q }, &.{ .bf16, .bf16 });
                     q_done = true;
                     try t_.iqRope(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
+                    if (sd) |x| try x.join(f.s); // the window's index keys are in
                     try f.select(b, ic, pos, 0, R, tt);
                 }
             }
         }
         try f.attentionCore(b, L, kc, pos, R, q_done);
+    }
+
+    /// attention_part's keys(): the window's latent and rope key and, on indexer layers (not under reuse), the index
+    /// key into the caches (kv_a already in b.kva).
+    fn keys(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, reuse: u32) !void {
+        const c = f.w.config;
+        const t_ = f.t();
+        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla());
+        if (L.indexer) |*ix| {
+            if (reuse == 0) {
+                try t_.router(b.normed, c.hidden, ix.wk, b.ik, b.rpart, R, c.hidden, c.index_dim);
+                try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope);
+            }
+        }
     }
 
     /// fused.attention_core for rows b.qn[:R] (selection in b.tok): q_b (unless attention_part ran it grouped with
@@ -527,22 +681,32 @@ pub const Forward = struct {
     pub fn attentionCore(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, pos: u64, R: usize, q_done: bool) !void {
         const t_ = f.t();
         const m = f.mla();
-        if (!q_done) try f.lin(b, &L.q_b, b.qn, R, b.q, .bf16);
+        if (!q_done) {
+            const p0 = try f.pbegin();
+            try f.lin(b, &L.q_b, b.qn, R, b.q, .bf16);
+            try f.pend(p0, .attn_proj);
+        }
+        const p1 = try f.pbegin();
         const wide = R > max_rows;
         if (wide) {
             const wd = f.wide orelse return error.WindowTooWide;
             try wd.absorb(f, b, L, pos, R);
         } else {
             try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+            try f.site(L, .o); // expand's and o_proj's weights, during the attention core
         }
         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
+        if (f.sideOn()) |sd| try sd.join(f.s); // TF_GLM53_SIDE: the window's latents are in the cache
         try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
         if (wide) {
             try f.wide.?.expand(f, b, L, R);
         } else {
             try t_.expand(b.ol, L.wv, b.o, R, m);
         }
+        try f.pend(p1, .attn_core);
+        const p2 = try f.pbegin();
         try f.lin(b, &L.o_proj, b.o, R, b.part, .f32);
+        try f.pend(p2, .attn_proj);
     }
 
     // ------------------------------------------------------------------------------- Phase 2b: device windows ---
@@ -550,6 +714,32 @@ pub const Forward = struct {
     /// fused.compute for rows b.ids[:R] (device ids) at st.pos ..: the target's caches written, its final hidden in
     /// b.hidden[:R], then `head` over every row (`last`: only row R - 1, as logits="last"). No host step: capturable.
     pub fn compute(f: *const Forward, b: *const Buffers, st: *const State, R: usize, T: ?usize, hm: HeadMode, last: bool) !void {
+        // fused.compute's _SideWindow (TF_GLM53_SIDE: windows up to min(b.small, MAX_ROWS) rows) and _compute_pf
+        // (TF_GLM53_L2PF: up to min(b.small, L2PF_ROWS) rows); both streams rejoin before the window ends
+        const sd = f.sideWindow(b, R);
+        var pf: ?*dec.L2pf = null;
+        if (f.l2pf) |p| {
+            if (!p.active and R <= @min(b.small, p.set.rows)) pf = p;
+        }
+        if (sd) |x| x.on = true;
+        if (pf) |p| p.active = true;
+        defer {
+            if (sd) |x| x.on = false;
+            if (pf) |p| p.active = false;
+        }
+        try f.computeWindow(b, st, R, T, hm, last);
+        if (pf) |p| try p.join(f.s);
+        if (sd) |x| try x.join(f.s);
+    }
+
+    /// The side stream a window of R rows of `b` runs beside, if any (_SideWindow: not already inside one).
+    fn sideWindow(f: *const Forward, b: *const Buffers, R: usize) ?*dec.Side {
+        const sd = f.side orelse return null;
+        if (sd.on or !sd.letters.any() or R > @min(b.small, max_rows)) return null;
+        return sd;
+    }
+
+    fn computeWindow(f: *const Forward, b: *const Buffers, st: *const State, R: usize, T: ?usize, hm: HeadMode, last: bool) !void {
         const c = f.w.config;
         const D = c.hidden;
         const o = f.ops();
@@ -656,7 +846,16 @@ pub const Forward = struct {
         try t_.cat2(b.mh, b.normed, b.mcat, n, D);
         try t_.router(b.mcat, 2 * D, m.eh_proj, b.mx32, b.epart, n, 2 * D, D);
         try o.f32ToBf16(b.mx32, b.x, n * D);
-        try f.layerWith(b, &f.w.mtp.?.layer, st.mkc, st.mic, st.mpos, n, T, opts.reuse);
+        {
+            // TF_GLM53_SIDE: draft and MTP refresh windows too (no L2 prefetch: l2pf skips the MTP passes)
+            const sd = f.sideWindow(b, n);
+            if (sd) |x| x.on = true;
+            defer if (sd) |x| {
+                x.on = false;
+            };
+            try f.layerWith(b, &f.w.mtp.?.layer, st.mkc, st.mic, st.mpos, n, T, opts.reuse);
+            if (sd) |x| try x.join(f.s);
+        }
         if (opts.keep_sel and T != null and n > 1) try o.copy(b.tok, b.tok + (n - 1) * c.index_topk * 4, c.index_topk * 4);
         if (opts.chain_normed) {
             try t_.rmsnorm(b.x, D, m.head_norm, b.hidden, D, n, D, c.eps);
@@ -686,7 +885,14 @@ pub const Forward = struct {
             const iq = b.iq + r0 * c.index_heads * c.index_dim * 2;
             const iw = b.iw + r0 * c.index_heads * 4;
             try t_.indexScores(iq, iw, ic, pos, b.sc, T, r0, n, c.index_heads, c.index_dim);
-            try t_.selectKeys(b.sc, b.tok + r0 * c.index_topk * 4, T, n, c.index_topk);
+            const out = b.tok + r0 * c.index_topk * 4;
+            const blocks = (T + kern.topk_chunk - 1) / kern.topk_chunk;
+            if (f.multi_select and n < radix_min_rows and n <= b.tsel.rows and blocks <= b.tsel.blocks) {
+                // fused.select below RADIX_MIN_ROWS (torch.topk + sort there): the same K columns, ascending
+                try f.ops().topkColumns(b.sc, T, T, n, c.index_topk, false, b.tsel, out, c.index_topk);
+            } else {
+                try t_.selectKeys(b.sc, out, T, n, c.index_topk);
+            }
         }
     }
 
@@ -730,12 +936,29 @@ pub const Forward = struct {
     }
 
     /// fused.ffn_part: the dense MLP, or the router (fused.route) and experts_part.
+    /// TF_GLM53_SIDE "f" inside a decode window: the shared expert on the side stream beside the router and the
+    /// routed experts (fused.ffn_part), joined right before the routed down + combine launch reads b.sy.
     fn ffnPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
         if (L.experts != null) {
+            var sy_ev: ?cuda.Event = null;
+            var sd_used: ?*dec.Side = null;
+            if (f.sideOn()) |sd| {
+                if (sd.letters.f and (!f.shared_experts or R <= b.xs_rows)) {
+                    const g = try f.forkSide(sd);
+                    const bs = sideBufs(b);
+                    try g.mlp(&bs, L, R, b.sy);
+                    sy_ev = try sd.mark();
+                    sd_used = sd;
+                }
+            }
             try f.route(b, L, 0, R);
-            return f.expertsPart(b, L, R);
+            try f.expertsPartWith(b, L, R, sy_ev);
+            if (sd_used) |sd| sd.forked = false; // joined inside the routed chain (experts.routed's sy_ready)
+            return;
         }
+        const p0 = try f.pbegin();
         try f.mlp(b, L, R, b.part);
+        try f.pend(p0, .dense);
     }
 
     /// fused.route: router logits and top-k of rows b.normed[r0 : r0 + n] -> b.pick / b.wts rows r0 ..
@@ -753,31 +976,43 @@ pub const Forward = struct {
     /// Wider windows of the shared impl (prompt chunks): SharedExperts.prefill (prompt_experts.cu) into b.part, then
     /// the shared expert into b.sy and b.part += b.sy.
     pub fn expertsPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
+        return f.expertsPartWith(b, L, R, null);
+    }
+
+    /// expertsPart; `sy_ev` (TF_GLM53_SIDE "f"): the shared expert is already queued on the side stream into b.sy,
+    /// this event marks its end (the routed chain waits on it right before its down + combine launch).
+    pub fn expertsPartWith(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, sy_ev: ?cuda.Event) !void {
         const D = f.w.config.hidden;
         const ex = if (L.experts) |*e| e else return error.Invalid;
         if (!f.shared_experts or R <= b.xs_rows) {
-            try f.mlp(b, L, R, b.sy);
+            if (sy_ev == null) try f.mlp(b, L, R, b.sy); // first: its weights may still be in L2 (TF_GLM53_L2PF)
             const xs = b.xs orelse return error.NoExpertScratch;
-            return f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R);
+            return f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R, sy_ev);
         }
         if (b.pe != null and kern.Ops.promptSupported(ex)) {
             if (f.k.pe.ipm != 112) return error.PromptExpertsUnsupported; // Buffers sized PromptScratch for IPM 112
+            const p0 = try f.pbegin();
             try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16);
+            try f.pend(p0, .routed);
+            const p1 = try f.pbegin();
             try f.mlp(b, L, R, b.sy);
             try f.ops().addF32(b.part, b.sy, R * D);
+            try f.pend(p1, .shared);
             return;
         }
         // widths prompt_experts does not take (the MTP layer's 8-bit experts): the Python engine runs cuda-exl3's
         // grouped GEMM (not ported; its split-K atomics make it irreproducible run to run anyway). Here: the decode
         // kernel in blocks of its scratch's rows, every row its one-row bits. Only MTP prompt rows take this: drafts
         // only propose and the target verifies each, so no token depends on it (acceptance may move a little).
-        const xs = b.xs orelse return error.NoExpertScratch;
+        // blocks of xs_big.rows rows when the prompt buffers carved one (Phase 3a speed: each block re-reads every
+        // routed expert it touches, so 10x fewer blocks read ~3x fewer bytes), else of the decode scratch's rows
+        const xs = b.xs_big orelse (b.xs orelse return error.NoExpertScratch);
         const K = f.w.config.top_k;
         try f.mlp(b, L, R, b.sy);
         var r0: usize = 0;
         while (r0 < R) : (r0 += xs.rows) {
             const n = @min(xs.rows, R - r0);
-            try f.ops().routed(b.normed + r0 * D * 2, D, b.pick + r0 * K * 4, b.wts + r0 * K * 4, ex, xs, b.part + r0 * D * 4, b.sy + r0 * D * 4, n);
+            try f.ops().routed(b.normed + r0 * D * 2, D, b.pick + r0 * K * 4, b.wts + r0 * K * 4, ex, xs, b.part + r0 * D * 4, b.sy + r0 * D * 4, n, null);
         }
     }
 

@@ -11,6 +11,9 @@
 //! glm53_roce.cu), the served prompt path (cuda_prompt.zig: sequence-parallel chunks of thousands of rows, the prompt
 //! GEMM, torch.bmm through cuBLAS, prompt experts) and the served tile table (tiles.zig); zig/tests/cuda/
 //! glm53_generate.zig --mode 3a against tools/glm53/reference3a.py (the Python engine in its served configuration).
+//! Phase 3a speed: the decode windows' side stream and L2 prefetch (cuda_decode.zig: TF_GLM53_SIDE / TF_GLM53_L2PF as
+//! the served image runs them), the decode-sized multi-block top-k and device-side sampling candidates
+//! (glm53_decode.cu), the MTP layer's prompt rows in bigger blocks, the prompt path's timers (cuda_prompt.Prof).
 //! Not yet a native family (native/cuda.zig's registry): no engine or server here.
 
 pub const Config = @import("config.zig").Config;
@@ -30,6 +33,7 @@ pub const Runner = runner.Runner;
 pub const roce = @import("cuda_roce.zig");
 pub const prompt = @import("cuda_prompt.zig");
 pub const tiles = @import("tiles.zig");
+pub const decode = @import("cuda_decode.zig");
 
 test {
     _ = @import("config.zig");
@@ -45,4 +49,5 @@ test {
     _ = roce;
     _ = prompt;
     _ = tiles;
+    _ = decode;
 }

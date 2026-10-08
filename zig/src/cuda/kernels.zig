@@ -37,6 +37,7 @@ pub const glm53_head: []const u8 = if (available) &Blob("fatbin_glm53_head").byt
 pub const glm53_roce: []const u8 = if (available) &Blob("fatbin_glm53_roce").bytes else &.{};
 pub const glm53_prompt: []const u8 = if (available) &Blob("fatbin_glm53_prompt").bytes else &.{};
 pub const glm53_prompt_experts: []const u8 = if (available) &Blob("fatbin_glm53_prompt_experts").bytes else &.{};
+pub const glm53_decode: []const u8 = if (available) &Blob("fatbin_glm53_decode").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

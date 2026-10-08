@@ -169,6 +169,122 @@ pub const Wide = struct {
     }
 };
 
+/// What a --prompt-prof timer counts. Main stream: attention_core's projections (q_b, o_proj: the prompt GEMM) and
+/// its core (absorb / expand through cuBLAS, _qrope, the attention kernels), the routed experts (prompt_experts), the
+/// shared expert (+ part += sy), the dense MLP (layers 0-2), the MTP layer's rows (all of it), the head. Comm stream
+/// (the sequence-parallel chains): the bf16 reduce-scatter + residual add, the own-row fronts (norms, q_a / kv_a,
+/// the indexer's wk / weights_proj / wq_b + rope, the router), the indexer's top-k, the all-gathers, the latent /
+/// index key writes.
+pub const Phase = enum { attn_proj, attn_core, routed, shared, dense, mtp, head, rs, front, select, ag, kv_write };
+const n_phases = @typeInfo(Phase).@"enum".fields.len;
+
+/// --prompt-prof (default off): CUDA timing events around the prompt path's phases on the main and comm streams,
+/// summed per chunk (`report`, after the caller synchronized) and per prompt (`total`). The streams overlap, so the
+/// main and comm sums each stay under the chunk's wall time; "main idle" = wall - main busy (host gaps and waits for
+/// the comm stream's chains). Recording events changes no kernel and no stream order: the bits are the same.
+pub const Prof = struct {
+    gpa: std.mem.Allocator,
+    d: *const cuda.Driver,
+    main: cuda.abi.Stream,
+    /// timing on (the caller turns it on after the prewarm's prompt)
+    on: bool = false,
+    /// inside a region timed as a whole (the MTP layer's rows): nested marks are not taken
+    suspended: bool = false,
+    pool: std.ArrayList(cuda.Event) = .empty,
+    used: usize = 0,
+    marks: std.ArrayList(Mark) = .empty,
+    sum_main: [n_phases]f64 = @splat(0),
+    sum_comm: [n_phases]f64 = @splat(0),
+    sum_wall: f64 = 0,
+    chunks: usize = 0,
+
+    const Mark = struct { a: usize, b: usize, ph: Phase, comm: bool };
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, main: cuda.Stream) Prof {
+        return .{ .gpa = gpa, .d = d, .main = main.handle };
+    }
+
+    pub fn deinit(p: *Prof) void {
+        for (p.pool.items) |*e| e.deinit();
+        p.pool.deinit(p.gpa);
+        p.marks.deinit(p.gpa);
+    }
+
+    fn next(p: *Prof) !usize {
+        if (p.used == p.pool.items.len) try p.pool.append(p.gpa, try cuda.Event.init(p.d, true));
+        p.used += 1;
+        return p.used - 1;
+    }
+
+    /// A timing mark on `s` (null when off or suspended).
+    pub fn begin(p: *Prof, s: cuda.Stream) !?usize {
+        if (!p.on or p.suspended) return null;
+        const i = try p.next();
+        try p.pool.items[i].record(s);
+        return i;
+    }
+
+    /// The end of the region `i` began on `s`, counted under `ph`.
+    pub fn end(p: *Prof, s: cuda.Stream, i: usize, ph: Phase) !void {
+        if (!p.on) return;
+        const j = try p.next();
+        try p.pool.items[j].record(s);
+        try p.marks.append(p.gpa, .{ .a = i, .b = j, .ph = ph, .comm = s.handle != p.main });
+    }
+
+    fn line(buf: []u8, label: []const u8, ms: *const [n_phases]f64) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        var busy: f64 = 0;
+        for (ms) |v| busy += v;
+        w.print("{s} {d:.1} ms:", .{ label, busy }) catch return buf[0..0];
+        for (ms, 0..) |v, i| {
+            if (v == 0) continue;
+            w.print(" {t} {d:.1}", .{ @as(Phase, @enumFromInt(i)), v }) catch break;
+        }
+        return w.buffered();
+    }
+
+    /// One chunk's sums (every event recorded so far has completed: the caller synchronized), printed as
+    /// `PROMPT-PROF rank R chunk I [a, e) rows R wall W ms | main ...: phase ms ... | comm ...: ... | main idle ...`.
+    pub fn report(p: *Prof, rank: usize, chunk: usize, a: usize, e: usize, wall_s: f64) !void {
+        if (!p.on) return;
+        var main_ms: [n_phases]f64 = @splat(0);
+        var comm_ms: [n_phases]f64 = @splat(0);
+        for (p.marks.items) |m| {
+            const ms: f64 = try cuda.Event.elapsedMs(p.pool.items[m.a], p.pool.items[m.b]);
+            if (m.comm) comm_ms[@intFromEnum(m.ph)] += ms else main_ms[@intFromEnum(m.ph)] += ms;
+        }
+        var busy: f64 = 0;
+        for (main_ms, 0..) |v, i| {
+            busy += v;
+            p.sum_main[i] += v;
+            p.sum_comm[i] += comm_ms[i];
+        }
+        const wall = wall_s * 1e3;
+        p.sum_wall += wall;
+        p.chunks += 1;
+        var b1: [512]u8 = undefined;
+        var b2: [512]u8 = undefined;
+        std.debug.print("PROMPT-PROF rank {d} chunk {d} [{d}, {d}) rows {d} wall {d:.1} ms | {s} | {s} | main idle {d:.1} ms\n", .{ rank, chunk, a, e, e - a, wall, line(&b1, "main", &main_ms), line(&b2, "comm", &comm_ms), wall - busy });
+        p.used = 0;
+        p.marks.clearRetainingCapacity();
+    }
+
+    /// The prompt's sums over its chunks (`PROMPT-PROF rank R total ...`), then zeroed for the next prompt.
+    pub fn total(p: *Prof, rank: usize, prompt_len: usize) void {
+        if (!p.on or p.chunks == 0) return;
+        var busy: f64 = 0;
+        for (p.sum_main) |v| busy += v;
+        var b1: [512]u8 = undefined;
+        var b2: [512]u8 = undefined;
+        std.debug.print("PROMPT-PROF rank {d} total prompt {d} chunks {d} wall {d:.1} ms | {s} | {s} | main idle {d:.1} ms\n", .{ rank, prompt_len, p.chunks, p.sum_wall, line(&b1, "main", &p.sum_main), line(&b2, "comm", &p.sum_comm), p.sum_wall - busy });
+        p.sum_main = @splat(0);
+        p.sum_comm = @splat(0);
+        p.sum_wall = 0;
+        p.chunks = 0;
+    }
+};
+
 /// fused.sp_fits: the padded halves fit the buffers (and the world splits rows at all).
 pub fn spFits(world: usize, rows0: usize, rows1: usize, R: usize) bool {
     if (world < 2) return false;
@@ -210,6 +326,8 @@ pub const Sp = struct {
         sp.side.s = side_stream;
         sp.side.wide = side_wide;
         sp.side.fast = null; // a prompt half's exchanges are NCCL's (never decode-sized)
+        sp.side.side = null; // no decode window runs on the comm stream
+        sp.side.l2pf = null;
         for (0..2) |i| {
             sp.ready[i] = try cuda.Event.init(d, false);
             sp.done[i] = try cuda.Event.init(d, false);
@@ -262,7 +380,9 @@ pub const Sp = struct {
                 if (L.experts != null) {
                     try f.expertsPart(h.b, L, h.R);
                 } else {
+                    const p0 = try f.pbegin();
                     try f.mlp(h.b, L, h.R, h.b.part);
+                    try f.pend(p0, .dense);
                 }
                 try sp.chain(h, st, .after_ffn, li, T);
             }
@@ -333,6 +453,7 @@ pub const Sp = struct {
         const n = h.n;
         const ql = c.q_lora;
         const nx = b.normed + o * D * 2;
+        const p0 = try f.pbegin();
         try t_.rmsnorm(b.xo, D, L.input_norm, nx, D, n, D, c.eps);
         try f.lin(b, &L.q_a, nx, n, b.qa + o * ql * 2, .bf16);
         try f.lin(b, &L.kv_a, nx, n, b.kva + o * b.kva_n * 2, .bf16);
@@ -352,18 +473,27 @@ pub const Sp = struct {
                 try t_.iqRope(iq, f.inv, h.spos, n, c.index_heads, c.index_dim, c.rope);
             }
         }
+        try f.pend(p0, .front);
+        const p1 = try f.pbegin();
         try sp.agRows(h, bufs[0..nb], re[0..nb], dts[0..nb], eb[0..nb]);
+        try f.pend(p1, .ag);
+        const p2 = try f.pbegin();
         const m: tri.Mla = .{ .heads = w.heads, .nope = c.nope, .rope = c.rope, .lw = c.kv_lora, .vd = c.v_dim, .topk = c.index_topk };
         try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, st.kc[li], h.pos, f.inv, c.eps, h.R, m);
-        const ix = if (L.indexer) |*x| x else return;
+        const ix = if (L.indexer) |*x| x else return f.pend(p2, .kv_write);
         try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, st.ic[li], h.pos, h.R, c.index_dim, c.rope);
+        try f.pend(p2, .kv_write);
         const tt = T orelse return;
+        const p3 = try f.pbegin();
         try f.select(b, st.ic[li], h.pos, o, n, tt);
+        try f.pend(p3, .select);
         bufs[0] = b.tok;
         re[0] = c.index_topk;
         dts[0] = .i32;
         eb[0] = 4;
+        const p4 = try f.pbegin();
         try sp.agRows(h, bufs[0..1], re[0..1], dts[0..1], eb[0..1]);
+        try f.pend(p4, .ag);
     }
 
     /// fused._front_ffn: own rows' post-attention norm and routing; the normed rows (and picks) gathered.
@@ -372,13 +502,17 @@ pub const Sp = struct {
         const c = f.w.config;
         const D = c.hidden;
         const b = h.b;
+        const p0 = try f.pbegin();
         try sp.tr().rmsnorm(b.xo, D, L.post_attn_norm, b.normed + h.o * D * 2, D, h.n, D, c.eps);
+        if (L.experts != null) try f.route(b, L, h.o, h.n);
+        try f.pend(p0, .front);
+        const p1 = try f.pbegin();
         if (L.experts != null) {
-            try f.route(b, L, h.o, h.n);
             try sp.agRows(h, &.{ b.normed, b.pick, b.wts }, &.{ D, c.top_k, c.top_k }, &.{ .bf16, .i32, .f32 }, &.{ 2, 4, 4 });
         } else {
             try sp.agRows(h, &.{b.normed}, &.{D}, &.{.bf16}, &.{2});
         }
+        try f.pend(p1, .ag);
     }
 
     /// fused._rs_residual (PREFILL_REDUCE ring): b.part[:Rp] (padding rows zeroed) to bf16, NCCL's ring
@@ -387,18 +521,22 @@ pub const Sp = struct {
         const D = sp.main.w.config.hidden;
         const b = h.b;
         const o = sp.ops();
+        const p0 = try sp.side.pbegin();
         if (h.Rp > h.R) try o.fill32(b.part + h.R * D * 4, 0, (h.Rp - h.R) * D);
         try o.f32ToBf16(b.part, b.bpart, h.Rp * D);
         try sp.comm.reduceScatter(b.bpart, b.bred, h.n * D, .bf16, .sum, sp.side.s.handle);
         try sp.tr().residualAddOf(b.xo, b.bred, "*bf16", h.n, D, 1);
+        try sp.side.pend(p0, .rs);
     }
 
     /// fused._gather_x: every row's residual stream gathered from the ranks' own rows -> out [R, D].
     fn gatherX(sp: *Sp, h: *const Half, out: u64) !void {
         const D = sp.main.w.config.hidden;
         const b = h.b;
+        const p0 = try sp.side.pbegin();
         try sp.comm.allGather(b.xo, b.gath, h.n * D, .bf16, sp.side.s.handle);
         try sp.ops().copy(out, b.gath, h.R * D * 2);
+        try sp.side.pend(p0, .ag);
     }
 };
 
