@@ -784,6 +784,41 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
   for (int j = 0; j < 128; j++) Y[base + j] = bfloat(float(Y[base + j]) + float(bfloat(c[j] * float(G[base + j]))));
 }
 
+// h3_gate_mix and the rounding of its rows to int8 in one pass, one simdgroup a row: the mixed row is never
+// written. Y, G: (R, H * 128) bf16. C: (H, tiles, 128) float. SLOT: (R). P: R, H, tiles.
+// Q: (MP, H * 128) int8, rows from R zero. XS: (MP). Threadgroups [MP, 1, 1] of [32, 1, 1].
+[[kernel]] void h3_mix_quant(
+  const device bfloat* Y [[buffer(0)]],
+  const device bfloat* G [[buffer(1)]],
+  const device float* C [[buffer(2)]],
+  const device int32_t* SLOT [[buffer(3)]],
+  const constant int32_t* P [[buffer(4)]],
+  device int8_t* Q [[buffer(5)]],
+  device float* XS [[buffer(6)]],
+  uint lane [[thread_index_in_simdgroup]],
+  uint3 tg [[threadgroup_position_in_grid]]) {
+  const int R = P[0], W = P[1] * 128, NT = P[2], row = int(tg.x);
+  const long base = long(row) * W;
+  if (row >= R) {
+    for (int c = int(lane); c < W; c += 32) Q[base + c] = 0;
+    if (lane == 0) XS[row] = 0.0f;
+    return;
+  }
+  const device float* coarse = C + long(SLOT[row] / 64) * 128;
+  float top = 0.0f;
+  for (int c = int(lane); c < W; c += 32) {
+    const float mixed = float(bfloat(float(Y[base + c]) + float(bfloat(coarse[long(c >> 7) * NT * 128 + (c & 127)] * float(G[base + c])))));
+    top = max(top, abs(mixed));
+  }
+  top = max(simd_max(top), 1e-12f);
+  if (lane == 0) XS[row] = top / 127.0f;
+  const float inverse = 127.0f / top;
+  for (int c = int(lane); c < W; c += 32) {
+    const float mixed = float(bfloat(float(Y[base + c]) + float(bfloat(coarse[long(c >> 7) * NT * 128 + (c & 127)] * float(G[base + c])))));
+    Q[base + c] = int8_t(clamp(int(rint(mixed * inverse)), -127, 127));
+  }
+}
+
 // h3_i8 products between the stream and the attention width, one activation scale a row.
 [[kernel]] void h3_i8_in(
   const device int8_t* X [[buffer(0)]],
