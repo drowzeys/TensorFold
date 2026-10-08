@@ -90,6 +90,9 @@ pub const Weights = struct {
     layers: []Layer = &.{},
     mtp: ?Mtp = null,
     draft: ?DraftHead = null,
+    /// Phase 4: headq.prepare's draft_lm_head - the 4-bit copy of this rank's lm_head share the drafters' block
+    /// passes read (cuda_draft.buildDraftHead); null without a drafter
+    draft_lm: ?kern.Q4 = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     chunk: u64 = 0, // the arena chunk being filled (0: none yet)
     chunk_used: usize = 0,
@@ -916,12 +919,18 @@ const q4_offsets = [8]usize{ 0, 8, 16, 24, 1, 9, 17, 25 };
 /// shared qmm.pack (gs 64): words [n, k / 8] -> out [npad / 64, k / 64, 8, 32, 2] int32 (npad = n rounded up to 128,
 /// zero columns past n); scales / biases [n, k / 64] -> [k / 64, npad] (zeros past n).
 pub fn pack4(words: []const u32, scales: []const u16, biases: []const u16, n: usize, k: usize, out: []u32, s_out: []u16, b_out: []u16) void {
-    const kg = k / 64;
-    const npad = (n + 127) / 128 * 128;
     @memset(out, 0);
     @memset(s_out, 0);
     @memset(b_out, 0);
-    for (0..n) |c| {
+    pack4Range(words, scales, biases, n, k, 0, n, out, s_out, b_out);
+}
+
+/// pack4's columns [c0, c1) only (outputs zeroed by the caller): each column writes its own words, scales and biases,
+/// so ranges can be packed side by side (Phase 4's threaded drafter quantization).
+pub fn pack4Range(words: []const u32, scales: []const u16, biases: []const u16, n: usize, k: usize, c0: usize, c1: usize, out: []u32, s_out: []u16, b_out: []u16) void {
+    const kg = k / 64;
+    const npad = (n + 127) / 128 * 128;
+    for (c0..c1) |c| {
         const T = c / 64;
         const j = (c % 64) / 8;
         const r = c % 8;

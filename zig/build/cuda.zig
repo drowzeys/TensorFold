@@ -46,6 +46,9 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_decode", .flags = &.{"-O3"} },
     // Phase 3a speed: the MTP layer's prompt rows (dense bf16 experts built at load, gather / SwiGLU / combine)
     .{ .name = "glm53_mtp", .flags = &.{"-O3"} },
+    // Phase 4: the drafters' torch steps (rotary, the ring, the rank-order sums, small dots) and strided row copies
+    // (the target's tap rows): torch's default nvcc flags (cosf / sinf as torch's, no fast math)
+    .{ .name = "glm53_draft", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

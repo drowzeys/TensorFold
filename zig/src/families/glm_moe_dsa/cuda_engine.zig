@@ -22,6 +22,9 @@ const dec = @import("cuda_decode.zig");
 const roce = @import("cuda_roce.zig");
 const tiles = @import("tiles.zig");
 const reuse = @import("cuda_reuse.zig");
+const draft = @import("cuda_draft.zig");
+const dhost = @import("draft_host.zig");
+const copies = @import("copies.zig");
 
 pub const world_default: usize = 4;
 /// engine.DCP_AUTO: contexts past this interleave the KV cache over the ranks (bf16 latent)
@@ -125,6 +128,17 @@ pub const Options = struct {
     dcp: usize = 0,
     timeout_s: f64 = 5400,
     reuse: reuse.Settings = .{},
+    /// Phase 4: the drafters (checkpoint directories, "" none: TF_GLM53_DSPARK / TF_GLM53_DFLASH), DSpark's settings
+    /// (TF_GLM53_DSPARK_*), DFlash2's (TF_GLM53_DFLASH_DEPTH / _CONFIDENCE), copy drafts (TF_GLM53_COPY_*), the
+    /// default draft mode (TF_GLM53_MTP: dspark | dflash; unset: a drafter when --mtp-drafts 0 (k 0) loads one, else
+    /// the MTP head), the drafters' verify rows (TF_GLM53_VERIFY_ROWS)
+    dspark: []const u8 = "",
+    dflash: []const u8 = "",
+    dspark_env: dhost.DSparkEnv = .{},
+    dflash_set: dhost.DFlashSettings = .{},
+    copy: copies.Settings = .{ .on = false, .match = 0, .most = 0 },
+    mode: ?[]const u8 = null,
+    verify_rows: usize = 8,
 
     /// The server's settings: TF_GLM53_RANK / _WORLD / _MASTER / _AOT / ... (the script's names), `context` from
     /// --context. Unset variables keep tf-glm53-generate --mode 3a's defaults (the image's served ones).
@@ -168,11 +182,33 @@ pub const Options = struct {
         o.dcp = try envInt(usize, "TF_GLM53_DCP", 0);
         o.timeout_s = try envFloat("TF_GLM53_TIMEOUT", o.timeout_s);
         o.reuse = try reuse.Settings.fromEnv();
+        o.dspark = env("TF_GLM53_DSPARK") orelse "";
+        o.dflash = env("TF_GLM53_DFLASH") orelse "";
+        o.dspark_env = .{ .depth = env("TF_GLM53_DSPARK_DEPTH"), .policy = env("TF_GLM53_DSPARK_POLICY"), .confidence = env("TF_GLM53_DSPARK_CONFIDENCE"), .top_k = env("TF_GLM53_DSPARK_TOPK"), .noise = env("TF_GLM53_DSPARK_NOISE"), .filter = env("TF_GLM53_DSPARK_FILTER"), .row_cost = env("TF_GLM53_DSPARK_ROW_COST"), .quant = env("TF_GLM53_DSPARK_QUANT"), .costs = env("TF_GLM53_DSPARK_COSTS") };
+        o.dflash_set = .{ .depth = try envInt(usize, "TF_GLM53_DFLASH_DEPTH", 7), .confidence = try envFloat("TF_GLM53_DFLASH_CONFIDENCE", 0.3) };
+        o.copy = copies.Settings.parse(env("TF_GLM53_COPY_DRAFTS"), env("TF_GLM53_COPY_MIN"), env("TF_GLM53_COPY_MAX")) catch {
+            std.log.err("TF_GLM53_COPY_DRAFTS (0 / 1), _MIN (2..64), _MAX (1..31)", .{});
+            return error.BadSetting;
+        };
+        o.mode = env("TF_GLM53_MTP");
+        o.verify_rows = try envInt(usize, "TF_GLM53_VERIFY_ROWS", 8);
         if (o.aot.len == 0) {
             std.log.err("glm53: no Triton kernel pack: set TF_GLM53_AOT to the directory with aot.json", .{});
             return error.NoKernelPack;
         }
         return o;
+    }
+
+    /// The draft mode of a request without its own (Glm53Engine: TF_GLM53_MTP; a drafter alone with --mtp-drafts 0).
+    pub fn defaultMode(o: Options) !rn.Mode {
+        if (o.mode) |m| {
+            if (std.mem.eql(u8, m, "dspark")) return if (o.dspark.len > 0) .dspark else error.NoDrafter;
+            if (std.mem.eql(u8, m, "dflash")) return if (o.dflash.len > 0) .dflash else error.NoDrafter;
+            return .mtp; // an MTP input mode (normed/normed, ...): the MTP head
+        }
+        if (o.k == 0 and o.dspark.len > 0) return .dspark;
+        if (o.k == 0 and o.dflash.len > 0) return .dflash;
+        return .mtp;
     }
 
     /// The decode context parallelism a context gets (Glm53Engine: TF_GLM53_DCP, else the world past DCP_AUTO).
@@ -184,8 +220,11 @@ pub const Options = struct {
 };
 
 /// The settings every rank must share, hashed (the rendezvous compares them before anything loads).
-fn settingsDigest(o: Options, dcp: usize) u64 {
+fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
     var h = std.hash.Wyhash.init(0x6a3b);
+    h.update(std.mem.asBytes(&drafts));
+    const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows };
+    h.update(std.mem.asBytes(&cw));
     const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
     h.update(std.mem.asBytes(&shape));
     for ([_][]const u8{ o.experts, o.pe_det, o.side, o.l2pf }) |t| {
@@ -233,6 +272,15 @@ pub const Boot = struct {
     sp: ?prompt.Sp = null,
     fwd: fw.Forward, // the sequence-parallel chunk points at it (Sp.main); the Runner holds a copy
     r: rn.Runner,
+    // Phase 4: the drafters' configs (read and checked before anything loads), their tap plan, the drafters, the
+    // default draft mode
+    dspark_cfg: ?dhost.DSparkConfig = null,
+    dflash_cfg: ?dhost.DFlashConfig = null,
+    dspark_set: dhost.DSparkSettings = .{ .depth = 0 },
+    plan: dhost.TapPlan = .{},
+    dspark_dr: ?*draft.Drafter = null,
+    dflash_dr: ?*draft.Drafter = null,
+    mode: rn.Mode = .mtp,
     load_s: f64 = 0,
     prewarm_graphs: usize = 0,
     prewarm_s: f64 = 0,
@@ -254,6 +302,13 @@ pub const Boot = struct {
         b.side = null;
         b.l2pf = null;
         b.sp = null;
+        b.dspark_cfg = null;
+        b.dflash_cfg = null;
+        b.dspark_set = .{ .depth = 0 };
+        b.plan = .{};
+        b.dspark_dr = null;
+        b.dflash_dr = null;
+        b.mode = try o.defaultMode();
         b.dcp = try o.dcpFor();
         errdefer b.undo();
         try b.bringUp();
@@ -286,7 +341,36 @@ pub const Boot = struct {
         b.stage = 5;
         std.log.info("glm53 rank {d} of {d}: NCCL {d} up; context {d}, MTP drafts {d}, DCP {d}, prompt reuse {s}", .{ o.rank, o.world, b.nccl_version, o.context, o.k, b.dcp, if (o.reuse.on) "on" else "off" });
         b.cfg = try Config.load(gpa, io, o.model);
-        try b.rdv.sync("settings", settingsDigest(o, b.dcp), o.timeout_s);
+        // Phase 4: the drafters' configs, checked against the target before anything big loads; the tap plan
+        // (dspark_host.tap_plan: DFlash2's layers first, DSpark's after)
+        var dh = std.hash.Wyhash.init(0x44);
+        var dspark_layers: [dhost.max_taps]usize = undefined;
+        var want: [2]?[]const usize = .{ null, null };
+        if (o.dflash.len > 0) {
+            const text = try readText(gpa, io, o.dflash, "config.json");
+            defer gpa.free(text);
+            const c = try dhost.DFlashConfig.parse(gpa, text);
+            try c.check(o.world, b.cfg.hidden, b.cfg.layers);
+            b.dflash_cfg = c;
+            want[0] = b.dflash_cfg.?.taps[0..c.n_taps];
+            dh.update(std.mem.asBytes(&c.crc));
+            o.dflash_set.digest(&dh);
+        }
+        if (o.dspark.len > 0) {
+            const text = try readText(gpa, io, o.dspark, "config.json");
+            defer gpa.free(text);
+            const c = try dhost.DSparkConfig.parse(gpa, text);
+            try c.check(o.world, b.cfg.hidden, b.cfg.vocab, b.cfg.layers);
+            b.dspark_cfg = c;
+            b.dspark_set = try dhost.DSparkSettings.parse(c.block, o.dspark_env);
+            want[1] = c.tapLayers(&dspark_layers);
+            dh.update(std.mem.asBytes(&c.crc));
+            b.dspark_set.digest(&dh);
+        }
+        b.plan = try dhost.TapPlan.make(want);
+        const mode_word: u64 = @intFromEnum(b.mode);
+        dh.update(std.mem.asBytes(&mode_word));
+        try b.rdv.sync("settings", settingsDigest(o, b.dcp, dh.final()), o.timeout_s);
 
         const t_load = now(io);
         b.w = try W.load(gpa, io, &b.driver, o.model, b.cfg, .{ .layers = b.cfg.layers, .rank = o.rank, .world = o.world, .head = true, .log_every = 10, .fast = o.fast_load, .mtp = o.k > 0, .draft_vocab = if (o.k > 0) o.draft_vocab else 0 });
@@ -294,6 +378,9 @@ pub const Boot = struct {
         if (o.tiles) |path| {
             const t = try tiles.load(gpa, io, &b.w, path);
             std.log.info("glm53 rank {d}: tiles from {s}: {d} linears, {d} differ from x3linear.plan", .{ o.rank, path, t.linears, t.changed });
+        }
+        if (b.plan.n > 0) { // headq.prepare(drafts=True): the 4-bit draft copy of this rank's head share
+            b.w.draft_lm = try draft.buildDraftHead(gpa, &b.driver, &b.w);
         }
         b.load_s = since(io, t_load);
         try b.rdv.sync("loaded", 0, o.timeout_s);
@@ -356,12 +443,26 @@ pub const Boot = struct {
             if (!(o.l2pf_mb > 0 and o.l2pf_mb <= 64)) return error.BadL2pfBudget;
             b.l2pf = try dec.L2pf.init(gpa, &b.driver, &b.w, .{ .mode = pf_mode, .mb = o.l2pf_mb });
         }
-        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp };
+        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan) };
         if (o.prompt_sp and o.world > 1 and b.dcp == 1) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
         b.stage = 17;
         const capacity = o.context + o.k + 1; // Glm53Engine: Runner(limit + k + 1)
-        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp });
+        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = o.copy });
         b.stage = 18;
+        // Phase 4: the drafters on every rank (each its heads / MLP share), attached to the runner before its prewarm
+        if (b.dflash_cfg != null) {
+            b.dflash_dr = try draft.Drafter.load(gpa, io, &b.driver, &b.k, b.stream, &b.w, o.dflash, .dflash, b.dspark_set, o.dflash_set);
+            try b.dflash_dr.?.setTaps(b.plan.cols[0][0..b.plan.n_cols[0]], b.plan.n);
+            b.r.dflash = b.dflash_dr;
+            std.log.info("glm53 rank {d}: DFlash2 drafter {s} (block {d}, taps after layers {any}, {d:.0} MiB on the device)", .{ o.rank, std.fs.path.basename(o.dflash), b.dflash_dr.?.sp.block, b.dflash_cfg.?.taps[0..b.dflash_cfg.?.n_taps], @as(f64, @floatFromInt(b.dflash_dr.?.deviceBytes())) / (1 << 20) });
+        }
+        if (b.dspark_cfg != null) {
+            b.dspark_dr = try draft.Drafter.load(gpa, io, &b.driver, &b.k, b.stream, &b.w, o.dspark, .dspark, b.dspark_set, o.dflash_set);
+            try b.dspark_dr.?.setTaps(b.plan.cols[1][0..b.plan.n_cols[1]], b.plan.n);
+            b.r.dspark = b.dspark_dr;
+            std.log.info("glm53 rank {d}: DSpark drafter {s} (block {d}, policy {t}, confidence {d}, depth {d}, {d:.0} MiB on the device)", .{ o.rank, std.fs.path.basename(o.dspark), b.dspark_cfg.?.block, b.dspark_set.policy, b.dspark_set.confidence, b.dspark_set.depth, @as(f64, @floatFromInt(b.dspark_dr.?.deviceBytes())) / (1 << 20) });
+        }
+        b.stage = 19;
         if (o.prewarm) {
             const tp = now(io);
             b.prewarm_graphs = try b.r.prewarm();
@@ -373,6 +474,8 @@ pub const Boot = struct {
 
     fn undo(b: *Boot) void {
         const s = b.stage;
+        if (b.dspark_dr) |x| x.deinit();
+        if (b.dflash_dr) |x| x.deinit();
         if (s >= 18) b.r.deinit();
         if (s >= 17) if (b.sp) |*x| x.deinit();
         if (s >= 16) {
@@ -531,6 +634,9 @@ pub const Exec = struct {
     keeps: []const u32 = &.{},
     flags: u32 = 0,
     hooks: ?rn.Hooks = null,
+    /// Phase 4: the draft mode (null: the boot's default) and copy drafts (drafted requests only)
+    mode: ?rn.Mode = null,
+    copies: bool = true,
 };
 
 pub const Done = struct {
@@ -591,7 +697,8 @@ pub const Session = struct {
     /// Glm53Engine._run on this rank: the request through prompt reuse (when on) and Runner.run. Tokens go to `out`.
     pub fn exec(s: *Session, x: Exec, out: *std.ArrayList(u32)) !Done {
         const k = if (x.draft) s.boot.o.k else 0;
-        const g: rn.Gen = .{ .max_tokens = x.max_tokens, .sampling = x.sampling, .k = k, .eos = x.eos, .hooks = x.hooks };
+        const mode: rn.Mode = if (x.draft) x.mode orelse s.boot.mode else .mtp;
+        const g: rn.Gen = .{ .max_tokens = x.max_tokens, .sampling = x.sampling, .k = k, .eos = x.eos, .hooks = x.hooks, .mode = mode, .copies = x.draft and x.copies };
         if (s.reuse) |pr| {
             const res = try pr.run(x.prompt, x.begin, x.stops, x.keeps, x.flags, x.draft, 0, g, out);
             return .{ .stats = res.stats, .kept = res.kept, .replay = res.replay };
@@ -761,6 +868,13 @@ pub const Session = struct {
         return std.hash.Wyhash.hash(0x71, all[0 .. b.o.world * 8]);
     }
 };
+
+/// A small file of `dir` (a drafter's config.json).
+fn readText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
+    const path = try std.fs.path.join(gpa, &.{ dir, name });
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+}
 
 fn putAll(fd: c_int, bytes: []const u8) !void {
     var done: usize = 0;

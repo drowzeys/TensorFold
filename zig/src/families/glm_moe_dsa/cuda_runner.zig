@@ -19,8 +19,12 @@
 //! cuts / keep points / resumed begin / replayed head (cuda_reuse.zig: prefixes.PromptReuse), decode context
 //! parallelism (Settings.dcp: the caches interleaved over the ranks; no sequence-parallel prompt chunks then).
 //! `generate` stays Phase 3a's schedule (caches zeroed first, EOS not a stop) for tf-glm53-generate --mode 3a.
-//! Not here: copy drafts, DFlash2, the depth policy, late tokens (each round's tokens reach the hook at once),
-//! concurrency.
+//! Phase 4 (Gen.mode, Gen.copies): the drafters (cuda_draft.zig) - DSpark and DFlash2 rounds (Runner._generate_dflash:
+//! the drafter proposes after the pending token, the target verifies [pending, drafts] in one window, the kept rows'
+//! taps extend every loaded drafter's context), and copy drafts (copies.zig: Runner._copied, verify windows of 8 and
+//! COPY_MAX + 1 rows besides the drafters', a copied MTP round leaving the MTP layer a backlog). The target's tap
+//! layers' rows land in every Buffers' taps (Forward.taps); prompt chunks feed the drafters too.
+//! Not here: the depth policy, auto mode, late tokens (each round's tokens reach the hook at once), concurrency.
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
@@ -29,6 +33,9 @@ const tri = @import("cuda_triton.zig");
 const smp = @import("sampling.zig");
 const W = @import("cuda_weights.zig");
 const prompt = @import("cuda_prompt.zig");
+const draft = @import("cuda_draft.zig");
+const dhost = @import("draft_host.zig");
+const copies = @import("copies.zig");
 
 pub const Settings = struct {
     /// MTP drafts a round the buffers and graphs are built for (a request may ask fewer; 0: serial only)
@@ -61,7 +68,16 @@ pub const Settings = struct {
     /// DCP_AUTO tokens of context): the target's and the MTP layer's cache rows interleaved over the ranks
     /// (position p on rank p % dcp at row p / dcp), so no sequence-parallel prompt chunks (compute_prompt_sp needs 1)
     dcp: usize = 1,
+    /// Phase 4: TF_GLM53_VERIFY_ROWS (runner.vrows when a drafter taps the target: 8) and a drafter's own verify rows
+    /// (DSpark: block + 1)
+    verify_rows: usize = 8,
+    draft_rows: usize = 0,
+    /// Phase 4: copy drafts (TF_GLM53_COPY_DRAFTS / _MIN / _MAX)
+    copy: copies.Settings = .{ .on = false, .match = 0, .most = 0 },
 };
+
+/// What drafts a request's rounds (runner.set_mode: the MTP head, DSpark, DFlash2).
+pub const Mode = enum { mtp, dspark, dflash };
 
 /// What `run` calls back on every rank (followers' hooks may be no-ops).
 pub const Hooks = struct {
@@ -92,6 +108,9 @@ pub const Gen = struct {
     /// zero every cache row first (Phase 3a's reference schedule); served runs keep the live rows (prompt reuse)
     reset: bool = false,
     hooks: ?Hooks = null,
+    /// Phase 4: the drafter (mtp: the MTP head with `k`) and copy drafts (Runner.generate's `copies`: drafted runs)
+    mode: Mode = .mtp,
+    copies: bool = false,
 };
 
 pub const Stats = struct {
@@ -107,6 +126,11 @@ pub const Stats = struct {
     begin: usize = 0, // prompt tokens resumed from a kept state
     eos: bool = false, // the run ended at an EOS token
     stopped: bool = false, // rank 0's stop wish ended it (StopVote.agreed)
+    // Phase 4
+    mode: Mode = .mtp,
+    copy_rounds: usize = 0,
+    copy_drafted: usize = 0,
+    copy_accepted: usize = 0,
 
     pub fn tokS(s: Stats, tokens: usize) f64 {
         return if (s.decode_s > 0 and tokens > 1) @as(f64, @floatFromInt(tokens - 1)) / s.decode_s else 0;
@@ -195,8 +219,16 @@ pub const Runner = struct {
     sp: ?*prompt.Sp = null,
     ids_dev: ?cuda.DeviceBuffer = null, // int64 [capacity]
     health: ?cuda.DeviceBuffer = null, // int32 [1 + world]
+    // Phase 4: the drafters (cuda_draft.zig; the engine attaches them), the verify widths (runner.widths: a bit a
+    // width), the MTP windows' widest backlog, copy drafts
+    dflash: ?*draft.Drafter = null,
+    dspark: ?*draft.Drafter = null,
+    widths: u64 = 0,
+    vrows: usize = 1,
+    mrows: usize = 1,
+    copy_on: bool = false,
 
-    fn pinLayout(r: *const Runner) struct { lg: usize, send: usize, all: usize, ids: usize, rd: usize, vote: usize, total: usize } {
+    fn pinLayout(r: *const Runner) struct { lg: usize, send: usize, all: usize, ids: usize, rd: usize, vote: usize, vids: usize, total: usize } {
         const V = r.w.vocab_part;
         const hr = r.vb.head_rows;
         const lg_b = std.mem.alignForward(usize, @max(hr, 1) * V * 4, 256);
@@ -207,8 +239,9 @@ pub const Runner = struct {
         const ids_b = std.mem.alignForward(usize, id_rows * 8, 256);
         const rd_b: usize = 2 * fw.decode_rows * 8;
         const vote_b: usize = 256; // the stop vote's word (StopVote), read with the window's picks
+        const vids_b: usize = std.mem.alignForward(usize, fw.decode_rows * 8, 256); // a host-drafted window's ids
         const rd = lg_b + send_b + all_b + ids_b;
-        return .{ .lg = 0, .send = lg_b, .all = lg_b + send_b, .ids = lg_b + send_b + all_b, .rd = rd, .vote = rd + rd_b, .total = rd + rd_b + vote_b };
+        return .{ .lg = 0, .send = lg_b, .all = lg_b + send_b, .ids = lg_b + send_b + all_b, .rd = rd, .vote = rd + rd_b, .vids = rd + rd_b + vote_b, .total = rd + rd_b + vote_b + vids_b };
     }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, f: fw.Forward, capacity: usize, set_in: Settings) !Runner {
@@ -226,6 +259,17 @@ pub const Runner = struct {
         if (set.served and (set.prompt_rows == 0 or set.prompt_rows > fw.max_prompt_rows or set.prompt_rows_short == 0)) return error.WindowTooWide;
         const topk = c.index_topk;
         const cols = bucketOf(capacity, topk) orelse 1;
+        // Phase 4 (Runner.__init__): verify windows of the drafters' widths and the copy widths
+        const taps = f.taps.n;
+        const vrows = @max(@max(set.k + 1, if (taps > 0) set.verify_rows else 1), set.draft_rows);
+        const copy_on = set.copy.on and (set.k > 0 or taps > 0);
+        const crows: usize = if (copy_on) set.copy.most + 1 else 1;
+        var widths: u64 = 0;
+        for (1..vrows + 1) |R| widths |= @as(u64, 1) << @intCast(R);
+        if (copy_on) widths |= (@as(u64, 1) << @intCast(@min(8, crows))) | (@as(u64, 1) << @intCast(crows));
+        const wrows: usize = 63 - @clz(widths);
+        if (wrows > fw.decode_rows) return error.WindowTooWide;
+        const mrows = @max(if (taps > 0) vrows else set.k + 1, crows);
         var r: Runner = undefined;
         r.gpa = gpa;
         r.io = io;
@@ -242,25 +286,31 @@ pub const Runner = struct {
         r.sp = null;
         r.ids_dev = null;
         r.health = null;
+        r.dflash = null;
+        r.dspark = null;
+        r.widths = widths;
+        r.vrows = vrows;
+        r.mrows = mrows;
+        r.copy_on = copy_on;
         const shared = f.shared_experts;
         r.st = try fw.State.initDcp(gpa, d, w, capacity, set.dcp);
         errdefer r.st.deinit();
         if (set.served) {
             // Runner.__init__: pb (prompt_rows, exact key range), pb1 (the second micro-batch) when chunks overlap
-            r.pb = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows, @max(capacity, 1), .{ .mtp = set.k > 0, .prompt = true, .shared_experts = shared, .mtp_dense = set.k > 0 and f.mtp_dense != null, .dcp = set.dcp });
+            r.pb = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows, @max(capacity, 1), .{ .mtp = set.k > 0, .prompt = true, .shared_experts = shared, .mtp_dense = set.k > 0 and f.mtp_dense != null, .dcp = set.dcp, .taps = taps });
         } else {
-            r.pb = try fw.Buffers.initWith(gpa, d, w, set.window, @max(capacity, 1), .{ .mtp = set.k > 0 });
+            r.pb = try fw.Buffers.initWith(gpa, d, w, set.window, @max(capacity, 1), .{ .mtp = set.k > 0, .taps = taps });
         }
         errdefer r.pb.deinit();
         if (set.served and set.prompt_sp and set.sp != null and w.world > 1 and set.dcp == 1) { // fused: sp needs dcp 1
-            r.pb1 = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows - set.prompt_rows / 2, @max(capacity, 1), .{ .prompt = true, .shared_experts = shared, .dcp = set.dcp });
+            r.pb1 = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows - set.prompt_rows / 2, @max(capacity, 1), .{ .prompt = true, .shared_experts = shared, .dcp = set.dcp, .taps = taps });
             r.sp = set.sp;
         }
         errdefer if (r.pb1) |*b| b.deinit();
-        r.vb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true, .shared_experts = shared, .dcp = set.dcp });
+        r.vb = try fw.Buffers.initWith(gpa, d, w, wrows, cols, .{ .decode = true, .shared_experts = shared, .dcp = set.dcp, .taps = taps });
         errdefer r.vb.deinit();
         r.mb = null;
-        if (set.k > 0) r.mb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true, .mtp = true, .shared_experts = shared, .dcp = set.dcp });
+        if (set.k > 0) r.mb = try fw.Buffers.initWith(gpa, d, w, @max(@max(set.k + 1, vrows), crows), cols, .{ .decode = true, .mtp = true, .shared_experts = shared, .dcp = set.dcp });
         errdefer if (r.mb) |*m| m.deinit();
         r.carry = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
         errdefer r.carry.free();
@@ -441,12 +491,13 @@ pub const Runner = struct {
         }
         var bs: [24]?usize = undefined;
         for (r.buckets(&bs)) |T| {
-            for (1..r.set.k + 2) |R| {
+            for (1..fw.decode_rows + 1) |R| {
+                if (!r.hasWidth(R)) continue;
                 try r.verify(R, 0, T, .argmax);
                 try r.verify(R, 0, T, .local);
             }
             if (r.set.k > 0) {
-                for (1..r.set.k + 2) |m| try r.mtp(m, 1, 0, T, 0);
+                for (1..r.mrows + 1) |m| try r.mtp(m, 1, 0, T, 0);
                 var j: usize = 2;
                 while (j <= r.set.k) : (j += 1) {
                     try r.mtp(1, j, 0, T, 0);
@@ -454,9 +505,227 @@ pub const Runner = struct {
                 }
             }
         }
+        // the drafters' passes (Drafter.capture: context updates of 1..block rows, the block pass; every rank
+        // together - the block pass gathers), then DSpark's cost cut (Runner._calibrate_dspark)
+        for (r.drafterList(), 0..) |maybe, which| {
+            const dr = maybe orelse continue;
+            try dr.resetAt(r.ops(), 0);
+            for (1..dr.sp.block + 1) |n| try r.runGraph(tapKey(which, n), TapCtx{ .r = r, .dr = dr, .n = n });
+            try dr.resetAt(r.ops(), 0);
+            try r.runGraph(blockKey(which), BlockCtx{ .r = r, .dr = dr });
+            try dr.resetAt(r.ops(), 0);
+        }
+        try r.calibrate();
         try r.f.s.synchronize();
         try r.resetState();
         return r.graphs.count();
+    }
+
+    // ------------------------------------------------------------------------------------------ Phase 4 ---
+
+    /// runner.widths: whether verify windows of R rows are captured (a drafter's or a copy's width).
+    pub fn hasWidth(r: *const Runner, R: usize) bool {
+        return R < 64 and (r.widths >> @intCast(R)) & 1 == 1;
+    }
+
+    /// Runner.drafters: DFlash2, then DSpark (the tap plan's order).
+    fn drafterList(r: *const Runner) [2]?*draft.Drafter {
+        return .{ r.dflash, r.dspark };
+    }
+
+    fn tapKey(which: usize, n: usize) u64 {
+        return 3 | (@as(u64, n) << 4) | (@as(u64, which) << 12);
+    }
+
+    fn blockKey(which: usize) u64 {
+        return 4 | (@as(u64, which) << 12);
+    }
+
+    /// What the drafters' passes launch on (this runner's stream, its Forward's exchanges).
+    fn dev(r: *const Runner) draft.Dev {
+        return .{ .t = .{ .set = &r.f.k.triton, .s = r.f.s }, .o = r.ops(), .f = &r.f };
+    }
+
+    const TapCtx = struct {
+        r: *Runner,
+        dr: *draft.Drafter,
+        n: usize,
+        fn go(c: @This()) !void {
+            try c.dr.tapsCompute(c.r.dev(), c.n);
+        }
+    };
+
+    const BlockCtx = struct {
+        r: *Runner,
+        dr: *draft.Drafter,
+        fn go(c: @This()) !void {
+            try c.dr.blockCompute(c.r.dev());
+        }
+    };
+
+    /// Drafter.add_taps for every loaded drafter: rows [row0, row0 + n) of b's taps into its context, `step` rows a
+    /// pass at most (decode: a block, each pass a captured graph; prompts: tap_rows, eager past a block).
+    fn feedDrafters(r: *Runner, b: *const fw.Buffers, row0: usize, n: usize, decode: bool) !void {
+        if (b.taps == 0) return;
+        const pitch = b.tap_n * r.w.config.hidden * 2;
+        for (r.drafterList(), 0..) |maybe, which| {
+            const dr = maybe orelse continue;
+            const step = if (decode) dr.sp.block else draft.tap_rows;
+            var a: usize = 0;
+            while (a < n) : (a += step) {
+                const m = @min(step, n - a);
+                try dr.loadTaps(r.ops(), b.taps + (row0 + a) * pitch, pitch, m);
+                if (m <= dr.sp.block) {
+                    try r.runGraph(tapKey(which, m), TapCtx{ .r = r, .dr = dr, .n = m });
+                } else {
+                    try dr.tapsCompute(r.dev(), m);
+                }
+                dr.context_end += m;
+            }
+        }
+    }
+
+    /// A prompt chunk's rows [a, e) of L0 into the drafters' contexts (Runner.prefill_chunk's add_taps). Rows a block
+    /// can never read (older than the ring's reach at the prompt's end) only move the position: each row's K / V is
+    /// its own (row-invariant passes), so the rows kept are the same bits.
+    fn feedPrompt(r: *Runner, b: *const fw.Buffers, a: usize, e: usize, L0: usize) !void {
+        if (b.taps == 0) return;
+        const keep = dhost.ring - dhost.max_block - draft.tap_rows; // >= every drafter's window + block
+        const from = @min(@max(L0 -| keep, a), e);
+        if (from > a) {
+            for (r.drafterList()) |maybe| {
+                const dr = maybe orelse continue;
+                try dr.skip(r.ops(), from - a);
+            }
+        }
+        if (e > from) try r.feedDrafters(b, from - a, e - from, false);
+    }
+
+    /// A fresh drafter context at `at` for every loaded drafter (Runner.prefill: reset at a new prompt; a resumed or
+    /// replayed one starts at its resume point).
+    fn resetDrafters(r: *Runner, at: usize) !void {
+        for (r.drafterList()) |maybe| {
+            const dr = maybe orelse continue;
+            try dr.resetAt(r.ops(), at);
+        }
+    }
+
+    /// Drafter.propose: up to `room` drafts after `tok` (pending at the drafter's context end): the block pass (its
+    /// graph), one read, the host stage.
+    fn propose(r: *Runner, dr: *draft.Drafter, which: usize, tok: u32, room: usize, s: ?smp.Sampling, out: []u32) ![]u32 {
+        const depth = @min(room, dr.sp.maxDepth());
+        if (depth == 0 or dr.context_end == 0) return out[0..0];
+        try dr.setPending(r.ops(), tok);
+        try r.runGraph(blockKey(which), BlockCtx{ .r = r, .dr = dr });
+        try dr.readCandidates(r.ops(), depth);
+        return dr.walkDrafts(depth, tok, dr.context_end + 1, s, out);
+    }
+
+    /// The drafts a drafter round asks for at most (runner: DSpark min(block, vrows - 1, its depth setting),
+    /// DFlash2 min(block - 1, vrows - 1, TF_GLM53_DFLASH_DEPTH)).
+    fn depthMax(r: *const Runner, dr: *const draft.Drafter) usize {
+        const want = if (dr.sp.kind == .dspark) dr.dset.depth else dr.fset.depth;
+        return @min(@min(dr.sp.maxDepth(), r.vrows - 1), want);
+    }
+
+    /// Runner._copied: this round's copy drafts, at most COPY_MAX, as many as `left` and the cache allow, in a captured
+    /// window width - padded up to the next width by repeating the last draft when there is room, else cut to the
+    /// widest width below it.
+    fn copied(r: *const Runner, cx: *const copies.CopyIndex, left: usize, P: usize, out: []u32) []u32 {
+        const room = @min(@min(r.set.copy.most, left), r.capacity -| (P + 1));
+        if (room == 0) return out[0..0];
+        const got = cx.propose(room, out);
+        const R = got.len + 1;
+        if (got.len == 0 or r.hasWidth(R)) return got;
+        var up = R + 1;
+        while (up <= fw.decode_rows and !r.hasWidth(up)) up += 1;
+        if (up <= fw.decode_rows and up - 1 <= room and up - 1 <= out.len) {
+            for (got.len..up - 1) |i| out[i] = got[got.len - 1];
+            return out[0 .. up - 1];
+        }
+        var down = R - 1;
+        while (down > 1 and !r.hasWidth(down)) down -= 1;
+        return out[0 .. down - 1];
+    }
+
+    /// Runner._mtp_flush: an MTP backlog of m rows (positions P - m .. P - 1) written without drafting from it.
+    fn mtpFlush(r: *Runner, m: usize, P: usize) !void {
+        if (m > 0) try r.mtp(m, 1, P - m, bucketOf(P, r.topk), 0);
+    }
+
+    /// int64 ids of a host-drafted verify window through its own pinned staging (the round's MTP ids use `ids`).
+    fn uploadVerify(r: *Runner, ids: []const u32) !void {
+        const lay = r.pinLayout();
+        if (ids.len > fw.decode_rows) return error.WindowTooWide;
+        const hostv = r.pinSlice(i64, lay.vids, ids.len);
+        for (ids, 0..) |t, i| hostv[i] = t;
+        try r.ops().upload(r.vb.ids, std.mem.sliceAsBytes(hostv));
+    }
+
+    /// Runner._calibrate_dspark (policy cost): ms of a round with k = 0 .. block drafts - the verify window of k + 1
+    /// rows (fastest of 7 graph replays, made non-decreasing) plus the block pass - the ranks' slowest, so every rank
+    /// cuts alike; TF_GLM53_DSPARK_COSTS replaces the measurement. Startup only (the caches hold scratch rows).
+    fn calibrate(r: *Runner) !void {
+        const dr = r.dspark orelse return;
+        if (dr.dset.policy != .cost) return;
+        if (dr.dset.n_costs > 0) {
+            @memcpy(dr.round_ms[0..dr.dset.n_costs], dr.dset.costs[0..dr.dset.n_costs]);
+            dr.n_round_ms = dr.dset.n_costs;
+            return;
+        }
+        const B = dr.sp.block;
+        for (1..B + 2) |R| if (!r.hasWidth(R)) return;
+        var mine: [dhost.max_block + 3]f32 = @splat(0);
+        try r.setI32(r.st.pos, 0);
+        for (1..B + 2) |R| {
+            var best: f64 = std.math.inf(f64);
+            for (0..7) |_| {
+                try r.f.s.synchronize();
+                const t0 = r.now();
+                try r.verify(R, 0, null, .argmax);
+                try r.f.s.synchronize();
+                best = @min(best, r.since(t0));
+            }
+            mine[R - 1] = @floatCast(1e3 * best);
+        }
+        try dr.resetAt(r.ops(), 0);
+        var best_b: f64 = std.math.inf(f64);
+        for (0..7) |_| {
+            try r.f.s.synchronize();
+            const t0 = r.now();
+            try r.runGraph(blockKey(1), BlockCtx{ .r = r, .dr = dr });
+            try r.f.s.synchronize();
+            best_b = @min(best_b, r.since(t0));
+        }
+        try dr.resetAt(r.ops(), 0);
+        const n = B + 2;
+        mine[n - 1] = @floatCast(1e3 * best_b);
+        var got: [dhost.max_block + 3]f32 = mine;
+        const world = r.w.world;
+        if (world > 1) if (r.f.comm) |cm| {
+            var dev_buf = try cuda.DeviceBuffer.alloc(r.d, (world + 1) * n * 4);
+            defer dev_buf.free();
+            try r.ops().upload(dev_buf.ptr, std.mem.sliceAsBytes(mine[0..n]));
+            try cm.allGather(dev_buf.ptr, dev_buf.ptr + n * 4, n, .f32, r.f.s.handle);
+            const every = try r.gpa.alloc(f32, world * n);
+            defer r.gpa.free(every);
+            try r.ops().download(std.mem.sliceAsBytes(every), dev_buf.ptr + n * 4);
+            try r.f.s.synchronize();
+            for (0..n) |i| {
+                var mx: f32 = every[i];
+                for (1..world) |q| mx = @max(mx, every[q * n + i]);
+                got[i] = mx;
+            }
+        };
+        var run_max: f64 = 0;
+        for (0..B + 1) |i| {
+            const v: f64 = got[i];
+            run_max = if (i == 0) v else @max(run_max, v);
+            const blk: f64 = got[n - 1];
+            dr.round_ms[i] = @round((run_max + blk) * 1e3) / 1e3;
+        }
+        dr.n_round_ms = B + 1;
+        if (r.w.rank == 0) std.log.info("glm53: DSpark cost cut: round ms with 0..{d} drafts {any} (block pass {d:.2} ms)", .{ B, dr.round_ms[0 .. B + 1], got[n - 1] });
     }
 
     // ------------------------------------------------------------------------------------------------ prompt ---
@@ -494,6 +763,9 @@ pub const Runner = struct {
             const ids = r.ids_dev orelse return error.Invalid;
             try r.uploadIds(ids.ptr, prompt_ids);
         }
+        // Runner._prefill: the drafters' contexts start at the prompt (a resumed one: at its resume point - the kept
+        // ring rows below it are not restored, which only costs acceptance until the window refills)
+        try r.resetDrafters(begin);
         for (chunks, 0..) |ch, ci| {
             const a = ch[0];
             const e = ch[1];
@@ -522,6 +794,7 @@ pub const Runner = struct {
                 try r.f.compute(&r.pb, &r.st, R, T, if (last) head else .none, true);
                 if (last) hb = &r.pb;
             }
+            try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
             if (r.set.k > 0) try r.mtpPrompt(prompt_ids, a, e, T);
             if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
             if (r.f.prof) |p| {
@@ -734,16 +1007,24 @@ pub const Runner = struct {
         return std.mem.indexOfScalar(u32, eos, t) != null;
     }
 
-    /// Runner.generate (MTP mode normed/normed, no copies, no depth policy) for one request: the prompt from
-    /// `g.begin` (or a replayed head), then MTP-drafted rounds until `g.max_tokens` picks, an EOS of `g.eos`, or
-    /// rank 0's stop wish heard by every rank. Tokens go to `out` and, round by round, to `g.hooks`.
+    /// Runner.generate (MTP mode normed/normed, no depth policy) for one request: the prompt from `g.begin` (or a
+    /// replayed head), then drafted rounds until `g.max_tokens` picks, an EOS of `g.eos`, or rank 0's stop wish heard
+    /// by every rank. Tokens go to `out` and, round by round, to `g.hooks`. Drafts: the MTP head (`g.mode` mtp, `g.k`
+    /// steps; 0: serial), DSpark or DFlash2 (Runner._generate_dflash), and with `g.copies` copy drafts ahead of them.
     pub fn run(r: *Runner, prompt_ids: []const u32, g: Gen, out: *std.ArrayList(u32)) !Stats {
-        const k = @min(g.k, r.set.k);
+        const mode = g.mode;
+        const k = if (mode == .mtp) @min(g.k, r.set.k) else 0;
+        const drafter: ?*draft.Drafter = switch (mode) {
+            .mtp => null,
+            .dspark => r.dspark orelse return error.NoDrafter,
+            .dflash => r.dflash orelse return error.NoDrafter,
+        };
+        const which: usize = if (mode == .dspark) 1 else 0;
         const D = r.w.config.hidden;
         const o = r.ops();
         const s = g.sampling;
         const max_tokens = g.max_tokens;
-        var st: Stats = .{ .prompt_len = prompt_ids.len, .begin = g.begin };
+        var st: Stats = .{ .prompt_len = prompt_ids.len, .begin = g.begin, .mode = mode };
         if (prompt_ids.len == 0 or max_tokens == 0 or prompt_ids.len + max_tokens + k + 1 > r.capacity) return error.ContextTooSmall;
         if (g.replay != null and g.begin != prompt_ids.len) return error.Invalid; // a replay resumes at its prompt's end
         if (g.reset and g.begin > 0) return error.Invalid;
@@ -751,11 +1032,19 @@ pub const Runner = struct {
         if (g.reset) try r.resetState();
         const t0 = r.now();
         const keep: ?Keep = if (g.hooks) |h| (if (h.keep != null) Keep{ .hooks = h } else null) else null;
+        if (g.replay != null) try r.resetDrafters(prompt_ids.len);
         var tok = if (g.replay) |lg| try r.replayHead(lg, prompt_ids.len, s) else try r.prefill(prompt_ids, s, g.begin, g.cuts, keep);
         try r.healthy(); // short prompts' chunks reduce over RoCE too
         st.prefill_s = r.since(t0);
         out.clearRetainingCapacity();
         try out.append(r.gpa, tok);
+        // the prompt's copy index (drafted runs only: the serial reference never copies)
+        var cx: ?copies.CopyIndex = null;
+        defer if (cx) |*c| c.deinit();
+        if (g.copies and r.copy_on and (mode != .mtp or k > 0)) {
+            cx = try copies.CopyIndex.init(r.gpa, prompt_ids, r.set.copy.match, r.set.copy.most);
+            try cx.?.extend(&.{tok});
+        }
         var vote: Vote = .{};
         // vb.amax[:, 2].zero_(): a previous run's vote (the head never writes the column)
         for (0..r.vb.head_rows) |i| try o.fill32(r.vb.amax + (i * 4 + 2) * 4, 0, 1);
@@ -769,25 +1058,49 @@ pub const Runner = struct {
             try o.copy(mb.hin, r.carry.ptr, D * 2);
             try r.setId(mb.ids, tok);
         }
+        const depth_max: usize = if (drafter) |dr| r.depthMax(dr) else 0;
         const lay = r.pinLayout();
         var picks: [fw.decode_rows]u32 = undefined;
         var drafts: [fw.decode_rows]u32 = undefined;
+        var window: [fw.decode_rows]u32 = undefined;
         var done = out.items.len >= max_tokens or isEos(g.eos, tok);
         st.eos = isEos(g.eos, tok);
         const multi = r.w.world > 1 and (r.f.comm != null or r.f.fast != null);
         const t1 = r.now();
         while (!done) {
             st.rounds += 1;
-            const room = @min(k, @min(max_tokens - out.items.len - 1, r.capacity - P - 1));
-            try r.setId(r.vb.ids, tok);
-            if (room > 0) {
-                const Tm = bucketOf(P + room, r.topk);
-                const ru: u32 = if (Tm != null and P - 1 >= r.topk) r.reuse else 0;
-                try r.mtp(m, 1, P - m, Tm, 0);
-                var j: usize = 2;
-                while (j <= room) : (j += 1) try r.mtp(1, j, P + j - 2, Tm, ru);
+            const left = max_tokens - out.items.len - 1;
+            var nd: usize = 0; // drafts this round
+            var on_device = false; // the MTP steps wrote them into vb.ids
+            var was_copied = false;
+            if (cx) |*c| {
+                nd = r.copied(c, left, P, &drafts).len;
+                was_copied = nd > 0;
             }
-            const R = room + 1;
+            if (!was_copied) {
+                if (drafter) |dr| {
+                    const room = @min(depth_max, @min(left, r.capacity - P - 1));
+                    if (room > 0) nd = (try r.propose(dr, which, tok, room, s, &drafts)).len;
+                } else {
+                    const room = @min(k, @min(left, r.capacity - P - 1));
+                    try r.setId(r.vb.ids, tok);
+                    if (room > 0) {
+                        const Tm = bucketOf(P + room, r.topk);
+                        const ru: u32 = if (Tm != null and P - 1 >= r.topk) r.reuse else 0;
+                        try r.mtp(m, 1, P - m, Tm, 0);
+                        var j: usize = 2;
+                        while (j <= room) : (j += 1) try r.mtp(1, j, P + j - 2, Tm, ru);
+                    }
+                    nd = room;
+                    on_device = true;
+                }
+            }
+            const R = nd + 1;
+            if (!on_device) { // vb.ids[:R] = [tok] + drafts
+                window[0] = tok;
+                @memcpy(window[1..R], drafts[0..nd]);
+                try r.uploadVerify(window[0..R]);
+            }
             const pick: Pick = if (s == null) .argmax else .local;
             // Runner._vote_arm: rank 0's wish into the argmax head's spare column (once: the head never writes it)
             if (pick == .argmax and multi and r.w.rank == 0 and vote.mine and !vote.armed) {
@@ -795,9 +1108,10 @@ pub const Runner = struct {
                 vote.armed = true;
             }
             try r.verify(R, P, bucketOf(P + R, r.topk), pick);
-            // the window's drafts (vb.ids[1:R]) and, greedy, its picks and the vote word, in one read
+            // the window's drafts (vb.ids[1:R], when the MTP steps made them) and, greedy, its picks and the vote word,
+            // in one read
             const rd = r.pinSlice(i64, lay.rd, 2 * fw.decode_rows);
-            if (R > 1) try o.download(std.mem.sliceAsBytes(rd[0 .. R - 1]), r.vb.ids + 8);
+            if (on_device and R > 1) try o.download(std.mem.sliceAsBytes(rd[0 .. R - 1]), r.vb.ids + 8);
             var voted: ?bool = null;
             if (s) |smpl| {
                 voted = try r.sampleRows(&r.vb, R, P + 1, smpl, picks[0..R], vote.mine);
@@ -809,13 +1123,22 @@ pub const Runner = struct {
                 for (0..R) |i| picks[i] = @intCast(rd[fw.decode_rows + i]);
                 if (multi) voted = word[0] > 0;
             }
-            for (0..R - 1) |i| drafts[i] = @intCast(rd[i]);
+            if (on_device) { // both branches synchronized after the drafts' copy was queued
+                for (0..R - 1) |i| drafts[i] = @intCast(rd[i]);
+            }
             try r.healthy(); // every rank: no RoCE timeout behind these picks
             var n: usize = 0;
             while (n < R - 1 and drafts[n] == picks[n]) n += 1;
             const emit = picks[0 .. n + 1];
             st.drafted += R - 1;
             st.accepted += n;
+            if (was_copied) {
+                st.copy_rounds += 1;
+                st.copy_drafted += R - 1;
+                st.copy_accepted += n;
+            }
+            // the drafters' contexts: every round's kept rows (Runner._add_taps; drafter modes only, as Python's)
+            if (drafter != null) try r.feedDrafters(&r.vb, 0, n + 1, true);
             const was = out.items.len;
             for (emit) |e| {
                 try out.append(r.gpa, e);
@@ -832,11 +1155,18 @@ pub const Runner = struct {
             if (g.hooks) |h| {
                 if (h.tokens(h.ctx, out.items[was..])) vote.mine = true;
             }
+            if (cx) |*c| try c.extend(out.items[was..]);
             if (vote.settle(voted)) done = true; // rank 0 asked to stop: every rank ends after this round
             if (k > 0) {
-                // next round's MTP rows: (target hidden P + i, token P + i + 1)
+                // next round's MTP rows: (target hidden P + i, token P + i + 1); a copied round's backlog grows (its
+                // MTP step did not run), written first when it would outgrow the MTP window
                 const mb = &r.mb.?;
-                m = 0;
+                if (!was_copied) {
+                    m = 0;
+                } else if (m + n + 1 > mb.rows) {
+                    try r.mtpFlush(m, P);
+                    m = 0;
+                }
                 if (r.set.hid_normed) {
                     try r.f.targetHidden(&r.vb, 0, n + 1, mb.hin + m * D * 2);
                 } else {

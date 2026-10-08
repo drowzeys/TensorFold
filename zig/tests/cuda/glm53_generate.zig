@@ -27,6 +27,12 @@
 //! plan's keep points as the server cuts a cold prompt (every run starts cold: the kept states are forgotten first),
 //! --dcp 0|1|4 (0: on past 200,000 tokens of context). Each prompt may name its own "temperature", "top_p", "min_p"
 //! and "eos" (ids) over the file's. The served == CLI check: the server's requests (TF_GLM53_DUMP) run here.
+//! --mode 4 (Phase 4): 3b's served engine with the speculative drafters: --dspark DIR (cuda_draft.zig, DSpark: its
+//! settings --dspark-policy cost|confidence|fixed --dspark-confidence X --dspark-depth N --dspark-topk N) and / or
+//! --dflash DIR (DFlash2: --dflash-depth 7 --dflash-confidence 0.3), copy drafts (--copy 0|1, default on when a run
+//! asks for them; --copy-min 8 --copy-max 15). A run label names its drafts: "g:K" / "s<top_k>:K" the MTP head with K
+//! steps (0: serial), "g:dspark" / "s20:dflash" a drafter (--mtp-drafts 0 loads no MTP layer), a "+c" suffix copy
+//! drafts ahead of them ("s20:dspark+c"). The output adds each run's draft mode and copy counts.
 //! --mode roce-bench: the RoCE runtime alone (no model): bit check against NCCL, then microseconds a reduction of
 //! [rows, --dims] fp32 for --bench-rows; prints `ROCE-BENCH PASS|FAIL ...` (decode windows <= 65 us).
 //!
@@ -44,7 +50,7 @@
 //!                          [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
 //!        tf-glm53-generate --sampler-check FILE
 //!        tf-glm53-generate --mode list-variants --model DIR --world 4 --context N --tiles F0,F1,.. [--aot DIR]
-//!                          [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE]
+//!                          [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE] [--dspark DIR] [--dflash DIR]
 //! --mode list-variants (no GPU): every Triton launch shape the engine can make for that configuration (cuda_coverage
 //! .zig: Tri in probe mode over every window size, index range and DCP rank) as JSON for tools/glm53/sweep_aot.py;
 //! with --aot, each marked "have" and `VARIANTS PASS|FAIL n needs, m missing` printed (exit 3 when any is missing).
@@ -67,6 +73,10 @@ const usage =
     \\                         [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
     \\                         [--mtp-dense 1]
     \\                         3b: 3a's flags and [--stop-eos 1] [--reuse 0|1] [--dcp 0|1|4]
+    \\                         4: 3b's flags and [--dspark DIR] [--dspark-policy P] [--dspark-confidence X]
+    \\                         [--dspark-depth N] [--dspark-topk N] [--dflash DIR] [--dflash-depth 7]
+    \\                         [--dflash-confidence 0.3] [--copy 0|1] [--copy-min 8] [--copy-max 15]
+    \\                         [--verify-rows 8] [--mtp-drafts K (= --k)]; runs "s20:dspark+c", "g:dflash", ...
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
@@ -132,6 +142,19 @@ const Args = struct {
     bench_rows: []const u8 = "1,2,3,4,8,16,32",
     bench_iters: usize = 200,
     dims: usize = 6144,
+    // Phase 4 (--mode 4; list-variants: the drafters' launches too)
+    dspark: []const u8 = "",
+    dflash: []const u8 = "",
+    dspark_policy: ?[]const u8 = null,
+    dspark_confidence: ?[]const u8 = null,
+    dspark_depth: ?[]const u8 = null,
+    dspark_topk: ?[]const u8 = null,
+    dflash_depth: usize = 7,
+    dflash_confidence: f64 = 0.3,
+    copy: ?bool = null,
+    copy_min: usize = 8,
+    copy_max: usize = 15,
+    verify_rows: usize = 8,
 };
 
 fn flag(v: []const u8) !bool {
@@ -201,7 +224,7 @@ pub fn main(init: std.process.Init) !u8 {
             a.timeout_s = try std.fmt.parseFloat(f64, v);
         } else if (std.mem.eql(u8, k, "--mode")) {
             a.mode = v;
-        } else if (std.mem.eql(u8, k, "--k")) {
+        } else if (std.mem.eql(u8, k, "--k") or std.mem.eql(u8, k, "--mtp-drafts")) {
             a.k = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--prewarm")) {
             a.prewarm = try flag(v);
@@ -273,6 +296,30 @@ pub fn main(init: std.process.Init) !u8 {
             a.bench_iters = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--dims")) {
             a.dims = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--dspark")) {
+            a.dspark = v;
+        } else if (std.mem.eql(u8, k, "--dflash")) {
+            a.dflash = v;
+        } else if (std.mem.eql(u8, k, "--dspark-policy")) {
+            a.dspark_policy = v;
+        } else if (std.mem.eql(u8, k, "--dspark-confidence")) {
+            a.dspark_confidence = v;
+        } else if (std.mem.eql(u8, k, "--dspark-depth")) {
+            a.dspark_depth = v;
+        } else if (std.mem.eql(u8, k, "--dspark-topk")) {
+            a.dspark_topk = v;
+        } else if (std.mem.eql(u8, k, "--dflash-depth")) {
+            a.dflash_depth = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--dflash-confidence")) {
+            a.dflash_confidence = try std.fmt.parseFloat(f64, v);
+        } else if (std.mem.eql(u8, k, "--copy")) {
+            a.copy = try flag(v);
+        } else if (std.mem.eql(u8, k, "--copy-min")) {
+            a.copy_min = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--copy-max")) {
+            a.copy_max = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--verify-rows")) {
+            a.verify_rows = try std.fmt.parseInt(usize, v, 10);
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -302,7 +349,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
-    if (std.mem.eql(u8, a.mode, "3b")) {
+    if (std.mem.eql(u8, a.mode, "3b") or std.mem.eql(u8, a.mode, "4")) {
         const ok3b = run3b(init.gpa, init.io, a) catch |e| {
             std.debug.print("RESULT glm53-generate FAIL rank {d}: error {t}\n", .{ a.rank, e });
             return 1;
@@ -564,7 +611,7 @@ fn writeOut(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights.W
 // ------------------------------------------------------------------------------------------------- Phase 2b ---
 
 /// A run of a prompt: greedy or sampled (top_k; 0 = top_p alone), with `k` drafts a round (0: serial).
-const RunSpec = struct { greedy: bool, top_k: usize, k: usize, label: []const u8 };
+const RunSpec = struct { greedy: bool, top_k: usize, k: usize, label: []const u8, mode: glm.runner.Mode = .mtp, copies: bool = false };
 
 const Prompt2b = struct {
     name: []const u8,
@@ -586,13 +633,27 @@ fn tf(b: bool) []const u8 {
 
 const Sampling2b = struct { temperature: f64 = 1.0, top_p: f64 = 0.95, min_p: f64 = 0.0 };
 
+/// "g:K" / "s<top_k>:K" (K MTP drafts, 0 serial); Phase 4: "g:dspark" / "s20:dflash" (a drafter's rounds) and a
+/// "+c" suffix (copy drafts ahead of the round's drafter).
 fn parseRun(gpa: std.mem.Allocator, text: []const u8) !RunSpec {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.BadRun;
-    const mode = text[0..colon];
-    const k = try std.fmt.parseInt(usize, text[colon + 1 ..], 10);
+    const pick = text[0..colon];
+    var rest = text[colon + 1 ..];
+    const with_copies = std.mem.endsWith(rest, "+c");
+    if (with_copies) rest = rest[0 .. rest.len - 2];
+    var dmode: glm.runner.Mode = .mtp;
+    var k: usize = 0;
+    if (std.mem.eql(u8, rest, "dspark")) {
+        dmode = .dspark;
+    } else if (std.mem.eql(u8, rest, "dflash")) {
+        dmode = .dflash;
+    } else {
+        k = try std.fmt.parseInt(usize, rest, 10);
+    }
+    if (with_copies and dmode == .mtp and k == 0) return error.BadRun; // the serial reference never copies
     const label = try gpa.dupe(u8, text);
-    if (std.mem.eql(u8, mode, "g")) return .{ .greedy = true, .top_k = 0, .k = k, .label = label };
-    if (mode.len >= 2 and mode[0] == 's') return .{ .greedy = false, .top_k = try std.fmt.parseInt(usize, mode[1..], 10), .k = k, .label = label };
+    if (std.mem.eql(u8, pick, "g")) return .{ .greedy = true, .top_k = 0, .k = k, .label = label, .mode = dmode, .copies = with_copies };
+    if (pick.len >= 2 and pick[0] == 's') return .{ .greedy = false, .top_k = try std.fmt.parseInt(usize, pick[1..], 10), .k = k, .label = label, .mode = dmode, .copies = with_copies };
     return error.BadRun;
 }
 
@@ -782,6 +843,7 @@ fn run2b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         for (p.runs, 0..) |rs, ri| {
             const s: ?glm.sampling.Sampling = if (rs.greedy) null else .{ .seed = p.seed, .temperature = sset.temperature, .top_k = rs.top_k, .top_p = sset.top_p, .min_p = sset.min_p };
             if (rs.k > a.k) return error.TooManyDrafts;
+            if (rs.mode != .mtp or rs.copies) return error.DraftersNeedMode4;
             const st = try r.generate(p.ids, p.tokens, s, rs.k, &toks);
             all_tokens.update(std.mem.sliceAsBytes(toks.items));
             const n = toks.items.len;
@@ -888,7 +950,32 @@ fn listVariants(gpa: std.mem.Allocator, io: std.Io, a: Args) !u8 {
             break :blk dbuf[0..1];
         },
     };
-    const sp: cov.Space = .{ .cfg = cfg, .world = a.world, .heads = cfg.heads / a.world, .vocab_part = cfg.vocab / a.world, .kva_n = kva_n, .max_rows = @max(@max(a.prompt_rows, a.window), a.k + 1), .capacity = a.context, .dcps = dcps, .widths = widths.items, .gemms = gemms.items, .mtp = cfg.mtp_layers > 0, .draft = a.draft_vocab > 0 };
+    // Phase 4: the drafters' tap passes and block passes (their configs; a DFlash2's selector rank is a CUDA launch)
+    var dspecs: [2]glm.draft.Spec = undefined;
+    var n_dspecs: usize = 0;
+    if (a.dspark.len > 0) {
+        const path = try std.fs.path.join(gpa, &.{ a.dspark, "config.json" });
+        defer gpa.free(path);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+        defer gpa.free(text);
+        const dc = try glm.draft_host.DSparkConfig.parse(gpa, text);
+        try dc.check(a.world, cfg.hidden, cfg.vocab, cfg.layers);
+        const ds = try glm.draft_host.DSparkSettings.parse(dc.block, .{ .top_k = a.dspark_topk });
+        dspecs[n_dspecs] = glm.draft.Spec.ofDSpark(&dc, &ds, a.world, cfg.vocab / a.world, 0);
+        n_dspecs += 1;
+    }
+    if (a.dflash.len > 0) {
+        const path = try std.fs.path.join(gpa, &.{ a.dflash, "config.json" });
+        defer gpa.free(path);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+        defer gpa.free(text);
+        const fc = try glm.draft_host.DFlashConfig.parse(gpa, text);
+        try fc.check(a.world, cfg.hidden, cfg.layers);
+        dspecs[n_dspecs] = glm.draft.Spec.ofDFlash(&fc, a.world, cfg.vocab / a.world, 0, 0);
+        n_dspecs += 1;
+    }
+    // verify windows up to the copy width and a DSpark block + 1 rows (all within the window rows enumerated)
+    const sp: cov.Space = .{ .cfg = cfg, .world = a.world, .heads = cfg.heads / a.world, .vocab_part = cfg.vocab / a.world, .kva_n = kva_n, .max_rows = @max(@max(a.prompt_rows, a.window), @max(a.k + 1, 32)), .capacity = a.context, .dcps = dcps, .widths = widths.items, .gemms = gemms.items, .mtp = cfg.mtp_layers > 0, .draft = a.draft_vocab > 0, .drafters = dspecs[0..n_dspecs] };
     var p = cuda.aot.Probe.init(gpa);
     defer p.deinit();
     try cov.enumerate(&p, sp);
@@ -1260,6 +1347,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         for (p.runs, 0..) |rs, ri| {
             const s: ?glm.sampling.Sampling = if (rs.greedy) null else .{ .seed = p.seed, .temperature = sset.temperature, .top_k = rs.top_k, .top_p = sset.top_p, .min_p = sset.min_p };
             if (rs.k > a.k) return error.TooManyDrafts;
+            if (rs.mode != .mtp or rs.copies) return error.DraftersNeedMode4;
             prof.on = a.prompt_prof.len > 0 and !profiled and std.mem.startsWith(u8, p.name, a.prompt_prof);
             if (prof.on) profiled = true;
             const st = try r.generate(p.ids, p.tokens, s, rs.k, &toks);
@@ -1300,7 +1388,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
 fn writeOut3a(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights.Weights, n_layers: usize, capacity: usize, nccl_version: c_int, inv_status: []const u8, load_s: f64, read_gib: f64, prewarm_graphs: usize, prewarm_s: f64, prompts: []const Prompt2b, done: []const Done, ex: Extra3a) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"{s}\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"runs\": [", .{ a.mode, a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s });
+    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"{s}\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"dspark\": \"{s}\", \"dflash\": \"{s}\", \"copy_max\": {d}, \"runs\": [", .{ a.mode, a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s, std.fs.path.basename(a.dspark), std.fs.path.basename(a.dflash), a.copy_max });
     defer gpa.free(head);
     try out.appendSlice(gpa, head);
     for (done, 0..) |dd, i| {
@@ -1308,7 +1396,7 @@ fn writeOut3a(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights
         const rs = p.runs[dd.run];
         const n = dd.tokens.len;
         const acc: f64 = if (dd.st.drafted > 0) @as(f64, @floatFromInt(dd.st.accepted)) / @as(f64, @floatFromInt(dd.st.drafted)) else 0;
-        const ph = try std.fmt.allocPrint(gpa, "{s}\n {{\"name\": \"{s}\", \"run\": \"{s}\", \"prompt_len\": {d}, \"seed\": \"{d}\", \"seed_ok\": {s}, \"k\": {d}, \"greedy\": {s}, \"top_k\": {d}, \"prefill_s\": {d:.3}, \"decode_s\": {d:.3}, \"tok_s\": {d:.3}, \"rounds\": {d}, \"tokens_per_round\": {d:.4}, \"accept\": {d:.4}, \"capture_s\": {d:.2}, \"graphs\": {d}, \"tokens\": [", .{ if (i > 0) "," else "", p.name, rs.label, p.ids.len, p.seed, tf(dd.seed_ok), rs.k, tf(rs.greedy), rs.top_k, dd.st.prefill_s, dd.st.decode_s, dd.st.tokS(n), dd.st.rounds, dd.st.perRound(n), acc, dd.st.capture_s, dd.st.graphs });
+        const ph = try std.fmt.allocPrint(gpa, "{s}\n {{\"name\": \"{s}\", \"run\": \"{s}\", \"prompt_len\": {d}, \"seed\": \"{d}\", \"seed_ok\": {s}, \"k\": {d}, \"greedy\": {s}, \"top_k\": {d}, \"prefill_s\": {d:.3}, \"decode_s\": {d:.3}, \"tok_s\": {d:.3}, \"rounds\": {d}, \"tokens_per_round\": {d:.4}, \"accept\": {d:.4}, \"capture_s\": {d:.2}, \"graphs\": {d}, \"draft_mode\": \"{t}\", \"copies\": {s}, \"copy_rounds\": {d}, \"copy_drafted\": {d}, \"copy_accepted\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"tokens\": [", .{ if (i > 0) "," else "", p.name, rs.label, p.ids.len, p.seed, tf(dd.seed_ok), rs.k, tf(rs.greedy), rs.top_k, dd.st.prefill_s, dd.st.decode_s, dd.st.tokS(n), dd.st.rounds, dd.st.perRound(n), acc, dd.st.capture_s, dd.st.graphs, rs.mode, tf(rs.copies), dd.st.copy_rounds, dd.st.copy_drafted, dd.st.copy_accepted, dd.st.drafted, dd.st.accepted });
         defer gpa.free(ph);
         try out.appendSlice(gpa, ph);
         for (dd.tokens, 0..) |t, j| {
@@ -1401,6 +1489,19 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s };
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
+    // Phase 4: the drafters, their settings, copy drafts (on when --copy 1 or a run asks for them)
+    var any_copies = false;
+    for (prompts) |p| for (p.runs) |rs| {
+        any_copies = any_copies or rs.copies;
+        if (rs.mode == .dspark and a.dspark.len == 0) return error.NoDSpark;
+        if (rs.mode == .dflash and a.dflash.len == 0) return error.NoDFlash;
+    };
+    o.dspark = a.dspark;
+    o.dflash = a.dflash;
+    o.dspark_env = .{ .policy = a.dspark_policy, .confidence = a.dspark_confidence, .depth = a.dspark_depth, .top_k = a.dspark_topk };
+    o.dflash_set = .{ .depth = a.dflash_depth, .confidence = a.dflash_confidence };
+    o.copy = if (a.copy orelse any_copies) .{ .on = true, .match = a.copy_min, .most = a.copy_max } else .{ .on = false, .match = 0, .most = 0 };
+    o.verify_rows = a.verify_rows;
     std.debug.print("rank {d} of {d}: phase 3b, {d} prompts, context {d}, MTP drafts {d}, stop at EOS {s}, prompt-reuse cuts {s}, DCP {d} (0: auto)\n", .{ a.rank, a.world, prompts.len, a.context, a.k, tf(a.stop_eos), tf(a.reuse), a.dcp });
     const boot = try glm.engine.Boot.init(gpa, io, o);
     defer boot.deinit();
@@ -1428,11 +1529,11 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
             // the server's cold prompt: nothing kept, cut at its keep points (drafted runs keep their states as a
             // served request does, then the next run forgets them)
             if (sess.reuse) |pr| try pr.flush();
-            const draft = rs.k > 0;
+            const draft = rs.k > 0 or rs.mode != .mtp;
             const c = try sess.choose(p.ids, draft);
             defer if (sess.reuse != null) c.deinit(gpa);
             const eos: []const u32 = if (!a.stop_eos) &.{} else p.eos orelse sess.eos;
-            const res = try sess.exec(.{ .prompt = p.ids, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps }, &toks);
+            const res = try sess.exec(.{ .prompt = p.ids, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .mode = rs.mode, .copies = rs.copies }, &toks);
             gpa.free(res.kept);
             const st = res.stats;
             all_tokens.update(std.mem.sliceAsBytes(toks.items));
@@ -1443,9 +1544,7 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         }
     }
     const ex: Extra3a = .{ .roce = boot.fast != null, .roce_ops = if (boot.fast) |f| f.stats()[0] else 0, .tiles_changed = 0, .unpack_hits = if (boot.cache) |c| c.hits else 0, .unpack_misses = if (boot.cache) |c| c.misses else 0, .bmm_probe = if (a.bmm_probe != null) "equal" else "not run", .cublas_version = try boot.blas.version(), .experts = a.experts, .pe_det = a.pe_det, .mtp_dense = boot.mtp_dense != null, .mtp_dense_gb = if (boot.mtp_dense) |x| @as(f64, @floatFromInt(x.bytes)) / 1e9 else 0, .mtp_chunks = if (boot.mtp_dense) |x| x.chunks else 0, .mtp_gemms = if (boot.mtp_dense) |x| x.gemms else 0 };
-    var a3 = a;
-    a3.mode = "3b";
-    try writeOut3a(gpa, io, a3, &boot.w, boot.cfg.layers, a.context + a.k + 1, boot.nccl_version, "device", boot.load_s, @as(f64, @floatFromInt(boot.w.read_bytes)) / (1 << 30), boot.prewarm_graphs, boot.prewarm_s, prompts, done.items, ex);
+    try writeOut3a(gpa, io, a, &boot.w, boot.cfg.layers, a.context + a.k + 1, boot.nccl_version, "device", boot.load_s, @as(f64, @floatFromInt(boot.w.read_bytes)) / (1 << 30), boot.prewarm_graphs, boot.prewarm_s, prompts, done.items, ex);
     std.debug.print("rank {d}: phase 3b DCP {d}, resumed begins {any}\n", .{ a.rank, boot.dcp, begins.items });
     const agree = boot.rdv.sync("done", all_tokens.final(), a.timeout_s);
     if (agree) {

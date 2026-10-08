@@ -88,6 +88,25 @@ pub const BufOpts = struct {
     /// every rank's heads, the query / partial exchange buffers, the selection's candidates; the score scratch holds a
     /// rank's ceil(score_cols / dcp) slots
     dcp: usize = 1,
+    /// Phase 4: fused.Buffers.taps - the drafters' tap layers' output rows, [rows, taps * D] bf16 (0: no drafter)
+    taps: usize = 0,
+};
+
+/// Phase 4: fused.Weights.tap_slot - which target layers' output rows the loaded drafters read and where in
+/// Buffers.taps (draft_host.TapPlan's slots); n 0: no drafter.
+pub const Taps = struct {
+    slot: [256]i16 = [_]i16{-1} ** 256,
+    n: usize = 0,
+
+    pub fn of(plan: anytype) !Taps {
+        var t: Taps = .{};
+        for (plan.layers[0..plan.n], 0..) |l, i| {
+            if (l >= t.slot.len) return error.Invalid;
+            t.slot[l] = @intCast(i);
+        }
+        t.n = plan.n;
+        return t;
+    }
 };
 
 /// What a window's head computes (fused.head's modes; `none`: no head).
@@ -185,6 +204,9 @@ pub const Buffers = struct {
     cand: u64 = 0, // int64 [G, min(rows, 128), index_topk]: every rank's candidate keys
     dmine: u64 = 0, // int64 [min(rows, 128), index_topk]: this rank's candidates (int64 min + 1 padded)
     dsel: u64 = 0, // int64 [min(rows, 128), index_topk]: topk.top_keys' output (radix branch)
+    // Phase 4: the drafters' taps (fused.Buffers.taps)
+    taps: u64 = 0, // bf16 [rows, tap_n * D]
+    tap_n: usize = 0,
 
     fn alloc(b: *Buffers, bytes: usize) !u64 {
         var m = try cuda.DeviceBuffer.alloc(b.d, @max(bytes, 16));
@@ -307,6 +329,10 @@ pub const Buffers = struct {
         }
         b.ids = try b.alloc(rows * 8);
         b.hidden = try b.alloc(rows * D * 2);
+        if (opts.taps > 0) {
+            b.taps = try b.alloc(rows * opts.taps * D * 2);
+            b.tap_n = opts.taps;
+        }
         if (opts.mtp) {
             b.hin = try b.alloc(rows * D * 2);
             b.ht = try b.alloc(rows * D * 2);
@@ -551,6 +577,9 @@ pub const Forward = struct {
     /// Phase 3b: decode context parallelism (w.dcp: 1, or the world - every rank of the TP world is one of the DCP
     /// group, its rank w.rank). The State must be State.initDcp(.., dcp) and every Buffers BufOpts.dcp = dcp.
     dcp: usize = 1,
+    /// Phase 4: the target layers whose output rows the drafters read (fused.Weights.tap_slot): every target window
+    /// copies them into its buffers' taps (Buffers with BufOpts.taps = taps.n); n 0: none
+    taps: Taps = .{},
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -829,11 +858,25 @@ pub const Forward = struct {
         const D = c.hidden;
         const o = f.ops();
         try o.embedRows(f.w.embed, b.ids, D, b.x, R, false);
-        for (0..f.w.layers.len) |li| try f.layer(b, st, li, R, T);
+        for (0..f.w.layers.len) |li| {
+            try f.layer(b, st, li, R, T);
+            try f.tapRows(b, li, b.x, R);
+        }
         try o.copy(b.hidden, b.x, R * D * 2);
         if (hm == .none) return;
         if (last) return f.headDevice(b, b.x + (R - 1) * D * 2, f.w.final_norm, 1, hm);
         return f.headDevice(b, b.x, f.w.final_norm, R, hm);
+    }
+
+    /// Phase 4 (fused._compute's tap): layer li's output rows x [R, D] into b.taps' column block of its slot, when a
+    /// drafter reads that layer (and `b` holds taps).
+    pub fn tapRows(f: *const Forward, b: *const Buffers, li: usize, x: u64, R: usize) !void {
+        if (f.taps.n == 0 or b.taps == 0 or li >= f.taps.slot.len) return;
+        const slot = f.taps.slot[li];
+        if (slot < 0) return;
+        const D = f.w.config.hidden;
+        const sl: usize = @intCast(slot);
+        try f.ops().copyRows(b.taps + sl * D * 2, b.tap_n * D * 2, x, D * 2, D * 2, R);
     }
 
     /// fused.head on n rows from `x` (bf16, row stride D) normed with `norm`: "local" leaves this rank's logits in

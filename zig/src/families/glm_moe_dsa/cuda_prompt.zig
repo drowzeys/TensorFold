@@ -392,6 +392,27 @@ pub const Sp = struct {
         for (&hs) |*h| try f.s.wait(sp.done[h.i]);
         try o.copy(b0.hidden, b0.x, hR * D * 2);
         try o.copy(b0.hidden + hR * D * 2, b1.x, (R - hR) * D * 2);
+        if (b0.taps != 0 and b1.taps != 0) { // b0.taps[hR:R].copy_(b1.taps[:R - hR])
+            const row = b0.tap_n * D * 2;
+            if (b1.tap_n != b0.tap_n) return error.Invalid;
+            try o.copy(b0.taps + hR * row, b1.taps, (R - hR) * row);
+        }
+    }
+
+    /// compute_prompt_sp's tap(h, i): when a drafter reads layer li, every row of the half (gathered from the ranks'
+    /// own rows, fused._gather_x) into its column block of h.b.taps (comm stream).
+    fn tap(sp: *Sp, h: *const Half, li: usize) !void {
+        const f = sp.main;
+        if (f.taps.n == 0 or h.b.taps == 0 or li >= f.taps.slot.len) return;
+        const slot = f.taps.slot[li];
+        if (slot < 0) return;
+        const D = f.w.config.hidden;
+        const b = h.b;
+        const p0 = try sp.side.pbegin();
+        try sp.comm.allGather(b.xo, b.gath, h.n * D, .bf16, sp.side.s.handle);
+        const sl: usize = @intCast(slot);
+        try sp.ops().copyRows(b.taps + sl * D * 2, b.tap_n * D * 2, b.gath, D * 2, D * 2, h.R);
+        try sp.side.pend(p0, .ag);
     }
 
     /// fused._side: `step` on the comm stream after the main stream's work so far; done[h] marks its end.
@@ -407,6 +428,7 @@ pub const Sp = struct {
             },
             .after_ffn => {
                 try sp.rsResidual(h);
+                try sp.tap(h, li);
                 if (li + 1 < w.layers.len) {
                     try sp.frontAttn(h, st, li + 1, T);
                 } else {

@@ -222,6 +222,57 @@ pub const Tri = struct {
         try t.run("_group_sums", .{ rows, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) }, .{ .num_warps = 2 });
     }
 
+    // ---- Phase 4: the drafters (glm5_next glue / dflash2, cuda/dspark.py, cuda/dflash.py) ----------------------
+
+    /// glue.rmsnorm with group sums (the drafters' _norm): out = bf16(w * bf16(x * rinv)) and XS[r, g] = fp32 sums of
+    /// out's 64-groups (the next 4-bit matmul's input sums).
+    pub fn rmsnormSums(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, o_stride: usize, xs: u64, rows: usize, d: usize, eps: f32) !void {
+        const block = pow2(d);
+        try t.run("_rmsnorm", .{ rows, 1, 1 }, &.{ p("X", "*bf16", x), int("x_stride", x_stride), p("W", "*bf16", w), p("OUT", "*bf16", out), int("o_stride", o_stride), p("XS", "*fp32", xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", block), cb("SUMS", true) }, .{ .num_warps = if (block <= 2048) 4 else 8 });
+    }
+
+    /// glue.embed over a BF16 table (_embed_b16): rows of the verifier's embedding for int32 ids, one copy.
+    pub fn embedB16(t: Tri, ids: u64, table: u64, out: u64, rows: usize, d: usize) !void {
+        try t.run("_embed_b16", .{ rows, d / 64, 1 }, &.{ p("IDS", "*i32", ids), p("W", "*bf16", table), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("COPIES", 1) }, .{ .num_warps = 1 });
+    }
+
+    /// glue.swiglu: [gate | up] (bf16) -> bf16(bf16(silu(min(g, L))) * clip(u, -L, L)) and its 64-group sums.
+    pub fn swigluSums(t: Tri, gu: u64, out: u64, xs: u64, limit: f32, rows: usize, width: usize) !void {
+        const blk = std.math.gcd(@as(usize, 512), width);
+        if (blk < 64) return error.Invalid;
+        try t.run("_swiglu", .{ rows, width / blk, 1 }, &.{ p("GU", "*bf16", gu), p("OUT", "*bf16", out), p("XS", "*fp32", xs), aot.float("LIMIT", limit) }, &.{ ci("W", width), ci("BLOCK", blk) }, .{ .num_warps = 4 });
+    }
+
+    /// dflash2._prep_kernel: q / k normed (q_norm / k_norm) and rotated, v copied, out of [q heads | k heads | v heads]
+    /// rows (row stride `stride`) into [heads, rows, head_dim]; heads 0 (context rows): QO is the input itself.
+    pub fn prep(t: Tri, qkv: u64, qn: u64, kn: u64, cos: u64, sin: u64, qo: u64, ko: u64, vo: u64, rows: usize, stride: usize, eps: f32, heads: usize, kvh: usize, half: usize) !void {
+        try t.run("_prep_kernel", .{ rows, heads + 2 * kvh, 1 }, &.{ p("QKV", "*bf16", qkv), p("QN", "*bf16", qn), p("KN", "*bf16", kn), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("QO", "*bf16", qo), p("KO", "*bf16", ko), p("VO", "*bf16", vo), int("L", rows), int("stride", stride), aot.float("eps", eps) }, &.{ ci("H", heads), ci("HKV", kvh), ci("HALF", half) }, .{ .num_warps = 1 });
+    }
+
+    /// dflash2._dconv_kernel: the two-tap grouped dynamic convolution over a block (row r mixes rows r and r - 1),
+    /// plus the residual when `has_res`.
+    pub fn dconv(t: Tri, x: u64, dyn: u64, base: u64, res: u64, out: u64, rows: usize, d: usize, gs: usize, branch: usize, has_res: bool) !void {
+        try t.run("_dconv_kernel", .{ rows, cdiv(d, 1024), 1 }, &.{ p("X", "*bf16", x), p("DYN", "*bf16", dyn), p("BASE", "*bf16", base), p("RES", "*bf16", res), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("G", d / gs), ci("GS", gs), ci("BRANCH", branch), cb("HAS_RES", has_res), ci("BLOCK", 1024) }, .{ .num_warps = 4 });
+    }
+
+    /// dspark._block_attn_kernel: one program a head - the block's N queries over the context rows [s - W, s) and the
+    /// block's keys (causal: up to their own slot), keys at ring slot position % RING_.
+    pub fn blockAttn(t: Tri, q: u64, k: u64, v: u64, out: u64, pos: u64, w: usize, scale: f32, n: usize, heads: usize, hd: usize, ring_rows: usize, causal: bool) !void {
+        try t.run("_block_attn_kernel", .{ heads, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", k), p("V", "*bf16", v), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("W", w), aot.float("scale", scale) }, &.{ ci("N", n), ci("MP", @max(16, pow2(n))), ci("NH", heads), ci("HD", hd), ci("RING_", ring_rows), ci("BK", 64), cb("CAUSAL", causal) }, .{ .num_warps = 4 });
+    }
+
+    /// dflash._dattn_ring: one program a KV head - its G query heads' N rows over the sliding window of committed
+    /// context and the block, keys at ring slot position % RING_.
+    pub fn dattnRing(t: Tri, q: u64, k: u64, v: u64, out: u64, pos: u64, window: usize, scale: f32, n: usize, g: usize, heads: usize, hd: usize, ring_rows: usize, kvh: usize, causal: bool) !void {
+        try t.run("_dattn_ring", .{ kvh, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", k), p("V", "*bf16", v), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("window", window), aot.float("scale", scale) }, &.{ ci("N", n), ci("G", g), ci("NH", heads), ci("HD", hd), ci("RING_", ring_rows), ci("BK", 64), cb("CAUSAL", causal) }, .{ .num_warps = 4 });
+    }
+
+    /// glue.residual_add with the gathered slots `rs` words apart (fused.small_gather's padded row stride).
+    pub fn residualAddStride(t: Tri, x: u64, g: u64, rows: usize, d: usize, world: usize, rs: usize) !void {
+        const block = @min(1024, d);
+        try t.run("_residual_add", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", x), p("G", "*fp32", g), int("RS", rs) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", block) }, .{ .num_warps = 4 });
+    }
+
     /// fused._swiglu2: bf16(bf16(silu(g)) * u) for separate gate and up rows of `width`.
     pub fn swiglu2(t: Tri, g: u64, up: u64, out: u64, rows: usize, width: usize) !void {
         const blk = std.math.gcd(@as(usize, 512), width);

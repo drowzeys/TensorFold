@@ -61,6 +61,16 @@ pub const Kernels = struct {
     mtp_swiglu: cuda.Function,
     mtp_combine: cuda.Function,
     gb10: bool, // sm_121: qmm_group launches with programmatic dependent launch (qmm_group_cuda's `early`)
+    // Phase 4: the drafters' 4-bit matmuls (qmm_group tiles 2 / 3 / 4, [bf16, fp32] out) and glm53_draft.cu
+    q4_tiles: [3][2]cuda.Function,
+    draft_mod: cuda.Module,
+    draft_rotary: cuda.Function,
+    draft_scatter: cuda.Function,
+    draft_pos_add: cuda.Function,
+    draft_rowsum: cuda.Function,
+    draft_dot: cuda.Function,
+    draft_linear: cuda.Function,
+    copy_rows: cuda.Function,
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
@@ -98,6 +108,19 @@ pub const Kernels = struct {
         k.q4_group = try k.qmm_mod.function(q4_group_symbol);
         try k.q4_group.allowDynamicShared(q4_group_smem);
         k.gb10 = (try ctx.capability()) == 121;
+        for (q4_tile_symbols, 0..) |pair, i| for (pair, 0..) |sym, j| {
+            k.q4_tiles[i][j] = try k.qmm_mod.function(sym);
+            try k.q4_tiles[i][j].allowDynamicShared(q4_tile_smem[i]);
+        };
+        k.draft_mod = try cuda.Module.load(d, cuda.kernels.glm53_draft);
+        errdefer k.draft_mod.unload();
+        k.draft_rotary = try k.draft_mod.function("glm53_draft_rotary");
+        k.draft_scatter = try k.draft_mod.function("glm53_draft_scatter");
+        k.draft_pos_add = try k.draft_mod.function("glm53_draft_pos_add");
+        k.draft_rowsum = try k.draft_mod.function("glm53_draft_rowsum");
+        k.draft_dot = try k.draft_mod.function("glm53_draft_dot");
+        k.draft_linear = try k.draft_mod.function("glm53_draft_linear");
+        k.copy_rows = try k.draft_mod.function("glm53_copy_rows");
         // Phase 3a: the prompt path's own kernels and the device copy of prompt_experts.cu
         k.prompt_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt);
         errdefer k.prompt_mod.unload();
@@ -137,6 +160,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.draft_mod.unload();
         k.mtp_mod.unload();
         k.decode_mod.unload();
         k.pe_mod.unload();
@@ -223,6 +247,22 @@ pub const PromptExpertScratch = struct {
 pub const q4_group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 /// LaneTile<64, 16, 64, 1, 4, 8>::SMEM (Nemotron's group_smem: the same tile).
 pub const q4_group_smem: u32 = 35328;
+
+/// Phase 4: qmm_group_cuda's tiles on GB10 (dispatch with tile 0: rows <= 16 -> 2, <= 32 -> 3, <= 64 -> 4), each
+/// [bf16 out, fp32 out]: group_kernel<64, BM, 64, 1, 4, STAGES, F32>.
+pub const q4_tile_symbols = [3][2][:0]const u8{
+    .{ "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii", q4_group_symbol },
+    .{ "_ZN12tf_qmm_group12group_kernelILi64ELi32ELi64ELi1ELi4ELi4ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii", "_ZN12tf_qmm_group12group_kernelILi64ELi32ELi64ELi1ELi4ELi4ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii" },
+    .{ "_ZN12tf_qmm_group12group_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii", "_ZN12tf_qmm_group12group_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii" },
+};
+/// LaneTile<64, BM, 64, 1, 4, STAGES>::SMEM: max(STAGES (BM 128 + 2048 + 256 + 4 BM), MT NT 4 * 128 * 4).
+pub const q4_tile_smem = [3]u32{ 35328, 26112, 43008 };
+/// The row tile (BM) of each.
+pub const q4_tile_rows = [3]usize{ 16, 32, 64 };
+
+/// A 4-bit group-64 matrix [n, k] packed by shared qmm.pack (glm5_next qmm.Q4 / headq's draft copies): int32 words
+/// [npad / 64, k / 64, 8, 32, 2], bf16 scales and biases [k / 64, npad]; `sk` glm5_next qmm.split_k(n, k).
+pub const Q4 = struct { w: u64 = 0, scales: u64 = 0, biases: u64 = 0, n: usize = 0, npad: usize = 0, k: usize = 0, sk: usize = 1 };
 
 /// qmm_group.cu's Part and Parts, passed by value (Nemotron's cuda_kernels.zig has the same layout).
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int };
@@ -513,6 +553,118 @@ pub const Ops = struct {
             .cluster = if (sk > 1) .{ .x = u(sk) } else null,
             .pdl = o.k.gb10,
         }, o.s, &a);
+    }
+
+    /// Phase 4: shared qmm.matmul on sm_12x (glm5_next qmm.matmul -> qmm_group_cuda, group_tile 0 on GB10): x [rows,
+    /// K] bf16 (contiguous) with its 64-input group sums xs -> out [rows, q.n] bf16 or fp32 (`f32`); tile 2 / 3 / 4 by
+    /// rows (up to 64), a cluster of q.sk CTAs a 64-column tile. Tiles never change bits.
+    pub fn q4Mm(o: Ops, x: u64, xs: u64, q: Q4, out: u64, rows: usize, f32_out: bool) !void {
+        if (rows == 0) return;
+        const ti: usize = if (rows <= 16) 0 else if (rows <= 32) 1 else if (rows <= 64) 2 else return error.WindowTooWide;
+        if (q.k % 64 != 0 or q.sk == 0) return error.Invalid;
+        const bm = q4_tile_rows[ti];
+        const tiles = (q.n + 63) / 64;
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 1;
+        parts.p[0] = .{ .w = q.w, .scales = q.scales, .biases = q.biases, .out = out, .n = int(q.n), .npad = int(q.npad), .sk = int(q.sk), .tiles = int(tiles), .first = 0 };
+        const rows_t = (rows + bm - 1) / bm;
+        const clusters = rows_t * tiles; // C == sk: one tile a cluster
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xs);
+        a.add(parts);
+        const ldx = q.k; // contiguous rows (M == 1: K too)
+        for ([_]usize{ rows, q.k, ldx, rows_t, q.sk }) |v| a.add(int(v));
+        try cuda.launch.launch(o.k.q4_tiles[ti][@intFromBool(f32_out)], .{
+            .grid = .{ .x = u(clusters * q.sk) },
+            .block = .{ .x = 128 },
+            .shared = q4_tile_smem[ti],
+            .cluster = if (q.sk > 1) .{ .x = u(q.sk) } else null,
+            .pdl = o.k.gb10,
+        }, o.s, &a);
+    }
+
+    /// glm53_draft_rotary: cos / sin [rows, half] fp32 of positions pos[0] + r (int64 device scalar).
+    pub fn draftRotary(o: Ops, pos: u64, inv: u64, half: usize, cos_out: u64, sin_out: u64, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pos);
+        a.add(inv);
+        a.add(int(half));
+        a.add(cos_out);
+        a.add(sin_out);
+        try cuda.launch.launch(o.k.draft_rotary, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = u((half + 31) / 32 * 32) } }, o.s, &a);
+    }
+
+    /// glm53_draft_scatter: src [heads, n, hd] bf16 into ring [heads, ring_rows, hd] at (pos[0] + r) % ring_rows.
+    pub fn draftScatter(o: Ops, src: u64, ring_buf: u64, pos: u64, heads: usize, n: usize, hd: usize, ring_rows: usize) !void {
+        if (n == 0 or heads == 0) return;
+        if (hd % 8 != 0) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(ring_buf);
+        a.add(pos);
+        a.add(int(n));
+        a.add(int(hd));
+        a.add(int(ring_rows));
+        try cuda.launch.launch(o.k.draft_scatter, .{ .grid = .{ .x = u(n), .y = u(heads) }, .block = .{ .x = u((hd / 8 + 31) / 32 * 32) } }, o.s, &a);
+    }
+
+    /// glm53_draft_pos_add: pos[0] += n (int64).
+    pub fn draftPosAdd(o: Ops, pos: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(pos);
+        a.add(int(n));
+        try cuda.launch.launch(o.k.draft_pos_add, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, o.s, &a);
+    }
+
+    /// glm53_draft_rowsum: out [count] bf16 = the `world` fp32 slots of g (stride words apart) summed rank 0 first.
+    pub fn draftRowsum(o: Ops, g: u64, stride: usize, world: usize, count: usize, out: u64) !void {
+        if (count == 0) return;
+        var a: cuda.Args = .{};
+        a.add(g);
+        a.add(@as(i64, @intCast(stride)));
+        a.add(int(world));
+        a.add(int(count));
+        a.add(out);
+        try cuda.launch.launch(o.k.draft_rowsum, .{ .grid = .{ .x = u((count + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_draft_dot: out [rows] fp32 = h [rows, D] bf16 . w [D] fp32.
+    pub fn draftDot(o: Ops, h: u64, w: u64, D: usize, out: u64, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(w);
+        a.add(int(D));
+        a.add(out);
+        try cuda.launch.launch(o.k.draft_dot, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_draft_linear: out [rows, R] fp32 = bf16(h [rows, D] @ W [R, D]^T).
+    pub fn draftLinear(o: Ops, h: u64, W: u64, D: usize, R: usize, out: u64, rows: usize) !void {
+        if (rows == 0 or R == 0) return;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(W);
+        a.add(int(D));
+        a.add(int(R));
+        a.add(out);
+        try cuda.launch.launch(o.k.draft_linear, .{ .grid = .{ .x = u(rows), .y = u(R) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_copy_rows: `rows` rows of `row_bytes` (a multiple of 16) from src (pitch src_pitch bytes) to dst (pitch
+    /// dst_pitch bytes); every pointer and pitch 16-byte aligned.
+    pub fn copyRows(o: Ops, dst: u64, dst_pitch: usize, src: u64, src_pitch: usize, row_bytes: usize, rows: usize) !void {
+        if (rows == 0 or row_bytes == 0) return;
+        if (row_bytes % 16 != 0 or dst_pitch % 16 != 0 or src_pitch % 16 != 0 or dst % 16 != 0 or src % 16 != 0) return error.Misaligned;
+        var a: cuda.Args = .{};
+        a.add(dst);
+        a.add(@as(i64, @intCast(dst_pitch / 16)));
+        a.add(src);
+        a.add(@as(i64, @intCast(src_pitch / 16)));
+        a.add(int(row_bytes / 16));
+        try cuda.launch.launch(o.k.copy_rows, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 
     // ---- Phase 3a: the prompt path ----------------------------------------------------------------------------

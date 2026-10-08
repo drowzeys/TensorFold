@@ -24,6 +24,7 @@ const Config = @import("config.zig").Config;
 const exl3 = @import("exl3.zig");
 const tri = @import("cuda_triton.zig");
 const dcpm = @import("cuda_dcp.zig");
+const draft = @import("cuda_draft.zig");
 
 /// The engine's own constants (cuda_forward.zig): kept equal by the test below.
 pub const max_window_rows: usize = 128; // fw.max_rows
@@ -51,6 +52,8 @@ pub const Space = struct {
     gemms: []const [2]usize,
     mtp: bool = true,
     draft: bool = true,
+    /// Phase 4: the loaded drafters' shapes (cuda_draft.Spec): their tap passes and block pass
+    drafters: []const draft.Spec = &.{},
 };
 
 const A: u64 = 1 << 20; // a 16-aligned device address (no memory is touched)
@@ -69,6 +72,7 @@ pub fn enumerate(p: *aot.Probe, sp: Space) !void {
     const t: tri.Tri = .{ .set = null, .s = undefined, .probe = p };
     for (1..sp.max_rows + 1) |R| try window(t, sp, R);
     try selects(t, sp);
+    for (sp.drafters) |ds| try draft.enumerate(p, ds);
 }
 
 /// One window of R rows: every per-window launch of fused.layer (target and MTP layers), the head, the MTP input
@@ -230,7 +234,11 @@ test "every Triton function cuda_triton.zig launches is reached, a 41-row window
     var p = aot.Probe.init(gpa);
     defer p.deinit();
     const gemms = [_][2]usize{ .{ 6144, 2048 }, .{ 6144, 640 }, .{ 2048, 4096 }, .{ 4096, 6144 }, .{ 6144, 3072 }, .{ 3072, 6144 }, .{ 6144, 512 }, .{ 512, 6144 } };
-    const sp: Space = .{ .cfg = c, .world = 4, .heads = c.heads / 4, .vocab_part = c.vocab / 4, .kva_n = 640, .max_rows = 160, .capacity = 4096, .dcps = &.{ 1, 4 }, .widths = &.{ 3072, 512 }, .gemms = &gemms };
+    const drafters = [_]draft.Spec{
+        .{ .kind = .dspark, .D = 6144, .hd = 64, .H = 16, .KV = 16, .I = 3072, .layers = 3, .ntaps = 5, .block = 8, .top_k = 64, .V = c.vocab / 4, .vocab_off = 0, .eps = 1e-5, .window = 2048, .causal = true, .world = 4, .theta = 8e6, .mask_id = 154856 },
+        .{ .kind = .dflash, .D = 6144, .hd = 128, .H = 16, .KV = 2, .I = 3072, .layers = 6, .ntaps = 6, .block = 8, .top_k = 16, .V = c.vocab / 4, .vocab_off = 0, .rsel = 256, .gs = 16, .eps = 1e-5, .window = 2047, .causal = false, .world = 4, .theta = 1e6, .mask_id = 154856 },
+    };
+    const sp: Space = .{ .cfg = c, .world = 4, .heads = c.heads / 4, .vocab_part = c.vocab / 4, .kva_n = 640, .max_rows = 160, .capacity = 4096, .dcps = &.{ 1, 4 }, .widths = &.{ 3072, 512 }, .gemms = &gemms, .drafters = &drafters };
     try enumerate(&p, sp);
     // the function names in cuda_triton.zig's launches: t.run("_name", ...)
     const src = @embedFile("cuda_triton.zig");
