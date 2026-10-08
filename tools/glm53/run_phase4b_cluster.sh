@@ -42,6 +42,7 @@
 #   CONTEXT32K [~/glm53-speed-20260920/context-32k.txt] (the reference's prompts)  REF_FROM []
 #   Zig decode knobs as 3b: ZSIDE [af] ZL2PF [1] ZL2PF_MB [8] ZMULTI_SELECT [1] ZDEVICE_CANDS [1] ZMTP_DENSE [1]
 #   ports: ZHTTP [18990] PYHTTP [18991] REF_PORT [29871] ZIG_PORT [29881] PY_MPORT [29891] CLI_PORT [29901]
+#   ZIG_ENV [] (extra docker arguments for the Zig server's ranks, e.g. -e TF_GLM53_ROUND_PROFILE=1)
 #   SKIP_SYNC SKIP_BUILD SKIP_REF SKIP_COVER SKIP_CLI SKIP_PY SKIP_ZIG =1 (with REUSE=<stamp>: its work dir)
 #   fail-fast: STALL_MIN [60] PROGRESS_MIN [15] REF_TIMEOUT [10800] CLI_TIMEOUT [10800] CLIENT_TIMEOUT [3600]
 #   LOAD_TIMEOUT [3600] SWEEP_TIMEOUT [10800] SWEEP_MEM [32g] PROMPT_ROWS [8192] ZERR_PAT
@@ -546,6 +547,14 @@ fi
 # ---- 8. the Zig server (rank 0 serves, 1..3 follow) and the same client -------------------------------------------
 if [ "${SKIP_ZIG:-0}" != 1 ]; then
   phase zig-server
+  # ZIG_WRAP0=1: rank 0 under `nsys launch --session-new=zs` (ZIG_HOOK then runs `nsys start/stop --session=zs`)
+  zig_entry() {
+    if [ "${ZIG_WRAP0:-0}" = 1 ] && [ "$1" = 0 ]; then
+      echo "-v /opt/nvidia/nsight-systems:/opt/nsys:ro --entrypoint /opt/nsys/2025.3.2/target-linux-sbsa-armv8/nsys $IMAGE launch --session-new=zs --trace=cuda,nvtx,osrt --cuda-graph-trace=node /work/zig-out/native/bin/tensorfold-native"
+    else
+      echo "--entrypoint /work/zig-out/native/bin/tensorfold-native $IMAGE"
+    fi
+  }
   zig_args() {
     echo "-v $MODEL:/model:ro -v $WORK:/work \
       -e TF_GLM53_RANK=$1 -e TF_GLM53_WORLD=4 -e TF_GLM53_MASTER=$MASTER:$ZIG_PORT -e TF_GLM53_AOT=/work/$ZAOT \
@@ -556,8 +565,8 @@ if [ "${SKIP_ZIG:-0}" != 1 ]; then
       -e TF_GLM53_SIDE=$ZSIDE -e TF_GLM53_L2PF=$ZL2PF -e TF_GLM53_L2PF_MB=$ZL2PF_MB -e TF_GLM53_MULTI_SELECT=$ZMULTI_SELECT \
       -e TF_GLM53_DEVICE_CANDS=$ZDEVICE_CANDS -e TF_GLM53_MTP_DENSE=$ZMTP_DENSE -e TF_GLM53_UNPACK_MB=384 -e TF_GLM53_PROMPT_ROWS=8192 \
       -e TF_GLM53_PROMPT_ROWS_SHORT=4096 -e TF_GLM53_PROMPT_SP=1 -e TF_GLM53_ROCE=1 -e TF_GLM53_TIMEOUT=${ZIG_RDV_TIMEOUT:-5400} \
-      -e TF_GLM53_DUMP=/work/gate/dump-zig.jsonl \
-      --entrypoint /work/zig-out/native/bin/tensorfold-native $IMAGE serve /model --host 0.0.0.0 --port $ZHTTP --name glm-5.3-tf \
+      -e TF_GLM53_DUMP=/work/gate/dump-zig.jsonl ${ZIG_ENV:-} \
+      $(zig_entry $1) serve /model --host 0.0.0.0 --port $ZHTTP --name glm-5.3-tf \
       --context $CONTEXT --parallel $PARALLEL --no-update-check"
   }
   rsh "${NODES[0]}" "rm -f $WORK/gate/dump-zig.jsonl"
@@ -566,7 +575,11 @@ if [ "${SKIP_ZIG:-0}" != 1 ]; then
   start_ranks zp4b-zig zig_args || { collect_ranks zp4b-zig; fatal "zig server start failed"; }
   wait_http zp4b-zig $ZHTTP "$LOAD_TIMEOUT" || { collect_ranks zp4b-zig; fatal "the zig server did not come up (zp4b-zig-r*.log)"; }
   grep -q . <<<"$(rsh "${NODES[1]}" "docker logs zp4b-zig-r1 2>&1 | grep -i 'following rank 0' | head -1")" || say "WARNING: rank 1 never logged 'following rank 0'"
-  clients zig zp4b-zig http://127.0.0.1:$ZHTTP
+  if [ -n "${ZIG_HOOK:-}" ]; then
+    NODE0=${NODES[0]} SRV=zp4b-zig-r0 ZHTTP=$ZHTTP WORK=$WORK LOCAL=$LOCAL RPORT=$RPORT TREE=$TREE IMAGE=$IMAGE bash "$ZIG_HOOK" 2>&1 | tee -a "$LOG"
+  else
+    clients zig zp4b-zig http://127.0.0.1:$ZHTTP
+  fi
   collect_ranks zp4b-zig
   say "zig server: memory min (GB) $(mem_min zig-server)"
   check_wd

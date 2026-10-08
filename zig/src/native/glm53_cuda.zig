@@ -110,6 +110,13 @@ pub const Host = struct {
     // between a round's picks and the next round's message, where the followers and every GPU wait on rank 0
     // (TF_GLM53_DEFER_EMITS=0: at once, as before)
     defer_emits: bool = false,
+    // --parallel N: requests that reach an idle engine together are admitted together (TF_GLM53_ADMIT_QUIET_MS,
+    // default 5: the engine waits until no request has come for that long, at most TF_GLM53_ADMIT_CAP_MS, default
+    // 30, or until N wait; 0: the first request at once). Requests sent together then start decoding in the same
+    // round, as tf-glm53-generate --mode 4b admits a group: identical prompts decode in lockstep, their verify rows
+    // routing to the same experts (Python's slower admission gets the same grouping by its message latency)
+    admit_quiet_ns: i96 = 0,
+    admit_cap_ns: i96 = 0,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -374,6 +381,7 @@ pub const Host = struct {
         while (true) {
             h.lock();
             while (h.queue.items.len == 0 and mu.live() == 0 and !h.closing) h.wake.waitUncancelable(h.io, &h.mutex);
+            if (mu.live() == 0 and h.queue.items.len > 0) h.gatherArrivals();
             if (h.closing) {
                 var left = h.queue;
                 h.queue = .empty;
@@ -417,6 +425,35 @@ pub const Host = struct {
                 h.endAll(.failed, words(e));
             };
             h.setStreaming(mu.live());
+        }
+    }
+
+    /// Rank 0, the lock held, the engine idle with a request waiting: wait (the lock released) for the requests sent
+    /// with it - until none has come for admit_quiet_ns, admit_cap_ns since the first or --parallel N wait.
+    fn gatherArrivals(h: *Host) void {
+        if (h.admit_quiet_ns <= 0) return;
+        const t_first = h.now();
+        var t_last = t_first;
+        var seen = h.queue.items.len;
+        while (!h.closing and h.queue.items.len < h.parallel) {
+            h.unlock();
+            std.Io.sleep(h.io, .fromMicroseconds(200), .awake) catch {};
+            h.lock();
+            const t = h.now();
+            if (h.queue.items.len != seen) {
+                seen = h.queue.items.len;
+                t_last = t;
+            }
+            if (t - t_last >= h.admit_quiet_ns or t - t_first >= h.admit_cap_ns) break;
+        }
+        if (h.boot.multi.?.pf.on and h.queue.items.len > 0) {
+            var lo: i96 = h.queue.items[0].submitted;
+            var hi: i96 = lo;
+            for (h.queue.items) |j| {
+                lo = @min(lo, j.submitted);
+                hi = @max(hi, j.submitted);
+            }
+            std.log.info("glm53: {d} requests admitted together (arrivals {d:.2} ms apart, waited {d:.2} ms)", .{ h.queue.items.len, @as(f64, @floatFromInt(hi - lo)) / 1e6, @as(f64, @floatFromInt(h.now() - t_first)) / 1e6 });
         }
     }
 
@@ -647,7 +684,11 @@ pub const Host = struct {
                 const plan = try glm.multi.Plan.decode(ws);
                 var res: [glm.multi.max_streams]glm.multi.Result = undefined;
                 var ds: [glm.multi.max_streams]usize = undefined;
+                // TF_GLM53_ROUND_PROFILE: a follower's wait for this round's message since its previous round ended
+                const t_in = mu.now();
+                if (mu.t_round_end > 0 and t_in > mu.t_round_end and t_in - mu.t_round_end < std.time.ns_per_s) mu.profWait(@intCast(t_in - mu.t_round_end));
                 try mu.applyRound(&plan, &res, &ds);
+                mu.t_round_end = mu.now();
             },
             .finish => {
                 const ws = try h.recvWords(head.at);
@@ -992,6 +1033,10 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.dump = if (std.c.getenv("TF_GLM53_DUMP")) |v| std.mem.span(v) else null;
     const defer_on = if (std.c.getenv("TF_GLM53_DEFER_EMITS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     h.defer_emits = opts.parallel > 1 and defer_on;
+    const quiet_ms = if (std.c.getenv("TF_GLM53_ADMIT_QUIET_MS")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 5 else 5;
+    const cap_ms = if (std.c.getenv("TF_GLM53_ADMIT_CAP_MS")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 30 else 30;
+    h.admit_quiet_ns = if (opts.parallel > 1) @intFromFloat(@max(0, quiet_ms) * 1e6) else 0;
+    h.admit_cap_ns = @intFromFloat(@max(0, cap_ms) * 1e6);
     h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, {d} concurrent stream{s}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, opts.parallel, if (opts.parallel > 1) "s" else "", if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
     h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup };
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});

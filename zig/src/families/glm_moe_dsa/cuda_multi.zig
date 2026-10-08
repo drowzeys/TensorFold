@@ -556,6 +556,20 @@ fn tIndex(T: ?usize) u64 {
     return std.math.log2_int(usize, t) + 1;
 }
 
+/// TF_GLM53_ROUND_PROFILE=1: each round's phases timed on every rank (the stream synchronized at each phase's end,
+/// so the phases do not overlap), averaged over windows of rounds with the same streams and picks and logged per rank.
+pub const Prof = struct {
+    pub const names = [_][]const u8{ "propose", "mtp", "cut", "verify", "picks", "commit" };
+    on: bool = false,
+    key: u64 = 0,
+    n: u64 = 0,
+    rows: u64 = 0,
+    acc: [names.len]u64 = @splat(0),
+    total: u64 = 0,
+    wait: u64 = 0, // the host time before the round since the previous one ended (rank 0: plan, hooks, message; others: the message)
+    last: i128 = 0,
+};
+
 /// The concurrent decoder on one rank.
 pub const Multi = struct {
     gpa: std.mem.Allocator,
@@ -607,6 +621,7 @@ pub const Multi = struct {
     // the lead: when its last round ended (0: no round since the streams went idle), and its idle hook (Idle)
     t_round_end: i128 = 0,
     idle: ?Idle = null,
+    pf: Prof = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, r: *rn.Runner, n: usize, set: Settings, lead: bool) !*Multi {
         const w = r.w;
@@ -661,6 +676,8 @@ pub const Multi = struct {
         mu.broken = false;
         mu.t_round_end = 0;
         mu.idle = null;
+        mu.pf = .{};
+        if (env("TF_GLM53_ROUND_PROFILE")) |v| mu.pf.on = !std.mem.eql(u8, v, "0");
         mu.lay = Layout.make(rows, n, k, w.world);
         const cols = tri.bucket(r.capacity, r.topk) orelse 1;
         const shared = r.f.shared_experts;
@@ -752,7 +769,7 @@ pub const Multi = struct {
         return .{ .k = mu.r.f.k, .s = mu.r.f.s };
     }
 
-    fn now(mu: *const Multi) i128 {
+    pub fn now(mu: *const Multi) i128 {
         return @intCast(std.Io.Clock.awake.now(mu.io).toNanoseconds());
     }
 
@@ -1214,6 +1231,7 @@ pub const Multi = struct {
         const gap: u64 = if (mu.t_round_end > 0 and t0 > mu.t_round_end) @intCast(t0 - mu.t_round_end) else 0;
         const took: u64 = @intCast(@max(0, t1 - t0));
         mu.t_round_end = t1;
+        mu.profWait(gap);
         for (plan.items[0..plan.n], 0..) |it, i| {
             const s = mu.find(it.sid).?;
             s.round_ns += took;
@@ -1248,9 +1266,13 @@ pub const Multi = struct {
             }
             ss[i] = s;
         }
+        const pt0 = if (mu.pf.on) try mu.profBegin(plan) else 0;
         const t = try mu.gpu(plan);
         try mu.picks(plan, &t, res);
+        try mu.mark(4);
         try mu.commit(plan, &t, res);
+        try mu.mark(5);
+        if (mu.pf.on) mu.profEnd(pt0, t.R);
         mu.rounds += 1;
         for (plan.items[0..plan.n], 0..) |_, i| {
             const s = ss[i];
@@ -1263,6 +1285,54 @@ pub const Multi = struct {
             s.m = x.n + 1;
             ds_out[i] = t.ds[i];
         }
+    }
+
+    /// TF_GLM53_ROUND_PROFILE: the host time before this round (since the previous round ended), from the caller.
+    pub fn profWait(mu: *Multi, ns: u64) void {
+        if (mu.pf.on) mu.pf.wait += ns;
+    }
+
+    fn profBegin(mu: *Multi, plan: *const Plan) !i128 {
+        var sampled: u64 = 0;
+        for (plan.items[0..plan.n]) |it| sampled |= it.sampled;
+        var drafting: u64 = 0;
+        for (plan.items[0..plan.n]) |it| drafting += @intFromBool(it.room > 0);
+        const key = @as(u64, plan.n) | (sampled << 8) | (drafting << 16) | (@as(u64, @intFromBool(plan.cut > 0)) << 24);
+        if (mu.pf.n > 0 and (key != mu.pf.key or mu.pf.n >= 64)) mu.profFlush();
+        mu.pf.key = key;
+        try mu.r.f.s.synchronize();
+        mu.pf.last = mu.now();
+        return mu.pf.last;
+    }
+
+    /// Phase `i` ends (profiling: the stream drained, the time since the previous mark).
+    fn mark(mu: *Multi, i: usize) !void {
+        if (!mu.pf.on) return;
+        try mu.r.f.s.synchronize();
+        const t = mu.now();
+        mu.pf.acc[i] += @intCast(@max(0, t - mu.pf.last));
+        mu.pf.last = t;
+    }
+
+    fn profEnd(mu: *Multi, t0: i128, R: usize) void {
+        mu.pf.total += @intCast(@max(0, mu.now() - t0));
+        mu.pf.rows += R;
+        mu.pf.n += 1;
+    }
+
+    fn profFlush(mu: *Multi) void {
+        const p = &mu.pf;
+        if (p.n == 0) return;
+        const n: f64 = @floatFromInt(p.n);
+        const ms = struct {
+            fn f(v: u64, c: f64) f64 {
+                return @as(f64, @floatFromInt(v)) / 1e6 / c;
+            }
+        }.f;
+        if (!@import("builtin").is_test) std.log.info("glm53 prof rank {d}: rounds={d} streams={d} sampled={d} drafting={d} cut={d} rows={d:.2} | propose={d:.2} mtp={d:.2} cut={d:.2} verify={d:.2} picks={d:.2} commit={d:.2} total={d:.2} wait={d:.2} ms/round", .{ mu.w.rank, p.n, p.key & 0xff, (p.key >> 8) & 0xff, (p.key >> 16) & 0xff, (p.key >> 24) & 0xff, @as(f64, @floatFromInt(p.rows)) / n, ms(p.acc[0], n), ms(p.acc[1], n), ms(p.acc[2], n), ms(p.acc[3], n), ms(p.acc[4], n), ms(p.acc[5], n), ms(p.total, n), ms(p.wait, n) });
+        const on = p.on;
+        p.* = .{};
+        p.on = on;
     }
 
     /// The round's tables to the device (one upload of the plan region; vb.ids from their own staging).
@@ -1290,6 +1360,7 @@ pub const Multi = struct {
     fn gpu(mu: *Multi, plan: *const Plan) !Tables {
         var dd: Drafts = .{};
         try mu.propose(plan, &dd);
+        try mu.mark(0);
         var t = try tables(plan, mu.k, mu.BL, mu.local, &dd);
         if (t.R == 0) return error.Invalid;
         try mu.upload(&t);
@@ -1303,13 +1374,18 @@ pub const Multi = struct {
             const Tm = tri.bucket(t.keep_end.?, topk);
             if (t.S == 0) return error.Invalid; // MTP streams always draft (no DFlash2 / auto rounds here)
             for (1..mu.k + 1) |j| try mu.mtpStep(j, if (j == 1) t.M else t.S, t.S, Tm);
+            try mu.mark(1);
             if (plan.cut > 0) try mu.cutWindow(plan, &t);
+            try mu.mark(2);
+        } else {
+            try mu.mark(1);
         }
         mu.widest = @max(mu.widest, t.R);
         const T = tri.bucket(t.end, topk);
         var sampled = false;
         for (plan.items[0..plan.n]) |it| sampled = sampled or it.sampled != 0;
         try mu.verify(t.R, T, if (sampled) .local else .argmax);
+        try mu.mark(3);
         return t;
     }
 
@@ -1400,6 +1476,7 @@ pub const Multi = struct {
         }
         try r.f.s.synchronize();
         try r.resetState();
+        mu.pf = .{ .on = mu.pf.on }; // the prewarm's rounds are not profiled
         try mu.bh.fill8(0, r.f.s.handle);
         try mu.bt.fill8(0, r.f.s.handle);
         try r.f.s.synchronize();
