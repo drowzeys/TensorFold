@@ -1184,7 +1184,7 @@ pub const Multi = struct {
         R: usize,
         T: ?usize,
         pick: fw.HeadMode,
-        fn go(c: @This()) !void {
+        pub fn go(c: @This()) !void {
             const m = c.mu;
             var g = m.r.f;
             g.base = m.tab.ptr + m.lay.vbase;
@@ -1205,7 +1205,7 @@ pub const Multi = struct {
         n: usize,
         S: usize,
         T: ?usize,
-        fn go(c: @This()) !void {
+        pub fn go(c: @This()) !void {
             const m = c.mu;
             const mb = &m.mb.?;
             const o = m.ops();
