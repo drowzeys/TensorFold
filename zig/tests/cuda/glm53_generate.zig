@@ -33,6 +33,13 @@
 //! asks for them; --copy-min 8 --copy-max 15). A run label names its drafts: "g:K" / "s<top_k>:K" the MTP head with K
 //! steps (0: serial), "g:dspark" / "s20:dflash" a drafter (--mtp-drafts 0 loads no MTP layer), a "+c" suffix copy
 //! drafts ahead of them ("s20:dspark+c"). The output adds each run's draft mode and copy counts.
+//! --mode 4b (Phase 4b): the served engine with --parallel N (cuda_multi.zig: concurrent streams, shared decode
+//! rounds): every rank runs the same schedule (the lead's, no messages) over the prompts file's groups - each group's
+//! prompts admitted together and decoded concurrently, then each one alone through the concurrent decoder, then
+//! (--single 1) each one through the one-stream path (Runner.run in slot 0, copy drafts off). Greedy or keyed
+//! sampled; every stream's tokens must equal its alone run's and its one-stream run's. Prints aggregate and per-stream
+//! tok/s and TTFT; `RESULT glm53-generate OK|FAIL` (FAIL: some stream differs). list-variants --parallel N adds the
+//! concurrent windows' launches (ROWS kernels, N x (k + 1) rows).
 //! --mode roce-bench: the RoCE runtime alone (no model): bit check against NCCL, then microseconds a reduction of
 //! [rows, --dims] fp32 for --bench-rows; prints `ROCE-BENCH PASS|FAIL ...` (decode windows <= 65 us).
 //!
@@ -77,11 +84,12 @@ const usage =
     \\                         [--dspark-depth N] [--dspark-topk N] [--dflash DIR] [--dflash-depth 7]
     \\                         [--dflash-confidence 0.3] [--copy 0|1] [--copy-min 8] [--copy-max 15]
     \\                         [--verify-rows 8] [--mtp-drafts K (= --k)]; runs "s20:dspark+c", "g:dflash", ...
+    \\                         4b: 3b's flags and --parallel N [--single 1]; prompts {"prompts": [...], "groups": [...]}
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
     \\       tf-glm53-generate --mode list-variants --model DIR --world 4 --context N --tiles F0,F1,.. [--aot DIR]
-    \\                         [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE]
+    \\                         [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE] [--parallel N]
     \\
 ;
 
@@ -155,6 +163,9 @@ const Args = struct {
     copy_min: usize = 8,
     copy_max: usize = 15,
     verify_rows: usize = 8,
+    // Phase 4b (--mode 4b; list-variants: the concurrent windows too)
+    parallel: usize = 1,
+    single: bool = true,
 };
 
 fn flag(v: []const u8) !bool {
@@ -320,6 +331,10 @@ pub fn main(init: std.process.Init) !u8 {
             a.copy_max = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--verify-rows")) {
             a.verify_rows = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--parallel")) {
+            a.parallel = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--single")) {
+            a.single = try flag(v);
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -348,6 +363,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (a.model.len == 0 or a.aot.len == 0 or a.prompts.len == 0 or a.out.len == 0 or a.rank >= a.world or a.tokens == 0 or a.window == 0 or a.window > glm.forward.max_rows) {
         std.debug.print("{s}", .{usage});
         return 2;
+    }
+    if (std.mem.eql(u8, a.mode, "4b")) {
+        const ok4b = run4b(init.gpa, init.io, a) catch |e| {
+            std.debug.print("RESULT glm53-generate FAIL rank {d}: error {t}\n", .{ a.rank, e });
+            return 1;
+        };
+        return if (ok4b) 0 else 1;
     }
     if (std.mem.eql(u8, a.mode, "3b") or std.mem.eql(u8, a.mode, "4")) {
         const ok3b = run3b(init.gpa, init.io, a) catch |e| {
@@ -975,7 +997,9 @@ fn listVariants(gpa: std.mem.Allocator, io: std.Io, a: Args) !u8 {
         n_dspecs += 1;
     }
     // verify windows up to the copy width and a DSpark block + 1 rows (all within the window rows enumerated)
-    const sp: cov.Space = .{ .cfg = cfg, .world = a.world, .heads = cfg.heads / a.world, .vocab_part = cfg.vocab / a.world, .kva_n = kva_n, .max_rows = @max(@max(a.prompt_rows, a.window), @max(a.k + 1, 32)), .capacity = a.context, .dcps = dcps, .widths = widths.items, .gemms = gemms.items, .mtp = cfg.mtp_layers > 0, .draft = a.draft_vocab > 0, .drafters = dspecs[0..n_dspecs] };
+    // Phase 4b: --parallel N's windows of up to N x (k + 1) rows with per-row positions and cache bases (ROWS)
+    const rows_windows: usize = if (a.parallel > 1) try glm.multi.windowRows(a.parallel, a.k) else 0;
+    const sp: cov.Space = .{ .cfg = cfg, .world = a.world, .heads = cfg.heads / a.world, .vocab_part = cfg.vocab / a.world, .kva_n = kva_n, .max_rows = @max(@max(a.prompt_rows, a.window), @max(a.k + 1, 32)), .capacity = a.context, .dcps = dcps, .widths = widths.items, .gemms = gemms.items, .mtp = cfg.mtp_layers > 0, .draft = a.draft_vocab > 0, .drafters = dspecs[0..n_dspecs], .rows_windows = rows_windows };
     var p = cuda.aot.Probe.init(gpa);
     defer p.deinit();
     try cov.enumerate(&p, sp);
@@ -986,7 +1010,7 @@ fn listVariants(gpa: std.mem.Allocator, io: std.Io, a: Args) !u8 {
     const doc = try p.json(gpa, specs);
     defer gpa.free(doc);
     if (a.out.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = doc });
-    std.debug.print("variants: {d} launches enumerated, {d} distinct needs (rows 1..{d}, context {d}, dcp {any}, {d} tile tables, {d} GEMM shapes, SwiGLU widths {any})\n", .{ p.calls, p.needs.count(), sp.max_rows, sp.capacity, dcps, tables, gemms.items.len, widths.items });
+    std.debug.print("variants: {d} launches enumerated, {d} distinct needs (rows 1..{d}, context {d}, dcp {any}, {d} tile tables, {d} GEMM shapes, SwiGLU widths {any}, concurrent windows up to {d} rows)\n", .{ p.calls, p.needs.count(), sp.max_rows, sp.capacity, dcps, tables, gemms.items.len, widths.items, rows_windows });
     const ks = specs orelse return 0;
     const miss = try p.missing(gpa, ks);
     defer gpa.free(miss);
@@ -1553,6 +1577,216 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     if (agree) {
         std.debug.print("RESULT glm53-generate {s} rank {d}: phase 3b, {d} runs, load {d:.0} s, DCP {d}\n", .{ if (seeds_ok) "OK" else "FAIL", a.rank, done.items.len, boot.load_s, boot.dcp });
         return seeds_ok;
+    } else |e| {
+        std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks' token streams differ ({t})\n", .{ a.rank, e });
+        return false;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- Phase 4b ---
+
+/// A group of the 4b prompts file: prompts decoded together (indexes into "prompts"), each with its seed.
+const Group4b = struct { name: []const u8, members: []usize, seeds: []u64, greedy: bool };
+
+/// One stream's outcome in a 4b run.
+const Out4b = struct {
+    tokens: []u32 = &.{},
+    ttft_s: f64 = 0,
+    prefill_s: f64 = 0,
+    decode_s: f64 = 0,
+    tok_s: f64 = 0,
+    rounds: usize = 0,
+    drafted: usize = 0,
+};
+
+fn freeOuts(gpa: std.mem.Allocator, outs: []Out4b) void {
+    for (outs) |x| gpa.free(x.tokens);
+    gpa.free(outs);
+}
+
+fn nsToS(ns: i128) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e9;
+}
+
+/// The lead's loop on every rank (no messages: every rank decides alike): the prompts `idx` admitted together, rounds
+/// until every stream finished. Outcomes in admission order; `wall`: admission to the last stream's end (seconds).
+fn concurrent4b(gpa: std.mem.Allocator, io: std.Io, mu: *glm.multi.Multi, prompts: []const Prompt, idx: []const usize, samps: []const ?glm.sampling.Sampling, count: usize, eos: []const u32, wall: *f64) ![]Out4b {
+    const outs = try gpa.alloc(Out4b, idx.len);
+    for (outs) |*x| x.* = .{};
+    errdefer freeOuts(gpa, outs);
+    var sids: [glm.multi.max_streams]u32 = undefined;
+    const t0 = now(io);
+    for (idx, 0..) |pi, i| {
+        const c = try mu.choose(prompts[pi].ids, true);
+        defer c.deinit(gpa);
+        const sid = mu.next_sid;
+        const limit = mu.r.capacity - mu.k - 1; // Glm53Engine.limit: the count within what is left after the prompt
+        if (prompts[pi].ids.len >= limit) return error.PromptTooLong;
+        const n_tok = @max(1, @min(count, limit - prompts[pi].ids.len));
+        _ = try mu.admit(.{ .sid = sid, .slot = c.slot, .mode = .mtp, .sampling = samps[i], .count = n_tok, .prompt = prompts[pi].ids, .eos = eos, .begin = c.begin, .src = c.src, .stops = c.stops, .keeps = c.keeps });
+        sids[i] = sid;
+    }
+    var buf: [glm.multi.max_streams]u32 = undefined;
+    while (mu.live() > 0) {
+        try mu.step(null);
+        for (mu.doneList(&buf)) |sid| {
+            const st = mu.find(sid).?;
+            const i = std.mem.indexOfScalar(u32, sids[0..idx.len], sid) orelse return error.UnknownStream;
+            outs[i] = .{ .tokens = try gpa.dupe(u32, st.out.items), .ttft_s = nsToS(st.t_first - st.t_admit), .prefill_s = st.prefill_s, .decode_s = st.decodeS(), .tok_s = st.tokS(), .rounds = st.rounds, .drafted = st.drafted };
+            mu.finish(sid);
+        }
+    }
+    wall.* = since(io, t0);
+    return outs;
+}
+
+fn jsonU64List(gpa: std.mem.Allocator, v: std.json.Value) ![]u64 {
+    if (v != .array) return error.BadPrompts;
+    const items = v.array.items;
+    const out = try gpa.alloc(u64, items.len);
+    errdefer gpa.free(out);
+    for (items, out) |x, *y| y.* = try jsonU64(x);
+    return out;
+}
+
+/// --mode 4b: the served engine with --parallel N over the prompts file's groups (see the header).
+fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
+    if (a.parallel < 2) return error.ParallelNeeded;
+    var prompts_text: []u8 = &.{};
+    const prompts = try readPrompts(gpa, io, a.prompts, &prompts_text);
+    defer {
+        for (prompts) |p| {
+            gpa.free(p.name);
+            gpa.free(p.ids);
+        }
+        gpa.free(prompts);
+        gpa.free(prompts_text);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, prompts_text, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const count: usize = if (root.get("tokens")) |v| @intCast(try jsonU64(v)) else a.tokens;
+    const temperature = if (root.get("temperature")) |v| try jsonFloat(v) else 1.0;
+    const top_p = if (root.get("top_p")) |v| try jsonFloat(v) else 0.95;
+    const min_p = if (root.get("min_p")) |v| try jsonFloat(v) else 0.0;
+    const top_k: usize = if (root.get("top_k")) |v| @intCast(try jsonU64(v)) else 20;
+    var groups: std.ArrayList(Group4b) = .empty;
+    defer {
+        for (groups.items) |g| {
+            gpa.free(g.members);
+            gpa.free(g.seeds);
+        }
+        groups.deinit(gpa);
+    }
+    for ((root.get("groups") orelse return error.BadPrompts).array.items) |gv| {
+        const go = gv.object;
+        const members64 = try jsonU64List(gpa, go.get("members") orelse return error.BadPrompts);
+        defer gpa.free(members64);
+        const members = try gpa.alloc(usize, members64.len);
+        errdefer gpa.free(members);
+        for (members64, members) |x, *y| {
+            if (x >= prompts.len) return error.BadPrompts;
+            y.* = @intCast(x);
+        }
+        const seeds = try jsonU64List(gpa, go.get("seeds") orelse return error.BadPrompts);
+        errdefer gpa.free(seeds);
+        if (seeds.len != members.len or members.len == 0 or members.len > a.parallel) return error.BadPrompts;
+        const greedy = if (go.get("greedy")) |v| v == .bool and v.bool else true;
+        const gname = go.get("name") orelse return error.BadPrompts;
+        if (gname != .string) return error.BadPrompts;
+        try groups.append(gpa, .{ .name = gname.string, .members = members, .seeds = seeds, .greedy = greedy });
+    }
+    var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s, .parallel = a.parallel };
+    o.reuse = try glm.reuse.Settings.fromEnv();
+    o.reuse.on = a.reuse;
+    o.multi_set = try glm.multi.Settings.fromEnv();
+    std.debug.print("rank {d} of {d}: phase 4b, --parallel {d}, {d} groups, context {d}, MTP drafts {d}, {d} tokens a stream, stop at EOS {s}, one-stream check {s}, draft cut {d} from {d} streams\n", .{ a.rank, a.world, a.parallel, groups.items.len, a.context, a.k, count, tf(a.stop_eos), tf(a.single), o.multi_set.draft_cut, o.multi_set.cut_streams });
+    const boot = try glm.engine.Boot.init(gpa, io, o);
+    defer boot.deinit();
+    var sess = try glm.engine.Session.init(gpa, boot);
+    defer sess.deinit();
+    const mu = boot.multi orelse return error.NoConcurrentDecoder;
+    const eos: []const u32 = if (a.stop_eos) sess.eos else &.{};
+    var all_tokens = std.hash.Wyhash.init(0);
+    var pass = true;
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    const out = &w.writer;
+    try out.print("{{\"tool\": \"tf-glm53-generate\", \"mode\": \"4b\", \"rank\": {d}, \"world\": {d}, \"parallel\": {d}, \"k\": {d}, \"context\": {d}, \"tokens\": {d}, \"stop_eos\": {s}, \"draft_cut\": {d}, \"cut_streams\": {d}, \"load_s\": {d:.1}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"groups\": [", .{ a.rank, a.world, a.parallel, a.k, a.context, count, tf(a.stop_eos), o.multi_set.draft_cut, o.multi_set.cut_streams, boot.load_s, boot.prewarm_graphs, boot.prewarm_s });
+    var toks: std.ArrayList(u32) = .empty;
+    defer toks.deinit(gpa);
+    for (groups.items, 0..) |g, gi| {
+        const n = g.members.len;
+        const samps = try gpa.alloc(?glm.sampling.Sampling, n);
+        defer gpa.free(samps);
+        for (samps, g.seeds) |*x, seed| {
+            x.* = if (g.greedy or temperature <= 0) null else .{ .seed = seed & 0x7FFFFFFFFFFFFFFF, .temperature = temperature, .top_k = top_k, .top_p = top_p, .min_p = min_p };
+        }
+        const cuts_before = mu.cuts;
+        const rounds_before = mu.rounds;
+        var wall: f64 = 0;
+        const conc = try concurrent4b(gpa, io, mu, prompts, g.members, samps, count, eos, &wall);
+        defer freeOuts(gpa, conc);
+        const conc_rounds = mu.rounds - rounds_before;
+        const conc_cuts = mu.cuts - cuts_before;
+        // each prompt alone through the concurrent decoder
+        const alone = try gpa.alloc(Out4b, n);
+        for (alone) |*x| x.* = .{};
+        defer freeOuts(gpa, alone);
+        for (0..n) |i| {
+            var wall1: f64 = 0;
+            const one = try concurrent4b(gpa, io, mu, prompts, g.members[i .. i + 1], samps[i .. i + 1], count, eos, &wall1);
+            alone[i] = one[0];
+            gpa.free(one);
+        }
+        // each prompt through the one-stream path (Runner.run in slot 0, copy drafts off)
+        const single = try gpa.alloc(Out4b, n);
+        for (single) |*x| x.* = .{};
+        defer freeOuts(gpa, single);
+        if (a.single) {
+            for (0..n) |i| {
+                const ids = prompts[g.members[i]].ids;
+                const max_tokens = try sess.clampTokens(ids.len, count);
+                const res = try sess.exec(.{ .prompt = ids, .max_tokens = max_tokens, .sampling = samps[i], .draft = true, .eos = eos, .copies = false }, &toks);
+                gpa.free(res.kept);
+                single[i] = .{ .tokens = try gpa.dupe(u32, toks.items), .prefill_s = res.stats.prefill_s, .decode_s = res.stats.decode_s, .tok_s = res.stats.tokS(toks.items.len), .rounds = res.stats.rounds };
+            }
+        }
+        var total: usize = 0;
+        var ttft_max: f64 = 0;
+        var tps_sum: f64 = 0;
+        var eq_alone = true;
+        var eq_single = true;
+        for (0..n) |i| {
+            total += conc[i].tokens.len;
+            ttft_max = @max(ttft_max, conc[i].ttft_s);
+            tps_sum += conc[i].tok_s;
+            eq_alone = eq_alone and std.mem.eql(u32, conc[i].tokens, alone[i].tokens);
+            if (a.single) eq_single = eq_single and std.mem.eql(u32, alone[i].tokens, single[i].tokens);
+            all_tokens.update(std.mem.sliceAsBytes(conc[i].tokens));
+        }
+        pass = pass and eq_alone and eq_single;
+        const nf: f64 = @floatFromInt(n);
+        const agg = @as(f64, @floatFromInt(total)) / @max(wall, 1e-9);
+        std.debug.print("rank {d} RESULT4B {s} {s}: {d} streams, aggregate {d:.1} tok/s ({d} tokens in {d:.2} s, {d} rounds, {d} drafts cut), per-stream {d:.1} tok/s, TTFT max {d:.3} s; concurrent == alone {s}; alone == one-stream {s}\n", .{ a.rank, g.name, if (g.greedy) "greedy" else "sampled", n, agg, total, wall, conc_rounds, conc_cuts, tps_sum / nf, ttft_max, tf(eq_alone), if (a.single) tf(eq_single) else "not run" });
+        try out.print("{s}\n {{\"name\": \"{s}\", \"greedy\": {s}, \"streams\": {d}, \"wall_s\": {d:.4}, \"aggregate_tps\": {d:.3}, \"per_stream_tps\": {d:.3}, \"ttft_max_s\": {d:.4}, \"rounds\": {d}, \"cuts\": {d}, \"concurrent_eq_alone\": {s}, \"alone_eq_single\": {s}, \"single_run\": {s}, \"members\": [", .{ if (gi > 0) "," else "", g.name, tf(g.greedy), n, wall, agg, tps_sum / nf, ttft_max, conc_rounds, conc_cuts, tf(eq_alone), tf(eq_single), tf(a.single) });
+        for (0..n) |i| {
+            const c = conc[i];
+            const tpr = @as(f64, @floatFromInt(c.tokens.len -| 1)) / @as(f64, @floatFromInt(@max(c.rounds, 1)));
+            const atpr = @as(f64, @floatFromInt(alone[i].tokens.len -| 1)) / @as(f64, @floatFromInt(@max(alone[i].rounds, 1)));
+            const same_single = !a.single or std.mem.eql(u32, alone[i].tokens, single[i].tokens);
+            try out.print("{s}\n  {{\"prompt\": \"{s}\", \"seed\": \"{d}\", \"tokens_n\": {d}, \"ttft_s\": {d:.4}, \"prefill_s\": {d:.4}, \"decode_s\": {d:.4}, \"tok_s\": {d:.3}, \"rounds\": {d}, \"tokens_per_round\": {d:.4}, \"alone_tok_s\": {d:.3}, \"alone_tokens_per_round\": {d:.4}, \"single_tok_s\": {d:.3}, \"eq_alone\": {s}, \"eq_single\": {s}, \"tokens\": [", .{ if (i > 0) "," else "", prompts[g.members[i]].name, g.seeds[i], c.tokens.len, c.ttft_s, c.prefill_s, c.decode_s, c.tok_s, c.rounds, tpr, alone[i].tok_s, atpr, single[i].tok_s, tf(std.mem.eql(u32, c.tokens, alone[i].tokens)), tf(same_single) });
+            for (c.tokens, 0..) |t, q| try out.print("{s}{d}", .{ if (q > 0) "," else "", t });
+            try out.writeAll("]}");
+        }
+        try out.writeAll("]}");
+    }
+    try out.print("\n], \"pass\": {s}}}\n", .{tf(pass)});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = w.written() });
+    const agree = boot.rdv.sync("done", all_tokens.final(), a.timeout_s);
+    if (agree) {
+        std.debug.print("RESULT glm53-generate {s} rank {d}: phase 4b, --parallel {d}, {d} groups, load {d:.0} s{s}\n", .{ if (pass) "OK" else "FAIL", a.rank, a.parallel, groups.items.len, boot.load_s, if (pass) "" else " (a stream differs from its alone / one-stream run)" });
+        return pass;
     } else |e| {
         std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks' token streams differ ({t})\n", .{ a.rank, e });
         return false;
