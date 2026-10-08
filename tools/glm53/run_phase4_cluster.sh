@@ -30,7 +30,7 @@
 # Environment (defaults in brackets):
 #   NODES [10.100.10.1 .2 .3 .5] MODEL IMAGE PORT_DIR PYSRC ZIG_DIR ZIG_FROM MASTER IF RAILS DROP_CACHES ALLOW_GPU_BUSY
 #   DSPARK [/mnt/spark2-models-local/GLM-5.3-speculator.dspark-keys-ft2]  DFLASH [/mnt/spark2-models-local/GLM-5.3-DFlash2]
-#   FT8 [] (a private DFlash2 checkpoint: the ft8 session; never printed into a recipe)  MTPC [1]  WITH_120K [0]
+#   FT8_120K [1] (0: the ft8 session at short + 32K only, context 33792)  FT8 [] (a private DFlash2 checkpoint: the ft8 session; never printed into a recipe)  MTPC [1]  WITH_120K [0]
 #   SESSIONS [ds,df + mc when MTPC=1 + ft8 when FT8 is set]  TOKENS [512]  CONTEXT32K [~/glm53-speed-20260920/context-32k.txt]
 #   CONTEXT [auto: the prompts' need rounded up to 1024; < 200,000]  RATIO [0.97]  TPR_TOL [0.02]  MEM_CAP [110g]
 #   DSPARK_POLICY [confidence] DSPARK_CONFIDENCE [0.3] DFLASH_DEPTH [7] DFLASH_CONFIDENCE [0.3] COPY_MIN [8] COPY_MAX [15]
@@ -257,7 +257,7 @@ session_runs() {   # $1 = session -> "short|32k|120k" run lists and the drafts l
     ds)  echo "g:dspark+c,g:0,s20:dspark+c,s20:dspark,s20:0|s20:dspark+c,s20:dspark,s20:0|s20:dspark+c" ;;
     df)  echo "g:dflash+c,g:0,s20:dflash+c,s20:dflash,s20:0|s20:dflash+c,s20:dflash,s20:0|s20:dflash+c" ;;
     mc)  echo "g:2+c,g:0,s20:2+c,s20:2,s20:0|s20:2+c,s20:2,s20:0|s20:2+c" ;;
-    ft8) echo "s20:dflash+c,s20:0|s20:dflash+c,s20:0|s20:dflash+c" ;;
+    ft8) echo "s20:dflash+c,s20:dflash,s20:0|s20:dflash+c,s20:dflash,s20:0|s20:dflash+c" ;;
   esac
 }
 if [ "${SKIP_REF:-0}" != 1 ] || [ ! -s "$LOCAL/prompts-${SESS[0]}.json" ]; then
@@ -265,7 +265,7 @@ if [ "${SKIP_REF:-0}" != 1 ] || [ ! -s "$LOCAL/prompts-${SESS[0]}.json" ]; then
   for n in "${NODES[@]}"; do rsh "$n" "cat > $WORK/context-32k.txt" < "$CONTEXT32K" || summary FAIL "could not copy $CONTEXT32K to $n" 3; done
   for s in "${SESS[@]}"; do
     IFS='|' read -r rs r32 r120 <<<"$(session_runs "$s")"
-    w120=""; { [ "$WITH_120K" = 1 ] || [ "$s" = ft8 ]; } && w120="--with-120k --runs-120k $r120"
+    w120=""; { [ "$WITH_120K" = 1 ] || { [ "$s" = ft8 ] && [ "${FT8_120K:-1}" = 1 ]; }; } && w120="--with-120k --runs-120k $r120"
     rsh "${NODES[0]}" "docker run --rm $COMMON --network none --memory 8g -v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro \
       -v $RPORT/tf:/tf:ro -v $WORK:/work -e PYTHONPATH=/opt/tensorfold/src --entrypoint python3 $IMAGE \
       -B /tf/tools/glm53/reference4.py --model /model --make-prompts /work/prompts-$s.json --context-file /work/context-32k.txt \
