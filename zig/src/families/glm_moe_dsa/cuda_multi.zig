@@ -903,10 +903,10 @@ pub const Multi = struct {
 
     /// SlotReuse.admit (every rank): forget the slot's states this request overwrites, bring the resumed state's rows
     /// into it, its carry (and, for a replay, its head row) into the slot's waiting rows.
-    fn admitReuse(mu: *Multi, s: *Stream, a: Admit) !void {
+    fn admitReuse(mu: *Multi, s: *Stream, a: Admit) !?*rz.Kept {
         const st = if (mu.store) |*x| x else {
             if (a.begin != 0) return error.ReuseOff;
-            return;
+            return null;
         };
         var hit: ?*rz.Kept = null;
         if (a.begin > 0) {
@@ -930,7 +930,7 @@ pub const Multi = struct {
         }
         if (a.src) |from| try mu.copySlotRows(from, a.slot, a.begin);
         try st.setLiveSlot(a.slot, a.prompt[0..a.begin]);
-        const h = hit orelse return;
+        const h = hit orelse return null;
         st.touch(h);
         const o = mu.ops();
         try o.copy(mu.carry0.ptr + a.slot * mu.D * 2, h.carry.ptr, mu.D * 2);
@@ -940,6 +940,7 @@ pub const Multi = struct {
             try o.copy(mu.head0.ptr + a.slot * mu.V * 4, head.ptr, mu.V * 4);
             s.head0 = true;
         }
+        return h;
     }
 
     /// SlotReuse.keep (every rank): the stream's state at prompt position n (its chunks reached n) in its slot.
@@ -955,6 +956,12 @@ pub const Multi = struct {
             const h = try pool.get(mu.V * 4);
             e.head = h;
             try o.copy(h.ptr, lg, mu.V * 4);
+        }
+        // multi._keep: a drafter stream's ring window at n (its prompt's taps are in: feedPrompt came first)
+        if (mu.mdOf(s.mode)) |x| {
+            const rg = try pool.get(x.windowBytes(n));
+            e.ring = rg;
+            try x.saveWindow(s.slot, n, rg.ptr);
         }
         if (!st.remember(e, &.{})) st.destroy(e);
     }
@@ -1005,9 +1012,13 @@ pub const Multi = struct {
             s.chunks = try rn.cutChunks(mu.gpa, a.begin, L, a.stops, rows, short);
         }
         errdefer mu.gpa.free(s.chunks);
-        try mu.admitReuse(s, a);
-        // the stream's drafter context starts at its prompt (a resumed one at its resume point; MultiDrafter.reset)
-        if (mu.mdOf(mode)) |x| x.reset(a.slot, a.begin);
+        const hit = try mu.admitReuse(s, a);
+        // the stream's drafter context starts at its prompt; a resumed one at its resume point with the kept state's
+        // ring window (multi._queue: put_slot_ring_window), else empty there (MultiDrafter.reset)
+        if (mu.mdOf(mode)) |x| {
+            const ring = if (hit) |h| h.ring else null;
+            if (ring) |rg| try x.putWindow(a.slot, a.begin, rg.ptr) else x.reset(a.slot, a.begin);
+        }
         try mu.filling.append(mu.gpa, s);
         mu.busy[a.slot] = true;
         if (a.sid >= mu.next_sid) mu.next_sid = a.sid + 1;

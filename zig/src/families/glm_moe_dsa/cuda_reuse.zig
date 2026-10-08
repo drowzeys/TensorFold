@@ -188,6 +188,7 @@ pub const Kept = struct {
     tick: u64 = 0,
     learned: bool = false, // --learn: written to disk (or read from it)
     slot: usize = 0, // Phase 4b (prefixes.SlotPrompts, e.extra["slot"]): the stream slot whose rows hold it
+    ring: ?Handle = null, // Phase 4c (Kept.ring): a drafter stream's ring window at n (MultiDrafter.saveWindow)
 
     pub fn n(e: *const Kept) usize {
         return e.ids.len;
@@ -336,6 +337,7 @@ pub const Store = struct {
         s.unsave(e);
         if (e.carry.len > 0) s.release.free(s.release.ctx, e.carry);
         if (e.head) |h| s.release.free(s.release.ctx, h);
+        if (e.ring) |h| s.release.free(s.release.ctx, h);
         s.gpa.free(e.ids);
         s.gpa.destroy(e);
     }

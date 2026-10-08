@@ -329,6 +329,55 @@ pub const MultiDrafter = struct {
         md.end[slot] = at;
     }
 
+    /// prefixes.slot_ring_window's rows: positions [lo, n) of the context a block at n still sees.
+    pub fn windowLo(md: *const MultiDrafter, n: usize) usize {
+        return n -| (md.base.sp.window + 1);
+    }
+
+    /// Bytes of a slot's ring window at n: [layers][k, v][kv heads][rows][hd] bf16.
+    pub fn windowBytes(md: *const MultiDrafter, n: usize) usize {
+        const sp = md.base.sp;
+        return sp.layers * 2 * sp.KV * (n - md.windowLo(n)) * sp.hd * 2;
+    }
+
+    /// prefixes.slot_ring_window / put_slot_ring_window: slot's ring rows of positions [lo, n) to `buf` (save) or
+    /// back from it (put), every layer's keys and values, each KV head's rows in at most two runs (the ring wraps).
+    fn moveWindow(md: *MultiDrafter, slot: usize, n: usize, buf: u64, save: bool) !void {
+        const sp = md.base.sp;
+        const lo = md.windowLo(n);
+        const rows = n - lo;
+        if (rows == 0) return;
+        const o = md.ops();
+        const rb = sp.hd * 2; // one ring row of one head
+        for (0..sp.layers) |i| {
+            for ([2]u64{ md.kc[i], md.vc[i] }, 0..) |pool, c| {
+                for (0..sp.KV) |h| {
+                    const ring0 = pool + (h * md.pl.head_stride + slot * md.pl.slot_stride) * rb;
+                    const out0 = buf + (((i * 2 + c) * sp.KV + h) * rows) * rb;
+                    var p = lo;
+                    while (p < n) {
+                        const q = p % ring_rows;
+                        const run = @min(n - p, ring_rows - q);
+                        const ring_at = ring0 + q * rb;
+                        const buf_at = out0 + (p - lo) * rb;
+                        if (save) try o.copy(buf_at, ring_at, run * rb) else try o.copy(ring_at, buf_at, run * rb);
+                        p += run;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn saveWindow(md: *MultiDrafter, slot: usize, n: usize, buf: u64) !void {
+        try md.moveWindow(slot, n, buf, true);
+    }
+
+    /// The slot's context resumes at n with the kept window's rows (multi._queue's put_slot_ring_window).
+    pub fn putWindow(md: *MultiDrafter, slot: usize, n: usize, buf: u64) !void {
+        try md.moveWindow(slot, n, buf, false);
+        md.end[slot] = n;
+    }
+
     // ------------------------------------------------------------------------------------------- passes ---
 
     const BlockCtx = struct {
