@@ -482,7 +482,7 @@ pub fn benchLayer(r: *const Roce, s: cuda.Stream, read_bytes: usize, ar_bytes: u
     defer e0.deinit();
     var e1 = try cuda.Event.init(dr, true);
     defer e1.deinit();
-    const Ctx = struct {
+    const LayerCtx = struct {
         r: *const Roce,
         fread: cuda.Function,
         fspin: cuda.Function,
@@ -547,7 +547,7 @@ pub fn benchLayer(r: *const Roce, s: cuda.Stream, read_bytes: usize, ar_bytes: u
             return best;
         }
     };
-    const cx: Ctx = .{ .r = r, .fread = fread, .fspin = fspin, .buf = buf.ptr, .packs = rb / 16, .sink = sink.ptr, .x = bx.ptr, .o = bo.ptr, .nb = ar_bytes, .base = spin_base_ns, .jit = spin_jitter_ns };
+    const cx: LayerCtx = .{ .r = r, .fread = fread, .fspin = fspin, .buf = buf.ptr, .packs = rb / 16, .sink = sink.ptr, .x = bx.ptr, .o = bo.ptr, .nb = ar_bytes, .base = spin_base_ns, .jit = spin_jitter_ns };
     // the all-reduce variants run on every rank in the same order (each is a collective sequence)
     const read_us = try cx.timed(s, &e0, &e1, 0, layers, reps);
     const read_ar_us = try cx.timed(s, &e0, &e1, 1, layers, reps);
