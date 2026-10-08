@@ -176,7 +176,7 @@ pub const Wide = struct {
 /// the indexer's wk / weights_proj / wq_b + rope, the router), the indexer's top-k, the all-gathers, the latent /
 /// index key writes.
 pub const Phase = enum { attn_proj, attn_core, routed, shared, dense, mtp, head, rs, front, select, ag, kv_write };
-const n_phases = @typeInfo(Phase).@"enum".fields.len;
+const n_phases = @typeInfo(Phase).@"enum".field_names.len;
 
 /// --prompt-prof (default off): CUDA timing events around the prompt path's phases on the main and comm streams,
 /// summed per chunk (`report`, after the caller synchronized) and per prompt (`total`). The streams overlap, so the
