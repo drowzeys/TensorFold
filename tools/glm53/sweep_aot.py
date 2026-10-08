@@ -46,6 +46,13 @@ MODULES = {
     "_group_sums": "tensorfold.families.glm5_next.cuda.qmm",
     "_gemm": "tensorfold.cuda.exl3.prefill",
     "_select_keys": "tensorfold.families.glm_moe_dsa.cuda.topk",
+    # Phase 4: the drafters (cuda_draft.zig's launches)
+    "_embed_b16": "tensorfold.families.glm5_next.cuda.glue",
+    "_swiglu": "tensorfold.families.glm5_next.cuda.glue",
+    "_prep_kernel": "tensorfold.families.glm5_next.cuda.dflash2",
+    "_dconv_kernel": "tensorfold.families.glm5_next.cuda.dflash2",
+    "_dattn_ring": "tensorfold.families.glm_moe_dsa.cuda.dflash",
+    "_block_attn_kernel": "tensorfold.families.glm_moe_dsa.cuda.dspark",
 }
 FUSED = "tensorfold.families.glm_moe_dsa.cuda.fused"
 DTYPES = {"*bf16": "bfloat16", "*fp16": "float16", "*fp32": "float32", "*i32": "int32", "*i64": "int64",
