@@ -34,6 +34,7 @@
 //!                          [--pe-det slots16|0] [--cublas-lib PATH] [--cublas-ws BYTES] [--cublas-math 0]
 //!                          [--unpack-mb 384] [--bmm-probe FILE] [--side af|0] [--l2pf 1|0|lines|touch]
 //!                          [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
+//!                          [--mtp-dense 1]
 //!        tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
 //!                          [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
 //!        tf-glm53-generate --sampler-check FILE
@@ -54,6 +55,7 @@ const usage =
     \\                         [--pe-det slots16|0] [--cublas-lib PATH] [--cublas-ws BYTES] [--cublas-math 0]
     \\                         [--unpack-mb 384] [--bmm-probe FILE] [--side af|0] [--l2pf 1|0|lines|touch]
     \\                         [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
+    \\                         [--mtp-dense 1]
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
@@ -108,6 +110,8 @@ const Args = struct {
     multi_select: bool = true,
     device_cands: bool = true,
     prompt_prof: []const u8 = "", // a prompt name prefix: its first run's prefill timed (--prompt-prof prose32k)
+    // the MTP layer's prompt rows through cuBLAS (dense bf16 experts built at load, eh_proj): drafts only
+    mtp_dense: bool = true,
     bench_rows: []const u8 = "1,2,3,4,8,16,32",
     bench_iters: usize = 200,
     dims: usize = 6144,
@@ -238,6 +242,8 @@ pub fn main(init: std.process.Init) !u8 {
             a.device_cands = try flag(v);
         } else if (std.mem.eql(u8, k, "--prompt-prof")) {
             a.prompt_prof = v;
+        } else if (std.mem.eql(u8, k, "--mtp-dense")) {
+            a.mtp_dense = try flag(v);
         } else if (std.mem.eql(u8, k, "--bench-rows")) {
             a.bench_rows = v;
         } else if (std.mem.eql(u8, k, "--bench-iters")) {
@@ -916,6 +922,10 @@ const Extra3a = struct {
     cublas_version: c_int,
     experts: []const u8,
     pe_det: []const u8,
+    mtp_dense: bool,
+    mtp_dense_gb: f64,
+    mtp_chunks: usize,
+    mtp_gemms: usize,
 };
 
 /// --mode 3a: Phase 2b's runs with the served engine's settings - the RoCE one-shot for decode windows (setup and
@@ -1061,6 +1071,20 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     try stream.synchronize();
     try side_stream.synchronize();
 
+    // -- Phase 3a speed: the MTP layer's prompt rows as cuBLAS GEMMs over dense bf16 experts (--mtp-dense 1; drafts
+    //    only, so no output token can move; built before the caches so its memory shows up at load)
+    var mtp_dense: ?glm.prompt.MtpDense = null;
+    if (a.mtp_dense and a.k > 0 and shared and w.mtp != null) {
+        const tm = now(io);
+        if (glm.prompt.MtpDense.init(gpa, &driver, &k, stream, &w, &blas, a.prompt_rows)) |x| {
+            mtp_dense = x;
+            std.debug.print("rank {d}: MTP prompt rows dense (cuBLAS): {d:.2} GB a rank (bf16 experts + scratch), built in {d:.1} s\n", .{ a.rank, @as(f64, @floatFromInt(x.bytes)) / 1e9, since(io, tm) });
+        } else |e| {
+            std.debug.print("WARN rank {d}: MTP prompt rows dense unavailable ({t}): the decode expert kernel in blocks\n", .{ a.rank, e });
+        }
+    }
+    defer if (mtp_dense) |*x| x.deinit();
+
     // -- Phase 3a speed: the decode side stream (TF_GLM53_SIDE), the L2 prefetch (TF_GLM53_L2PF: after the tiles, before
     //    any capture), the prompt path's timers (--prompt-prof, on after the prewarm)
     var side_obj: ?glm.decode.Side = null;
@@ -1076,7 +1100,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     var prof = glm.prompt.Prof.init(gpa, &driver, stream);
     defer prof.deinit();
     std.debug.print("rank {d}: decode side stream {s}{s}{s}, L2 prefetch {s}, decode top-k {s}, device candidates {s}, prompt timers {s}\n", .{ a.rank, if (letters.a) "a" else "", if (letters.w) "w" else "", if (letters.f) "f" else "", a.l2pf, if (a.multi_select) "multi-block" else "radix", tf(a.device_cands), if (a.prompt_prof.len > 0) a.prompt_prof else "off" });
-    const fwd: glm.Forward = .{ .w = &w, .k = &k, .s = stream, .inv = inv_buf.ptr, .comm = &comm, .fast = fast, .ring = true, .wide = &main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (side_obj) |*x| x else null, .l2pf = if (pf_obj) |*x| x else null, .multi_select = a.multi_select, .prof = if (a.prompt_prof.len > 0) &prof else null };
+    const fwd: glm.Forward = .{ .w = &w, .k = &k, .s = stream, .inv = inv_buf.ptr, .comm = &comm, .fast = fast, .ring = true, .wide = &main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (side_obj) |*x| x else null, .l2pf = if (pf_obj) |*x| x else null, .multi_select = a.multi_select, .prof = if (a.prompt_prof.len > 0) &prof else null, .mtp_dense = if (mtp_dense) |*x| x else null };
     var sp: ?glm.prompt.Sp = null;
     if (a.prompt_sp and a.world > 1) sp = try glm.prompt.Sp.init(&driver, &fwd, side_stream, &side_wide);
     defer if (sp) |*x| x.deinit();
@@ -1130,6 +1154,10 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         .cublas_version = cublas_version,
         .experts = a.experts,
         .pe_det = a.pe_det,
+        .mtp_dense = mtp_dense != null,
+        .mtp_dense_gb = if (mtp_dense) |x| @as(f64, @floatFromInt(x.bytes)) / 1e9 else 0,
+        .mtp_chunks = if (mtp_dense) |x| x.chunks else 0,
+        .mtp_gemms = if (mtp_dense) |x| x.gemms else 0,
     };
     try writeOut3a(gpa, io, a, &w, n_layers, capacity, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s, prompts, done.items, ex);
     const agree = rdv.sync("done", all_tokens.final(), a.timeout_s);
@@ -1145,7 +1173,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
 fn writeOut3a(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights.Weights, n_layers: usize, capacity: usize, nccl_version: c_int, inv_status: []const u8, load_s: f64, read_gib: f64, prewarm_graphs: usize, prewarm_s: f64, prompts: []const Prompt2b, done: []const Done, ex: Extra3a) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"3a\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"runs\": [", .{ a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s });
+    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"3a\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"runs\": [", .{ a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s });
     defer gpa.free(head);
     try out.appendSlice(gpa, head);
     for (done, 0..) |dd, i| {

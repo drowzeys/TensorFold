@@ -540,6 +540,235 @@ pub const Sp = struct {
     }
 };
 
+/// Phase 3a speed (--mtp-dense 1): the MTP layer's prompt rows through cuBLAS. Its 8-bit (K2 16) routed experts
+/// are not prompt_experts' widths, and the decode expert kernel re-decodes each expert's trellis for every 16 member
+/// rows (~0.5 s an 8K chunk). The MTP layer only drafts - the target verifies every token, and the Python engine's
+/// own path there (cuda-exl3's split-K grouped GEMM) is not reproducible run to run - so here each expert is kept a
+/// second time as dense bf16 matrices with the EXL3 rotations folded in (built once at load from the same trellis:
+/// unpack, the Hadamards, suh / svh), and a prompt chunk's MTP rows run:
+///   picks to the host (one sync) -> pairs grouped by expert (counting sort, pair order within an expert) ->
+///   gather of the rows (b.gath, idle while the MTP layer runs) -> a cuBLAS GEMM an expert for gate | up ->
+///   SwiGLU in place -> a GEMM an expert for down (into the expert's own gathered rows) -> combine in slot order
+///   with the shared expert's b.sy into b.part.
+/// eh_proj of the prompt rows also goes through one cuBLAS GEMM (Forward.mtpCompute), which drops the router's
+/// [ROUTER_KS, rows, D] fp32 partials from the prompt buffers.
+/// Memory a rank: E * 3 * D * I * 2 bytes of weights (GLM-5.3 at world 4: 256 * 3 * 6144 * 512 * 2 = 4.83 GB) +
+/// h (rows * K * 2 I * 2 = 134 MB at 8192 rows) - the eh_proj partials and fp32 rows it saves (1.79 GB at 8192 rows).
+pub const MtpDense = struct {
+    gpa: std.mem.Allocator,
+    blas: *const cuda.cublas.Blas,
+    wgu: cuda.DeviceBuffer, // bf16 [E, D, 2 I]: x @ wgu[e] = (gate | up) of expert e
+    wd: cuda.DeviceBuffer, // bf16 [E, I, D]: a @ wd[e] = down of expert e
+    h: cuda.DeviceBuffer, // bf16 [rows K, 2 I]: gate | up of the grouped pairs (SwiGLU in place into [:, :I])
+    perm_dev: cuda.DeviceBuffer, // int32 [rows K]: segment position -> pair (row K + slot), segments one after another
+    inv_dev: cuda.DeviceBuffer, // int32 [rows K]: pair -> position in its segment (-1: unrouted)
+    pick: []i32, // host copies
+    perm: []i32,
+    inv: []i32,
+    cnt: []usize, // a segment's pairs an expert
+    off: []usize, // their first position
+    fill: []usize,
+    E: usize,
+    D: usize,
+    I: usize,
+    K: usize,
+    rows: usize,
+    /// device bytes held (weights + scratch)
+    bytes: usize,
+    /// prompt chunks run, segments, cuBLAS GEMMs launched (stats)
+    chunks: usize = 0,
+    segments: usize = 0,
+    gemms: usize = 0,
+
+    /// Builds the dense experts of `w`'s MTP layer on `s` (synchronizes) for prompt windows of up to `rows` rows.
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, k: *const kern.Kernels, s: cuda.Stream, w: *const W.Weights, blas: *const cuda.cublas.Blas, rows: usize) !MtpDense {
+        const c = w.config;
+        const m = w.mtp orelse return error.NoMtpLayer;
+        const ex = if (m.layer.experts) |*e| e else return error.NoMtpExperts;
+        const E = ex.count;
+        const D = ex.dims;
+        const I = ex.width;
+        const K = c.top_k;
+        if (K == 0 or K > 32 or D % 128 != 0 or I % 128 != 0) return error.Invalid;
+        const o: kern.Ops = .{ .k = k, .s = s };
+        // the trellis pointer and width tables (device int64 / int32 [E] each) to the host
+        const ptrs = try gpa.alloc(u64, 3 * E);
+        defer gpa.free(ptrs);
+        const k2s = try gpa.alloc(i32, 3 * E);
+        defer gpa.free(k2s);
+        for ([_]u64{ ex.gate_ptr, ex.up_ptr, ex.down_ptr }, 0..) |tab, j| try o.download(std.mem.sliceAsBytes(ptrs[j * E ..][0..E]), tab);
+        for ([_]u64{ ex.gate_k2, ex.up_k2, ex.down_k2 }, 0..) |tab, j| try o.download(std.mem.sliceAsBytes(k2s[j * E ..][0..E]), tab);
+        try s.synchronize();
+        var wgu = try cuda.DeviceBuffer.alloc(d, E * D * 2 * I * 2);
+        errdefer wgu.free();
+        var wd = try cuda.DeviceBuffer.alloc(d, E * I * D * 2);
+        errdefer wd.free();
+        {
+            var wq = try cuda.DeviceBuffer.alloc(d, D * I * 2); // fp16 W_q of one matrix (every one is D x I or I x D)
+            defer wq.free();
+            var tt = try cuda.DeviceBuffer.alloc(d, D * I * 4);
+            defer tt.free();
+            for (0..E) |e| {
+                const gu = wgu.ptr + e * D * 2 * I * 2;
+                try o.unpackRaw(ptrs[e], @intCast(k2s[e]), D, I, wq.ptr);
+                try o.mtpDense(wq.ptr, tt.ptr, ex.suh_g + e * D * 2, ex.svh_g + e * I * 2, gu, D, I, 2 * I);
+                try o.unpackRaw(ptrs[E + e], @intCast(k2s[E + e]), D, I, wq.ptr);
+                try o.mtpDense(wq.ptr, tt.ptr, ex.suh_u + e * D * 2, ex.svh_u + e * I * 2, gu + I * 2, D, I, 2 * I);
+                try o.unpackRaw(ptrs[2 * E + e], @intCast(k2s[2 * E + e]), I, D, wq.ptr);
+                try o.mtpDense(wq.ptr, tt.ptr, ex.suh_d + e * I * 2, ex.svh_d + e * D * 2, wd.ptr + e * I * D * 2, I, D, D);
+            }
+            try s.synchronize(); // wq / tt are freed at the end of this block
+        }
+        const P = rows * K;
+        var h = try cuda.DeviceBuffer.alloc(d, P * 2 * I * 2);
+        errdefer h.free();
+        var perm_dev = try cuda.DeviceBuffer.alloc(d, P * 4);
+        errdefer perm_dev.free();
+        var inv_dev = try cuda.DeviceBuffer.alloc(d, P * 4);
+        errdefer inv_dev.free();
+        const pick = try gpa.alloc(i32, P);
+        errdefer gpa.free(pick);
+        const perm = try gpa.alloc(i32, P);
+        errdefer gpa.free(perm);
+        const inv = try gpa.alloc(i32, P);
+        errdefer gpa.free(inv);
+        const cnt = try gpa.alloc(usize, E);
+        errdefer gpa.free(cnt);
+        const off = try gpa.alloc(usize, E);
+        errdefer gpa.free(off);
+        const fill = try gpa.alloc(usize, E);
+        errdefer gpa.free(fill);
+        return .{
+            .gpa = gpa,
+            .blas = blas,
+            .wgu = wgu,
+            .wd = wd,
+            .h = h,
+            .perm_dev = perm_dev,
+            .inv_dev = inv_dev,
+            .pick = pick,
+            .perm = perm,
+            .inv = inv,
+            .cnt = cnt,
+            .off = off,
+            .fill = fill,
+            .E = E,
+            .D = D,
+            .I = I,
+            .K = K,
+            .rows = rows,
+            .bytes = wgu.len + wd.len + h.len + perm_dev.len + inv_dev.len,
+        };
+    }
+
+    pub fn deinit(md: *MtpDense) void {
+        md.gpa.free(md.fill);
+        md.gpa.free(md.off);
+        md.gpa.free(md.cnt);
+        md.gpa.free(md.inv);
+        md.gpa.free(md.perm);
+        md.gpa.free(md.pick);
+        md.inv_dev.free();
+        md.perm_dev.free();
+        md.h.free();
+        md.wd.free();
+        md.wgu.free();
+        md.* = undefined;
+    }
+
+    /// eh_proj of prompt rows: x [n, D] bf16 = mcat [n, 2 D] @ eh_proj^T (eh_proj bf16 [D, 2 D]), fp32 compute.
+    pub fn ehProj(md: *MtpDense, f: *const fw.Forward, mcat: u64, eh_proj: u64, x: u64, n: usize) !void {
+        const D = f.w.config.hidden;
+        // column-major: x^T [D, n] = (eh_proj as [2D, D] col-major)^T @ mcat^T [2D, n]
+        try md.blas.bgemmBf16(f.s.handle, .t, .n, D, n, 2 * D, eh_proj, 2 * D, 0, mcat, 2 * D, 0, x, D, 0, 1);
+        md.gemms += 1;
+    }
+
+    /// Rows [r0, r0 + n) of md.pick: cnt / off (segment positions grouped by expert, ascending; pairs in order
+    /// within an expert), perm[base ..] (position -> pair) and inv[r0 K ..] (pair -> position, -1 unrouted).
+    /// Returns the routed pairs.
+    fn plan(md: *MtpDense, r0: usize, n: usize, base: usize) usize {
+        const K = md.K;
+        const E: i32 = @intCast(md.E);
+        @memset(md.cnt, 0);
+        for (r0 * K..(r0 + n) * K) |p| {
+            const e = md.pick[p];
+            if (e >= 0 and e < E) md.cnt[@intCast(e)] += 1;
+        }
+        var acc: usize = 0;
+        for (0..md.E) |e| {
+            md.off[e] = acc;
+            md.fill[e] = acc;
+            acc += md.cnt[e];
+        }
+        for (r0 * K..(r0 + n) * K) |p| {
+            const e = md.pick[p];
+            if (e >= 0 and e < E) {
+                const q = md.fill[@intCast(e)];
+                md.fill[@intCast(e)] = q + 1;
+                md.perm[base + q] = @intCast(p);
+                md.inv[p] = @intCast(q);
+            } else {
+                md.inv[p] = -1;
+            }
+        }
+        return acc;
+    }
+
+    /// The MTP layer's routed experts of prompt rows b.normed[:R] (picks b.pick, weights b.wts), plus b.sy (the
+    /// shared expert, already queued), into b.part[:R] (fp32). One host sync (the picks); rows in segments that fit
+    /// b.gath (one segment at 8192 rows, world 4, top-k 8) and md.h.
+    pub fn routed(md: *MtpDense, f: *const fw.Forward, b: *const fw.Buffers, R: usize) !void {
+        const o: kern.Ops = .{ .k = f.k, .s = f.s };
+        const K = md.K;
+        const D = md.D;
+        const I = md.I;
+        if (R > md.rows or b.gath == 0) return error.NoMtpScratch;
+        // xs: the grouped rows, then each expert's down output over its own rows (bf16 [pairs, D]) - b.gath (fp32
+        // [world, rows, D]) is idle while the MTP layer runs: prompt chunks reduce over the bf16 ring, and the next
+        // chunk's comm stream waits for this chunk's main stream
+        const room = f.w.world * b.rows * D * 4;
+        const seg = @min(room / (K * D * 2), md.h.len / (K * 2 * I * 2));
+        if (seg == 0) return error.ScratchTooSmall;
+        const xs = b.gath;
+        try o.download(std.mem.sliceAsBytes(md.pick[0 .. R * K]), b.pick);
+        try f.s.synchronize(); // the picks on the host: a prompt chunk's MTP layer only
+        md.chunks += 1;
+        var r0: usize = 0;
+        var base: usize = 0;
+        while (r0 < R) : (r0 += seg) {
+            const n = @min(seg, R - r0);
+            const np = md.plan(r0, n, base);
+            md.segments += 1;
+            try o.upload(md.inv_dev.ptr + r0 * K * 4, std.mem.sliceAsBytes(md.inv[r0 * K ..][0 .. n * K]));
+            if (np > 0) {
+                const pd = md.perm_dev.ptr + base * 4;
+                try o.upload(pd, std.mem.sliceAsBytes(md.perm[base..][0..np]));
+                try o.mtpGather(b.normed, D, pd, K, xs, np, D);
+                // gate | up: h[pos] = xs[pos] @ wgu[e] (column-major h^T [2I, cnt] = wgu[e]^T-view [2I, D] @ xs^T)
+                for (0..md.E) |e| {
+                    const cn = md.cnt[e];
+                    if (cn == 0) continue;
+                    const q = md.off[e];
+                    try md.blas.bgemmBf16(f.s.handle, .n, .n, 2 * I, cn, D, md.wgu.ptr + e * D * 2 * I * 2, 2 * I, 0, xs + q * D * 2, D, 0, md.h.ptr + q * 2 * I * 2, 2 * I, 0, 1);
+                    md.gemms += 1;
+                }
+                try o.mtpSwiglu(md.h.ptr, np, I);
+                // down: xs[pos] = act[pos] @ wd[e] (over the expert's own gathered rows: spent by its gate | up)
+                for (0..md.E) |e| {
+                    const cn = md.cnt[e];
+                    if (cn == 0) continue;
+                    const q = md.off[e];
+                    try md.blas.bgemmBf16(f.s.handle, .n, .n, D, cn, I, md.wd.ptr + e * I * D * 2, D, 0, md.h.ptr + q * 2 * I * 2, 2 * I, 0, xs + q * D * 2, D, 0, 1);
+                    md.gemms += 1;
+                }
+            }
+            try o.mtpCombine(xs, md.inv_dev.ptr + r0 * K * 4, b.wts + r0 * K * 4, b.sy + r0 * D * 4, b.part + r0 * D * 4, n, K, D);
+            base += np;
+        }
+    }
+};
+
 test "sequence-parallel fits as fused.sp_fits" {
     try std.testing.expect(spFits(4, 8192, 4096, 8177)); // a 32K prompt's chunk: halves 4088 / 4089 -> 4088, 4092
     try std.testing.expect(!spFits(4, 8192, 4096, 8192 + 4)); // the second half pads to 4100 > 4096

@@ -51,3 +51,9 @@ glm53_topk_count
 glm53_topk_write
 glm53_cands
 glm53_l2pf
+# Phase 3a speed (glm53_mtp.cu): the MTP layer's prompt rows through dense bf16 experts
+glm53_mtp_had_rows
+glm53_mtp_had_cols
+glm53_mtp_gather
+glm53_mtp_swiglu
+glm53_mtp_combine

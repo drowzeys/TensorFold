@@ -73,6 +73,10 @@ pub const BufOpts = struct {
     /// MAX_ROWS) rows and wider windows take the prompt experts kernel (prompt_experts.cu); false ("tf"): the decode
     /// kernel at every width, its scratch for every row
     shared_experts: bool = false,
+    /// Phase 3a speed (cuda_prompt.MtpDense, --mtp-dense 1): the MTP layer's prompt rows take cuBLAS for eh_proj and
+    /// the dense experts, so the eh_proj router partials / fp32 rows stay at max_rows rows and no decode-kernel
+    /// blocks are carved (xs_big)
+    mtp_dense: bool = false,
 };
 
 /// What a window's head computes (fused.head's modes; `none`: no head).
@@ -133,6 +137,7 @@ pub const Buffers = struct {
     mcat: u64 = 0, // bf16 [rows, 2 D]
     mx32: u64 = 0, // fp32 [rows, D]
     epart: u64 = 0, // fp32 [ROUTER_KS, rows, D]: eh_proj's router partials
+    erows: usize = 0, // rows mx32 / epart hold (BufOpts.mtp_dense: min(rows, max_rows))
     argmax: u64 = 0, // int64 [head_rows]
     gsum: u64 = 0, // fp32 [head_rows, D / 64]: the draft head's input group sums
     head_v: usize = 0, // b.lg holds head_rows rows of up to this many logits (max(vocab_part, draft rows))
@@ -268,8 +273,9 @@ pub const Buffers = struct {
             b.me = try b.alloc(rows * D * 2);
             b.mh = try b.alloc(rows * D * 2);
             b.mcat = try b.alloc(rows * 2 * D * 2);
-            b.mx32 = try b.alloc(rows * D * 4);
-            b.epart = try b.alloc(tri.router_ks * rows * D * 4);
+            b.erows = if (opts.mtp_dense) @min(rows, max_rows) else rows;
+            b.mx32 = try b.alloc(b.erows * D * 4);
+            b.epart = try b.alloc(tri.router_ks * b.erows * D * 4);
         }
         // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N] (the row-invariant kernel: up to
         // max_rows rows; prompt chunks' wider calls take the prompt GEMM's workspace)
@@ -331,7 +337,7 @@ pub const Buffers = struct {
             // the MTP layer's prompt rows in bigger blocks of the decode kernel (row-invariant: the same bits as
             // blocks of xs_rows), xg / xu / y / z carved out of b.gath (world * rows * D fp32); the group kernel
             // stages a block's picks in 48 KiB of shared memory (1536 rows of 8 slots)
-            if (opts.prompt and opts.mtp and opts.shared_experts and rows > xrows and b.gath != 0) {
+            if (opts.prompt and opts.mtp and !opts.mtp_dense and opts.shared_experts and rows > xrows and b.gath != 0) {
                 const zcols = @max(2 * gu.sk * ex.width, dn.sk * ex.dims);
                 const per_slot = std.mem.alignForward(usize, ex.dims * 2, 256) * 2 + ex.dims * 4 + zcols * 4;
                 const room = w.world * rows * D * 4;
@@ -472,6 +478,10 @@ pub const Forward = struct {
     multi_select: bool = true,
     /// the prompt path's per-phase timers (cuda_prompt.Prof, --prompt-prof); null: none
     prof: ?*prompt.Prof = null,
+    /// Phase 3a speed (--mtp-dense 1): the MTP layer's prompt rows (windows over max_rows rows) through cuBLAS -
+    /// eh_proj and its routed experts as dense bf16 GEMMs (cuda_prompt.MtpDense); null: the router kernel and the
+    /// decode expert kernel in blocks. Drafts only: the target verifies every token, so no output token moves.
+    mtp_dense: ?*prompt.MtpDense = null,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -844,8 +854,14 @@ pub const Forward = struct {
         try t_.rmsnorm(b.me, D, m.enorm, b.mh, D, n, D, c.eps);
         try t_.rmsnorm(b.hin, D, m.hnorm, b.normed, D, n, D, c.eps);
         try t_.cat2(b.mh, b.normed, b.mcat, n, D);
-        try t_.router(b.mcat, 2 * D, m.eh_proj, b.mx32, b.epart, n, 2 * D, D);
-        try o.f32ToBf16(b.mx32, b.x, n * D);
+        if (f.mtp_dense != null and n > max_rows) {
+            // prompt rows: one cuBLAS bf16 GEMM into b.x (bf16 of fp32 sums, as the router's split-K partials + cast)
+            try f.mtp_dense.?.ehProj(f, b.mcat, m.eh_proj, b.x, n);
+        } else {
+            if (n > b.erows) return error.NoMtpScratch;
+            try t_.router(b.mcat, 2 * D, m.eh_proj, b.mx32, b.epart, n, 2 * D, D);
+            try o.f32ToBf16(b.mx32, b.x, n * D);
+        }
         {
             // TF_GLM53_SIDE: draft and MTP refresh windows too (no L2 prefetch: l2pf skips the MTP passes)
             const sd = f.sideWindow(b, n);
@@ -1004,6 +1020,14 @@ pub const Forward = struct {
         // grouped GEMM (not ported; its split-K atomics make it irreproducible run to run anyway). Here: the decode
         // kernel in blocks of its scratch's rows, every row its one-row bits. Only MTP prompt rows take this: drafts
         // only propose and the target verifies each, so no token depends on it (acceptance may move a little).
+        // --mtp-dense 1 (the MTP layer): the shared expert into b.sy, then the dense bf16 experts through cuBLAS, the
+        // combine adding b.sy (cuda_prompt.MtpDense.routed)
+        if (f.mtp_dense) |md| {
+            if (L.index == f.w.config.layers) {
+                try f.mlp(b, L, R, b.sy);
+                return md.routed(f, b, R);
+            }
+        }
         // blocks of xs_big.rows rows when the prompt buffers carved one (Phase 3a speed: each block re-reads every
         // routed expert it touches, so 10x fewer blocks read ~3x fewer bytes), else of the decode scratch's rows
         const xs = b.xs_big orelse (b.xs orelse return error.NoExpertScratch);

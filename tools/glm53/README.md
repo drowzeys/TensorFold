@@ -193,6 +193,14 @@ in both engines (`prefill-prof.txt`). The reference container now gets a writabl
 run 2's Python ran WITHOUT RoCE ("Permission denied: /root/.cache/vllm/b12x-compile"), so its decode figures were
 NCCL's.
 
+After run 4 (prefill 32K 0.960, 128K 0.946; the MTP layer's prompt rows 2.1 s of a 29.4 s 32K prefill, serial on the
+main stream): `--mtp-dense 1` (`ZMTP_DENSE`, default 1) runs the MTP layer's prompt rows through cuBLAS -
+`cuda_prompt.MtpDense`: its 8-bit experts kept a second time as dense bf16 (EXL3 rotations folded in, built at load
+from the same trellis: `unpack_kernel`, `glm53_mtp.cu`'s Hadamard passes), the pairs grouped by expert on the host (one
+sync a chunk), a GEMM an expert for gate | up and for down, combine in slot order; eh_proj as one GEMM (which drops its
+1.6 GB of router partials from the prompt buffers). ~4.97 GB a rank, ~3.2 GB net. Drafts only: the target verifies
+every token, so tokens cannot move; the gate adds a tokens/round check on the 32K prose drafted runs (`TPR_TOL`, 2 %).
+
 What must match bit for bit beyond Phase 2b's kernels: the prompt GEMM (`x3prefill._gemm`, Triton, captured), its
 weight decode (`unpack_kernel`) and input rotation (`rot_in`), torch.bmm (cuBLAS `GemmStridedBatchedEx` with torch's
 arguments, workspace and math mode, the library file torch loaded - `--bmm-probe` checks three shapes first), the prompt

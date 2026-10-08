@@ -3,6 +3,7 @@
 
   compare_phase3a.py REF-r0.json GEN-r0.json [GEN-r1.json ...] [--ref-ranks REF-r1.json ...]
                      [--roce-bench BENCH-r0.json] [--speed-default REF-SPEED-r0.json] [--ratio 0.97]
+                     [--tpr-tol 0.02]
 
 PASS needs every one of:
   * tokens: every (prompt, run) of the Zig engine equal to Python's (greedy and keyed sampled, drafted and serial);
@@ -10,6 +11,9 @@ PASS needs every one of:
   * speed: Zig >= RATIO x Python on the 32K prose decode (the drafted sampled run, MTP k = 2) and on prefill at 32K
     and 128K (prompt tokens / prefill seconds, the best of each prompt's runs: both engines prefill a prompt once a
     run, and the first run of the first long prompt pays first-use costs in neither engine - both prewarm);
+  * drafts: on every 32K prose drafted run (MTP k > 0), Zig's tokens a round within TPR_TOL (relative, default 2 %)
+    of Python's - the MTP layer's prompt rows may take another implementation (--mtp-dense: cuBLAS over dense bf16
+    experts; Python's cuda-exl3 GEMM is not reproducible either), which can move drafts but never a token;
   * both engines ran the served exchanges: RoCE one-shot on (the reference's and Zig's), and the reference's prompt
     path (sequence parallel, 8192 / 4096-row chunks).
 Also printed: the speed table of every run, both engines' load time (not gated), the RoCE micro-benchmark (us a
@@ -60,6 +64,7 @@ def main() -> int:
     ap.add_argument("--roce-bench", default="")
     ap.add_argument("--speed-default", default="")
     ap.add_argument("--ratio", type=float, default=0.97)
+    ap.add_argument("--tpr-tol", type=float, default=0.02)
     a = ap.parse_args()
     ref, gens = load(a.ref), [load(p) for p in a.gen]
     gen = gens[0]
@@ -132,11 +137,14 @@ def main() -> int:
     print(f"{'prompt':12s} {'run':7s} {'P':>6s} {'n':>4s}  {'tokens':8s}  {'py tok/s':>8s} {'zig tok/s':>9s} "
           f"{'zig/py':>6s}  {'py t/rd':>7s} {'zig t/rd':>8s}  {'py pf/s':>8s} {'zig pf/s':>8s}")
     prose = None
+    tpr = []   # (run, python t/rd, zig t/rd) of the 32K prose drafted runs
     for (name, run), r, g, d in rows:
         rt, zt = float(r.get("tok_s") or 0), float(g.get("tok_s") or 0)
         ratio = zt / rt if rt > 0 else 0.0
         if name.startswith("prose32k") and r.get("k", 0) and not r.get("greedy"):
             prose = (rt, zt, float(r.get("tokens_per_round") or 0), float(g.get("tokens_per_round") or 0))
+        if name.startswith("prose32k") and r.get("k", 0):
+            tpr.append((run, float(r.get("tokens_per_round") or 0), float(g.get("tokens_per_round") or 0)))
         rp = r["prompt_len"] / float(r["prefill_s"]) if float(r.get("prefill_s") or 0) > 0 else 0.0
         zp = g["prompt_len"] / float(g["prefill_s"]) if float(g.get("prefill_s") or 0) > 0 else 0.0
         status = "equal" if d is None else f"@{d}"
@@ -185,10 +193,18 @@ def main() -> int:
     if ref.get("nccl_version") != gen.get("nccl_version"):
         print(f"note: NCCL {ref.get('nccl_version')} (python) vs {gen.get('nccl_version')} (zig)")
     slow = [f"{lab} {z / p:.3f}" for lab, p, z in gates if z < a.ratio * p]
+    tpr_bad = [f"{run} {py:.3f}/{zg:.3f}" for run, py, zg in tpr if py <= 0 or abs(zg - py) > a.tpr_tol * py]
+    if not tpr:
+        problems.append("no 32K prose drafted run for the tokens/round check")
+    print("32K prose tokens/round (drafted runs, python / zig, tolerance "
+          f"{a.tpr_tol:.1%}): " + ", ".join(f"{run} {py:.3f} / {zg:.3f}" for run, py, zg in tpr)
+          + f"; zig MTP prompt rows: {'dense cuBLAS' if gen.get('mtp_dense') else 'decode kernel'}"
+          + (f" ({gen.get('mtp_dense_gb')} GB a rank, {gen.get('mtp_chunks')} chunks, {gen.get('mtp_gemms')} GEMMs)"
+             if gen.get('mtp_dense') else ""))
     for p in problems:
         print("problem:", p)
     tokens_ok = not problems and tok_all > 0 and tok_eq == tok_all and runs_eq == len(rows)
-    ok = tokens_ok and not slow and len(gates) == 3
+    ok = tokens_ok and not slow and len(gates) == 3 and not tpr_bad
     geo = math.exp(sum(math.log(z / p) for _, p, z in gates) / len(gates)) if gates else 0.0
     print(f"PHASE3A {'PASS' if ok else 'FAIL'} runs={runs_eq}/{len(rows)} tokens={tok_eq}/{tok_all} "
           f"drafted==serial={ds_ok}/{ds_all} "
@@ -198,6 +214,7 @@ def main() -> int:
           + f"load_zig={max(float(o.get('load_s') or 0) for o in gens):.0f}"
           + (f" roce_us={bench_worst}" if bench_worst is not None else "")
           + (f" below_{a.ratio}=[{'; '.join(slow)}]" if slow else "")
+          + (f" tpr_off=[{'; '.join(tpr_bad)}]" if tpr_bad else "")
           + (f" first_divergence={','.join(first[:6])}" if first else "")
           + (f" problems={len(problems)}" if problems else ""))
     return 0 if ok else 1

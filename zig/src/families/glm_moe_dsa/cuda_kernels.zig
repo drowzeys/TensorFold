@@ -49,6 +49,13 @@ pub const Kernels = struct {
     topk_write: cuda.Function,
     cands: cuda.Function,
     l2pf: cuda.Function,
+    // Phase 3a speed (glm53_mtp.cu): the MTP layer's prompt rows through dense bf16 experts (cuda_prompt.MtpDense)
+    mtp_mod: cuda.Module,
+    mtp_had_rows: cuda.Function,
+    mtp_had_cols: cuda.Function,
+    mtp_gather: cuda.Function,
+    mtp_swiglu: cuda.Function,
+    mtp_combine: cuda.Function,
     gb10: bool, // sm_121: qmm_group launches with programmatic dependent launch (qmm_group_cuda's `early`)
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
@@ -108,6 +115,13 @@ pub const Kernels = struct {
         k.topk_write = try k.decode_mod.function("glm53_topk_write");
         k.cands = try k.decode_mod.function("glm53_cands");
         k.l2pf = try k.decode_mod.function("glm53_l2pf");
+        k.mtp_mod = try cuda.Module.load(d, cuda.kernels.glm53_mtp);
+        errdefer k.mtp_mod.unload();
+        k.mtp_had_rows = try k.mtp_mod.function("glm53_mtp_had_rows");
+        k.mtp_had_cols = try k.mtp_mod.function("glm53_mtp_had_cols");
+        k.mtp_gather = try k.mtp_mod.function("glm53_mtp_gather");
+        k.mtp_swiglu = try k.mtp_mod.function("glm53_mtp_swiglu");
+        k.mtp_combine = try k.mtp_mod.function("glm53_mtp_combine");
         try k.pe_gateup.allowDynamicShared(k.pe.gu_smem);
         try k.pe_down.allowDynamicShared(k.pe.dn_smem);
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
@@ -116,6 +130,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.mtp_mod.unload();
         k.decode_mod.unload();
         k.pe_mod.unload();
         k.prompt_mod.unload();
@@ -518,6 +533,81 @@ pub const Ops = struct {
         a.add(st[0]);
         a.add(st[1]);
         try cuda.launch.launch(o.k.unpack[i], .{ .grid = .{ .x = u(l.n / 16), .y = u(l.k / 16) }, .block = .{ .x = 32 } }, o.s, &a);
+    }
+
+    /// unpack_kernel on a raw expert trellis (tiles [K/16, N/16] in row order, `k2` half-bits a value, codebook
+    /// mul1): W_q [K, N] fp16 at `w` (the rotated domain, as Exl3Linear.unpack).
+    pub fn unpackRaw(o: Ops, words: u64, k2: usize, K: usize, N: usize, w: u64) !void {
+        const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, k2) orelse return error.UnsupportedExl3Width;
+        if (N % 128 != 0 or K % 16 != 0) return error.BadSplit;
+        const tw: i64 = @intCast(4 * k2);
+        var a: cuda.Args = .{};
+        a.add(words);
+        a.add(w);
+        a.add(int(N));
+        a.add(@as(i64, @intCast(N / 16)) * tw);
+        a.add(8 * tw);
+        try cuda.launch.launch(o.k.unpack[i], .{ .grid = .{ .x = u(N / 16), .y = u(K / 16) }, .block = .{ .x = 32 } }, o.s, &a);
+    }
+
+    /// glm53_mtp_had_rows + glm53_mtp_had_cols: W_q [K, N] fp16 (rotated domain) -> out [K, N] bf16 (row stride
+    /// `ldo`) with x @ out = the EXL3 linear of x (suh, the input / output Hadamards and svh folded in); `t` fp32
+    /// [K, N] scratch.
+    pub fn mtpDense(o: Ops, wq: u64, t: u64, suh: u64, svh: u64, out: u64, K: usize, N: usize, ldo: usize) !void {
+        if (K % 128 != 0 or N % 128 != 0) return error.BadSplit;
+        var a: cuda.Args = .{};
+        a.add(wq);
+        a.add(t);
+        a.add(int(K));
+        a.add(int(N));
+        try cuda.launch.launch(o.k.mtp_had_rows, .{ .grid = .{ .x = u((K * (N / 128) + 7) / 8) }, .block = .{ .x = 256 } }, o.s, &a);
+        var b: cuda.Args = .{};
+        b.add(t);
+        b.add(suh);
+        b.add(svh);
+        b.add(out);
+        b.add(int(K));
+        b.add(int(N));
+        b.add(int(ldo));
+        try cuda.launch.launch(o.k.mtp_had_cols, .{ .grid = .{ .x = u(((K / 128) * N + 7) / 8) }, .block = .{ .x = 256 } }, o.s, &b);
+    }
+
+    /// glm53_mtp_gather: xs[p, :D] = x[perm[p] / slots, :D] for p < n (bf16 rows; x rows `x_stride` elements apart).
+    pub fn mtpGather(o: Ops, x: u64, x_stride: usize, perm: u64, slots: usize, xs: u64, n: usize, D: usize) !void {
+        if (n == 0) return;
+        if ((D * 2) % 16 != 0 or (x_stride * 2) % 16 != 0) return error.BadSplit;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(x_stride * 2 / 16));
+        a.add(perm);
+        a.add(int(slots));
+        a.add(xs);
+        a.add(int(D * 2 / 16));
+        try cuda.launch.launch(o.k.mtp_gather, .{ .grid = .{ .x = u(n) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_mtp_swiglu: h [n, 2I] bf16 (gate | up) -> h[:, :I] = silu(gate) * up, in place.
+    pub fn mtpSwiglu(o: Ops, h: u64, n: usize, I: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(int(I));
+        try cuda.launch.launch(o.k.mtp_swiglu, .{ .grid = .{ .x = u(n) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_mtp_combine: out[r] = sy[r] + sum_s wts[r, s] y[inv[r, s]] for r < rows (sy 0: no shared term).
+    pub fn mtpCombine(o: Ops, y: u64, inv: u64, wts: u64, sy: u64, out: u64, rows: usize, slots: usize, D: usize) !void {
+        if (rows == 0) return;
+        if (slots > 32) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(y);
+        a.add(inv);
+        a.add(wts);
+        a.add(sy);
+        a.add(out);
+        a.add(int(slots));
+        a.add(int(D));
+        try cuda.launch.launch(o.k.mtp_combine, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 
     /// out [R, H, X] = in [H, R, X] (bf16): the copy_ of a torch.bmm result into fused's row-major view.

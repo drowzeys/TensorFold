@@ -35,6 +35,9 @@
 #   Zig decode knobs (the image's served defaults): ZSIDE [af] (TF_GLM53_SIDE)  ZL2PF [1] (TF_GLM53_L2PF: 1|0|lines|touch)
 #   ZL2PF_MB [8]  ZMULTI_SELECT [1] (decode-sized top-k over many blocks; 0: the one-program radix select)
 #   ZDEVICE_CANDS [1] (sampled windows: each rank's candidates picked on the device)
+#   ZMTP_DENSE [1] (the MTP layer's prompt rows through cuBLAS: its 8-bit experts as dense bf16 built at load, ~4.8 GB
+#     a rank, and eh_proj; drafts only. 0: the decode expert kernel in blocks and the router kernel)
+#   TPR_TOL [0.02]: the gate's tokens/round tolerance |zig - py| / py on the 32K prose drafted runs
 #   PROFILE [0]: 1 = the prefill of PROFILE_PROMPT [prose32k]'s first run timed by phase in both engines (Zig:
 #     --prompt-prof, CUDA events a chunk; Python: Runner.prefill's torch.profiler table rolled up by
 #     reference3a.py --profile-prefill), printed after each engine's runs as PROMPT-PROF / PREFILL-PROF lines and kept
@@ -71,6 +74,8 @@ ZL2PF=${ZL2PF:-1}
 ZL2PF_MB=${ZL2PF_MB:-8}
 ZMULTI_SELECT=${ZMULTI_SELECT:-1}
 ZDEVICE_CANDS=${ZDEVICE_CANDS:-1}
+ZMTP_DENSE=${ZMTP_DENSE:-1}
+TPR_TOL=${TPR_TOL:-0.02}
 PROFILE=${PROFILE:-0}
 PROFILE_PROMPT=${PROFILE_PROMPT:-prose32k}
 REF_PORT=${REF_PORT:-29571}
@@ -366,7 +371,7 @@ gen_args() {
     --prompt-rows 8192 --prompt-rows-short 4096 --prompt-sp 1 --experts ${EXPERTS:-shared} --pe-det slots16 \
     --cublas-lib $CUBLAS --unpack-mb 384 --bmm-probe /work/ref/bmm_probe.json \
     --side $ZSIDE --l2pf $ZL2PF --l2pf-mb $ZL2PF_MB --multi-select $ZMULTI_SELECT --device-cands $ZDEVICE_CANDS \
-    $([ "$PROFILE" = 1 ] && echo "--prompt-prof $PROFILE_PROMPT") \
+    --mtp-dense $ZMTP_DENSE $([ "$PROFILE" = 1 ] && echo "--prompt-prof $PROFILE_PROMPT") \
     --timeout ${ZIG_RDV_TIMEOUT:-5400} --out /work/gen-r$1.json"
 }
 say "zig: tf-glm53-generate --mode 3a at TP4 (docker --memory $MEM_CAP a rank)"
@@ -394,7 +399,7 @@ extra=""
 [ -s "$LOCAL/roce-bench-r0.json" ] && extra="$extra --roce-bench $WORK/roce-bench-r0.json"
 [ -s "$LOCAL/refd-r0.json" ] && extra="$extra --speed-default $WORK/refd/ref-r0.json"
 rsh "${NODES[0]}" "python3 -B $RPORT/tf/tools/glm53/compare_phase3a.py $WORK/ref/ref-r0.json $WORK/gen-r0.json $WORK/gen-r1.json $WORK/gen-r2.json $WORK/gen-r3.json \
-  --ref-ranks $WORK/ref/ref-r1.json.copy $WORK/ref/ref-r2.json.copy $WORK/ref/ref-r3.json.copy --ratio $RATIO $extra" > "$LOCAL/compare.log" 2>&1
+  --ref-ranks $WORK/ref/ref-r1.json.copy $WORK/ref/ref-r2.json.copy $WORK/ref/ref-r3.json.copy --ratio $RATIO --tpr-tol $TPR_TOL $extra" > "$LOCAL/compare.log" 2>&1
 crc=$?
 grep -v '^PHASE3A' "$LOCAL/compare.log" | tee -a "$LOG"
 line=$(grep '^PHASE3A' "$LOCAL/compare.log" | tail -1)
