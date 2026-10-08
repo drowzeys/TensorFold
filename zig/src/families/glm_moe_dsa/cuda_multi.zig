@@ -586,7 +586,6 @@ pub const Multi = struct {
         const k = r.set.k;
         if (r.set.slots != n or r.set.dcp != 1 or !r.set.served) return error.Invalid;
         if (r.copy_on) return error.CopiesNeedOneStream;
-        if (r.dspark != null) return error.DrafterNeedsOneStream; // DSpark: one stream at a time (for now)
         // Phase 4c: the runner's drafters serve the streams too (MultiDrafter); their rows widen the windows
         const bases = [2]?*draft.Drafter{ r.dflash, r.dspark };
         var specs: [2]draft.Spec = undefined;

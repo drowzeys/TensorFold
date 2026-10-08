@@ -596,10 +596,6 @@ pub fn checkParallel(o: Options, dcp: usize) !void {
 pub fn checkParallelDrafters(parallel: usize, dflash_block: ?usize, dspark_block: ?usize) !void {
     if (parallel <= 1) return;
     const quiet = @import("builtin").is_test;
-    if (dspark_block != null) {
-        if (!quiet) std.log.err("TF_GLM53_DSPARK drafts one stream at a time: --parallel 1 (concurrent streams draft with the MTP head or DFlash2)", .{});
-        return error.DrafterNeedsOneStream;
-    }
     for ([_]?usize{ dflash_block, dspark_block }, [_][]const u8{ "TF_GLM53_DFLASH", "TF_GLM53_DSPARK" }) |maybe, name| {
         const block = maybe orelse continue;
         if (parallel * block > mdraft.max_pass_rows or parallel > mdraft.max_streams) {
@@ -1039,8 +1035,8 @@ test "--parallel refusals: DCP, a window wider than a decode window; the drafter
 
 test "Phase 4c: a drafter drafts N streams when N blocks fit one pass" {
     try checkParallelDrafters(1, 64, null);
-    try checkParallelDrafters(4, 8, null);
+    try checkParallelDrafters(4, 8, 8);
     try checkParallelDrafters(8, 8, null);
     try std.testing.expectError(error.DrafterTooWide, checkParallelDrafters(9, 8, null));
-    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallelDrafters(4, null, 8));
+    try std.testing.expectError(error.DrafterTooWide, checkParallelDrafters(4, null, 17));
 }
