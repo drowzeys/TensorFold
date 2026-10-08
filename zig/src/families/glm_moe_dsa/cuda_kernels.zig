@@ -49,6 +49,10 @@ pub const Kernels = struct {
     topk_write: cuda.Function,
     cands: cuda.Function,
     l2pf: cuda.Function,
+    // Phase 3b (glm53_decode.cu): decode context parallelism's query pack, candidate keys and global merge
+    dcp_qpack: cuda.Function,
+    dcp_cands: cuda.Function,
+    dcp_merge: cuda.Function,
     // Phase 3a speed (glm53_mtp.cu): the MTP layer's prompt rows through dense bf16 experts (cuda_prompt.MtpDense)
     mtp_mod: cuda.Module,
     mtp_had_rows: cuda.Function,
@@ -115,6 +119,9 @@ pub const Kernels = struct {
         k.topk_write = try k.decode_mod.function("glm53_topk_write");
         k.cands = try k.decode_mod.function("glm53_cands");
         k.l2pf = try k.decode_mod.function("glm53_l2pf");
+        k.dcp_qpack = try k.decode_mod.function("glm53_dcp_qpack");
+        k.dcp_cands = try k.decode_mod.function("glm53_dcp_cands");
+        k.dcp_merge = try k.decode_mod.function("glm53_dcp_merge");
         k.mtp_mod = try cuda.Module.load(d, cuda.kernels.glm53_mtp);
         errdefer k.mtp_mod.unload();
         k.mtp_had_rows = try k.mtp_mod.function("glm53_mtp_had_rows");
@@ -275,6 +282,8 @@ pub const ExpertScratch = struct {
 /// glm53_decode.cu's multi-block top-k: columns a block, and the scratch a selection of up to `rows` rows over up
 /// to `blocks` blocks of columns needs (zero at allocation; every selection leaves it zero again).
 pub const topk_chunk: usize = 2048;
+/// glm53_dcp_merge's MERGE_MAX_K: the widest index_topk its own-slot sort holds.
+pub const dcp_merge_max_k: usize = 2048;
 pub const TopkScratch = struct {
     hist: u64 = 0, // uint32 [rows, 2048]
     state: u64 = 0, // uint32 [rows, 4]
@@ -734,12 +743,19 @@ pub const Ops = struct {
     /// ascending, ties to the lower column (int32). `fmode`: keys are fp32 values in sampling.topBetter's order (else
     /// uint32 order words). Five launches, no host step: capturable.
     pub fn topkColumns(o: Ops, keys: u64, nc: usize, ld: usize, rows: usize, K: usize, fmode: bool, sc: TopkScratch, out: u64, out_ld: usize) !void {
+        return o.topkColumnsMode(keys, nc, ld, rows, K, @intFromBool(fmode), sc, out, out_ld);
+    }
+
+    /// topkColumns with the key mode named: 0 uint32 order words, 1 fp32 values, 2 (Phase 3b, DCP) packed int64 keys
+    /// of _index_scores PACK=True (`ld` in keys), ordered by their high word - the set torch.topk keeps of them.
+    pub fn topkColumnsMode(o: Ops, keys: u64, nc: usize, ld: usize, rows: usize, K: usize, mode: c_int, sc: TopkScratch, out: u64, out_ld: usize) !void {
         if (rows == 0) return;
+        if (mode < 0 or mode > 2) return error.Invalid;
         if (K == 0 or K > nc or rows > sc.rows) return error.Invalid;
         const B = (nc + topk_chunk - 1) / topk_chunk;
         if (B > sc.blocks) return error.ScratchTooSmall;
         const cfg: cuda.Config = .{ .grid = .{ .x = u(B), .y = u(rows) }, .block = .{ .x = 256 } };
-        const fm: c_int = @intFromBool(fmode);
+        const fm: c_int = mode;
         for (0..3) |pass| {
             var a: cuda.Args = .{};
             a.add(keys);
@@ -787,6 +803,53 @@ pub const Ops = struct {
         a.add(@as(i64, @intCast(off)));
         a.add(send);
         try cuda.launch.launch(o.k.cands, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = u((cnt + 31) / 32 * 32) } }, o.s, &a);
+    }
+
+    /// glm53_dcp_qpack (fused._attention_dcp): out [n, lw + rd] = [qlat [n, lw] ; qrot [n, rd]] (bf16), n = rows x heads.
+    pub fn dcpQpack(o: Ops, qlat: u64, qrot: u64, out: u64, n: usize, lw: usize, rd: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(qlat);
+        a.add(qrot);
+        a.add(out);
+        a.add(int(lw));
+        a.add(int(rd));
+        try cuda.launch.launch(o.k.dcp_qpack, .{ .grid = .{ .x = u(n) }, .block = .{ .x = 128 } }, o.s, &a);
+    }
+
+    /// glm53_dcp_cands (fused.select, DCP): out [rows, K] int64 = this rank's top kk keys, then int64 min + 1. `cols`
+    /// mode (0): src int32 columns [rows, sld] into sc [rows, ld] int64; keys mode (1): src int64 keys [rows, sld].
+    pub fn dcpCands(o: Ops, sc: u64, ld: usize, src: u64, sld: usize, kk: usize, K: usize, keys_mode: bool, out: u64, rows: usize) !void {
+        if (rows == 0) return;
+        if (kk > K) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(sc);
+        a.add(@as(i64, @intCast(ld)));
+        a.add(src);
+        a.add(@as(i64, @intCast(sld)));
+        a.add(int(kk));
+        a.add(int(K));
+        a.add(@as(c_int, @intFromBool(keys_mode)));
+        a.add(out);
+        try cuda.launch.launch(o.k.dcp_cands, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_dcp_merge (fused.select, DCP): the K best of every rank's candidates (cand [dcp, rows, K] int64; `hi`:
+    /// topk.top_keys' high-word select, else torch.topk's whole keys) -> tok [rows, K] int32 own slots ascending, cnt
+    /// [rows] int32.
+    pub fn dcpMerge(o: Ops, cand: u64, rows: usize, K: usize, dcp: usize, rank: usize, hi: bool, tok: u64, cnt: u64) !void {
+        if (rows == 0) return;
+        if (K > dcp_merge_max_k or dcp == 0) return error.Invalid;
+        var a: cuda.Args = .{};
+        a.add(cand);
+        a.add(int(rows));
+        a.add(int(K));
+        a.add(int(dcp));
+        a.add(int(rank));
+        a.add(@as(c_int, @intFromBool(hi)));
+        a.add(tok);
+        a.add(cnt);
+        try cuda.launch.launch(o.k.dcp_merge, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 1024 } }, o.s, &a);
     }
 
     /// glm53_l2pf: prefetch `count` (address, bytes) pieces of `table` (int64 pairs) into L2.

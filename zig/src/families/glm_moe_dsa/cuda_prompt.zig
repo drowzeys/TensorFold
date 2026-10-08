@@ -285,7 +285,8 @@ pub const Prof = struct {
     }
 };
 
-/// fused.sp_fits: the padded halves fit the buffers (and the world splits rows at all).
+/// fused.sp_fits: the padded halves fit the buffers (and the world splits rows at all). Under DCP (Forward.dcp > 1)
+/// fused.sp_fits is False whatever the rows: the caller checks Forward.dcp first (Sp.chunk refuses it).
 pub fn spFits(world: usize, rows0: usize, rows1: usize, R: usize) bool {
     if (world < 2) return false;
     const hR = R / 2;
@@ -360,6 +361,7 @@ pub const Sp = struct {
         const D = f.w.config.hidden;
         const o = kern.Ops{ .k = f.k, .s = f.s };
         const hR = R / 2;
+        if (f.dcp != 1) return error.SpWithDcp; // fused.sp_fits: no sequence-parallel chunk under DCP
         if (!spFits(f.w.world, b0.rows, b1.rows, R)) return error.WindowTooWide;
         try o.copy(b1.ids, b0.ids + hR * 8, (R - hR) * 8);
         try o.fill32(sp.pos1.ptr, @intCast(a + hR), 1);

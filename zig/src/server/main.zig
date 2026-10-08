@@ -60,6 +60,13 @@ pub fn main(init: std.process.Init) !u8 {
     const model_type = modelType(a, io, dir);
     const opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
     defer opened.close(opened.ctx);
+    if (opened.follow) |follow| { // a follower rank of a tensor-parallel world: no HTTP, rank 0's requests mirrored
+        follow(opened.ctx) catch |e| {
+            std.debug.print("tensorfold: following rank 0 stopped: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
     return serve.run(gpa, io, args, .{
         .engine = opened.engine,
         .text = text.text(),

@@ -22,6 +22,11 @@
 //! reference boot's EXL3 tiles (--tiles FILE), the served prompt path (--prompt-rows 8192 --prompt-rows-short 4096
 //! --prompt-sp 1: sequence-parallel halves, the prompt GEMM, cuBLAS absorb / expand checked first on --bmm-probe FILE,
 //! prompt experts --experts shared --pe-det slots16), NCCL's bf16 ring exchanges for prompt rows.
+//! --mode 3b (Phase 3b): the served engine itself (cuda_engine.zig: Boot, Session - what tensorfold-native serve runs
+//! on every rank) over a prompts file: EOS stops a run (--stop-eos 1), --reuse 1 cuts each prompt at the prompt-reuse
+//! plan's keep points as the server cuts a cold prompt (every run starts cold: the kept states are forgotten first),
+//! --dcp 0|1|4 (0: on past 200,000 tokens of context). Each prompt may name its own "temperature", "top_p", "min_p"
+//! and "eos" (ids) over the file's. The served == CLI check: the server's requests (TF_GLM53_DUMP) run here.
 //! --mode roce-bench: the RoCE runtime alone (no model): bit check against NCCL, then microseconds a reduction of
 //! [rows, --dims] fp32 for --bench-rows; prints `ROCE-BENCH PASS|FAIL ...` (decode windows <= 65 us).
 //!
@@ -56,6 +61,7 @@ const usage =
     \\                         [--unpack-mb 384] [--bmm-probe FILE] [--side af|0] [--l2pf 1|0|lines|touch]
     \\                         [--l2pf-mb 8] [--multi-select 1] [--device-cands 1] [--prompt-prof NAME]
     \\                         [--mtp-dense 1]
+    \\                         3b: 3a's flags and [--stop-eos 1] [--reuse 0|1] [--dcp 0|1|4]
     \\       tf-glm53-generate --mode roce-bench --rank R --world W --master IP:PORT --hcas A,B --gid N
     \\                         [--bench-rows 1,2,3,4,8,16,32] [--bench-iters 200] [--dims 6144] [--out FILE]
     \\       tf-glm53-generate --sampler-check FILE
@@ -112,6 +118,10 @@ const Args = struct {
     prompt_prof: []const u8 = "", // a prompt name prefix: its first run's prefill timed (--prompt-prof prose32k)
     // the MTP layer's prompt rows through cuBLAS (dense bf16 experts built at load, eh_proj): drafts only
     mtp_dense: bool = true,
+    // Phase 3b (--mode 3b): EOS ends a run, the prompt-reuse cuts, decode context parallelism (0: auto)
+    stop_eos: bool = true,
+    reuse: bool = false,
+    dcp: usize = 0,
     bench_rows: []const u8 = "1,2,3,4,8,16,32",
     bench_iters: usize = 200,
     dims: usize = 6144,
@@ -244,6 +254,12 @@ pub fn main(init: std.process.Init) !u8 {
             a.prompt_prof = v;
         } else if (std.mem.eql(u8, k, "--mtp-dense")) {
             a.mtp_dense = try flag(v);
+        } else if (std.mem.eql(u8, k, "--stop-eos")) {
+            a.stop_eos = try flag(v);
+        } else if (std.mem.eql(u8, k, "--reuse")) {
+            a.reuse = try flag(v);
+        } else if (std.mem.eql(u8, k, "--dcp")) {
+            a.dcp = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--bench-rows")) {
             a.bench_rows = v;
         } else if (std.mem.eql(u8, k, "--bench-iters")) {
@@ -273,6 +289,13 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    if (std.mem.eql(u8, a.mode, "3b")) {
+        const ok3b = run3b(init.gpa, init.io, a) catch |e| {
+            std.debug.print("RESULT glm53-generate FAIL rank {d}: error {t}\n", .{ a.rank, e });
+            return 1;
+        };
+        return if (ok3b) 0 else 1;
+    }
     if (std.mem.eql(u8, a.mode, "3a")) {
         const ok3 = run3a(init.gpa, init.io, a) catch |e| {
             std.debug.print("RESULT glm53-generate FAIL rank {d}: error {t}\n", .{ a.rank, e });
@@ -282,7 +305,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const two_b = std.mem.eql(u8, a.mode, "2b");
     if (!two_b and !std.mem.eql(u8, a.mode, "2a")) {
-        std.debug.print("--mode 2a, 2b, 3a or roce-bench\n{s}", .{usage});
+        std.debug.print("--mode 2a, 2b, 3a, 3b or roce-bench\n{s}", .{usage});
         return 2;
     }
     if (two_b) {
@@ -537,6 +560,11 @@ const Prompt2b = struct {
     seed: u64,
     seed_from_prompt: bool,
     runs: []RunSpec,
+    // Phase 3b: this prompt's own sampling over the file's, and its end ids (null: the model's)
+    temperature: ?f64 = null,
+    top_p: ?f64 = null,
+    min_p: ?f64 = null,
+    eos: ?[]u32 = null,
 };
 
 fn tf(b: bool) []const u8 {
@@ -599,6 +627,16 @@ fn readPrompts2b(gpa: std.mem.Allocator, io: std.Io, path: []const u8, default_t
         p.tokens = if (o.get("tokens")) |t| @intCast(try jsonU64(t)) else default_tokens;
         p.seed_from_prompt = if (o.get("seed_from_prompt")) |b| b == .bool and b.bool else false;
         p.seed = if (o.get("seed")) |sd| try jsonU64(sd) else glm.sampling.seedFor(p.ids, 0);
+        p.temperature = if (o.get("temperature")) |x| try jsonFloat(x) else null;
+        p.top_p = if (o.get("top_p")) |x| try jsonFloat(x) else null;
+        p.min_p = if (o.get("min_p")) |x| try jsonFloat(x) else null;
+        p.eos = null;
+        if (o.get("eos")) |ev| {
+            const list = ev.array.items;
+            const e = try gpa.alloc(u32, list.len);
+            for (list, e) |x, *y| y.* = @intCast(try jsonU64(x));
+            p.eos = e;
+        }
         const runs = if (o.get("runs")) |r| r.array.items else &[_]std.json.Value{};
         p.runs = try gpa.alloc(RunSpec, runs.len);
         for (runs, p.runs) |rv, *rs| rs.* = try parseRun(gpa, rv.string);
@@ -1173,7 +1211,7 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
 fn writeOut3a(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights.Weights, n_layers: usize, capacity: usize, nccl_version: c_int, inv_status: []const u8, load_s: f64, read_gib: f64, prewarm_graphs: usize, prewarm_s: f64, prompts: []const Prompt2b, done: []const Done, ex: Extra3a) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"3a\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"runs\": [", .{ a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s });
+    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"{s}\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"runs\": [", .{ a.mode, a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s });
     defer gpa.free(head);
     try out.appendSlice(gpa, head);
     for (done, 0..) |dd, i| {
@@ -1249,4 +1287,83 @@ fn samplerCheck(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
     const ok = bad == 0 and bad_keep == 0 and seed_bad == 0 and total > 0;
     std.debug.print("SAMPLER {s} picks {d}/{d} nucleus sizes {d}/{d} seeds {d}/{d}\n", .{ if (ok) "PASS" else "FAIL", total - bad, total, total - bad_keep, total, seed_total - seed_bad, seed_total });
     return ok;
+}
+
+/// --mode 3b: the served engine (cuda_engine.Boot + Session, as tensorfold-native serve runs it on every rank) over the
+/// prompts file - every rank reads the same file and runs the same requests in the same order, so no rank needs
+/// rank 0's header. Each run starts cold (--reuse 1: the kept states forgotten, the prompt cut at its keep points as
+/// the server cuts a cold prompt), stops at EOS (--stop-eos 1: the prompt's "eos", else the model's end ids), and
+/// samples with the prompt's own temperature / top_p / min_p over the file's.
+fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
+    var prompts_text: []u8 = &.{};
+    var sset: Sampling2b = .{};
+    const prompts = try readPrompts2b(gpa, io, a.prompts, a.tokens, &prompts_text, &sset);
+    defer gpa.free(prompts_text);
+    defer {
+        for (prompts) |p| {
+            gpa.free(p.name);
+            gpa.free(p.ids);
+            if (p.eos) |e| gpa.free(e);
+            for (p.runs) |rs| gpa.free(rs.label);
+            gpa.free(p.runs);
+        }
+        gpa.free(prompts);
+    }
+    var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s };
+    o.reuse = try glm.reuse.Settings.fromEnv();
+    o.reuse.on = a.reuse;
+    std.debug.print("rank {d} of {d}: phase 3b, {d} prompts, context {d}, MTP drafts {d}, stop at EOS {s}, prompt-reuse cuts {s}, DCP {d} (0: auto)\n", .{ a.rank, a.world, prompts.len, a.context, a.k, tf(a.stop_eos), tf(a.reuse), a.dcp });
+    const boot = try glm.engine.Boot.init(gpa, io, o);
+    defer boot.deinit();
+    var sess = try glm.engine.Session.init(gpa, boot);
+    defer sess.deinit();
+    var done: std.ArrayList(Done) = .empty;
+    defer {
+        for (done.items) |dd| gpa.free(dd.tokens);
+        done.deinit(gpa);
+    }
+    var begins: std.ArrayList(usize) = .empty;
+    defer begins.deinit(gpa);
+    var toks: std.ArrayList(u32) = .empty;
+    defer toks.deinit(gpa);
+    var all_tokens = std.hash.Wyhash.init(0);
+    var seeds_ok = true;
+    for (prompts, 0..) |p, pi| {
+        const seed_ok = !p.seed_from_prompt or glm.sampling.seedFor(p.ids, 0) == p.seed;
+        if (!seed_ok) seeds_ok = false;
+        for (p.runs, 0..) |rs, ri| {
+            const temperature = p.temperature orelse sset.temperature;
+            const s: ?glm.sampling.Sampling = if (rs.greedy or temperature <= 0) null else .{ .seed = p.seed, .temperature = temperature, .top_k = rs.top_k, .top_p = p.top_p orelse sset.top_p, .min_p = p.min_p orelse sset.min_p };
+            if (rs.k > a.k) return error.TooManyDrafts;
+            const max_tokens = try sess.clampTokens(p.ids.len, p.tokens);
+            // the server's cold prompt: nothing kept, cut at its keep points (drafted runs keep their states as a
+            // served request does, then the next run forgets them)
+            if (sess.reuse) |pr| try pr.flush();
+            const draft = rs.k > 0;
+            const c = try sess.choose(p.ids, draft);
+            defer if (sess.reuse != null) c.deinit(gpa);
+            const eos: []const u32 = if (!a.stop_eos) &.{} else p.eos orelse sess.eos;
+            const res = try sess.exec(.{ .prompt = p.ids, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps }, &toks);
+            gpa.free(res.kept);
+            const st = res.stats;
+            all_tokens.update(std.mem.sliceAsBytes(toks.items));
+            const n = toks.items.len;
+            try done.append(gpa, .{ .prompt = pi, .run = ri, .tokens = try gpa.dupe(u32, toks.items), .st = st, .seed_ok = seed_ok });
+            try begins.append(gpa, c.begin);
+            std.debug.print("rank {d} {s} {s}: prompt {d} ({d} cuts) in {d:.2} s ({d:.0} tok/s); {d} tokens{s}, decode {d:.2} tok/s, {d:.3} tokens/round ({d} rounds), accept {d:.3}; first {any}\n", .{ a.rank, p.name, rs.label, p.ids.len, c.stops.len, st.prefill_s, @as(f64, @floatFromInt(p.ids.len)) / @max(st.prefill_s, 1e-9), n, if (st.eos) " (EOS)" else "", st.tokS(n), st.perRound(n), st.rounds, if (st.drafted > 0) @as(f64, @floatFromInt(st.accepted)) / @as(f64, @floatFromInt(st.drafted)) else 0, toks.items[0..@min(8, n)] });
+        }
+    }
+    const ex: Extra3a = .{ .roce = boot.fast != null, .roce_ops = if (boot.fast) |f| f.stats()[0] else 0, .tiles_changed = 0, .unpack_hits = if (boot.cache) |c| c.hits else 0, .unpack_misses = if (boot.cache) |c| c.misses else 0, .bmm_probe = if (a.bmm_probe != null) "equal" else "not run", .cublas_version = try boot.blas.version(), .experts = a.experts, .pe_det = a.pe_det, .mtp_dense = boot.mtp_dense != null, .mtp_dense_gb = if (boot.mtp_dense) |x| @as(f64, @floatFromInt(x.bytes)) / 1e9 else 0, .mtp_chunks = if (boot.mtp_dense) |x| x.chunks else 0, .mtp_gemms = if (boot.mtp_dense) |x| x.gemms else 0 };
+    var a3 = a;
+    a3.mode = "3b";
+    try writeOut3a(gpa, io, a3, &boot.w, boot.cfg.layers, a.context + a.k + 1, boot.nccl_version, "device", boot.load_s, @as(f64, @floatFromInt(boot.w.read_bytes)) / (1 << 30), boot.prewarm_graphs, boot.prewarm_s, prompts, done.items, ex);
+    std.debug.print("rank {d}: phase 3b DCP {d}, resumed begins {any}\n", .{ a.rank, boot.dcp, begins.items });
+    const agree = boot.rdv.sync("done", all_tokens.final(), a.timeout_s);
+    if (agree) {
+        std.debug.print("RESULT glm53-generate {s} rank {d}: phase 3b, {d} runs, load {d:.0} s, DCP {d}\n", .{ if (seeds_ok) "OK" else "FAIL", a.rank, done.items.len, boot.load_s, boot.dcp });
+        return seeds_ok;
+    } else |e| {
+        std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks' token streams differ ({t})\n", .{ a.rank, e });
+        return false;
+    }
 }

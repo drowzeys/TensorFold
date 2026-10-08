@@ -57,3 +57,7 @@ glm53_mtp_had_cols
 glm53_mtp_gather
 glm53_mtp_swiglu
 glm53_mtp_combine
+# Phase 3b (glm53_decode.cu): decode context parallelism - query pack, candidate keys, the global merge
+glm53_dcp_qpack
+glm53_dcp_cands
+glm53_dcp_merge

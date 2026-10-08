@@ -14,7 +14,10 @@
 //! Phase 3a speed: the decode windows' side stream and L2 prefetch (cuda_decode.zig: TF_GLM53_SIDE / TF_GLM53_L2PF as
 //! the served image runs them), the decode-sized multi-block top-k and device-side sampling candidates
 //! (glm53_decode.cu), the MTP layer's prompt rows in bigger blocks, the prompt path's timers (cuda_prompt.Prof).
-//! Not yet a native family (native/cuda.zig's registry): no engine or server here.
+//! Phase 3b: the served engine (cuda_engine.zig: Boot, Session; native/glm53_cuda.zig serves it over the native
+//! server's OpenAI routes, ranks 1..3 following rank 0's requests), EOS and rank 0's stop vote (cuda_runner.run),
+//! prompt reuse (cuda_reuse.zig: prefixes.PromptReuse) and its learned states on disk (--learn), decode context
+//! parallelism (cuda_dcp.zig, DCP = 4 past 200K tokens of context).
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -34,6 +37,9 @@ pub const roce = @import("cuda_roce.zig");
 pub const prompt = @import("cuda_prompt.zig");
 pub const tiles = @import("tiles.zig");
 pub const decode = @import("cuda_decode.zig");
+pub const reuse = @import("cuda_reuse.zig");
+pub const engine = @import("cuda_engine.zig");
+pub const dcp = @import("cuda_dcp.zig");
 
 test {
     _ = @import("config.zig");
@@ -50,4 +56,7 @@ test {
     _ = prompt;
     _ = tiles;
     _ = decode;
+    _ = reuse;
+    _ = engine;
+    _ = dcp;
 }

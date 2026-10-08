@@ -1,0 +1,669 @@
+//! Full GLM-5.3 (glm_moe_dsa) at TP4 behind the native server: rank 0 serves the OpenAI routes and shares each
+//! request with ranks 1..3, which mirror it (Glm53Engine.generate / follow, with the request's header over the TCP
+//! rendezvous instead of the all-gather). One request at a time (--parallel 1), its tokens streamed round by round;
+//! EOS and rank 0's stop (a stop string, a cancel) end it on every rank after the same round (cuda_runner.run).
+//!
+//! Prompt reuse (TF_GLM53_PROMPT_REUSE=1: cuda_reuse.zig) keeps prompt states in memory; --learn (upstream 1.0.2's
+//! learned states, prompt_imprint.zig) also keeps the shared ones (system prompt + tools) on disk: every rank writes
+//! and reads its own shard of a state (<learn-dir>/<identity>/<key>.r<rank>.bin, the same key), rank 0 decides hit or
+//! miss and sends the command, every rank answers and all agree before any resumes. The identity covers the
+//! checkpoint, the split, the kernel pack and a startup probe's prompt-pass bits on every rank, so a state is only
+//! read by a build that computes the same bits.
+//!
+//! Ranks: TF_GLM53_RANK / TF_GLM53_WORLD / TF_GLM53_MASTER and the other TF_GLM53_* variables (cuda_engine.Options
+//! .fromEnv); every rank runs the same `tensorfold-native serve` command. Ranks 1..3 never listen: `Opened.follow`.
+const std = @import("std");
+const cuda = @import("cuda");
+const api = @import("engine_api");
+const glm = @import("glm53");
+const eng = glm.engine;
+const smp = glm.sampling;
+const Allocator = std.mem.Allocator;
+const Imprint = api.prompt_imprint.Imprint;
+
+pub const model_type = "glm_moe_dsa";
+pub const formats: []const []const u8 = &.{"exl3"};
+/// Glm53Engine.DEFAULT_CONTEXT
+pub const default_context: i64 = 32768;
+
+// ------------------------------------------------------------------------------------------------- protocol ---
+
+const magic: u32 = 0x47353348; // "G53H"
+
+const Kind = enum(u32) { request = 1, load = 2, persist = 3, forget = 4, bye = 5 };
+
+const flag_flush: u32 = 1; // PromptReuse.FLUSH
+const flag_draft: u32 = 2; // "draft": true (drafted, resumable, keeps)
+const flag_greedy: u32 = 4;
+
+/// Rank 0's command, then its payload (u32 words: the prompt, stops, keeps, eos for a request; a state's tokens for
+/// load / persist). Fixed size, little-endian (every rank is the same machine type).
+const Head = extern struct {
+    magic: u32 = magic,
+    kind: u32,
+    seq: u64 = 0,
+    max_tokens: u32 = 0,
+    flags: u32 = 0,
+    top_k: u32 = 0,
+    prompt_len: u32 = 0,
+    seed: u64 = 0,
+    temperature: f64 = 0,
+    top_p: f64 = 1,
+    min_p: f64 = 0,
+    begin: u32 = 0,
+    n_stops: u32 = 0,
+    n_keeps: u32 = 0,
+    n_eos: u32 = 0,
+    key: u64 = 0,
+    at: u32 = 0,
+    pad: u32 = 0,
+};
+
+// ---------------------------------------------------------------------------------------------------- host ---
+
+const Job = struct {
+    id: api.Id,
+    request: *const api.Request,
+    sink: api.Sink,
+    submitted: i96,
+};
+
+pub const Host = struct {
+    gpa: Allocator,
+    io: std.Io,
+    boot: *eng.Boot,
+    session: eng.Session,
+    rank: usize,
+    info_: api.Info = .{},
+    startup: []u8 = &.{},
+    // --learn
+    learned: ?Imprint = null,
+    identity: u64 = 0,
+    // rank 0's engine thread and its queue
+    thread: ?std.Thread = null,
+    mutex: std.Io.Mutex = .init,
+    wake: std.Io.Condition = .init,
+    queue: std.ArrayList(Job) = .empty,
+    cancels: std.ArrayList(api.Id) = .empty,
+    closing: bool = false,
+    running: ?api.Id = null,
+    seq: u64 = 0,
+    flush_file: ?[]const u8 = null,
+    dump: ?[]const u8 = null,
+    out: std.ArrayList(u32) = .empty,
+    last_rate: f64 = 0,
+    last_prefill_rate: f64 = 0,
+
+    fn lock(h: *Host) void {
+        h.mutex.lockUncancelable(h.io);
+    }
+
+    fn unlock(h: *Host) void {
+        h.mutex.unlock(h.io);
+    }
+
+    fn now(h: *const Host) i96 {
+        return std.Io.Clock.awake.now(h.io).toNanoseconds();
+    }
+
+    // ----------------------------------------------------------------------------------------- the engine API ---
+
+    pub fn engine(h: *Host) api.Engine {
+        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn } };
+    }
+
+    fn self(ctx: *anyopaque) *Host {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn infoFn(ctx: *anyopaque) api.Info {
+        return self(ctx).info_;
+    }
+
+    fn submitFn(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        const h = self(ctx);
+        if (h.rank != 0) return error.Closed;
+        h.lock();
+        defer h.unlock();
+        if (h.closing) return error.Closed;
+        h.queue.append(h.gpa, .{ .id = id, .request = request, .sink = sink, .submitted = h.now() }) catch return error.Busy;
+        h.wake.signal(h.io);
+    }
+
+    fn cancelFn(ctx: *anyopaque, id: api.Id) void {
+        const h = self(ctx);
+        h.lock();
+        defer h.unlock();
+        h.cancels.append(h.gpa, id) catch {};
+        h.wake.signal(h.io);
+    }
+
+    fn statusFn(ctx: *anyopaque, out: *api.Status, _: []u32) void {
+        const h = self(ctx);
+        h.lock();
+        defer h.unlock();
+        out.* = .{ .running = @intFromBool(h.running != null), .waiting = @intCast(h.queue.items.len), .decode_tokens_per_second = if (h.running != null) h.last_rate else 0, .prefill_tokens_per_second = h.last_prefill_rate };
+    }
+
+    fn memoryFn(_: *anyopaque, reset_peak: bool) ?api.Memory {
+        const u = cuda.usage(reset_peak);
+        return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    }
+
+    fn cancelled(h: *Host, id: api.Id) bool {
+        h.lock();
+        defer h.unlock();
+        return h.closing or std.mem.indexOfScalar(api.Id, h.cancels.items, id) != null;
+    }
+
+    // --------------------------------------------------------------------------------------- rank 0's thread ---
+
+    fn loop(h: *Host) void {
+        h.boot.ctx.makeCurrent() catch |e| std.log.err("glm53: cuCtxSetCurrent on the engine thread: {t}", .{e});
+        while (true) {
+            h.lock();
+            while (h.queue.items.len == 0 and !h.closing) h.wake.waitUncancelable(h.io, &h.mutex);
+            if (h.closing) {
+                var left = h.queue;
+                h.queue = .empty;
+                h.unlock();
+                for (left.items) |j| emit(j, .{ .finished = .{ .reason = .cancelled } });
+                left.deinit(h.gpa);
+                return;
+            }
+            const job = h.queue.orderedRemove(0);
+            // a cancel that arrived while it waited
+            var gone = false;
+            for (h.cancels.items, 0..) |c, i| if (c == job.id) {
+                _ = h.cancels.swapRemove(i);
+                gone = true;
+                break;
+            };
+            if (!gone) h.running = job.id;
+            h.unlock();
+            if (gone) {
+                emit(job, .{ .finished = .{ .reason = .cancelled } });
+                continue;
+            }
+            h.serveJob(job);
+            h.lock();
+            h.running = null;
+            var i: usize = 0;
+            while (i < h.cancels.items.len) {
+                if (h.cancels.items[i] == job.id) _ = h.cancels.swapRemove(i) else i += 1;
+            }
+            h.unlock();
+        }
+    }
+
+    fn emit(job: Job, event: api.Event) void {
+        job.sink.event(job.sink.ctx, job.id, &event);
+    }
+
+    /// The tokens hook on rank 0: the prefilled event before the first token, each round's tokens to the sink, the
+    /// request's stop strings and its cancel as rank 0's stop wish.
+    const Live = struct {
+        h: *Host,
+        job: Job,
+        emitted: std.ArrayList(u32) = .empty,
+        begin: u32 = 0,
+        first: ?i96 = null,
+        stop_hit: bool = false,
+        cancel_hit: bool = false,
+        started: i96,
+
+        fn tokens(ctx: *anyopaque, toks: []const u32) bool {
+            const lv: *Live = @ptrCast(@alignCast(ctx));
+            if (lv.first == null) {
+                lv.first = lv.h.now();
+                emit(lv.job, .{ .prefilled = lv.begin });
+            }
+            lv.emitted.appendSlice(lv.h.gpa, toks) catch {};
+            emit(lv.job, .{ .tokens = toks });
+            if (lv.job.request.stop) |s| {
+                if (s.check(s.ctx, lv.emitted.items)) lv.stop_hit = true;
+            }
+            if (lv.h.cancelled(lv.job.id)) lv.cancel_hit = true;
+            return lv.stop_hit or lv.cancel_hit;
+        }
+    };
+
+    fn serveJob(h: *Host, job: Job) void {
+        const r = job.request;
+        const started = h.now();
+        var live: Live = .{ .h = h, .job = job, .started = started };
+        defer live.emitted.deinit(h.gpa);
+        const outcome = h.runRequest(job, &live) catch |e| {
+            std.log.err("glm53: request {d} failed: {t}", .{ job.id, e });
+            if (live.first == null) emit(job, .{ .prefilled = 0 });
+            emit(job, .{ .finished = .{ .reason = .failed, .message = words(e) } });
+            return;
+        };
+        defer h.gpa.free(outcome.kept);
+        const st = outcome.stats;
+        const reason: api.Reason = if (live.cancel_hit) .cancelled else if (st.eos or live.stop_hit) .stop else .length;
+        h.lock();
+        h.last_rate = st.tokS(h.out.items.len);
+        if (st.prefill_s > 0) h.last_prefill_rate = @as(f64, @floatFromInt(r.prompt.len - st.begin)) / st.prefill_s;
+        h.unlock();
+        if (h.dump) |path| h.writeDump(path, job, &live, outcome) catch |e| std.log.warn("glm53: TF_GLM53_DUMP {s}: {t}", .{ path, e });
+        // --learn: the request's shared states reach the disk before its reply ends (a client that stops the server
+        // right after the reply still finds them learned)
+        h.afterRequest();
+        emit(job, .{ .finished = .{ .reason = reason, .stats = .{ .rounds = st.rounds, .drafted = st.drafted, .accepted = st.accepted, .min_rows = 1, .prefill_seconds = st.prefill_s } } });
+    }
+
+    const Outcome = struct { stats: glm.runner.Stats, kept: []usize, learned: usize, sampling: ?smp.Sampling, draft: bool, begin: usize };
+
+    /// Rank 0: Glm53Engine.generate - the clamps, the flush, a learned state read back when it resumes more than any
+    /// kept one, PromptReuse.choose, the header to every rank, then the run.
+    fn runRequest(h: *Host, job: Job, live: *Live) !Outcome {
+        const r = job.request;
+        const sess = &h.session;
+        const max_tokens = try sess.clampTokens(r.prompt.len, r.max_tokens);
+        const s: ?smp.Sampling = if (r.sampling) |x| (if (x.temperature > 0) smp.Sampling{ .seed = x.seed & 0x7FFFFFFFFFFFFFFF, .temperature = x.temperature, .top_k = x.top_k, .top_p = x.top_p, .min_p = x.min_p } else null) else null;
+        const draft = r.drafts;
+        var flags: u32 = if (draft) flag_draft else 0;
+        if (s == null) flags |= flag_greedy;
+        if (h.flush_file) |path| if (sess.reuse != null and takeFlush(path)) {
+            flags |= flag_flush;
+            try sess.reuse.?.flush(); // rank 0 forgets before it chooses; the others at the request
+        };
+        var learned: usize = 0;
+        if (draft and h.learned != null and sess.reuse != null) learned = try h.loadLearned(r.prompt);
+        const c = try sess.choose(r.prompt, draft);
+        defer if (sess.reuse != null) c.deinit(h.gpa);
+        live.begin = @intCast(c.begin);
+        h.seq += 1;
+        var head: Head = .{ .kind = @intFromEnum(Kind.request), .seq = h.seq, .max_tokens = @intCast(max_tokens), .flags = flags, .prompt_len = @intCast(r.prompt.len), .begin = @intCast(c.begin), .n_stops = @intCast(c.stops.len), .n_keeps = @intCast(c.keeps.len), .n_eos = @intCast(r.eos.len) };
+        if (s) |x| {
+            head.seed = x.seed;
+            head.temperature = x.temperature;
+            head.top_k = @intCast(x.top_k);
+            head.top_p = x.top_p;
+            head.min_p = x.min_p;
+        }
+        const words_n = r.prompt.len + c.stops.len + c.keeps.len + r.eos.len;
+        const payload = try h.gpa.alloc(u32, words_n);
+        defer h.gpa.free(payload);
+        @memcpy(payload[0..r.prompt.len], r.prompt);
+        for (c.stops, 0..) |p, i| payload[r.prompt.len + i] = @intCast(p);
+        @memcpy(payload[r.prompt.len + c.stops.len ..][0..c.keeps.len], c.keeps);
+        @memcpy(payload[r.prompt.len + c.stops.len + c.keeps.len ..], r.eos);
+        try h.send(&head, payload);
+        const done = try sess.exec(.{ .prompt = r.prompt, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = r.eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .flags = flags & flag_flush, .hooks = .{ .ctx = live, .tokens = Live.tokens } }, &h.out);
+        return .{ .stats = done.stats, .kept = done.kept, .learned = learned, .sampling = s, .draft = draft, .begin = c.begin };
+    }
+
+    /// Rank 0's command and payload to ranks 1..
+    fn send(h: *Host, head: *Head, payload: []const u32) !void {
+        if (h.boot.o.world == 1) return;
+        try h.boot.rdv.broadcast(std.mem.asBytes(head));
+        if (payload.len > 0) try h.boot.rdv.broadcast(@constCast(std.mem.sliceAsBytes(payload)));
+    }
+
+    fn takeFlush(path: []const u8) bool {
+        var buf: [1100]u8 = undefined;
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return false;
+        return std.c.unlink(z) == 0;
+    }
+
+    // ----------------------------------------------------------------------------------------- the followers ---
+
+    /// Ranks 1..: Glm53Engine.follow - every command rank 0 sends, until it says goodbye or its connection closes.
+    pub fn follow(h: *Host) !void {
+        std.log.info("glm53 rank {d}: following rank 0", .{h.rank});
+        var out: std.ArrayList(u32) = .empty;
+        defer out.deinit(h.gpa);
+        while (true) {
+            var head: Head = undefined;
+            if (!try h.boot.rdv.awaitBroadcast(std.mem.asBytes(&head))) return; // rank 0 has gone
+            if (head.magic != magic) return error.ProtocolOutOfStep;
+            const kind = std.enums.fromInt(Kind, head.kind) orelse return error.ProtocolOutOfStep;
+            switch (kind) {
+                .bye => return,
+                .request => try h.followRequest(&head, &out),
+                .load => {
+                    const ids = try h.recvWords(head.at);
+                    defer h.gpa.free(ids);
+                    _ = try h.learnLoad(head.key, ids);
+                },
+                .persist => {
+                    const ids = try h.recvWords(head.at);
+                    defer h.gpa.free(ids);
+                    _ = try h.learnPersist(head.key, ids);
+                },
+                .forget => h.learnForget(head.key),
+            }
+        }
+    }
+
+    fn recvWords(h: *Host, n: usize) ![]u32 {
+        const w = try h.gpa.alloc(u32, n);
+        errdefer h.gpa.free(w);
+        if (n > 0) try h.boot.rdv.broadcast(std.mem.sliceAsBytes(w));
+        return w;
+    }
+
+    fn followRequest(h: *Host, head: *const Head, out: *std.ArrayList(u32)) !void {
+        const n = @as(usize, head.prompt_len) + head.n_stops + head.n_keeps + head.n_eos;
+        const words_ = try h.recvWords(n);
+        defer h.gpa.free(words_);
+        const prompt = words_[0..head.prompt_len];
+        const stops = try h.gpa.alloc(usize, head.n_stops);
+        defer h.gpa.free(stops);
+        for (stops, words_[head.prompt_len..][0..head.n_stops]) |*d, v| d.* = v;
+        const keeps = words_[head.prompt_len + head.n_stops ..][0..head.n_keeps];
+        const eos = words_[head.prompt_len + head.n_stops + head.n_keeps ..][0..head.n_eos];
+        const s: ?smp.Sampling = if (head.flags & flag_greedy != 0) null else .{ .seed = head.seed, .temperature = head.temperature, .top_k = head.top_k, .top_p = head.top_p, .min_p = head.min_p };
+        const done = try h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush }, out);
+        h.gpa.free(done.kept);
+        h.afterRequest();
+    }
+
+    /// After a request on every rank: nothing to do but rank 0's learning (it sends the commands).
+    fn afterRequest(h: *Host) void {
+        if (h.rank != 0 or h.learned == null) return;
+        h.persistShared() catch |e| std.log.warn("glm53: --learn: a shared prompt state was not learned ({t})", .{e});
+    }
+
+    // ------------------------------------------------------------------------------------------------ --learn ---
+
+    fn dir(h: *const Host) []const u8 {
+        return h.learned.?.dir;
+    }
+
+    /// Rank 0: the longest learned state the prompt resumes past every kept one, read back on every rank (each its
+    /// shard) and kept as a shared state - or forgotten everywhere when any rank cannot read it. Returns its tokens
+    /// (0: none).
+    fn loadLearned(h: *Host, prompt: []const u32) !usize {
+        const pr = h.session.reuse.?;
+        const m = &h.learned.?;
+        const pts = try h.session.plan.points(h.gpa, prompt);
+        defer h.gpa.free(pts);
+        const starts = try h.gpa.alloc(u32, pts.len);
+        defer h.gpa.free(starts);
+        for (pts, starts) |p, *x| x.* = @intCast(p);
+        const in_memory = if (pr.store.best(prompt, pts, 0)) |e| e.n() else 0;
+        const best = m.best(prompt, starts, true, @intCast(in_memory)) orelse return 0;
+        const key = best.key;
+        const at = best.at;
+        var head: Head = .{ .kind = @intFromEnum(Kind.load), .key = key, .at = at };
+        try h.send(&head, prompt[0..at]);
+        if (try h.learnLoad(key, prompt[0..at])) {
+            m.touch(key);
+            return at;
+        }
+        var forget: Head = .{ .kind = @intFromEnum(Kind.forget), .key = key };
+        try h.send(&forget, &.{});
+        h.learnForget(key);
+        return 0;
+    }
+
+    /// Every rank: its shard of learned state `key` read back; kept (on every rank alike) only when every rank read
+    /// its own.
+    fn learnLoad(h: *Host, key: u64, ids: []const u32) !bool {
+        const pr = h.session.reuse orelse return false;
+        var buf: [1200]u8 = undefined;
+        const file = try eng.Session.statePath(&buf, h.dir(), key, h.rank);
+        const got = h.session.readState(ids, file, key, h.identity) catch |e| blk: {
+            std.log.warn("glm53 rank {d}: learned state {x:0>16} not read ({t})", .{ h.rank, key, e });
+            break :blk null;
+        };
+        const all = try h.boot.rdv.agree(got != null);
+        if (!all) {
+            if (got) |e| pr.store.destroy(e);
+            return false;
+        }
+        if (!pr.store.remember(got.?, &.{})) {
+            pr.store.destroy(got.?);
+            return false;
+        }
+        return true;
+    }
+
+    /// Rank 0: every shared kept state not learned yet written to disk (each rank its shard), within --learn-gib.
+    fn persistShared(h: *Host) !void {
+        const pr = h.session.reuse orelse return;
+        const m = &h.learned.?;
+        var i: usize = 0;
+        while (i < pr.store.entries.items.len) : (i += 1) {
+            const e = pr.store.entries.items[i];
+            if (!e.shared or e.learned) continue;
+            const key = Imprint.keyOf(e.ids);
+            if (m.has(key)) {
+                e.learned = true;
+                continue;
+            }
+            if (!pr.store.usable(e)) continue;
+            const bytes = try h.stateBytes(e.n());
+            while (!m.fits(bytes)) {
+                const v = m.victim() orelse return; // nothing more to give
+                var forget: Head = .{ .kind = @intFromEnum(Kind.forget), .key = v };
+                try h.send(&forget, &.{});
+                h.learnForget(v);
+            }
+            var head: Head = .{ .kind = @intFromEnum(Kind.persist), .key = key, .at = @intCast(e.n()) };
+            const ids = try h.gpa.dupe(u32, e.ids);
+            defer h.gpa.free(ids);
+            try h.send(&head, ids);
+            _ = try h.learnPersist(key, ids);
+        }
+    }
+
+    /// A learned state's file bytes on a rank (every rank the same: its row views are sized alike).
+    fn stateBytes(h: *Host, n: usize) !u64 {
+        const pr = h.session.reuse.?;
+        const vs = try pr.views(n);
+        defer h.gpa.free(vs);
+        var total: u64 = 0;
+        for (vs) |v| total += v.row * v.rows;
+        return @sizeOf(eng.Session.Head) + vs.len * 16 + total + h.boot.cfg.hidden * 2;
+    }
+
+    /// Every rank: its shard of kept state `ids` written; recorded in the index (every rank alike) only when every
+    /// rank wrote its own, else every rank's file is removed.
+    fn learnPersist(h: *Host, key: u64, ids: []const u32) !bool {
+        const pr = h.session.reuse orelse return false;
+        var buf: [1200]u8 = undefined;
+        const file = try eng.Session.statePath(&buf, h.dir(), key, h.rank);
+        var bytes: u64 = 0;
+        const e = pr.store.named(ids, ids.len);
+        if (e) |x| {
+            bytes = h.session.writeState(x, file, key, h.identity) catch |err| blk: {
+                std.log.warn("glm53 rank {d}: learned state {x:0>16} not written ({t})", .{ h.rank, key, err });
+                break :blk 0;
+            };
+        }
+        const all = try h.boot.rdv.agree(bytes > 0);
+        if (!all) {
+            _ = std.c.unlink(file);
+            return false;
+        }
+        const pts = try h.session.plan.points(h.gpa, ids);
+        defer h.gpa.free(pts);
+        const starts = try h.gpa.alloc(u32, pts.len);
+        defer h.gpa.free(starts);
+        for (pts, starts) |p, *x| x.* = @intCast(p);
+        try h.learned.?.add(key, @intCast(ids.len), ids, starts, bytes);
+        e.?.learned = true;
+        if (h.rank == 0) std.log.info("glm53: learned a shared prompt state of {d} tokens ({d:.2} GiB a rank)", .{ ids.len, @as(f64, @floatFromInt(bytes)) / (1 << 30) });
+        return true;
+    }
+
+    /// Every rank: learned state `key` forgotten (its index record and this rank's file).
+    fn learnForget(h: *Host, key: u64) void {
+        const m = if (h.learned) |*x| x else return;
+        m.remove(key) catch |e| std.log.warn("glm53: --learn index: {t}", .{e});
+        var buf: [1200]u8 = undefined;
+        const file = eng.Session.statePath(&buf, m.dir, key, h.rank) catch return;
+        _ = std.c.unlink(file);
+    }
+
+    /// Learned states' identity: the checkpoint (config and weight index), the split and the served settings, the
+    /// kernel pack, the driver, and the probe's prompt-pass bits on every rank.
+    fn identityOf(h: *Host) !u64 {
+        const b = h.boot;
+        const o = b.o;
+        var x = std.hash.Wyhash.init(0x67353362);
+        for ([_][]const u8{ "config.json", "model.safetensors.index.json" }) |name| {
+            const path = try std.fs.path.join(h.gpa, &.{ o.model, name });
+            defer h.gpa.free(path);
+            if (std.Io.Dir.cwd().readFileAlloc(h.io, path, h.gpa, .limited(64 << 20))) |bytes| {
+                defer h.gpa.free(bytes);
+                x.update(bytes);
+            } else |_| {}
+        }
+        const aot = try std.fs.path.join(h.gpa, &.{ o.aot, "aot.json" });
+        defer h.gpa.free(aot);
+        if (std.Io.Dir.cwd().readFileAlloc(h.io, aot, h.gpa, .limited(64 << 20))) |bytes| {
+            defer h.gpa.free(bytes);
+            x.update(bytes);
+        } else |_| {}
+        const shape = [_]u64{ o.world, b.dcp, o.k, o.draft_vocab, o.mtp_reuse, o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.mtp_dense), @intCast(try b.driver.version()), @intCast(b.nccl_version), o.reuse.gap };
+        x.update(std.mem.asBytes(&shape));
+        x.update(o.experts);
+        x.update(o.pe_det);
+        const probe = try h.session.probe();
+        x.update(std.mem.asBytes(&probe));
+        return x.final();
+    }
+
+    fn writeDump(h: *Host, path: []const u8, job: Job, live: *const Live, oc: Outcome) !void {
+        var w: std.Io.Writer.Allocating = .init(h.gpa);
+        defer w.deinit();
+        const o = &w.writer;
+        const st = oc.stats;
+        try o.print("{{\"id\": {d}, \"prompt_ids\": [", .{job.id});
+        for (job.request.prompt, 0..) |t, i| try o.print("{s}{d}", .{ if (i > 0) "," else "", t });
+        try o.writeAll("], \"tokens\": [");
+        for (h.out.items, 0..) |t, i| try o.print("{s}{d}", .{ if (i > 0) "," else "", t });
+        const finish = if (live.cancel_hit) "cancelled" else if (st.eos or live.stop_hit) "stop" else "length";
+        try o.print("], \"finish\": \"{s}\", \"begin\": {d}, \"learned\": {d}, \"kept\": [", .{ finish, oc.begin, oc.learned });
+        for (oc.kept, 0..) |n, i| try o.print("{s}{d}", .{ if (i > 0) "," else "", n });
+        try o.writeAll("], \"sampling\": ");
+        if (oc.sampling) |s| {
+            try o.print("{{\"greedy\": false, \"seed\": {d}, \"temperature\": {d}, \"top_k\": {d}, \"top_p\": {d}, \"min_p\": {d}}}", .{ s.seed, s.temperature, s.top_k, s.top_p, s.min_p });
+        } else try o.writeAll("{\"greedy\": true}");
+        try o.writeAll(", \"eos\": [");
+        for (job.request.eos, 0..) |t, i| try o.print("{s}{d}", .{ if (i > 0) "," else "", t });
+        const ttft: f64 = if (live.first) |f| @as(f64, @floatFromInt(f - live.started)) / 1e9 else 0;
+        try o.print("], \"drafts\": {s}, \"k\": {d}, \"ttft_s\": {d:.4}, \"prefill_s\": {d:.4}, \"decode_s\": {d:.4}, \"tok_s\": {d:.3}, \"rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"replay\": {s}}}\n", .{ if (oc.draft) "true" else "false", if (oc.draft) h.boot.o.k else 0, ttft, st.prefill_s, st.decode_s, st.tokS(h.out.items.len), st.rounds, st.drafted, st.accepted, if (st.begin == job.request.prompt.len) "true" else "false" });
+        var pbuf: [1100]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0);
+        const fd = std.c.open(z, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return error.DumpOpen;
+        defer _ = std.c.close(fd);
+        try api.prompt_imprint.writeAll(fd, w.written());
+    }
+};
+
+/// The words for a request the engine refuses.
+fn words(err: anyerror) []const u8 {
+    return switch (err) {
+        error.PromptTooLong => "the prompt does not fit this server's --context",
+        error.ContextTooSmall => "the prompt and max_tokens do not fit this server's --context",
+        error.ReuseOutOfStep => "the ranks' kept prompt states are out of step (restart the server)",
+        else => @errorName(err),
+    };
+}
+
+fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+    return words(err);
+}
+
+fn closeFn(ctx: *anyopaque) void {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    if (h.rank == 0) {
+        h.lock();
+        h.closing = true;
+        h.wake.broadcast(h.io);
+        h.unlock();
+        if (h.thread) |t| t.join();
+        var bye: Head = .{ .kind = @intFromEnum(Kind.bye) };
+        h.send(&bye, &.{}) catch {};
+    }
+    h.queue.deinit(h.gpa);
+    h.cancels.deinit(h.gpa);
+    h.out.deinit(h.gpa);
+    if (h.learned) |*m| m.deinit();
+    h.session.deinit();
+    h.boot.deinit();
+    h.gpa.free(h.startup);
+    h.gpa.destroy(h);
+}
+
+fn followFn(ctx: *anyopaque) anyerror!void {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    return h.follow();
+}
+
+/// The model's window (config.json's max_position_embeddings), 0 when it names none.
+fn modelContext(a: Allocator, io: std.Io, dir_: []const u8) i64 {
+    const path = std.fs.path.join(a, &.{ dir_, "config.json" }) catch return 0;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return 0;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return 0;
+    if (doc != .object) return 0;
+    const limit = doc.object.get("max_position_embeddings") orelse return 0;
+    return if (limit == .integer and limit.integer > 0) limit.integer else 0;
+}
+
+/// The GLM-5.3 engine for `o.dir` on this rank (TF_GLM53_RANK): loads, warms and agrees with the other ranks; rank 0
+/// returns the served engine, ranks 1..3 an engine whose `follow` mirrors rank 0 until it stops.
+pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const native = modelContext(a, io, o.dir);
+    var window: i64 = o.context orelse default_context;
+    if (window == 0) window = native;
+    if (window <= 0 or (native > 0 and window > native)) {
+        problem.* = try std.fmt.allocPrint(a, "--context {d}: a token count within this model's {d}-token window", .{ window, native });
+        return null;
+    }
+    if (o.lanes_fixed and o.lanes != 1) {
+        problem.* = "the native GLM-5.3 engine serves one stream (--parallel 1): concurrency is Phase 4";
+        return null;
+    }
+    const opts = eng.Options.fromEnv(o.dir, @intCast(window)) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "glm53 settings: {t} (TF_GLM53_* variables)", .{e});
+        return null;
+    };
+    if (o.learn != null and !opts.reuse.on) {
+        problem.* = "--learn keeps prompt states that prompt reuse made: set TF_GLM53_PROMPT_REUSE=1 on every rank";
+        return null;
+    }
+    const boot = eng.Boot.init(gpa, io, opts) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "glm53 rank {d}: the engine did not start ({t})", .{ opts.rank, e });
+        return null;
+    };
+    var ok = false;
+    defer if (!ok) boot.deinit();
+    const h = try gpa.create(Host);
+    defer if (!ok) gpa.destroy(h);
+    h.* = .{ .gpa = gpa, .io = io, .boot = boot, .session = undefined, .rank = opts.rank };
+    h.session = try eng.Session.init(gpa, boot);
+    defer if (!ok) h.session.deinit();
+    // --learn on every rank or none: the ranks agree, then the probe gives the identity
+    const all_learn = try boot.rdv.agree(o.learn != null);
+    const none_learn = try boot.rdv.agree(o.learn == null);
+    if (!all_learn and !none_learn) {
+        problem.* = "--learn: start every rank with it (or none)";
+        return null;
+    }
+    const learning = all_learn;
+    defer if (!ok) if (h.learned) |*m| m.deinit();
+    if (learning) {
+        h.identity = try h.identityOf();
+        h.learned = try Imprint.open(gpa, o.learn.?, h.identity, @intFromFloat(o.learn_gib * (1 << 30)));
+        if (h.rank == 0) std.log.info("glm53: learned prompt states in {s} ({d} known, {d} of {d} MiB)", .{ h.learned.?.dir, h.learned.?.metas.items.len, h.learned.?.total() >> 20, @as(u64, @intFromFloat(o.learn_gib * 1024)) });
+    }
+    h.flush_file = if (std.c.getenv("TF_GLM53_FLUSH_FILE")) |v| std.mem.span(v) else null;
+    h.dump = if (std.c.getenv("TF_GLM53_DUMP")) |v| std.mem.span(v) else null;
+    h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
+    h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = 1, .context_window = @intCast(opts.context), .startup = h.startup };
+    if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
+    ok = true;
+    return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn };
+}
+
+test "the header is a fixed little block" {
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Head));
+}

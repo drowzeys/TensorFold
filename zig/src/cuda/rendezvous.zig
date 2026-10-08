@@ -168,6 +168,31 @@ pub const Rendezvous = struct {
         try recvAll(self.fds[0], bytes, 600_000);
     }
 
+    /// Ranks 1..: rank 0's next `bytes` (a served request's header), waiting as long as it takes - a follower idles
+    /// between requests. False when rank 0 has closed the connection (the server stopped).
+    pub fn awaitBroadcast(self: *Rendezvous, bytes: []u8) Error!bool {
+        if (self.world == 1 or self.rank == 0) return error.BadPeer;
+        while (true) {
+            var fds = [_]posix.pollfd{.{ .fd = self.fds[0], .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&fds, 60_000) catch return error.PeerClosed;
+            if (ready == 0) continue;
+            recvAll(self.fds[0], bytes, 600_000) catch |e| switch (e) {
+                error.PeerClosed => return false,
+                else => return e,
+            };
+            return true;
+        }
+    }
+
+    /// Whether every rank's `ok` holds (one byte each through rank 0); every rank gets the same answer.
+    pub fn agree(self: *Rendezvous, ok: bool) Error!bool {
+        var all: [max_world]u8 = undefined;
+        const mine = [1]u8{@intFromBool(ok)};
+        try self.allGather(&mine, all[0..self.world]);
+        for (all[0..self.world]) |x| if (x == 0) return false;
+        return true;
+    }
+
     /// Every rank's `mine` (the same length on every rank) into `all` [world * mine.len] in rank order (the RoCE
     /// setup's exchange of connection records: b12x's dist.all_gather_object over gloo). Rank 0 collects, then sends
     /// the whole to every rank.

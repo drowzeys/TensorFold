@@ -23,7 +23,13 @@
 //! rank-order sum into b.red, the head's records and sampled candidates gathered over it), wider windows over NCCL's
 //! bf16 ring all-reduce (`Forward.ring`, TF_GLM53_PREFILL_REDUCE=ring) - and windows over 128 rows (`Forward.wide`:
 //! the prompt GEMM, torch.bmm absorb / expand, prompt experts); the sequence-parallel prompt chunk itself is
-//! cuda_prompt.zig's. TODO(3b): DCP, int8/int4 latent caches, the exact reduce-scatter (TF_GLM53_PREFILL_REDUCE=rs).
+//! cuda_prompt.zig's.
+//! Phase 3b: decode context parallelism (`Forward.dcp`, cuda_dcp.zig; fused._attention_dcp and select's DCP branch):
+//! the caches sharded round robin over the ranks (State.initDcp), each rank's keys written by their owner only
+//! (_kv_write / _ik_write DCP, RANK), every rank's queries gathered and all heads attended over this rank's keys, the
+//! partials merged by log-sum-exp at the heads' owners; the indexer's per-rank top-k, gathered candidates and one
+//! global top-k. DCP 1 keeps every Phase 3a path unchanged. TODO: int8/int4 latent caches, the exact reduce-scatter
+//! (TF_GLM53_PREFILL_REDUCE=rs).
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -35,6 +41,7 @@ const smp = @import("sampling.zig");
 const roce = @import("cuda_roce.zig");
 const prompt = @import("cuda_prompt.zig");
 const dec = @import("cuda_decode.zig");
+const dcpm = @import("cuda_dcp.zig");
 
 /// The widest TP world the head's exchange records hold.
 pub const max_world: usize = 16;
@@ -77,6 +84,10 @@ pub const BufOpts = struct {
     /// the dense experts, so the eh_proj router partials / fp32 rows stay at max_rows rows and no decode-kernel
     /// blocks are carved (xs_big)
     mtp_dense: bool = false,
+    /// Phase 3b: decode context parallelism over this many ranks (fused.Buffers with w.dcp > 1): partial slots for
+    /// every rank's heads, the query / partial exchange buffers, the selection's candidates; the score scratch holds a
+    /// rank's ceil(score_cols / dcp) slots
+    dcp: usize = 1,
 };
 
 /// What a window's head computes (fused.head's modes; `none`: no head).
@@ -162,6 +173,18 @@ pub const Buffers = struct {
     /// xs_big.rows rows, its big buffers inside b.gath (idle while the MTP layer runs: prompt chunks reduce over the
     /// bf16 ring); null: blocks of xs_rows
     xs_big: ?kern.ExpertScratch = null,
+    // Phase 3b: decode context parallelism (fused.Buffers with w.dcp > 1; the exchange buffers 0 at DCP 1)
+    dcp: usize = 1,
+    qpack: u64 = 0, // bf16 [rows, H, lw + rd]: this rank's absorbed queries, packed
+    qall: u64 = 0, // bf16 [G, rows, H, lw + rd]: every rank's
+    osend: u64 = 0, // bf16 [G, rows, H, lw]: normalized partials by destination rank
+    lsend: u64 = 0, // fp32 [G, rows, H]: their log-sum-exps
+    orecv: u64 = 0, // bf16 [fan, G, rows, H, lw] (fan G for decode windows' all-gather, 1 for the all-to-all)
+    lrecv: u64 = 0, // fp32 [fan, G, rows, H]
+    cnt: u64 = 0, // int32 [rows]: this rank's share of each row's selection
+    cand: u64 = 0, // int64 [G, min(rows, 128), index_topk]: every rank's candidate keys
+    dmine: u64 = 0, // int64 [min(rows, 128), index_topk]: this rank's candidates (int64 min + 1 padded)
+    dsel: u64 = 0, // int64 [min(rows, 128), index_topk]: topk.top_keys' output (radix branch)
 
     fn alloc(b: *Buffers, bytes: usize) !u64 {
         var m = try cuda.DeviceBuffer.alloc(b.d, @max(bytes, 16));
@@ -198,7 +221,24 @@ pub const Buffers = struct {
         b.q = try b.alloc(rows * H * qd * 2);
         b.qlat = try b.alloc(rows * H * lw * 2);
         b.qrot = try b.alloc(rows * H * rd * 2);
-        const slots = @max(c.index_topk / tri.attn_decode.chk * @min(rows, b.small), c.index_topk / tri.attn_prompt.chk * rows);
+        const G = @max(opts.dcp, 1);
+        b.dcp = G;
+        // DCP: partials for every rank's heads
+        const slots = @max(c.index_topk / tri.attn_decode.chk * @min(rows, b.small), c.index_topk / tri.attn_prompt.chk * rows) * G;
+        if (G > 1) {
+            b.qpack = try b.alloc(rows * H * (lw + rd) * 2);
+            b.qall = try b.alloc(G * rows * H * (lw + rd) * 2);
+            b.osend = try b.alloc(G * rows * H * lw * 2);
+            b.lsend = try b.alloc(G * rows * H * 4);
+            const fan: usize = if (rows <= b.small) G else 1; // decode windows exchange by all-gather (G x the bytes)
+            b.orecv = try b.alloc(fan * G * rows * H * lw * 2);
+            b.lrecv = try b.alloc(fan * G * rows * H * 4);
+            b.cnt = try b.alloc(rows * 4);
+            const sel_rows = @min(rows, 128);
+            b.cand = try b.alloc(G * sel_rows * c.index_topk * 8);
+            b.dmine = try b.alloc(sel_rows * c.index_topk * 8);
+            b.dsel = try b.alloc(sel_rows * c.index_topk * 8);
+        }
         b.po = try b.alloc(slots * H * lw * 4);
         b.pm = try b.alloc(slots * H * 4);
         b.pl = try b.alloc(slots * H * 4);
@@ -208,7 +248,7 @@ pub const Buffers = struct {
         b.ik = try b.alloc(rows * c.index_dim * 4);
         b.iw = try b.alloc(rows * c.index_heads * 4);
         b.iq = try b.alloc(rows * c.index_heads * c.index_dim * 2);
-        b.sc = try b.alloc(@min(rows, 128) * score_cols * 8);
+        b.sc = try b.alloc(@min(rows, 128) * dcpm.cdiv(score_cols, G) * 8); // Buffers.score_len
         b.tok = try b.alloc(rows * c.index_topk * 4);
         const width = @max(c.dense_width, c.expert_width * @max(c.shared_experts, 1)) / w.world;
         b.g = try b.alloc(rows * width * 2);
@@ -388,12 +428,16 @@ pub const Buffers = struct {
 };
 
 /// fused.State: a 576-wide latent row a token and layer, bf16 index keys on full-indexer layers, the device position.
+/// DCP (Phase 3b): position p on rank p % dcp at local row p // dcp; every cache holds `local` = ceil(capacity / dcp)
+/// + 1 rows (capacity + 1 at DCP 1).
 pub const State = struct {
     d: *const cuda.Driver,
     gpa: std.mem.Allocator,
     capacity: usize,
-    kc: []u64, // per layer: bf16 [capacity + 1, latent]
-    ic: []u64, // per layer: bf16 [capacity + 1, index_dim], 0 on layers without an indexer
+    dcp: usize = 1,
+    local: usize = 0,
+    kc: []u64, // per layer: bf16 [local, latent]
+    ic: []u64, // per layer: bf16 [local, index_dim], 0 on layers without an indexer
     pos: u64, // int32 [1]
     mkc: u64 = 0, // the MTP layer's latent rows (0: no MTP layer)
     mic: u64 = 0, // the MTP layer's index keys (0: no indexer there)
@@ -401,10 +445,16 @@ pub const State = struct {
     mem: std.ArrayList(cuda.DeviceBuffer) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize) !State {
+        return initDcp(gpa, d, w, capacity, 1);
+    }
+
+    /// fused.State(w, capacity) with w.dcp = `dcp`: this rank's shard, ceil(capacity / dcp) + 1 rows a cache.
+    pub fn initDcp(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize) !State {
         const c = w.config;
-        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
+        if (dcp == 0 or (dcp > 1 and dcp != w.world)) return error.Invalid;
+        const rows = dcpm.localCapacity(capacity, dcp);
+        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
         errdefer s.deinit();
-        const rows = capacity + 1;
         for (w.layers, 0..) |*L, i| {
             s.kc[i] = try s.zeros(rows * c.latentWidth() * 2);
             s.ic[i] = if (L.indexer != null) try s.zeros(rows * c.index_dim * 2) else 0;
@@ -420,11 +470,27 @@ pub const State = struct {
 
     /// fused.State.bytes_for: what the caches of `capacity` tokens take (the cache guard's figure).
     pub fn bytesFor(w: *const W.Weights, capacity: usize) usize {
+        return bytesForDcp(w, capacity, 1);
+    }
+
+    /// fused.State.bytes_for with w.dcp: a rank's shard of the caches.
+    pub fn bytesForDcp(w: *const W.Weights, capacity: usize, dcp: usize) usize {
         const c = w.config;
         var per: usize = 0;
         for (w.layers) |*L| per += c.latentWidth() * 2 + (if (L.indexer != null) c.index_dim * 2 else 0);
         if (w.mtp) |*m| per += c.latentWidth() * 2 + (if (m.layer.indexer != null) c.index_dim * 2 else 0);
-        return per * (capacity + 1);
+        return per * dcpm.localCapacity(capacity, @max(dcp, 1));
+    }
+
+    /// prefixes.row_views' m: the local rows a state of n tokens reads on this rank (every rank counts the most any
+    /// rank holds, ceil(n / dcp), so every rank saves the same bytes).
+    pub fn localRows(s: *const State, n: usize) usize {
+        return dcpm.cdiv(n, s.dcp);
+    }
+
+    /// prefixes.row_views' mm: the MTP layer's local rows of a state of n tokens (positions < n - 1).
+    pub fn localMtpRows(s: *const State, n: usize) usize {
+        return dcpm.cdiv(n -| 1, s.dcp);
     }
 
     /// A fresh request: every cache row and the position zeroed (fused.State's torch.zeros).
@@ -482,6 +548,9 @@ pub const Forward = struct {
     /// eh_proj and its routed experts as dense bf16 GEMMs (cuda_prompt.MtpDense); null: the router kernel and the
     /// decode expert kernel in blocks. Drafts only: the target verifies every token, so no output token moves.
     mtp_dense: ?*prompt.MtpDense = null,
+    /// Phase 3b: decode context parallelism (w.dcp: 1, or the world - every rank of the TP world is one of the DCP
+    /// group, its rank w.rank). The State must be State.initDcp(.., dcp) and every Buffers BufOpts.dcp = dcp.
+    dcp: usize = 1,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -653,7 +722,8 @@ pub const Forward = struct {
         }
         try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
         if (!side_a and !side_w) try f.keys(b, L, kc, ic, pos, R, reuse);
-        if (reuse == 1 and T != null) try o.copy(b.tok + (c.index_topk - 1) * 4, pos, 4); // b.tok[0, K-1:] = pos
+        // b.tok[0, K-1:] = pos (DCP 1 only: under DCP the row's own key is in its owner's share already)
+        if (reuse == 1 and T != null and f.dcp == 1) try o.copy(b.tok + (c.index_topk - 1) * 4, pos, 4);
         var q_done = false;
         if (L.indexer) |*ix| {
             if (T) |tt| {
@@ -675,11 +745,12 @@ pub const Forward = struct {
     fn keys(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, reuse: u32) !void {
         const c = f.w.config;
         const t_ = f.t();
-        try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla());
+        const rank = f.dcpRank();
+        try t_.kvWriteDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla(), f.dcp, rank);
         if (L.indexer) |*ix| {
             if (reuse == 0) {
                 try t_.router(b.normed, c.hidden, ix.wk, b.ik, b.rpart, R, c.hidden, c.index_dim);
-                try t_.ikWrite(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope);
+                try t_.ikWriteDcp(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope, f.dcp, rank);
             }
         }
     }
@@ -707,7 +778,11 @@ pub const Forward = struct {
         }
         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
         if (f.sideOn()) |sd| try sd.join(f.s); // TF_GLM53_SIDE: the window's latents are in the cache
-        try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
+        if (f.dcp > 1) {
+            try f.attentionDcp(b, kc, pos, R, tiling);
+        } else {
+            try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
+        }
         if (wide) {
             try f.wide.?.expand(f, b, L, R);
         } else {
@@ -872,7 +947,10 @@ pub const Forward = struct {
             try f.layerWith(b, &f.w.mtp.?.layer, st.mkc, st.mic, st.mpos, n, T, opts.reuse);
             if (sd) |x| try x.join(f.s);
         }
-        if (opts.keep_sel and T != null and n > 1) try o.copy(b.tok, b.tok + (n - 1) * c.index_topk * 4, c.index_topk * 4);
+        if (opts.keep_sel and T != null and n > 1) {
+            try o.copy(b.tok, b.tok + (n - 1) * c.index_topk * 4, c.index_topk * 4);
+            if (f.dcp > 1) try o.copy(b.cnt, b.cnt + (n - 1) * 4, 4); // b.cnt[0:1].copy_(b.cnt[n - 1:n])
+        }
         if (opts.chain_normed) {
             try t_.rmsnorm(b.x, D, m.head_norm, b.hidden, D, n, D, c.eps);
         } else {
@@ -895,6 +973,7 @@ pub const Forward = struct {
         const t_ = f.t();
         if (T > b.score_cols) return error.ScoreBufferTooSmall;
         if (T < c.index_topk) return error.Invalid;
+        if (f.dcp > 1) return f.selectDcp(b, ic, pos, row0, R, T);
         var r0: usize = row0;
         while (r0 < row0 + R) : (r0 += 128) {
             const n = @min(128, row0 + R - r0);
@@ -910,6 +989,99 @@ pub const Forward = struct {
                 try t_.selectKeys(b.sc, out, T, n, c.index_topk);
             }
         }
+    }
+
+    // ---------------------------------------------------------------- Phase 3b: decode context parallelism ---
+
+    /// This rank in the DCP group (fused: `w.rank if w.dcp > 1 else 0`).
+    fn dcpRank(f: *const Forward) usize {
+        return if (f.dcp > 1) f.w.rank else 0;
+    }
+
+    /// fused.dcp_gather: every rank's `bytes` at x into out [world, bytes] in rank order - the RoCE one-shot gather for
+    /// decode-window exchanges (`small`) when it is up and the whole result fits its buffers, else NCCL (`count`
+    /// elements of `dt`). A gather only moves words: both give the same bits.
+    fn dcpGather(f: *const Forward, x: u64, out: u64, bytes: usize, count: usize, dt: cuda.nccl.DataType, small: bool) !void {
+        const world = f.w.world;
+        if (small) if (f.fast) |r| {
+            if (bytes % 16 == 0 and world * bytes <= roce.max_bytes) return r.allGather(f.s, x, out, bytes);
+        };
+        const cm = f.comm orelse return error.NoCommunicator;
+        try cm.allGather(x, out, count, dt, f.s.handle);
+    }
+
+    /// fused.select's DCP branch for window rows row0 .. row0 + R - 1 (blocks of SEL_ROWS = 128): this rank's slots
+    /// t < Tl = ceil(T / dcp) scored as packed int64 keys (_index_scores DCP, RANK, PACK), its top kk = min(K, Tl) of
+    /// them padded to K (int64 min + 1), every rank's candidates gathered (RoCE for decode windows), then the K best
+    /// of the dcp * K - by the whole key (torch.topk) below RADIX_MIN_ROWS rows, by the high word with ties to the
+    /// lower column at or above it (topk.top_keys: the Python radix branch's own tie rule) - and this rank's share as
+    /// local slots ascending in b.tok, its count in b.cnt. The per-rank top kk is one set however it is found
+    /// (scores tie-free by position): the multi-block top-k over the keys' high words (glm53_topk_*, mode 2) where its
+    /// scratch fits, else topk.top_keys.
+    fn selectDcp(f: *const Forward, b: *const Buffers, ic: u64, pos: u64, row0: usize, R: usize, T: usize) !void {
+        const c = f.w.config;
+        const t_ = f.t();
+        const o = f.ops();
+        const G = f.dcp;
+        const rank = f.dcpRank();
+        const K = c.index_topk;
+        if (b.dcp != G or b.cand == 0) return error.NoDcpBuffers;
+        const Tl = dcpm.localCols(T, G);
+        const kk = @min(K, Tl);
+        var r0: usize = row0;
+        while (r0 < row0 + R) : (r0 += 128) {
+            const n = @min(128, row0 + R - r0);
+            const iq = b.iq + r0 * c.index_heads * c.index_dim * 2;
+            const iw = b.iw + r0 * c.index_heads * 4;
+            const radix = n >= radix_min_rows; // fused.RADIX and n >= RADIX_MIN_ROWS (dcp > 1)
+            try t_.indexScoresDcp(iq, iw, ic, pos, b.sc, Tl, r0, n, c.index_heads, c.index_dim, G, rank);
+            const tok = b.tok + r0 * K * 4;
+            const blocks = (Tl + kern.topk_chunk - 1) / kern.topk_chunk;
+            if (n <= b.tsel.rows and blocks <= b.tsel.blocks) {
+                // this rank's kk best columns ascending (b.tok's rows as scratch), then their keys
+                try o.topkColumnsMode(b.sc, Tl, Tl, n, kk, 2, b.tsel, tok, K);
+                try o.dcpCands(b.sc, Tl, tok, K, kk, K, false, b.dmine, n);
+            } else {
+                try t_.topKeys(b.sc, b.dsel, Tl, n, kk);
+                try o.dcpCands(b.sc, Tl, b.dsel, kk, kk, K, true, b.dmine, n);
+            }
+            try f.dcpGather(b.dmine, b.cand, n * K * 8, n * K, .i64, n <= b.small);
+            try o.dcpMerge(b.cand, n, K, G, rank, radix, tok, b.cnt + r0 * 4);
+        }
+    }
+
+    /// fused._attention_dcp: this rank's absorbed queries packed ([R, H, lw + rd]) and gathered from every rank, all
+    /// G * H heads attended over this rank's keys (_attn_dcp: chunk partials), merged per head into a normalized
+    /// output and log-sum-exp by destination rank (_merge_lse), exchanged (decode windows: all-gather of everything,
+    /// read our block; prompt chunks: NCCL all-to-all of head blocks) and combined in rank order (_dcp_combine) ->
+    /// b.ol.
+    fn attentionDcp(f: *const Forward, b: *const Buffers, kc: u64, pos: u64, R: usize, tl: tri.AttnTiling) !void {
+        const c = f.w.config;
+        const t_ = f.t();
+        const o = f.ops();
+        const m = f.mla();
+        const G = f.dcp;
+        const rank = f.dcpRank();
+        const H = m.heads;
+        const lw = m.lw;
+        const rd = m.rope;
+        if (b.dcp != G or b.qall == 0) return error.NoDcpBuffers;
+        const small = R <= b.small;
+        try o.dcpQpack(b.qlat, b.qrot, b.qpack, R * H, lw, rd);
+        try f.dcpGather(b.qpack, b.qall, R * H * (lw + rd) * 2, R * H * (lw + rd), .bf16, small);
+        const nch = @max(1, c.index_topk / tl.chk);
+        try t_.attnDcp(b.qall, kc, b.tok, b.cnt, pos, b.po, b.pm, b.pl, R, m, G, rank, tl);
+        try t_.mergeLse(b.po, b.pm, b.pl, b.osend, b.lsend, R, G, m, nch);
+        if (small) {
+            try f.dcpGather(b.osend, b.orecv, G * R * H * lw * 2, G * R * H * lw, .bf16, true);
+            try f.dcpGather(b.lsend, b.lrecv, G * R * H * 4, G * R * H, .f32, true);
+        } else {
+            const cm = f.comm orelse return error.NoCommunicator;
+            try dcpm.allToAll(cm, b.osend, b.orecv, R * H * lw, .bf16, 2, f.s.handle);
+            try dcpm.allToAll(cm, b.lsend, b.lrecv, R * H, .f32, 4, f.s.handle);
+        }
+        const ex = dcpm.exchange(small, G, rank, R, H, lw);
+        try t_.dcpCombine(b.orecv + ex.o0 * 2, b.lrecv + ex.l0 * 4, b.ol, R, ex.ss, ex.ssl, m, G);
     }
 
     /// fused.head(x, final_norm, R, slice(R - 1, R), mode="argmax") for the window's last row: the final RMSNorm,

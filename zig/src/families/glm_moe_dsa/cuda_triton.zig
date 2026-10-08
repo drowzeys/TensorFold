@@ -106,12 +106,23 @@ pub const Tri = struct {
 
     /// fused._kv_write (bf16 cache, DCP 1, one stream): row r's latent RMSNorm and rotated key into cache row POS + r.
     pub fn kvWrite(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, inv: u64, eps: f32, rows: usize, m: Mla) !void {
-        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", 1), ci("RANK", 0), cb("ROWS", false) }, .{ .num_warps = 4 });
+        return t.kvWriteDcp(kva, kva_stride, nw, cache, pos, inv, eps, rows, m, 1, 0);
+    }
+
+    /// fused.kv_write's _kv_write with DCP / RANK (Phase 3b): only the owner of position p (p % DCP == RANK) stores
+    /// its row, at local row p // DCP (DCP 1, RANK 0: every row at p, as kvWrite).
+    pub fn kvWriteDcp(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, inv: u64, eps: f32, rows: usize, m: Mla, dcp: usize, rank: usize) !void {
+        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", dcp), ci("RANK", rank), cb("ROWS", false) }, .{ .num_warps = 4 });
     }
 
     /// fused._ik_write: the index key's LayerNorm (fp32, bias) and RoPE on its first RD dims into IC[POS + r].
     pub fn ikWrite(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, rows: usize, d: usize, rd: usize) !void {
-        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", 1), ci("RANK", 0), cb("ROWS", false) }, .{ .num_warps = 4 });
+        return t.ikWriteDcp(ik, nw, nb, inv, ic, pos, rows, d, rd, 1, 0);
+    }
+
+    /// _ik_write with DCP / RANK (Phase 3b): the owner's local row p // DCP only.
+    pub fn ikWriteDcp(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, rows: usize, d: usize, rd: usize, dcp: usize, rank: usize) !void {
+        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", dcp), ci("RANK", rank), cb("ROWS", false) }, .{ .num_warps = 4 });
     }
 
     /// fused._iq_rope: the index query's first RD dims rotated in place.
@@ -124,6 +135,42 @@ pub const Tri = struct {
         const ws = f32of(std.math.pow(f64, @floatFromInt(nh), -0.5));
         const qs = f32of(std.math.pow(f64, @floatFromInt(d), -0.5));
         try t.run("_index_scores", .{ n, cdiv(T, bt), 1 }, &.{ p("Q", "*bf16", q), p("W", "*fp32", w), p("IC", "*bf16", ic), p("POS", "*i32", pos), p("OUT", "*i32", out), int("T", T), int("R0", r0) }, &.{ ci("NH", nh), ci("D", d), ci("BTT", bt), aot.cf("WSCALE", ws), aot.cf("QSCALE", qs), ci("DCP", 1), ci("RANK", 0), cb("PACK", false), cb("ROWS", false) }, .{ .num_warps = 2, .num_stages = 2 });
+    }
+
+    /// fused._index_scores, DCP > 1 (Phase 3b; PACK True: fused.select packs whenever DCP > 1): row r's score of this
+    /// rank's slots t < Tl (global position t * DCP + RANK) packed with the position into one int64 that orders by
+    /// score, then lower position; later positions int64 min + 1. OUT [n, Tl] int64.
+    pub fn indexScoresDcp(t: Tri, q: u64, w: u64, ic: u64, pos: u64, out: u64, Tl: usize, r0: usize, n: usize, nh: usize, d: usize, dcp: usize, rank: usize) !void {
+        const ws = f32of(std.math.pow(f64, @floatFromInt(nh), -0.5));
+        const qs = f32of(std.math.pow(f64, @floatFromInt(d), -0.5));
+        try t.run("_index_scores", .{ n, cdiv(Tl, bt), 1 }, &.{ p("Q", "*bf16", q), p("W", "*fp32", w), p("IC", "*bf16", ic), p("POS", "*i32", pos), p("OUT", "*i64", out), int("T", Tl), int("R0", r0) }, &.{ ci("NH", nh), ci("D", d), ci("BTT", bt), aot.cf("WSCALE", ws), aot.cf("QSCALE", qs), ci("DCP", dcp), ci("RANK", rank), cb("PACK", true), cb("ROWS", false) }, .{ .num_warps = 2, .num_stages = 2 });
+    }
+
+    /// topk.top_keys: row r's k best packed keys of S [rows, nc] int64 (high word order, ties to the lower column),
+    /// int64 in column order -> OUT [rows, k] (the radix branch of fused.select under DCP).
+    pub fn topKeys(t: Tri, sc: u64, out: u64, nc: usize, rows: usize, k: usize) !void {
+        try t.run("_select_keys", .{ rows, 1, 1 }, &.{ p("S", "*i64", sc), p("OUT", "*i64", out), int("NC", nc) }, &.{ ci("K", k), ci("BLOCK", 1024), cb("KEYS", true) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._attn_dcp (bf16 cache; Phase 3b): program (row, chunk, head group g) - rank g's gathered queries (QALL
+    /// [G, R, H, LW + RD]) over this rank's keys of row r (its slots of positions 0..p while p < K, else its share
+    /// of the selection, TOK / CNT); partials at head g * H + h of [nch, R, G * H].
+    pub fn attnDcp(t: Tri, qall: u64, cache: u64, tok: u64, cnt: u64, pos: u64, po: u64, pm: u64, pl: u64, rows: usize, m: Mla, g: usize, rank: usize, tl: AttnTiling) !void {
+        const nch = @max(1, m.topk / tl.chk);
+        const scale = f32of(std.math.pow(f64, @floatFromInt(m.nope + m.rope), -0.5));
+        try t.run("_attn_dcp", .{ rows, nch, g }, &.{ p("QALL", "*bf16", qall), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("CNT", "*i32", cnt), p("POS", "*i32", pos), p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows) }, &.{ ci("H", m.heads), ci("G", g), ci("LW", m.lw), ci("RD", m.rope), ci("K", m.topk), ci("CHK", tl.chk), ci("KTT", tl.kt), aot.cf("SCALE", scale), ci("DCP", g), ci("RANK", rank) }, .{ .num_warps = tl.nw, .num_stages = tl.ns });
+    }
+
+    /// fused._merge_lse: program (row, head of all HT = G * H): this rank's chunk partials in chunk order -> the
+    /// normalized output (bf16) and its log-sum-exp at [destination rank = head // H, row, head % H].
+    pub fn mergeLse(t: Tri, po: u64, pm: u64, pl: u64, osend: u64, lsend: u64, rows: usize, g: usize, m: Mla, nch: usize) !void {
+        try t.run("_merge_lse", .{ rows, g * m.heads, 1 }, &.{ p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), p("OSEND", "*bf16", osend), p("LSEND", "*fp32", lsend), int("R", rows) }, &.{ ci("HT", g * m.heads), ci("H", m.heads), ci("LW", m.lw), ci("NCH", nch) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._dcp_combine: program (row, own head) - every rank's normalized partial merged in rank order by their
+    /// log-sum-exps (ORECV[src] at stride ss elements, LRECV[src] at stride ssl) -> OUT [R, H, LW] bf16.
+    pub fn dcpCombine(t: Tri, orecv: u64, lrecv: u64, out: u64, rows: usize, ss: usize, ssl: usize, m: Mla, world: usize) !void {
+        try t.run("_dcp_combine", .{ rows, m.heads, 1 }, &.{ p("ORECV", "*bf16", orecv), p("LRECV", "*fp32", lrecv), p("OUT", "*bf16", out), int("R", rows), int("SS", ss), int("SSL", ssl) }, &.{ ci("H", m.heads), ci("LW", m.lw), ci("WORLD", world) }, .{ .num_warps = 4 });
     }
 
     /// topk.top_columns over int32 order words: row r's K best columns, ascending, ties to the lower column.
