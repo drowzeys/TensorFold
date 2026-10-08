@@ -391,7 +391,7 @@ pub const TapPlan = struct {
     layers: [2 * max_taps]usize = @splat(0),
     n: usize = 0,
     /// per drafter (DFlash2, DSpark): its column blocks of the taps buffer in its own order
-    cols: [2][max_taps]usize = [_][max_taps]usize{[_]usize{0} ** max_taps} ** 2,
+    cols: [2][max_taps]usize = @splat(@splat(0)),
     n_cols: [2]usize = .{ 0, 0 },
 
     pub fn slotOf(p: *const TapPlan, layer: usize) ?usize {

@@ -689,9 +689,9 @@ pub const Session = struct {
     }
 
     /// Rank 0: PromptReuse.choose for a request (no reuse: nothing resumed, nothing cut).
-    pub fn choose(s: *Session, prompt_ids: []const u32, draft: bool) !reuse.Choice {
+    pub fn choose(s: *Session, prompt_ids: []const u32, drafting: bool) !reuse.Choice {
         const pr = s.reuse orelse return .{ .begin = 0, .stops = &.{}, .keeps = &.{} };
-        return reuse.choose(s.gpa, s.plan, &pr.store, prompt_ids, draft, 0);
+        return reuse.choose(s.gpa, s.plan, &pr.store, prompt_ids, drafting, 0);
     }
 
     /// Glm53Engine._run on this rank: the request through prompt reuse (when on) and Runner.run. Tokens go to `out`.

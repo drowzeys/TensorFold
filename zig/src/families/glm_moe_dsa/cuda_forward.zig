@@ -95,7 +95,7 @@ pub const BufOpts = struct {
 /// Phase 4: fused.Weights.tap_slot - which target layers' output rows the loaded drafters read and where in
 /// Buffers.taps (draft_host.TapPlan's slots); n 0: no drafter.
 pub const Taps = struct {
-    slot: [256]i16 = [_]i16{-1} ** 256,
+    slot: [256]i16 = @splat(-1),
     n: usize = 0,
 
     pub fn of(plan: anytype) !Taps {
