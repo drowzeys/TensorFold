@@ -77,6 +77,17 @@ pub fn modeOf(m: rn.Mode) Mode {
     };
 }
 
+/// A plan item's mode word as a Mode (null: not one).
+pub fn modeOfWord(w: u32) ?Mode {
+    return switch (w) {
+        0 => .serial,
+        1 => .mtp,
+        2 => .dflash,
+        4 => .dspark,
+        else => null,
+    };
+}
+
 /// The drafter a mode drafts with (the runner's order: 0 DFlash2, 1 DSpark); null: none.
 pub fn drafterOf(m: Mode) ?usize {
     return switch (m) {
@@ -1277,7 +1288,7 @@ pub const Multi = struct {
             var na: usize = 0;
             for (plan.items[0..plan.n], 0..) |it, i| {
                 if (it.arm != arm_draft or it.room == 0) continue;
-                const m = std.enums.fromInt(Mode, it.mode) orelse return error.OutOfStep;
+                const m = modeOfWord(it.mode) orelse return error.OutOfStep;
                 if ((drafterOf(m) orelse return error.OutOfStep) != which) continue;
                 const s = mu.find(it.sid) orelse return error.OutOfStep;
                 asks[na] = .{ .slot = it.slot, .pending = it.tok, .depth = it.room, .sampling = s.sampling, .conf = mu.confOf(which, plan.dcut) };
@@ -1535,7 +1546,7 @@ pub const Multi = struct {
             var items: [max_streams]mdraft.Commit = undefined;
             var ni: usize = 0;
             for (plan.items[0..plan.n], 0..) |it, i| {
-                const m = std.enums.fromInt(Mode, it.mode) orelse return error.OutOfStep;
+                const m = modeOfWord(it.mode) orelse return error.OutOfStep;
                 if ((drafterOf(m) orelse continue) != which) continue;
                 items[ni] = .{ .slot = it.slot, .src = vb.taps + t.offs[i] * pitch, .n = res[i].n + 1 };
                 ni += 1;
@@ -1723,6 +1734,8 @@ test "Phase 4c: modes, the drafter rows and the window with drafters" {
     try std.testing.expectEqual(@as(?usize, 0), drafterOf(.dflash));
     try std.testing.expectEqual(@as(?usize, 1), drafterOf(.dspark));
     try std.testing.expectEqual(@as(?usize, null), drafterOf(.mtp));
+    try std.testing.expectEqual(@as(?Mode, .dspark), modeOfWord(@intFromEnum(Mode.dspark)));
+    try std.testing.expectEqual(@as(?Mode, null), modeOfWord(3));
     const df: draft.Spec = .{ .kind = .dflash, .D = 6144, .hd = 128, .H = 16, .KV = 2, .I = 3072, .layers = 6, .ntaps = 6, .block = 8, .top_k = 16, .V = 38720, .vocab_off = 0, .rsel = 256, .gs = 16, .eps = 1e-5, .window = 2047, .causal = false, .world = 4, .theta = 1e6, .mask_id = 154856 };
     var ds = df;
     ds.kind = .dspark;
