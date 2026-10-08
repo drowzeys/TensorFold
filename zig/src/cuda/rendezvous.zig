@@ -1,8 +1,9 @@
 //! A TCP rendezvous for the ranks of one tensor-parallel world: the part of torch's TCPStore that cuda/comm.py uses.
 //! Rank 0 listens on the master's port, every other rank connects (retrying while rank 0 is not up yet), rank 0 hands
 //! out NCCL's unique id, and the same connections then serve named barriers (`sync`), which also check that every
-//! rank was started with the same settings (a 64-bit digest each rank passes). Plain blocking sockets: a handful of
-//! messages a run, none on the decode path.
+//! rank was started with the same settings (a 64-bit digest each rank passes). Plain blocking sockets with Nagle off
+//! (TCP_NODELAY): GLM-5.3's --parallel N sends rank 0's small round messages on them, one a decode round, and a write
+//! must not wait for the previous one's acknowledgement.
 const std = @import("std");
 const posix = std.posix;
 
@@ -33,6 +34,13 @@ pub fn parseIp4(host: []const u8) Error!u32 {
 
 fn sockaddr(ip: u32, port: u16) posix.sockaddr.in {
     return .{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, ip) };
+}
+
+/// Nagle off on a connection (best effort: a socket that refuses keeps working, only slower for small messages).
+fn noDelay(fd: posix.socket_t) void {
+    const one: c_int = 1;
+    // IPPROTO_TCP (6) and TCP_NODELAY (1): the same numbers on Linux and macOS
+    posix.setsockopt(fd, 6, 1, std.mem.asBytes(&one)) catch {};
 }
 
 fn seconds(io: std.Io, since: anytype) f64 {
@@ -118,6 +126,7 @@ pub const Rendezvous = struct {
                     _ = posix.system.close(fd);
                     continue;
                 }
+                noDelay(fd);
                 self.fds[r] = fd;
                 joined += 1;
                 std.log.info("rendezvous: rank {d} joined ({d} of {d})", .{ r, joined, world });
@@ -131,6 +140,7 @@ pub const Rendezvous = struct {
             const fd: posix.socket_t = @intCast(rc);
             var addr = sockaddr(ip, port);
             if (posix.errno(posix.system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) == .SUCCESS) {
+                noDelay(fd);
                 self.fds[0] = fd;
                 break;
             }
