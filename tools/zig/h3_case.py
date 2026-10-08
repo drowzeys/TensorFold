@@ -12,6 +12,9 @@ Writes case.safetensors from the Python 0.6 family, float projections and FastVi
   the small float projections (patches in, heads out) and the first forward's two velocities
 The block projections are read by the native tool from the checkpoint itself.
 `--decode PREFIX` instead decodes PREFIX.video.f32 and PREFIX.audio.f32 (raw rows) into --mp4.
+`--revoice N` with it first makes the audio rows again with the released model (no distillation) in N steps against
+the finished picture, as families/h3/sampler.py `revoice` does; it needs the prompt (--prompt-file) and --seed.
+`--steps N` exports N forwards instead of the checkpoint's own count, rungs spread evenly from its first rung.
 """
 
 from __future__ import annotations
@@ -38,6 +41,9 @@ def main() -> int:
     parser.add_argument("--decode", help="prefix of the raw float32 rows to decode into --mp4")
     parser.add_argument("--mp4")
     parser.add_argument("--crop", help="with --decode: WxH, centre-crop the decoded frames before the MP4 is written")
+    parser.add_argument("--steps", type=int, default=0, help="forwards, when not the checkpoint's trained count")
+    parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
+                        help="with --decode: audio made again by the released model in this many steps")
     parser.add_argument("--no-reference", action="store_true",
                         help="skip the reference forward (its velocities are written as zeros): for renders, not parity")
     args = parser.parse_args()
@@ -68,6 +74,25 @@ def main() -> int:
         audio = np.fromfile(args.decode + ".audio.f32", dtype=np.float32).reshape(-1, config.audio_latents_dim)
         latents = SimpleNamespace(video_rows=mx.array(video), audio_rows=mx.array(audio), latent_frames=frames_l,
                                   latent_height=lat_h, latent_width=lat_w, audio_latents=audio_l)
+        if args.revoice:
+            import gc
+
+            from tensorfold.families.h3.sampler import revoice
+
+            # the native run keeps no layout: rebuild it from the prompt, as the export did
+            text, tags = tool.encode_text(root, Path(args.prompt_file).read_text())
+            latents.packed = layout(tags, frames_l, lat_h, lat_w, audio_l, config.patch_size)
+            mark = time.perf_counter()
+            base = tool.load_dit(args.model_dir)
+            tool.int8_mlp(base)
+            tool.int8_attention(base, qkv=True, out=True, fused=True)
+            latents.audio_rows = revoice(base, text, latents, args.revoice + 1, args.seed, release=True,
+                                         on_step=lambda i, n, t: print(f"[tensorfold] voice {i}/{n} {t:.2f}s", flush=True))
+            mx.eval(latents.audio_rows)
+            print(f"[tensorfold] re-voiced in {time.perf_counter() - mark:.1f}s", flush=True)
+            del base
+            gc.collect()
+            mx.clear_cache()
         frames, wave, rate = tool.decode(args.model_dir, root, latents, h3.DiTConfig.from_checkpoint(args.model_dir))
         from minimax_h3_mlx.media import save_mp4
 
@@ -85,7 +110,10 @@ def main() -> int:
     video, audio = start_noise(config, frames_l, lat_h, lat_w, audio_l, args.seed)
     prepare = fasth3.route(dit, gates, fast.sparsity, fast.tile, "reference")
     geometry = prepare(packed, frames_l, lat_h, lat_w)
-    schedules = [Schedule(fast.video_shift, 0, None, fast.nodes), Schedule(fast.audio_shift, 0, None, fast.nodes)]
+    nodes = fast.nodes
+    if args.steps and args.steps != len(nodes):
+        nodes = tuple(nodes[0] * (1 - i / args.steps) for i in range(args.steps))
+    schedules = [Schedule(fast.video_shift, 0, None, nodes), Schedule(fast.audio_shift, 0, None, nodes)]
     table, plan = timestep_plan(packed, schedules[0].timesteps, schedules[1].timesteps)
     text = text.astype(mx.bfloat16)
     rows = dit.token_refiner(dit.condition_proj(text.astype(dit.condition_proj.weight.dtype)).astype(mx.bfloat16))
