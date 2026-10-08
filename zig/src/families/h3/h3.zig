@@ -550,17 +550,22 @@ pub const Model = struct {
                 self.attend(enc.*, self.all_tiles, self.prefix_tiles, self.tiles, 0, false);
                 self.attend(enc.*, self.chosen, video_tiles, self.prefix_tiles + self.keep, self.prefix_tiles, true);
                 self.lap(&pass, "attention");
-                enc.setPipeline(self.pipeline("h3_gate_mix"));
+                // the pooled branch gated in and the rows rounded to int8, in one pass
+                enc.setPipeline(self.pipeline("h3_mix_quant"));
                 enc.setBuffer(self.qr, 0, 0);
                 enc.setBuffer(self.cr, 0, 1);
                 enc.setBuffer(self.coarse, 0, 2);
                 enc.setBuffer(self.slot.buffer, self.slot.offset, 3);
                 enc.setValue([3]i32{ @intCast(rows), @intCast(heads), @intCast(self.tiles) }, 4);
-                enc.dispatchThreads(mtl.Size.of(rows, heads, 1), mtl.Size.of(32, 8, 1));
+                enc.setBuffer(self.a8, 0, 5);
+                enc.setBuffer(self.as, 0, 6);
+                enc.dispatchGroups(mtl.Size.of(self.paddedRows(), 1, 1), mtl.Size.of(32, 1, 1));
                 self.lap(&pass, "gate mix");
             }
-            self.quantRows(enc.*, self.qr, self.a8, self.as, self.inner, self.inner);
-            self.lap(&pass, "quantize");
+            if (self.dense) {
+                self.quantRows(enc.*, self.qr, self.a8, self.as, self.inner, self.inner);
+                self.lap(&pass, "quantize");
+            }
             self.product(enc.*, "h3_i8_out", self.a8, self.as, b.out, self.y, hidden);
             self.lap(&pass, "attention out");
             self.norm(enc.*, b.norm2, b.tables, gate_a, b.tables, scale_m, shift_m);
