@@ -212,6 +212,57 @@ pub const Tri = struct {
         try t.run("_expand", .{ m.heads, m.vd / 16, cdiv(rows, rbk) }, &.{ p("OL", "*bf16", ol), p("WV", "*bf16", wv), p("OUT", "*bf16", out), int("R", rows) }, &.{ ci("H", m.heads), ci("DV", m.vd), ci("LW", m.lw), ci("BN", 16), ci("RBK", rbk) }, .{ .num_warps = 4 });
     }
 
+    // ---- Phase 4b: several streams in one decode window (fused.Rows: ROWS=True, BASE an int32 table) ----------
+    // Row r sits at position POS[r] (an int32 table, not the window's first position) of the stream whose cache rows
+    // start at row BASE[r]; every row computes what it computes alone (DCP 1, multi.GlmMultiDecoder's windows).
+
+    /// _kv_write ROWS: row r's latent and rotated key into cache row BASE[r] + POS[r].
+    pub fn kvWriteRows(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, base: u64, inv: u64, eps: f32, rows: usize, m: Mla) !void {
+        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps), p("BASE", "*i32", base) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", 1), ci("RANK", 0), cb("ROWS", true) }, .{ .num_warps = 4 });
+    }
+
+    /// _ik_write ROWS: row r's index key into IC row BASE[r] + POS[r].
+    pub fn ikWriteRows(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, base: u64, rows: usize, d: usize, rd: usize) !void {
+        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6), p("BASE", "*i32", base) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", 1), ci("RANK", 0), cb("ROWS", true) }, .{ .num_warps = 4 });
+    }
+
+    /// _iq_rope ROWS: the index query of row r rotated at POS[r].
+    pub fn iqRopeRows(t: Tri, q: u64, inv: u64, pos: u64, rows: usize, nh: usize, d: usize, rd: usize) !void {
+        try t.run("_iq_rope", .{ rows, nh, 1 }, &.{ p("Q", "*bf16", q), p("INV", "*fp32", inv), p("POS", "*i32", pos) }, &.{ ci("NH", nh), ci("D", d), ci("RD", rd), cb("ROWS", true) }, .{ .num_warps = 1 });
+    }
+
+    /// _index_scores ROWS (PACK False): window row R0 + r scores the keys t <= POS[R0 + r] of its stream's index-key
+    /// rows from BASE[R0 + r]; OUT [n, T] int32 order words.
+    pub fn indexScoresRows(t: Tri, q: u64, w: u64, ic: u64, pos: u64, base: u64, out: u64, T: usize, r0: usize, n: usize, nh: usize, d: usize) !void {
+        const ws = f32of(std.math.pow(f64, @floatFromInt(nh), -0.5));
+        const qs = f32of(std.math.pow(f64, @floatFromInt(d), -0.5));
+        try t.run("_index_scores", .{ n, cdiv(T, bt), 1 }, &.{ p("Q", "*bf16", q), p("W", "*fp32", w), p("IC", "*bf16", ic), p("POS", "*i32", pos), p("OUT", "*i32", out), int("T", T), int("R0", r0), p("BASE", "*i32", base) }, &.{ ci("NH", nh), ci("D", d), ci("BTT", bt), aot.cf("WSCALE", ws), aot.cf("QSCALE", qs), ci("DCP", 1), ci("RANK", 0), cb("PACK", false), cb("ROWS", true) }, .{ .num_warps = 2, .num_stages = 2 });
+    }
+
+    /// _absorb ROWS: q_rot of row r at its own position POS[r].
+    pub fn absorbRows(t: Tri, q: u64, wk: u64, inv: u64, qa: u64, qr: u64, pos: u64, rows: usize, m: Mla) !void {
+        const rbk = if (rows > rb) rb else rows;
+        try t.run("_absorb", .{ m.heads, m.lw / 32, cdiv(rows, rbk) }, &.{ p("Q", "*bf16", q), p("WK", "*bf16", wk), p("INV", "*fp32", inv), p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("POS", "*i32", pos), int("R", rows) }, &.{ ci("H", m.heads), ci("QD", m.nope + m.rope), ci("NOPE", m.nope), ci("NOPE_P", pow2(m.nope)), ci("RD", m.rope), ci("LW", m.lw), ci("BN", 32), ci("RBK", rbk), cb("ROWS", true) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._attention_local ROWS: row r at POS[r] over its stream's cache rows from BASE[r] (its key list: keys
+    /// 0..p while p < K, else TOK[r]); one pass when a chunk covers index_topk keys, else partials + latent._merge.
+    pub fn attentionRows(t: Tri, qa: u64, qr: u64, cache: u64, tok: u64, pos: u64, base: u64, po: u64, pm: u64, pl: u64, ol: u64, dummy: u64, rows: usize, m: Mla, tl: AttnTiling) !void {
+        const nch = @max(1, m.topk / tl.chk);
+        const scale = f32of(std.math.pow(f64, @floatFromInt(m.nope + m.rope), -0.5));
+        const opts: aot.Launch = .{ .num_warps = tl.nw, .num_stages = tl.ns };
+        const common = [_]aot.Const{ ci("H", m.heads), ci("LW", m.lw), ci("RD", m.rope), ci("K", m.topk), ci("CHK", tl.chk), ci("KTT", tl.kt), aot.cf("SCALE", scale), cb("ROWS", true) };
+        if (nch == 1) {
+            var direct: [common.len + 1]aot.Const = undefined;
+            @memcpy(direct[0..common.len], &common);
+            direct[common.len] = cb("DIRECT", true);
+            try t.run("_attn_chunks", .{ rows, 1, 1 }, &.{ p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("POS", "*i32", pos), p("PO", "*bf16", ol), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows), p("BASE", "*i32", base) }, &direct, opts);
+            return;
+        }
+        try t.run("_attn_chunks", .{ rows, nch, 1 }, &.{ p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("POS", "*i32", pos), p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows), p("BASE", "*i32", base) }, &common, opts);
+        try t.run("_merge", .{ rows, m.heads, 1 }, &.{ p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), p("OUT", "*bf16", ol), p("CNT", "*i32", dummy), int("R", rows) }, &.{ ci("H", m.heads), ci("LW", m.lw), ci("NCH", nch), cb("SPARSE", false) }, .{ .num_warps = 4 });
+    }
+
     /// fused._cat2: OUT[r] = [A[r] ; B[r]] (bf16 rows of D each), the MTP layer's [enorm(embedding) ; hnorm(hidden)].
     pub fn cat2(t: Tri, a: u64, b: u64, out: u64, rows: usize, d: usize) !void {
         try t.run("_cat2", .{ rows, d / 1024, 1 }, &.{ p("A", "*bf16", a), p("B", "*bf16", b), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("BLOCK", 1024) }, .{ .num_warps = 4 });

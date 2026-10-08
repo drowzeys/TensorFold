@@ -187,6 +187,7 @@ pub const Kept = struct {
     saved: ?*Saved = null,
     tick: u64 = 0,
     learned: bool = false, // --learn: written to disk (or read from it)
+    slot: usize = 0, // Phase 4b (prefixes.SlotPrompts, e.extra["slot"]): the stream slot whose rows hold it
 
     pub fn n(e: *const Kept) usize {
         return e.ids.len;
@@ -213,6 +214,10 @@ pub const Store = struct {
     entries: std.ArrayList(*Kept) = .empty,
     live: std.ArrayList(u32) = .empty, // the ids whose rows the live caches hold
     clock: u64 = 0,
+    /// Phase 4b (prefixes.SlotPrompts, --parallel N): lives[slot] = the ids whose rows that slot holds; states stay in
+    /// their slot's rows (never saved out of them) and are usable while the slot still holds their ids. Empty: one
+    /// stream (`live`).
+    lives: []std.ArrayList(u32) = &.{},
 
     pub fn init(gpa: std.mem.Allocator, budget: u64, entries: usize, loose: bool, carry_bytes: usize, head_bytes: usize, release: Release) Store {
         return .{ .gpa = gpa, .budget = budget, .cap = @max(1, entries), .loose = loose, .carry_bytes = carry_bytes, .head_bytes = head_bytes, .release = release };
@@ -222,6 +227,54 @@ pub const Store = struct {
         s.clear();
         s.entries.deinit(s.gpa);
         s.live.deinit(s.gpa);
+        for (s.lives) |*l| l.deinit(s.gpa);
+        if (s.lives.len > 0) s.gpa.free(s.lives);
+    }
+
+    /// Slot mode (prefixes.SlotPrompts) over `n` stream slots, every slot holding nothing yet.
+    pub fn setSlots(s: *Store, n: usize) !void {
+        if (s.lives.len > 0 or n == 0) return error.Invalid;
+        s.lives = try s.gpa.alloc(std.ArrayList(u32), n);
+        for (s.lives) |*l| l.* = .empty;
+    }
+
+    /// SlotPrompts.lives[slot] = ids (the slot's rows hold these ids now).
+    pub fn setLiveSlot(s: *Store, slot: usize, ids: []const u32) !void {
+        if (slot >= s.lives.len) return error.Invalid;
+        s.lives[slot].clearRetainingCapacity();
+        try s.lives[slot].appendSlice(s.gpa, ids);
+    }
+
+    /// SlotPrompts.named_in: the usable state of `slot` with prompt[:n] (followers find rank 0's resume point).
+    pub fn namedIn(s: *const Store, prompt: []const u32, n: usize, slot: usize) ?*Kept {
+        for (s.entries.items) |e| {
+            if (e.slot == slot and e.n() == n and n <= prompt.len and s.usable(e) and std.mem.eql(u32, prompt[0..n], e.ids)) return e;
+        }
+        return null;
+    }
+
+    /// The newest tick among `slot`'s states (0: none) - SlotReuse.choose takes the free slot whose states are worth
+    /// least.
+    pub fn slotTick(s: *const Store, slot: usize) u64 {
+        var t: u64 = 0;
+        for (s.entries.items) |e| if (e.slot == slot) {
+            t = @max(t, e.tick);
+        };
+        return t;
+    }
+
+    /// SlotPrompts.overwritten_slot: the states of `slot` a request resumed there at `begin` overwrites - all but the
+    /// prefixes of its prompt no longer than `begin` (and, when rows copied from another slot replace this slot's,
+    /// only those `same` accepts).
+    pub fn overwrittenSlot(s: *const Store, gpa: std.mem.Allocator, slot: usize, prompt: []const u32, begin: usize, same: ?Same) ![]*Kept {
+        var out: std.ArrayList(*Kept) = .empty;
+        errdefer out.deinit(gpa);
+        for (s.entries.items) |e| {
+            if (e.slot != slot) continue;
+            if (e.n() <= begin and e.n() <= prompt.len and std.mem.eql(u32, prompt[0..e.n()], e.ids) and (same == null or same.?.accepts(e))) continue;
+            try out.append(gpa, e);
+        }
+        return out.toOwnedSlice(gpa);
     }
 
     fn heldOne(s: *const Store, e: *const Kept) u64 {
@@ -294,11 +347,18 @@ pub const Store = struct {
     }
 
     pub fn inLive(s: *const Store, e: *const Kept) bool {
+        if (s.lives.len > 0) {
+            if (e.slot >= s.lives.len) return false;
+            const live = s.lives[e.slot].items;
+            return e.n() <= live.len and std.mem.eql(u32, live[0..e.n()], e.ids);
+        }
         return e.n() <= s.live.items.len and std.mem.eql(u32, s.live.items[0..e.n()], e.ids);
     }
 
-    /// Saved, or still in the live caches (a request that failed mid-prefill left later rows unknown).
+    /// Saved, or still in the live caches (a request that failed mid-prefill left later rows unknown); slot mode: in
+    /// its slot's rows only.
     pub fn usable(s: *const Store, e: *const Kept) bool {
+        if (s.lives.len > 0) return s.inLive(e);
         return e.saved != null or s.inLive(e);
     }
 
@@ -380,7 +440,9 @@ pub const Store = struct {
         var i: usize = 0;
         while (i < s.entries.items.len) {
             const x = s.entries.items[i];
-            if (x.n() == e.n() and std.mem.eql(u32, x.ids, e.ids)) {
+            // KeptPrompts.same_place: one stream - always; slot mode - the same slot
+            const same_place = s.lives.len == 0 or x.slot == e.slot;
+            if (same_place and x.n() == e.n() and std.mem.eql(u32, x.ids, e.ids)) {
                 s.drop(x);
                 continue;
             }
@@ -1015,4 +1077,46 @@ test "overwritten: saved states stay, prefixes up to begin stay" {
     try std.testing.expectEqual(@as(usize, 2), over.len);
     try std.testing.expectEqual(c, over[0]); // newest first
     try std.testing.expectEqual(b, over[1]);
+}
+
+test "slot mode (SlotPrompts): states live in their slot's rows, one slot's ids never stand for another's" {
+    const gpa = std.testing.allocator;
+    var rel: TestRelease = .{};
+    var store = Store.init(gpa, 1 << 20, 8, false, 8, 8, .{ .ctx = &rel, .free = TestRelease.free });
+    defer store.deinit();
+    try store.setSlots(3);
+    const p = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    try store.setLiveSlot(0, &p);
+    try store.setLiveSlot(2, p[0..4]);
+    const a = try testKept(gpa, p[0..4], false);
+    a.slot = 0;
+    const b = try testKept(gpa, p[0..4], false);
+    b.slot = 2;
+    try std.testing.expect(store.remember(a, &.{}));
+    try std.testing.expect(store.remember(b, &.{})); // the same ids in another slot: a second state
+    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
+    try std.testing.expectEqual(b, store.namedIn(&p, 4, 2).?);
+    try std.testing.expectEqual(a, store.namedIn(&p, 4, 0).?);
+    try std.testing.expectEqual(@as(?*Kept, null), store.namedIn(&p, 4, 1));
+    try std.testing.expect(store.slotTick(2) > store.slotTick(0));
+    try std.testing.expectEqual(@as(u64, 0), store.slotTick(1));
+    // slot 0 takes another conversation: its state is no longer in its rows (never saved out of them)
+    try store.setLiveSlot(0, &.{ 9, 9 });
+    try std.testing.expect(!store.usable(a));
+    try std.testing.expect(store.usable(b));
+    try std.testing.expectEqual(b, store.best(&p, &.{4}, 0).?);
+    // what a request resumed in slot 2 at 4 overwrites there: nothing (its own prefix); at 2: the state at 4
+    const keep4 = try store.overwrittenSlot(gpa, 2, &p, 4, null);
+    defer gpa.free(keep4);
+    try std.testing.expectEqual(@as(usize, 0), keep4.len);
+    const over2 = try store.overwrittenSlot(gpa, 2, &p, 2, null);
+    defer gpa.free(over2);
+    try std.testing.expectEqual(@as(usize, 1), over2.len);
+    try std.testing.expectEqual(b, over2[0]);
+    // the same state again in the same slot replaces it
+    const b2 = try testKept(gpa, p[0..4], false);
+    b2.slot = 2;
+    try std.testing.expect(store.remember(b2, &.{}));
+    try std.testing.expect(!store.has(b));
+    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
 }

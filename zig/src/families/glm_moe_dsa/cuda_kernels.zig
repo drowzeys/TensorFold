@@ -71,6 +71,10 @@ pub const Kernels = struct {
     draft_dot: cuda.Function,
     draft_linear: cuda.Function,
     copy_rows: cuda.Function,
+    // Phase 4b (glm53_draft.cu): --parallel N's table-driven row gathers / scatters and the draft cut's numbers
+    rows_gather: cuda.Function,
+    rows_scatter: cuda.Function,
+    cut_stats: cuda.Function,
 
     /// Loads both fatbins and resolves every kernel; `triton_dir` holds the captured aot.json and cubins.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8) !Kernels {
@@ -121,6 +125,9 @@ pub const Kernels = struct {
         k.draft_dot = try k.draft_mod.function("glm53_draft_dot");
         k.draft_linear = try k.draft_mod.function("glm53_draft_linear");
         k.copy_rows = try k.draft_mod.function("glm53_copy_rows");
+        k.rows_gather = try k.draft_mod.function("glm53_rows_gather");
+        k.rows_scatter = try k.draft_mod.function("glm53_rows_scatter");
+        k.cut_stats = try k.draft_mod.function("glm53_cut_stats");
         // Phase 3a: the prompt path's own kernels and the device copy of prompt_experts.cu
         k.prompt_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt);
         errdefer k.prompt_mod.unload();
@@ -665,6 +672,49 @@ pub const Ops = struct {
         a.add(@as(i64, @intCast(src_pitch / 16)));
         a.add(int(row_bytes / 16));
         try cuda.launch.launch(o.k.copy_rows, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    // ---- Phase 4b: --parallel N (cuda_multi.zig) ---------------------------------------------------------------
+
+    /// glm53_rows_gather: dst[r] = src[idx[r]] for r < n, rows of `row_bytes` (a multiple of 4; idx int64 on the
+    /// device) - torch.index_select(src, 0, idx, out=dst).
+    pub fn rowsGather(o: Ops, dst: u64, src: u64, idx: u64, n: usize, row_bytes: usize) !void {
+        if (n == 0 or row_bytes == 0) return;
+        if (row_bytes % 4 != 0) return error.Misaligned;
+        var a: cuda.Args = .{};
+        a.add(dst);
+        a.add(src);
+        a.add(idx);
+        a.add(int(row_bytes / 4));
+        try cuda.launch.launch(o.k.rows_gather, .{ .grid = .{ .x = u(n) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_rows_scatter: dst[idx[r]] = src[r] for r < n, rows of `row_bytes` (a multiple of 4) - dst.index_copy_.
+    pub fn rowsScatter(o: Ops, dst: u64, idx: u64, src: u64, n: usize, row_bytes: usize) !void {
+        if (n == 0 or row_bytes == 0) return;
+        if (row_bytes % 4 != 0) return error.Misaligned;
+        var a: cuda.Args = .{};
+        a.add(dst);
+        a.add(idx);
+        a.add(src);
+        a.add(int(row_bytes / 4));
+        try cuda.launch.launch(o.k.rows_scatter, .{ .grid = .{ .x = u(n) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_cut_stats: for S head rows - lse[s] = log-sum-exp of lg [S, V] (row stride ld floats) and top[s] = the
+    /// largest of the ranks' records amax_all [world, S, 4] column 0 (multi._draft_stats).
+    pub fn cutStats(o: Ops, lg: u64, V: usize, ld: usize, amax_all: u64, world: usize, S: usize, lse: u64, top: u64) !void {
+        if (S == 0) return;
+        var a: cuda.Args = .{};
+        a.add(lg);
+        a.add(int(V));
+        a.add(int(ld));
+        a.add(amax_all);
+        a.add(int(world));
+        a.add(int(S));
+        a.add(lse);
+        a.add(top);
+        try cuda.launch.launch(o.k.cut_stats, .{ .grid = .{ .x = u(S) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 
     // ---- Phase 3a: the prompt path ----------------------------------------------------------------------------

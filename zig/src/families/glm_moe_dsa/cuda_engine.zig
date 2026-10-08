@@ -25,6 +25,8 @@ const reuse = @import("cuda_reuse.zig");
 const draft = @import("cuda_draft.zig");
 const dhost = @import("draft_host.zig");
 const copies = @import("copies.zig");
+const multi = @import("cuda_multi.zig");
+const dcpm = @import("cuda_dcp.zig");
 
 pub const world_default: usize = 4;
 /// engine.DCP_AUTO: contexts past this interleave the KV cache over the ranks (bf16 latent)
@@ -139,6 +141,11 @@ pub const Options = struct {
     copy: copies.Settings = .{ .on = false, .match = 0, .most = 0 },
     mode: ?[]const u8 = null,
     verify_rows: usize = 8,
+    /// Phase 4b: concurrent streams (--parallel N / TF_GLM53_PARALLEL; 1: one request at a time) and the concurrent
+    /// decoder's settings (TF_GLM53_DRAFT_CUT / _STREAMS, TF_GLM53_BATCH_FILL, TF_GLM53_QUICK_ROWS,
+    /// TF_GLM53_PRECAPTURE)
+    parallel: usize = 1,
+    multi_set: multi.Settings = .{},
 
     /// The server's settings: TF_GLM53_RANK / _WORLD / _MASTER / _AOT / ... (the script's names), `context` from
     /// --context. Unset variables keep tf-glm53-generate --mode 3a's defaults (the image's served ones).
@@ -192,6 +199,11 @@ pub const Options = struct {
         };
         o.mode = env("TF_GLM53_MTP");
         o.verify_rows = try envInt(usize, "TF_GLM53_VERIFY_ROWS", 8);
+        o.parallel = @max(1, try envInt(usize, "TF_GLM53_PARALLEL", 1));
+        o.multi_set = multi.Settings.fromEnv() catch {
+            std.log.err("TF_GLM53_DRAFT_CUT (a number), _STREAMS / TF_GLM53_QUICK_ROWS (whole numbers)", .{});
+            return error.BadSetting;
+        };
         if (o.aot.len == 0) {
             std.log.err("glm53: no Triton kernel pack: set TF_GLM53_AOT to the directory with aot.json", .{});
             return error.NoKernelPack;
@@ -219,12 +231,27 @@ pub const Options = struct {
     }
 };
 
+/// Runner._check_cache_fits: the target layers' bf16 latent rows of `slots` streams of `capacity` tokens (`need`
+/// bytes, a drafter's `extra` included) against what is free less the reserve (TF_GLM53_CACHE_RESERVE_GB, default 6,
+/// at most half of what is free): on GB10's unified memory an overcommitted cache swaps the node instead of failing.
+/// Null when it fits, else the most context a stream that would fit (Python's "--context <= fit").
+pub const CacheFit = struct { need: u64, free: u64, spare: u64, fit: u64 };
+
+pub fn cacheFit(row: u64, local: u64, slots: u64, dcp: u64, extra: u64, free: u64, reserve_gb: f64) ?CacheFit {
+    const need = row * local * slots + extra;
+    const spare: u64 = @intFromFloat(@min(reserve_gb * (1 << 30), @as(f64, @floatFromInt(free)) / 2));
+    if (need + spare <= free) return null;
+    const room = free -| spare -| extra;
+    return .{ .need = need, .free = free, .spare = spare, .fit = room / (row * slots) * dcp };
+}
+
 /// The settings every rank must share, hashed (the rendezvous compares them before anything loads).
 fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
     var h = std.hash.Wyhash.init(0x6a3b);
     h.update(std.mem.asBytes(&drafts));
-    const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows };
+    const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows, o.parallel };
     h.update(std.mem.asBytes(&cw));
+    if (o.parallel > 1) o.multi_set.digest(&h);
     const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
     h.update(std.mem.asBytes(&shape));
     for ([_][]const u8{ o.experts, o.pe_det, o.side, o.l2pf }) |t| {
@@ -280,6 +307,8 @@ pub const Boot = struct {
     plan: dhost.TapPlan = .{},
     dspark_dr: ?*draft.Drafter = null,
     dflash_dr: ?*draft.Drafter = null,
+    /// Phase 4b: the concurrent decoder (--parallel N > 1; cuda_multi.zig), on every rank
+    multi: ?*multi.Multi = null,
     mode: rn.Mode = .mtp,
     load_s: f64 = 0,
     prewarm_graphs: usize = 0,
@@ -308,6 +337,7 @@ pub const Boot = struct {
         b.plan = .{};
         b.dspark_dr = null;
         b.dflash_dr = null;
+        b.multi = null;
         b.mode = try o.defaultMode();
         b.dcp = try o.dcpFor();
         errdefer b.undo();
@@ -320,6 +350,7 @@ pub const Boot = struct {
         const io = b.io;
         const o = b.o;
         if (o.rank >= o.world) return error.BadRank;
+        try checkParallel(o, b.dcp);
         const det16 = std.mem.eql(u8, o.pe_det, "slots16");
         if (!det16 and !std.mem.eql(u8, o.pe_det, "0")) return error.UnsupportedPromptDet;
         const shared = std.mem.eql(u8, o.experts, "shared");
@@ -447,7 +478,10 @@ pub const Boot = struct {
         if (o.prompt_sp and o.world > 1 and b.dcp == 1) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
         b.stage = 17;
         const capacity = o.context + o.k + 1; // Glm53Engine: Runner(limit + k + 1)
-        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = o.copy });
+        try b.checkCacheFits(capacity);
+        // --parallel N: N slots of the caches; copy drafts are one stream's (Runner: slots == 1)
+        const copy_set: copies.Settings = if (o.parallel > 1) .{ .on = false, .match = 0, .most = 0 } else o.copy;
+        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = copy_set, .slots = o.parallel });
         b.stage = 18;
         // Phase 4: the drafters on every rank (each its heads / MLP share), attached to the runner before its prewarm
         if (b.dflash_cfg != null) {
@@ -462,18 +496,42 @@ pub const Boot = struct {
             b.r.dspark = b.dspark_dr;
             std.log.info("glm53 rank {d}: DSpark drafter {s} (block {d}, policy {t}, confidence {d}, depth {d}, {d:.0} MiB on the device)", .{ o.rank, std.fs.path.basename(o.dspark), b.dspark_cfg.?.block, b.dspark_set.policy, b.dspark_set.confidence, b.dspark_set.depth, @as(f64, @floatFromInt(b.dspark_dr.?.deviceBytes())) / (1 << 20) });
         }
+        if (o.parallel > 1) {
+            b.multi = try multi.Multi.init(gpa, io, &b.r, o.parallel, o.multi_set, o.rank == 0);
+            const per = b.multi.?.bytesPerStream();
+            std.log.info("glm53 rank {d}: {d} concurrent streams (MTP drafts {d}, windows up to {d} rows), {d:.2} GiB of caches each ({d} tokens); draft cut {d} from {d} streams", .{ o.rank, o.parallel, o.k, b.multi.?.rows, @as(f64, @floatFromInt(per)) / (1 << 30), o.context, o.multi_set.draft_cut, o.multi_set.cut_streams });
+        }
         b.stage = 19;
         if (o.prewarm) {
             const tp = now(io);
-            b.prewarm_graphs = try b.r.prewarm();
+            if (b.multi) |mu| {
+                // Runner.prewarm(capture=False) then the concurrent windows (multi.prewarm)
+                _ = try b.r.prewarmWith(false);
+                b.prewarm_graphs = try mu.prewarm();
+            } else {
+                b.prewarm_graphs = try b.r.prewarm();
+            }
             b.prewarm_s = since(io, tp);
         }
         try b.rdv.sync("warm", b.prewarm_graphs, o.timeout_s);
         std.log.info("glm53 rank {d}: loaded in {d:.0} s, {d} decode graphs captured in {d:.1} s{s}", .{ o.rank, b.load_s, b.prewarm_graphs, b.prewarm_s, if (b.dcp > 1) "; decode context parallel" else "" });
     }
 
+    /// Runner._check_cache_fits before the caches allocate (every rank; Python's message on the refusing rank).
+    fn checkCacheFits(b: *Boot, capacity: usize) !void {
+        const mem = try b.ctx.memInfo();
+        const reserve_gb: f64 = if (std.c.getenv("TF_GLM53_CACHE_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch 6) else 6;
+        const row: u64 = b.cfg.layers * b.cfg.latentWidth() * 2;
+        const local: u64 = dcpm.localCapacity(capacity, b.dcp);
+        const x = cacheFit(row, local, b.o.parallel, b.dcp, 0, mem.free, reserve_gb) orelse return;
+        const gib = 1 << 30;
+        std.log.err("context {d} x {d} streams needs {d:.1} GiB of caches a rank, {d:.1} GiB is free (keeping {d:.0} GiB spare): use --context <= {d} with --parallel {d}, or fewer streams", .{ capacity, b.o.parallel, @as(f64, @floatFromInt(x.need)) / gib, @as(f64, @floatFromInt(x.free)) / gib, @as(f64, @floatFromInt(x.spare)) / gib, x.fit, b.o.parallel });
+        return error.CacheDoesNotFit;
+    }
+
     fn undo(b: *Boot) void {
         const s = b.stage;
+        if (b.multi) |x| x.deinit();
         if (b.dspark_dr) |x| x.deinit();
         if (b.dflash_dr) |x| x.deinit();
         if (s >= 18) b.r.deinit();
@@ -509,6 +567,34 @@ pub const Boot = struct {
         b.gpa.destroy(b);
     }
 };
+
+/// Glm53Engine's refusals of --parallel N > 1 (before anything loads): decode context parallelism must be off, the
+/// drafts are the MTP head's (DSpark and DFlash2 draft one stream at a time in the Zig engine), the verify window of
+/// N x (k + 1) rows must be a decode window.
+pub fn checkParallel(o: Options, dcp: usize) !void {
+    if (o.parallel <= 1) return;
+    const quiet = @import("builtin").is_test;
+    if (dcp > 1) {
+        if (!quiet) std.log.err("--parallel {d} needs decode context parallelism off: a context of at most {d} tokens a stream (--context), TF_GLM53_DCP unset or 1", .{ o.parallel, dcp_auto });
+        return error.ParallelNeedsDcpOff;
+    }
+    if (o.dspark.len > 0) {
+        if (!quiet) std.log.err("TF_GLM53_DSPARK drafts one stream at a time: --parallel 1 (concurrent streams draft with the MTP head)", .{});
+        return error.DrafterNeedsOneStream;
+    }
+    if (o.dflash.len > 0) {
+        if (!quiet) std.log.err("TF_GLM53_DFLASH drafts one stream at a time in the Zig engine: --parallel 1 (concurrent streams draft with the MTP head)", .{});
+        return error.DrafterNeedsOneStream;
+    }
+    if (o.mode) |m| if (std.mem.eql(u8, m, "dspark") or std.mem.eql(u8, m, "dflash")) {
+        if (!quiet) std.log.err("TF_GLM53_MTP={s} drafts one stream at a time: --parallel 1", .{m});
+        return error.DrafterNeedsOneStream;
+    };
+    _ = multi.windowRows(o.parallel, o.k) catch {
+        if (!quiet) std.log.err("{d} streams x {d} rows = {d} > {d}: a window that wide is not a decode window (lower --parallel or --mtp-drafts)", .{ o.parallel, o.k + 1, o.parallel * (o.k + 1), fw.decode_rows });
+        return error.WindowTooWide;
+    };
+}
 
 /// --bmm-probe FILE (tf-glm53-generate's): torch.bmm's bits on fused.attention_core's wide absorb / expand shapes
 /// against cuBLAS here with torch's arguments; true when every case matches.
@@ -669,7 +755,12 @@ pub const Session = struct {
         try boot.rdv.allGather(std.mem.asBytes(&mine), all[0 .. boot.o.world * 8]);
         var least: u64 = std.math.maxInt(u64);
         for (0..boot.o.world) |i| least = @min(least, std.mem.readInt(u64, all[i * 8 ..][0..8], .little));
-        if (o.reuse.on) {
+        if (o.reuse.on and boot.multi != null) {
+            // --parallel N: the kept states live in the streams' slots (prefixes.SlotReuse); the one-stream store
+            // never runs
+            try boot.multi.?.enableReuse(s.plan, least << 20, o.reuse.entries, o.reuse.loose);
+            if (o.rank == 0) std.log.info("glm53: prompt reuse on in the {d} streams' slots (never saved out of them): up to {d} entries, keep points every >= {d} tokens", .{ o.parallel, o.reuse.entries, o.reuse.gap });
+        } else if (o.reuse.on) {
             s.reuse = try reuse.Reuse.init(gpa, &boot.r, s.plan, least << 20, o.reuse.entries, o.reuse.loose);
             if (o.rank == 0) std.log.info("glm53: prompt reuse on: kept prompt states up to {d:.2} GiB a rank and {d} entries, keep points every >= {d} tokens at assistant openers; <|user|> {?d}, <|assistant|> {?d}, <think> {?d}", .{ @as(f64, @floatFromInt(least << 20)) / (1 << 30), o.reuse.entries, o.reuse.gap, s.plan.ids.user, s.plan.ids.assistant, s.plan.ids.think });
         }
@@ -907,4 +998,27 @@ test "DCP turns on past DCP_AUTO unless named" {
     try std.testing.expectEqual(@as(usize, 4), try (Options{ .context = 1048576 }).dcpFor());
     try std.testing.expectEqual(@as(usize, 1), try (Options{ .context = 1048576, .dcp = 1 }).dcpFor());
     try std.testing.expectError(error.BadDcp, (Options{ .dcp = 2 }).dcpFor());
+}
+
+test "the cache check refuses a context x streams that leaves less than the reserve free (Python's figures)" {
+    // 78 layers x 576 x 2 bytes a row; 4 streams x 140K context (~47 GiB) on 50 GiB free: refused, fit ~131K
+    const row: u64 = 78 * 576 * 2;
+    const gib: u64 = 1 << 30;
+    const x = cacheFit(row, 140_000 + 4, 4, 1, 0, 50 * gib, 6).?;
+    try std.testing.expect(x.need > 45 * gib);
+    try std.testing.expectEqual(@as(u64, 6 * gib), x.spare);
+    try std.testing.expect(x.fit < 140_000 and x.fit > 100_000);
+    // 4 x 32K fits easily
+    try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row, 32768 + 4, 4, 1, 0, 60 * gib, 6));
+    // the reserve is at most half of what is free
+    try std.testing.expectEqual(@as(?CacheFit, null), cacheFit(row, 1000, 1, 1, 0, 4 * gib, 6));
+}
+
+test "--parallel refusals: DCP, the drafters, a window wider than a decode window" {
+    try checkParallel(.{ .parallel = 1, .dspark = "/x" }, 4);
+    try checkParallel(.{ .parallel = 4, .k = 2 }, 1);
+    try std.testing.expectError(error.ParallelNeedsDcpOff, checkParallel(.{ .parallel = 4 }, 4));
+    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallel(.{ .parallel = 4, .dspark = "/x" }, 1));
+    try std.testing.expectError(error.DrafterNeedsOneStream, checkParallel(.{ .parallel = 2, .dflash = "/x" }, 1));
+    try std.testing.expectError(error.WindowTooWide, checkParallel(.{ .parallel = 16, .k = 2 }, 1));
 }

@@ -74,6 +74,9 @@ pub const Settings = struct {
     draft_rows: usize = 0,
     /// Phase 4: copy drafts (TF_GLM53_COPY_DRAFTS / _MIN / _MAX)
     copy: copies.Settings = .{ .on = false, .match = 0, .most = 0 },
+    /// Phase 4b (--parallel N): the caches hold this many streams' slots (fused.State(slots=N)); `run` uses slot 0,
+    /// cuda_multi.zig drives the rest. DCP 1 only.
+    slots: usize = 1,
 };
 
 /// What drafts a request's rounds (runner.set_mode: the MTP head, DSpark, DFlash2).
@@ -249,6 +252,7 @@ pub const Runner = struct {
         const c = w.config;
         var set = set_in;
         if (set.dcp != 1 and set.dcp != w.world) return error.BadDcp;
+        if (set.slots == 0 or (set.slots > 1 and set.dcp != 1)) return error.BadDcp; // concurrent streams: DCP off
         if (set.dcp > 1 and !set.served) return error.BadDcp; // the served prompt path only
         if (set.dcp > 1) { // Runner.__init__ with dcp > 1: prompt chunks of at most 1024 rows, no overlap
             set.prompt_rows = @min(set.prompt_rows, 1024);
@@ -293,7 +297,7 @@ pub const Runner = struct {
         r.mrows = mrows;
         r.copy_on = copy_on;
         const shared = f.shared_experts;
-        r.st = try fw.State.initDcp(gpa, d, w, capacity, set.dcp);
+        r.st = try fw.State.initSlots(gpa, d, w, capacity, set.dcp, set.slots);
         errdefer r.st.deinit();
         if (set.served) {
             // Runner.__init__: pb (prompt_rows, exact key range), pb1 (the second micro-batch) when chunks overlap
@@ -375,7 +379,7 @@ pub const Runner = struct {
     }
 
     /// int64 ids from the host through the pinned staging (async; the staging is reused only after a sync).
-    fn uploadIds(r: *Runner, dst: u64, ids: []const u32) !void {
+    pub fn uploadIds(r: *Runner, dst: u64, ids: []const u32) !void {
         const lay = r.pinLayout();
         if (ids.len * 8 > lay.rd - lay.ids) return error.WindowTooWide;
         const host = r.pinSlice(i64, lay.ids, ids.len);
@@ -392,7 +396,7 @@ pub const Runner = struct {
     // ------------------------------------------------------------------------------------------------ graphs ---
 
     /// GraphSet.run: replay `key`'s graph, or run `ctx.go()` eagerly (the step's real result) and capture it.
-    fn runGraph(r: *Runner, key: u64, ctx: anytype) !void {
+    pub fn runGraph(r: *Runner, key: u64, ctx: anytype) !void {
         if (r.graphs.get(key)) |e| return e.launchOn(r.f.s);
         try ctx.go();
         if (!r.set.graphs) return;
@@ -478,6 +482,12 @@ pub const Runner = struct {
     /// Runner.prewarm's captures: every decode graph (each bucket, windows of 1..k+1 rows, both picks, the MTP
     /// steps) up front, so no request pays a capture; the caches are zeroed after (they took scratch values).
     pub fn prewarm(r: *Runner) !usize {
+        return r.prewarmWith(true);
+    }
+
+    /// Runner.prewarm(capture=...): `capture` false (--parallel N: cuda_multi.zig captures its own windows) runs only
+    /// the served prompt path's first use and zeroes the caches after it.
+    pub fn prewarmWith(r: *Runner, capture: bool) !usize {
         if (r.set.served) {
             // Runner.prewarm's first step: a prompt of a full chunk, a remainder and rows past index_topk
             // (1000 + 7919 i mod 150000), so the prompt path's first use (cuBLAS's heuristics, NCCL's buffers for
@@ -488,6 +498,11 @@ pub const Runner = struct {
             for (ids, 0..) |*v, i| v.* = @intCast(1000 + (i * 7919) % 150000);
             _ = try r.prefill(ids, null, 0, &.{}, null);
             try r.healthy();
+        }
+        if (!capture) {
+            try r.f.s.synchronize();
+            try r.resetState();
+            return r.graphs.count();
         }
         var bs: [24]?usize = undefined;
         for (r.buckets(&bs)) |T| {
@@ -750,7 +765,6 @@ pub const Runner = struct {
     /// head's logits row. DCP > 1: never the sequence-parallel chunk (fused.compute_prompt_sp needs dcp 1).
     fn prefill(r: *Runner, prompt_ids: []const u32, s: ?smp.Sampling, begin: usize, cuts: []const usize, keep: ?Keep) !u32 {
         const L0 = prompt_ids.len;
-        const D = r.w.config.hidden;
         const rows = if (r.set.served) r.set.prompt_rows else r.set.window;
         const short = if (r.set.served) r.set.prompt_rows_short else r.set.window;
         if (begin >= L0) return error.Invalid;
@@ -769,43 +783,9 @@ pub const Runner = struct {
         for (chunks, 0..) |ch, ci| {
             const a = ch[0];
             const e = ch[1];
-            const R = e - a;
-            const t_chunk = r.now();
-            const T: ?usize = if (e > r.topk) e else null;
-            const last = e == L0;
-            if (r.set.served) {
-                try r.ops().copy(r.pb.ids, r.ids_dev.?.ptr + a * 8, R * 8);
-            } else {
-                try r.uploadIds(r.pb.ids, prompt_ids[a..e]);
-            }
-            try r.setI32(r.st.pos, a);
-            const sp_ok = if (r.sp != null and r.pb1 != null and r.set.dcp == 1) R >= prompt.min_overlap_rows and prompt.spFits(r.w.world, r.pb.rows, r.pb1.?.rows, R) else false;
-            if (sp_ok) {
-                const b1 = &r.pb1.?;
-                try r.sp.?.chunk(&r.st, &r.pb, b1, a, R, T);
-                if (last) {
-                    const hR = R / 2;
-                    const p0 = try r.f.pbegin();
-                    try r.f.headDevice(b1, b1.x + (R - hR - 1) * D * 2, r.w.final_norm, 1, head);
-                    try r.f.pend(p0, .head);
-                    hb = b1;
-                }
-            } else {
-                try r.f.compute(&r.pb, &r.st, R, T, if (last) head else .none, true);
-                if (last) hb = &r.pb;
-            }
-            try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
-            if (r.set.k > 0) try r.mtpPrompt(prompt_ids, a, e, T);
-            if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
-            if (r.f.prof) |p| {
-                if (p.on) { // --prompt-prof: this chunk's phases (a sync a chunk: profiling runs only)
-                    try r.f.s.synchronize();
-                    if (r.sp) |sp| try sp.side.s.synchronize();
-                    try p.report(r.w.rank, ci, a, e, r.since(t_chunk));
-                }
-            }
+            if (try r.prefillChunk(&r.st, prompt_ids, a, e, ci, head)) |b| hb = b;
             // prefixes.PromptReuse.run's keep(e): a cut the prompt keeps (the caller filters); the state is queued
-            if (!last) if (keep) |k| {
+            if (e != L0) if (keep) |k| {
                 for (cuts) |c| if (c == e) {
                     try k.at(e, null);
                     break;
@@ -820,9 +800,56 @@ pub const Runner = struct {
         return r.pickFirst(hb, L0, s);
     }
 
+    /// One prompt chunk [a, e) of prompt_ids (L0 = its length) into the caches of `st` (the Runner's State, or one
+    /// stream's slot view: Runner.prefill_chunk(st, ...)) through the target and, when the runner drafts, the MTP
+    /// layer; the served path takes the chunk's ids from the device copy of the prompt (uploaded by the caller). The
+    /// last chunk (e == L0) runs `head` on its last row and returns the buffers holding that head row; else null.
+    pub fn prefillChunk(r: *Runner, st: *const fw.State, prompt_ids: []const u32, a: usize, e: usize, ci: usize, head: fw.HeadMode) !?*const fw.Buffers {
+        const L0 = prompt_ids.len;
+        const D = r.w.config.hidden;
+        if (a >= e or e > L0) return error.Invalid;
+        const R = e - a;
+        const t_chunk = r.now();
+        const T: ?usize = if (e > r.topk) e else null;
+        const last = e == L0;
+        var hb: ?*const fw.Buffers = null;
+        if (r.set.served) {
+            try r.ops().copy(r.pb.ids, r.ids_dev.?.ptr + a * 8, R * 8);
+        } else {
+            try r.uploadIds(r.pb.ids, prompt_ids[a..e]);
+        }
+        try r.setI32(st.pos, a);
+        const sp_ok = if (r.sp != null and r.pb1 != null and r.set.dcp == 1) R >= prompt.min_overlap_rows and prompt.spFits(r.w.world, r.pb.rows, r.pb1.?.rows, R) else false;
+        if (sp_ok) {
+            const b1 = &r.pb1.?;
+            try r.sp.?.chunk(st, &r.pb, b1, a, R, T);
+            if (last) {
+                const hR = R / 2;
+                const p0 = try r.f.pbegin();
+                try r.f.headDevice(b1, b1.x + (R - hR - 1) * D * 2, r.w.final_norm, 1, head);
+                try r.f.pend(p0, .head);
+                hb = b1;
+            }
+        } else {
+            try r.f.compute(&r.pb, st, R, T, if (last) head else .none, true);
+            if (last) hb = &r.pb;
+        }
+        try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
+        if (r.set.k > 0) try r.mtpPrompt(st, prompt_ids, a, e, T);
+        if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
+        if (r.f.prof) |p| {
+            if (p.on) { // --prompt-prof: this chunk's phases (a sync a chunk: profiling runs only)
+                try r.f.s.synchronize();
+                if (r.sp) |sp| try sp.side.s.synchronize();
+                try p.report(r.w.rank, ci, a, e, r.since(t_chunk));
+            }
+        }
+        return hb;
+    }
+
     /// The first pick from `hb`'s head row (row 0: the prompt's last row): greedy from its argmax records, sampled
     /// from its local logits (Runner.generate's `sample(lg, L0)`).
-    fn pickFirst(r: *Runner, hb: *const fw.Buffers, L0: usize, s: ?smp.Sampling) !u32 {
+    pub fn pickFirst(r: *Runner, hb: *const fw.Buffers, L0: usize, s: ?smp.Sampling) !u32 {
         if (s) |smpl| {
             var pick: [1]u32 = undefined;
             _ = try r.sampleRows(hb, 1, L0, smpl, &pick, false);
@@ -838,7 +865,7 @@ pub const Runner = struct {
     /// Runner.generate's `head` replay: a kept prompt end's logits row (device fp32 [vocab_part]) back into the prompt
     /// buffers' head row, its first pick made from it as the prefill made it (greedy: fused.head's argmax records
     /// exchanged; sampled: the candidates) - nothing prefilled, the kept rows and carry in place.
-    fn replayHead(r: *Runner, lg: u64, L0: usize, s: ?smp.Sampling) !u32 {
+    pub fn replayHead(r: *Runner, lg: u64, L0: usize, s: ?smp.Sampling) !u32 {
         const b = &r.pb;
         const V = r.w.vocab_part;
         const o = r.ops();
@@ -863,7 +890,7 @@ pub const Runner = struct {
     /// Runner._mtp_prompt: MTP rows for positions a - 1 .. e - 2 (hidden q, token q + 1); row e - 1 waits (carry).
     /// Served chunks run the MTP layer over all their rows at once (Forward.wide past MAX_ROWS rows, NCCL's ring
     /// all-reduce past b.small).
-    fn mtpPrompt(r: *Runner, prompt_ids: []const u32, a: usize, e: usize, T: ?usize) !void {
+    fn mtpPrompt(r: *Runner, st: *const fw.State, prompt_ids: []const u32, a: usize, e: usize, T: ?usize) !void {
         const D = r.w.config.hidden;
         const o = r.ops();
         const b = &r.pb;
@@ -889,13 +916,13 @@ pub const Runner = struct {
                 try r.f.s.synchronize(); // the pinned ids staging held this chunk's ids until its copy ran
                 try r.uploadIds(b.ids, if (first) prompt_ids[a + 1 .. e] else prompt_ids[a..e]);
             }
-            try r.setI32(r.st.mpos, if (first) 0 else a - 1);
+            try r.setI32(st.mpos, if (first) 0 else a - 1);
             const p0 = try r.f.pbegin();
             if (r.f.prof) |p| p.suspended = true;
             defer if (r.f.prof) |p| {
                 p.suspended = false;
             };
-            try r.f.mtpCompute(b, &r.st, rows, T, .{ .head = false, .zero_first = first, .chain_normed = r.set.chain_normed });
+            try r.f.mtpCompute(b, st, rows, T, .{ .head = false, .zero_first = first, .chain_normed = r.set.chain_normed });
             if (r.f.prof) |p| p.suspended = false;
             try r.f.pend(p0, .mtp);
         }
@@ -904,7 +931,7 @@ pub const Runner = struct {
 
     /// runner.healthy: every rank agrees no RoCE runtime timed out (after a window's picks are read, before a token
     /// leaves); nothing without RoCE. Synchronizes.
-    fn healthy(r: *Runner) !void {
+    pub fn healthy(r: *Runner) !void {
         const fast = r.f.fast orelse return;
         if (!r.set.roce_health) return;
         const hw = r.health orelse return;

@@ -20,6 +20,9 @@
 //! parallelism (cuda_dcp.zig, DCP = 4 past 200K tokens of context).
 //! Phase 4: the speculative drafters (cuda_draft.zig: DSpark and DFlash2 on the device, draft_host.zig: their host
 //! stages), copy drafts (copies.zig), the target's tap rows (Forward.taps), drafter / copy rounds in cuda_runner.run.
+//! Phase 4b: concurrent streams (cuda_multi.zig: --parallel N, multi.GlmMultiDecoder - the caches' slots, shared
+//! decode rounds with per-row positions and cache bases, the batched MTP chain, the draft cut, prompt reuse in the
+//! slots).
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -46,6 +49,7 @@ pub const coverage = @import("cuda_coverage.zig");
 pub const draft = @import("cuda_draft.zig");
 pub const draft_host = @import("draft_host.zig");
 pub const copies = @import("copies.zig");
+pub const multi = @import("cuda_multi.zig");
 
 test {
     _ = @import("config.zig");
@@ -69,4 +73,5 @@ test {
     _ = draft;
     _ = draft_host;
     _ = copies;
+    _ = multi;
 }

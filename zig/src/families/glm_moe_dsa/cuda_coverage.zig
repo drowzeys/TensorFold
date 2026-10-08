@@ -11,7 +11,10 @@
 //!     dtypes, at every R above fw.max_rows;
 //!   * the indexer's selection blocks n = 1 .. 128 over index ranges T that reach every specialization class of T and
 //!     of DCP's ceil(T / dcp) (decode buckets and arbitrary prompt-chunk ends), row offsets R0 of every class;
-//!   * DCP 1 and DCP = world with every rank's RANK constexpr.
+//!   * DCP 1 and DCP = world with every rank's RANK constexpr;
+//!   * Phase 4b (`rows_windows` > 0, --parallel N): the concurrent decode windows of 1 .. N x (k + 1) rows with per-row
+//!     positions and cache bases (fused.Rows: _kv_write / _ik_write / _iq_rope / _absorb / _attn_chunks /
+//!     _index_scores with ROWS and a BASE table), their selections over the decode key buckets.
 //! Arguments that reach a kernel only as runtime ints (rows, T, R0, strides) select a variant by class alone (the value
 //! 1, a multiple of 16, other): aot.pick's own rule, so walking every class is walking every variant. Pointers are
 //! 16-aligned here: every call site's pointer is a buffer base plus whole rows of 16-byte multiples (D, q_lora,
@@ -54,6 +57,8 @@ pub const Space = struct {
     draft: bool = true,
     /// Phase 4: the loaded drafters' shapes (cuda_draft.Spec): their tap passes and block pass
     drafters: []const draft.Spec = &.{},
+    /// Phase 4b: the widest concurrent decode window (--parallel N: N x (k + 1) rows); 0: one stream
+    rows_windows: usize = 0,
 };
 
 const A: u64 = 1 << 20; // a 16-aligned device address (no memory is touched)
@@ -72,6 +77,7 @@ pub fn enumerate(p: *aot.Probe, sp: Space) !void {
     const t: tri.Tri = .{ .set = null, .s = undefined, .probe = p };
     for (1..sp.max_rows + 1) |R| try window(t, sp, R);
     try selects(t, sp);
+    for (1..sp.rows_windows + 1) |R| try rowsWindow(t, sp, R);
     for (sp.drafters) |ds| try draft.enumerate(p, ds);
 }
 
@@ -132,6 +138,24 @@ fn window(t: tri.Tri, sp: Space, R: usize) !void {
             }
         }
     }
+}
+
+/// Phase 4b: a concurrent decode window of R rows (fused.Rows): the position-dependent launches with ROWS (the other
+/// launches are a one-stream window's, enumerated by `window`), the decode attention tiling (every concurrent window
+/// is a decode window), the selections of its R rows (row offset 0) over the decode key buckets.
+fn rowsWindow(t: tri.Tri, sp: Space, R: usize) !void {
+    const c = sp.cfg;
+    const m = mla(sp);
+    try t.kvWriteRows(A, sp.kva_n, A, A, A, A, A, c.eps, R, m);
+    try t.ikWriteRows(A, A, A, A, A, A, A, R, c.index_dim, c.rope);
+    try t.iqRopeRows(A, A, A, R, c.index_heads, c.index_dim, c.rope);
+    try t.absorbRows(A, A, A, A, A, A, R, m);
+    try t.attentionRows(A, A, A, A, A, A, A, A, A, A, A, R, m, tri.attn_decode);
+    // decode key buckets: powers of two from 2 index_topk up to the capacity's (one class: multiples of 16)
+    const K = c.index_topk;
+    const top = std.math.ceilPowerOfTwo(usize, @max(sp.capacity, 2 * K)) catch return error.Overflow;
+    var T: usize = 2 * K;
+    while (T <= top) : (T *= 2) try t.indexScoresRows(A, A, A, A, A, A, T, 0, R, c.index_heads, c.index_dim);
 }
 
 /// Index ranges reaching every class of T and of ceil(T / dcp) for dcp in sp.dcps: decode buckets (powers of two
@@ -303,4 +327,31 @@ test "call-site row offsets stay 16-byte aligned for GLM-5.3 (pointers are taken
     for ([_]usize{ c.hidden * 2, c.experts * 4, c.top_k * 4, c.index_heads * c.index_dim * 2, c.index_heads * 4, c.index_dim * 4, c.q_lora * 2, c.index_topk * 4, 640 * 2 }) |row| {
         try std.testing.expectEqual(@as(usize, 0), row % 16);
     }
+}
+
+test "Phase 4b: concurrent windows enumerate the ROWS launches with a BASE table" {
+    const gpa = std.testing.allocator;
+    const c = testConfig();
+    var p = aot.Probe.init(gpa);
+    defer p.deinit();
+    const sp: Space = .{ .cfg = c, .world = 4, .heads = c.heads / 4, .vocab_part = c.vocab / 4, .kva_n = 640, .max_rows = 4, .capacity = 32771, .dcps = &.{1}, .widths = &.{}, .gemms = &.{}, .rows_windows = 12 };
+    try enumerate(&p, sp);
+    const fns = [_][]const u8{ "_kv_write", "_ik_write", "_iq_rope", "_absorb", "_attn_chunks", "_index_scores" };
+    for (fns) |name| {
+        var rows_true = false;
+        for (p.needs.values()) |n| {
+            if (!std.mem.eql(u8, n.function, name)) continue;
+            for (n.consts) |k| if (std.mem.eql(u8, k.name, "ROWS") and (k.int orelse 0) == 1) {
+                rows_true = true;
+            };
+        }
+        if (!rows_true) std.debug.print("cuda_coverage: no ROWS launch of {s}\n", .{name});
+        try std.testing.expect(rows_true);
+    }
+    // the BASE table is a runtime pointer of the ROWS variants
+    var base_seen = false;
+    for (p.needs.values()) |n| for (n.args) |a| {
+        if (std.mem.eql(u8, a.name, "BASE")) base_seen = true;
+    };
+    try std.testing.expect(base_seen);
 }

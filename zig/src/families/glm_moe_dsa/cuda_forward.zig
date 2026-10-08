@@ -469,6 +469,11 @@ pub const State = struct {
     mic: u64 = 0, // the MTP layer's index keys (0: no indexer there)
     mpos: u64 = 0, // int32 [1]: the MTP window's first position
     mem: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    /// Phase 4b (fused.State(slots=N)): each cache holds `slots` streams' rows back to back, `local` rows each (slot s
+    /// at rows [s local, (s + 1) local)); `slotView` is one stream alone (the one-stream kernels on its rows). A view
+    /// owns only its kc / ic arrays (`view` true: `freeView`, never `deinit`).
+    slots: usize = 1,
+    view: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize) !State {
         return initDcp(gpa, d, w, capacity, 1);
@@ -476,27 +481,69 @@ pub const State = struct {
 
     /// fused.State(w, capacity) with w.dcp = `dcp`: this rank's shard, ceil(capacity / dcp) + 1 rows a cache.
     pub fn initDcp(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize) !State {
+        return initSlots(gpa, d, w, capacity, dcp, 1);
+    }
+
+    /// fused.State(w, capacity, slots): `slots` streams of ceil(capacity / dcp) + 1 rows each (slots > 1: DCP 1).
+    pub fn initSlots(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize, slots: usize) !State {
         const c = w.config;
         if (dcp == 0 or (dcp > 1 and dcp != w.world)) return error.Invalid;
+        if (slots == 0 or (slots > 1 and dcp > 1)) return error.Invalid; // concurrent streams need DCP off
         const rows = dcpm.localCapacity(capacity, dcp);
-        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
+        const all = rows * slots;
+        var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .slots = slots, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
         errdefer s.deinit();
         for (w.layers, 0..) |*L, i| {
-            s.kc[i] = try s.zeros(rows * c.latentWidth() * 2);
-            s.ic[i] = if (L.indexer != null) try s.zeros(rows * c.index_dim * 2) else 0;
+            s.kc[i] = try s.zeros(all * c.latentWidth() * 2);
+            s.ic[i] = if (L.indexer != null) try s.zeros(all * c.index_dim * 2) else 0;
         }
         s.pos = try s.zeros(4);
         if (w.mtp) |*m| {
-            s.mkc = try s.zeros(rows * c.latentWidth() * 2);
-            s.mic = if (m.layer.indexer != null) try s.zeros(rows * c.index_dim * 2) else 0;
+            s.mkc = try s.zeros(all * c.latentWidth() * 2);
+            s.mic = if (m.layer.indexer != null) try s.zeros(all * c.index_dim * 2) else 0;
             s.mpos = try s.zeros(4);
         }
         return s;
     }
 
+    /// fused.SlotView: stream `slot` alone - every cache pointer moved to its first row, the positions shared with
+    /// the whole State (each window sets them before it runs). Free with `freeView`.
+    pub fn slotView(s: *const State, w: *const W.Weights, slot: usize) !State {
+        if (slot >= s.slots) return error.Invalid;
+        const c = w.config;
+        const lat = s.local * c.latentWidth() * 2;
+        const idx = s.local * c.index_dim * 2;
+        var v = s.*;
+        v.view = true;
+        v.mem = .empty;
+        v.slots = 1;
+        v.kc = try s.gpa.alloc(u64, s.kc.len);
+        errdefer s.gpa.free(v.kc);
+        v.ic = try s.gpa.alloc(u64, s.ic.len);
+        for (s.kc, v.kc) |a, *b| b.* = a + slot * lat;
+        for (s.ic, v.ic) |a, *b| b.* = if (a != 0) a + slot * idx else 0;
+        if (s.mkc != 0) v.mkc = s.mkc + slot * lat;
+        if (s.mic != 0) v.mic = s.mic + slot * idx;
+        return v;
+    }
+
+    pub fn freeView(v: *State) void {
+        std.debug.assert(v.view);
+        v.gpa.free(v.kc);
+        v.gpa.free(v.ic);
+        v.* = undefined;
+    }
+
     /// fused.State.bytes_for: what the caches of `capacity` tokens take (the cache guard's figure).
     pub fn bytesFor(w: *const W.Weights, capacity: usize) usize {
         return bytesForDcp(w, capacity, 1);
+    }
+
+    /// Runner._check_cache_fits' figure: the target layers' bf16 latent rows (index keys and the MTP layer not
+    /// counted, as Python counts) of `slots` streams of `capacity` tokens on this rank.
+    pub fn latentBytes(w: *const W.Weights, capacity: usize, dcp: usize, slots: usize) usize {
+        const c = w.config;
+        return w.layers.len * c.latentWidth() * 2 * dcpm.localCapacity(capacity, @max(dcp, 1)) * slots;
     }
 
     /// fused.State.bytes_for with w.dcp: a rank's shard of the caches.
@@ -580,6 +627,11 @@ pub const Forward = struct {
     /// Phase 4: the target layers whose output rows the drafters read (fused.Weights.tap_slot): every target window
     /// copies them into its buffers' taps (Buffers with BufOpts.taps = taps.n); n 0: none
     taps: Taps = .{},
+    /// Phase 4b (--parallel N, fused.Rows): several streams in one window - the `pos` a layer is given is then an int32
+    /// table of each row's own position and this an int32 table of each row's cache base row (its stream's slot
+    /// start), every position-dependent kernel launched with ROWS (cuda_triton *Rows); 0: one stream, `pos` the
+    /// window's first position. DCP 1 only (concurrent streams need it off).
+    base: u64 = 0,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -732,6 +784,7 @@ pub const Forward = struct {
         const t_ = f.t();
         const D = c.hidden;
         if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
+        if (f.base != 0 and (reuse != 0 or f.dcp > 1)) return error.Invalid; // several streams: no MTP index reuse, DCP 1
         const sd = f.sideOn();
         const side_a = if (sd) |x| x.letters.a else false;
         const side_w = if (sd) |x| x.letters.w else false;
@@ -760,7 +813,11 @@ pub const Forward = struct {
                     try t_.router(b.normed, D, ix.weights_proj, b.iw, b.rpart, R, D, c.index_heads);
                     try f.lins(b, &.{ &ix.wq_b, &L.q_b }, b.qn, R, &.{ b.iq, b.q }, &.{ .bf16, .bf16 });
                     q_done = true;
-                    try t_.iqRope(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
+                    if (f.base != 0) {
+                        try t_.iqRopeRows(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
+                    } else {
+                        try t_.iqRope(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
+                    }
                     if (sd) |x| try x.join(f.s); // the window's index keys are in
                     try f.select(b, ic, pos, 0, R, tt);
                 }
@@ -775,11 +832,19 @@ pub const Forward = struct {
         const c = f.w.config;
         const t_ = f.t();
         const rank = f.dcpRank();
-        try t_.kvWriteDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla(), f.dcp, rank);
+        if (f.base != 0) {
+            try t_.kvWriteRows(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.base, f.inv, c.eps, R, f.mla());
+        } else {
+            try t_.kvWriteDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla(), f.dcp, rank);
+        }
         if (L.indexer) |*ix| {
             if (reuse == 0) {
                 try t_.router(b.normed, c.hidden, ix.wk, b.ik, b.rpart, R, c.hidden, c.index_dim);
-                try t_.ikWriteDcp(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope, f.dcp, rank);
+                if (f.base != 0) {
+                    try t_.ikWriteRows(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, f.base, R, c.index_dim, c.rope);
+                } else {
+                    try t_.ikWriteDcp(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope, f.dcp, rank);
+                }
             }
         }
     }
@@ -799,16 +864,23 @@ pub const Forward = struct {
         const p1 = try f.pbegin();
         const wide = R > max_rows;
         if (wide) {
+            if (f.base != 0) return error.WindowTooWide; // several streams: decode windows only
             const wd = f.wide orelse return error.WindowTooWide;
             try wd.absorb(f, b, L, pos, R);
         } else {
-            try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+            if (f.base != 0) {
+                try t_.absorbRows(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+            } else {
+                try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+            }
             try f.site(L, .o); // expand's and o_proj's weights, during the attention core
         }
         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
         if (f.sideOn()) |sd| try sd.join(f.s); // TF_GLM53_SIDE: the window's latents are in the cache
         if (f.dcp > 1) {
             try f.attentionDcp(b, kc, pos, R, tiling);
+        } else if (f.base != 0) {
+            try t_.attentionRows(b.qlat, b.qrot, kc, b.tok, pos, f.base, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
         } else {
             try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
         }
@@ -957,6 +1029,10 @@ pub const Forward = struct {
         keep_sel: bool = false,
         /// later one-row steps attend b.tok[0] (TF_GLM53_MTP_REUSE 1 / 2)
         reuse: u32 = 0,
+        /// Phase 4b (mtp_compute's `last`, several streams): the head over `last_n` rows of the layer's output picked
+        /// by the int64 device table `last` (each drafting stream's last row) into b.me first; 0: the window's last row
+        last: u64 = 0,
+        last_n: usize = 0,
     };
 
     /// fused.mtp_compute: rows (b.hin[:n] = the previous position's hidden, b.ids[:n] = the token) through the MTP
@@ -999,7 +1075,15 @@ pub const Forward = struct {
         } else {
             try o.copy(b.hidden, b.x, n * D * 2);
         }
-        if (opts.head) try f.headDevice(b, b.x + (n - 1) * D * 2, m.head_norm, 1, f.draftMode());
+        if (!opts.head) return;
+        if (opts.last != 0) {
+            // several streams: index_select(x, 0, last, out=b.me[:S]) (the embeddings are spent by now), then the
+            // head over those S rows
+            if (opts.last_n == 0 or opts.last_n > n) return error.Invalid;
+            try o.rowsGather(b.me, b.x, opts.last, opts.last_n, D * 2);
+            return f.headDevice(b, b.me, m.head_norm, opts.last_n, f.draftMode());
+        }
+        try f.headDevice(b, b.x + (n - 1) * D * 2, m.head_norm, 1, f.draftMode());
     }
 
     /// fused.target_hidden_for_mtp (normed): rmsnorm(src.hidden[row0 .. row0 + n], final_norm) into `out` rows.
@@ -1016,13 +1100,20 @@ pub const Forward = struct {
         const t_ = f.t();
         if (T > b.score_cols) return error.ScoreBufferTooSmall;
         if (T < c.index_topk) return error.Invalid;
-        if (f.dcp > 1) return f.selectDcp(b, ic, pos, row0, R, T);
+        if (f.dcp > 1) {
+            if (f.base != 0) return error.Invalid;
+            return f.selectDcp(b, ic, pos, row0, R, T);
+        }
         var r0: usize = row0;
         while (r0 < row0 + R) : (r0 += 128) {
             const n = @min(128, row0 + R - r0);
             const iq = b.iq + r0 * c.index_heads * c.index_dim * 2;
             const iw = b.iw + r0 * c.index_heads * 4;
-            try t_.indexScores(iq, iw, ic, pos, b.sc, T, r0, n, c.index_heads, c.index_dim);
+            if (f.base != 0) {
+                try t_.indexScoresRows(iq, iw, ic, pos, f.base, b.sc, T, r0, n, c.index_heads, c.index_dim);
+            } else {
+                try t_.indexScores(iq, iw, ic, pos, b.sc, T, r0, n, c.index_heads, c.index_dim);
+            }
             const out = b.tok + r0 * c.index_topk * 4;
             const blocks = (T + kern.topk_chunk - 1) / kern.topk_chunk;
             if (f.multi_select and n < radix_min_rows and n <= b.tsel.rows and blocks <= b.tsel.blocks) {
