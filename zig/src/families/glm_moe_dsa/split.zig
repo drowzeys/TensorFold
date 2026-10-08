@@ -15,9 +15,9 @@ const exl3_parts = [_][]const u8{ "trellis", "suh", "svh", "mul1", "mcg" };
 fn exl3Proj(name: []const u8) ?struct { proj: []const u8, part: []const u8 } {
     const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
     const part = name[dot + 1 ..];
-    var known = false;
-    for (exl3_parts) |p| known = known or std.mem.eql(u8, p, part);
-    if (!known) return null;
+    var is_part = false;
+    for (exl3_parts) |p| is_part = is_part or std.mem.eql(u8, p, part);
+    if (!is_part) return null;
     const stem = name[0..dot];
     const pd = std.mem.lastIndexOfScalar(u8, stem, '.') orelse return null;
     const proj = stem[pd + 1 ..];
