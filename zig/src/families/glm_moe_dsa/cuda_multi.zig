@@ -40,8 +40,9 @@
 //! [pending, drafts] from the host; after the picks every drafter stream's kept rows' taps (vb.taps) extend its slot's
 //! drafter context, and each prompt chunk's taps do too. From TF_GLM53_DRAFT_CUT_STREAMS streams their confidence floor
 //! rises to TF_GLM53_DRAFT_CUT_DFLASH (default: TF_GLM53_DRAFT_CUT). Verify windows hold N x max(k + 1, the drafters'
-//! rows) rows. Not here: auto mode (per-stream MTP / DFlash2 by rate), the drafters' kept ring windows on prompt reuse
-//! (a resumed stream's drafter context restarts at its resume point), copy drafts, DCP (refused at boot).
+//! rows) rows. A drafter stream's kept prompt state keeps its slot's ring window, and a stream resumed from it gets the
+//! window in its own slot (prefixes.slot_ring_window / put_slot_ring_window). Not here: auto mode (per-stream MTP /
+//! DFlash2 by rate), copy drafts, DCP (refused at boot).
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");

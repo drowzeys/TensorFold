@@ -323,8 +323,8 @@ pub const MultiDrafter = struct {
         return p[0..n];
     }
 
-    /// MultiDrafter.reset: slot's context starts at `at` (0: a new prompt; a resumed one at its resume point - the
-    /// ring's rows below it are not restored, which costs acceptance only until the window refills).
+    /// MultiDrafter.reset: slot's context starts at `at` (0: a new prompt; a resumed one without a kept ring window
+    /// at its resume point - putWindow when the kept state has one).
     pub fn reset(md: *MultiDrafter, slot: usize, at: usize) void {
         md.end[slot] = at;
     }
