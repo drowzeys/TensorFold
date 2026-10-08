@@ -673,8 +673,8 @@ fn samplerCheck(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
             .top_p = try jsonFloat(o.get("top_p").?),
             .min_p = try jsonFloat(o.get("min_p").?),
         };
-        var keep: usize = 0;
-        const got = glm.sampling.chooseKeep(cands.items, @intCast(o.get("position").?.integer), s, &keep);
+        var nk: usize = 0;
+        const got = glm.sampling.chooseKeep(cands.items, @intCast(o.get("position").?.integer), s, &nk);
         const want: u32 = @intCast(o.get("pick").?.integer);
         total += 1;
         if (got != want) {
@@ -682,7 +682,7 @@ fn samplerCheck(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
             if (bad <= 10) std.debug.print("case {d}: zig {d}, python {d} (top_k {d}, top_p {d}, {d} candidates)\n", .{ total - 1, got, want, s.top_k, s.top_p, vals.len });
         }
         if (o.get("keep")) |kv| {
-            if (keep != @as(usize, @intCast(kv.integer))) bad_keep += 1;
+            if (nk != @as(usize, @intCast(kv.integer))) bad_keep += 1;
         }
     }
     var seed_bad: usize = 0;

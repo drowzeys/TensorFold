@@ -431,16 +431,16 @@ pub const Forward = struct {
 
     /// fused.compute for rows b.ids[:R] (device ids) at st.pos ..: the target's caches written, its final hidden in
     /// b.hidden[:R], then `head` over every row (`last`: only row R - 1, as logits="last"). No host step: capturable.
-    pub fn compute(f: *const Forward, b: *const Buffers, st: *const State, R: usize, T: ?usize, head: HeadMode, last: bool) !void {
+    pub fn compute(f: *const Forward, b: *const Buffers, st: *const State, R: usize, T: ?usize, hm: HeadMode, last: bool) !void {
         const c = f.w.config;
         const D = c.hidden;
         const o = f.ops();
         try o.embedRows(f.w.embed, b.ids, D, b.x, R, false);
         for (0..f.w.layers.len) |li| try f.layer(b, st, li, R, T);
         try o.copy(b.hidden, b.x, R * D * 2);
-        if (head == .none) return;
-        if (last) return f.headDevice(b, b.x + (R - 1) * D * 2, f.w.final_norm, 1, head);
-        return f.headDevice(b, b.x, f.w.final_norm, R, head);
+        if (hm == .none) return;
+        if (last) return f.headDevice(b, b.x + (R - 1) * D * 2, f.w.final_norm, 1, hm);
+        return f.headDevice(b, b.x, f.w.final_norm, R, hm);
     }
 
     /// fused.head on n rows from `x` (bf16, row stride D) normed with `norm`: "local" leaves this rank's logits in
