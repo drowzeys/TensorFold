@@ -639,7 +639,7 @@ fn parseRun(gpa: std.mem.Allocator, text: []const u8) !RunSpec {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.BadRun;
     const pick = text[0..colon];
     var rest = text[colon + 1 ..];
-    const with_copies = std.mem.endsWith(rest, "+c");
+    const with_copies = std.mem.endsWith(u8, rest, "+c");
     if (with_copies) rest = rest[0 .. rest.len - 2];
     var dmode: glm.runner.Mode = .mtp;
     var k: usize = 0;
@@ -1388,7 +1388,10 @@ fn run3a(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
 fn writeOut3a(gpa: std.mem.Allocator, io: std.Io, a: Args, w: *const glm.weights.Weights, n_layers: usize, capacity: usize, nccl_version: c_int, inv_status: []const u8, load_s: f64, read_gib: f64, prewarm_graphs: usize, prewarm_s: f64, prompts: []const Prompt2b, done: []const Done, ex: Extra3a) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const head = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"{s}\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, \"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"dspark\": \"{s}\", \"dflash\": \"{s}\", \"copy_max\": {d}, \"runs\": [", .{ a.mode, a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense), ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s, std.fs.path.basename(a.dspark), std.fs.path.basename(a.dflash), a.copy_max });
+    const head1 = try std.fmt.allocPrint(gpa, "{{\"tool\": \"tf-glm53-generate\", \"mode\": \"{s}\", \"rank\": {d}, \"world\": {d}, \"layers\": {d}, \"context\": {d}, \"capacity\": {d}, \"window\": {d}, \"k\": {d}, \"prompt_rows\": {d}, \"prompt_rows_short\": {d}, \"prompt_sp\": {s}, \"roce\": {s}, \"roce_ops\": {d}, \"tiles_changed\": {d}, \"unpack_hits\": {d}, \"unpack_misses\": {d}, \"bmm_probe\": \"{s}\", \"cublas_version\": {d}, \"experts\": \"{s}\", \"pe_det\": \"{s}\", \"mtp_dense\": {s}, ", .{ a.mode, a.rank, a.world, n_layers, a.context, capacity, a.window, a.k, a.prompt_rows, a.prompt_rows_short, tf(a.prompt_sp), tf(ex.roce), ex.roce_ops, ex.tiles_changed, ex.unpack_hits, ex.unpack_misses, ex.bmm_probe, ex.cublas_version, ex.experts, ex.pe_det, tf(ex.mtp_dense) });
+    defer gpa.free(head1);
+    try out.appendSlice(gpa, head1);
+    const head = try std.fmt.allocPrint(gpa, "\"mtp_dense_gb\": {d:.2}, \"mtp_chunks\": {d}, \"mtp_gemms\": {d}, \"vocab_off\": {d}, \"vocab_part\": {d}, \"nccl_version\": {d}, \"inv_freq\": \"{s}\", \"load_s\": {d:.1}, \"read_gib\": {d:.2}, \"prewarm_graphs\": {d}, \"prewarm_s\": {d:.1}, \"dspark\": \"{s}\", \"dflash\": \"{s}\", \"copy_max\": {d}, \"runs\": [", .{ ex.mtp_dense_gb, ex.mtp_chunks, ex.mtp_gemms, w.vocab_off, w.vocab_part, nccl_version, inv_status, load_s, read_gib, prewarm_graphs, prewarm_s, std.fs.path.basename(a.dspark), std.fs.path.basename(a.dflash), a.copy_max });
     defer gpa.free(head);
     try out.appendSlice(gpa, head);
     for (done, 0..) |dd, i| {

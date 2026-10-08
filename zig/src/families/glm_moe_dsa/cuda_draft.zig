@@ -348,8 +348,9 @@ pub const Drafter = struct {
         dr.embed = A;
         dr.hproj = A;
         dr.conf_h = A;
-        inline for (@typeInfo(Bufs).@"struct".fields) |fd| {
-            if (fd.type == u64) @field(dr.b, fd.name) = A;
+        const binfo = @typeInfo(Bufs).@"struct";
+        inline for (binfo.field_names, binfo.field_types) |fname, FT| {
+            if (FT == u64) @field(dr.b, fname) = A;
         }
         dr.b.tsel = .{ .hist = A, .state = A, .cnt = A, .rows = sp.headRows(), .blocks = (sp.V + kern.topk_chunk - 1) / kern.topk_chunk };
         return dr;

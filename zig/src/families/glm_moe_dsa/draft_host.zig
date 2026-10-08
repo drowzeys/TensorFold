@@ -10,6 +10,11 @@
 //! change a reply - only how many rows a round keeps. Every rank runs these on the same gathered words, so every rank
 //! drafts alike. float64 as NumPy; exp / log are libm's (the Python engine's NumPy calls the same libm in the image).
 const std = @import("std");
+
+/// Config errors are logged for users; under test the negative cases expect them (a logged error fails a Zig test).
+fn logErr(comptime fmt: []const u8, args: anytype) void {
+    if (!@import("builtin").is_test) std.log.err(fmt, args);
+}
 const smp = @import("sampling.zig");
 
 const libm = struct {
@@ -129,7 +134,7 @@ pub const DSparkConfig = struct {
             kind = jstr(sc.get("algorithm"));
         };
         if (kind == null or !std.mem.eql(u8, kind.?, "dspark")) {
-            std.log.err("not a DSpark speculator (speculators_model_type {?s})", .{kind});
+            logErr("not a DSpark speculator (speculators_model_type {?s})", .{kind});
             return error.NotDSpark;
         }
         const t = jobj(cfg.get("transformer_layer_config")) orelse return error.BadDrafterConfig;
@@ -146,7 +151,7 @@ pub const DSparkConfig = struct {
             }
             if (any_other) {
                 if (any_sliding) {
-                    std.log.err("mixed sliding / full DSpark draft layers are not ported", .{});
+                    logErr("mixed sliding / full DSpark draft layers are not ported", .{});
                     return error.UnsupportedDrafter;
                 }
                 sliding = false;
@@ -155,16 +160,16 @@ pub const DSparkConfig = struct {
         const mtype = jstr(cfg.get("markov_head_type")) orelse "vanilla";
         const rank: usize = if (jint(cfg.get("markov_rank"))) |x| @intCast(@max(x, 0)) else 0;
         if (rank > 0 and !std.mem.eql(u8, mtype, "vanilla")) {
-            std.log.err("only the vanilla Markov head is ported, not {s}", .{mtype});
+            logErr("only the vanilla Markov head is ported, not {s}", .{mtype});
             return error.UnsupportedDrafter;
         }
         if (!jbool(cfg.get("sample_from_anchor"), true)) {
-            std.log.err("only sample_from_anchor=true is ported", .{});
+            logErr("only sample_from_anchor=true is ported", .{});
             return error.UnsupportedDrafter;
         }
         for ([_][]const u8{ "t2d", "d2t" }) |k| if (cfg.get(k)) |v| switch (v) {
             .array, .object, .string, .integer => {
-                std.log.err("a reduced draft vocabulary (t2d / d2t) is not ported", .{});
+                logErr("a reduced draft vocabulary (t2d / d2t) is not ported", .{});
                 return error.UnsupportedDrafter;
             },
             else => {},
@@ -173,7 +178,7 @@ pub const DSparkConfig = struct {
         if (jobj(t.get("rope_parameters"))) |rp| {
             if (jfloat(rp.get("rope_theta"))) |x| theta = x;
             if (jstr(rp.get("rope_type"))) |rt| if (!std.mem.eql(u8, rt, "default")) {
-                std.log.err("only default RoPE is ported", .{});
+                logErr("only default RoPE is ported", .{});
                 return error.UnsupportedDrafter;
             };
         } else if (jfloat(t.get("rope_theta"))) |x| theta = x;
@@ -207,11 +212,11 @@ pub const DSparkConfig = struct {
     /// dspark_host.check: refuse a speculator this engine cannot run against this target at `world` ranks.
     pub fn check(c: *const DSparkConfig, world: usize, hidden: usize, vocab: usize, layers: usize) !void {
         if (c.hidden != hidden) {
-            std.log.err("DSpark hidden size {d} != the target's {d}", .{ c.hidden, hidden });
+            logErr("DSpark hidden size {d} != the target's {d}", .{ c.hidden, hidden });
             return error.DrafterMismatch;
         }
         if (c.vocab != vocab) {
-            std.log.err("DSpark draft vocabulary {d} != the target's {d}", .{ c.vocab, vocab });
+            logErr("DSpark draft vocabulary {d} != the target's {d}", .{ c.vocab, vocab });
             return error.DrafterMismatch;
         }
         if (c.heads != c.kv_heads) return error.UnsupportedDrafter; // the block attention is multi-head
@@ -259,7 +264,7 @@ pub const DSparkSettings = struct {
         var s: DSparkSettings = .{ .depth = block };
         if (e.depth) |v| s.depth = std.fmt.parseInt(usize, v, 10) catch return error.BadSetting;
         if (e.policy) |v| s.policy = std.meta.stringToEnum(Policy, v) orelse {
-            std.log.err("TF_GLM53_DSPARK_POLICY={s}: cost, confidence or fixed", .{v});
+            logErr("TF_GLM53_DSPARK_POLICY={s}: cost, confidence or fixed", .{v});
             return error.BadSetting;
         };
         if (e.confidence) |v| s.confidence = std.fmt.parseFloat(f64, v) catch return error.BadSetting;
@@ -268,7 +273,7 @@ pub const DSparkSettings = struct {
         if (e.filter) |v| s.filter = !std.mem.eql(u8, v, "0");
         if (e.row_cost) |v| s.row_cost = std.fmt.parseFloat(f64, v) catch return error.BadSetting;
         if (e.quant) |v| if (!std.mem.eql(u8, v, "q4")) {
-            std.log.err("TF_GLM53_DSPARK_QUANT={s}: the Zig engine keeps DSpark's weights 4-bit (q4) only", .{v});
+            logErr("TF_GLM53_DSPARK_QUANT={s}: the Zig engine keeps DSpark's weights 4-bit (q4) only", .{v});
             return error.BadSetting;
         };
         if (e.costs) |v| {
@@ -322,11 +327,11 @@ pub const DFlashConfig = struct {
         defer parsed.deinit();
         const cfg = jobj(parsed.value) orelse return error.BadDrafterConfig;
         const dc = jobj(cfg.get("dflash_config")) orelse {
-            std.log.err("not a DFlash2 drafter (no dflash_config)", .{});
+            logErr("not a DFlash2 drafter (no dflash_config)", .{});
             return error.NotDFlash;
         };
         if ((jint(dc.get("conv_kernel_size")) orelse 0) != 2) {
-            std.log.err("only two-tap DFlash2 convolutions are ported", .{});
+            logErr("only two-tap DFlash2 convolutions are ported", .{});
             return error.UnsupportedDrafter;
         }
         const rp = jobj(cfg.get("rope_parameters")) orelse return error.BadDrafterConfig;
