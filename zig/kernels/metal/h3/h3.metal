@@ -470,6 +470,304 @@ inline float h3_mod(float x, float inv, float w, float scale, float shift) {
   }
 }
 
+// Each key tile's int8 values summed over its 64 slots, one simdgroup per (tile, head), four channels a lane: what
+// the offset weights of h3_attention_w8 add back. V8: (H, H3_SLOTS, 128). VSUM: (H, tiles, 128) int32.
+// Threadgroups [tiles, H, 1] of [32, 1, 1].
+[[kernel]] void h3_value_sums(
+  const device int8_t* V8 [[buffer(0)]],
+  device int32_t* VSUM [[buffer(1)]],
+  uint lane [[thread_index_in_simdgroup]],
+  uint3 tg [[threadgroup_position_in_grid]]) {
+  const int c0 = 4 * int(lane);
+  const device int8_t* v = V8 + (long(tg.y) * H3_SLOTS + long(tg.x) * 64) * 128 + c0;
+  int4 sum = 0;
+  for (int s = 0; s < 64; s++, v += 128) sum += int4(v[0], v[1], v[2], v[3]);
+  device int32_t* out = VSUM + (long(tg.y) * H3_TILES + tg.x) * 128 + c0;
+  for (int j = 0; j < 4; j++) out[j] = sum[j];
+}
+
+// h3_attention_tiles with the value product on the int8 path: a key tile's weights are scaled by each row's
+// largest in that tile to 0..255 and stored less 128, so the product is int8 x int8 into int32, and 128 times the
+// tile's summed values (VSUM) is added back where the tile merges into the row's running sum. With H3_W7 the
+// weights are 0..127 with no offset. Scores stay in registers. A thread's elements fall in four rows (r, r + 8,
+// r + 32, r + 40) and four score columns, the same rows for lanes l, l^1, l^8, l^9 and for four of the eight
+// simdgroups: a row's maximum is reduced by two lane shuffles and one exchange of four values, and every holder
+// keeps the same running maximum for it. Two barriers a key tile. Needs H3_TILE_SCALES.
+// Buffers as h3_attention_tiles, then VSUM: (H, tiles, 128) int32.
+[[kernel]] void h3_attention_w8(
+  const device int8_t* Q [[buffer(0)]],
+  const device float* QS [[buffer(1)]],
+  const device int8_t* K [[buffer(2)]],
+  const device float* KS [[buffer(3)]],
+  const device int8_t* V [[buffer(4)]],
+  const device float* VS [[buffer(5)]],
+  const device int32_t* IDX [[buffer(6)]],
+  const device int32_t* SIZES [[buffer(7)]],
+  const device int32_t* ROWOF [[buffer(8)]],
+  const constant int32_t* P [[buffer(9)]],
+  const constant float* SC [[buffer(10)]],
+  device bfloat* Y [[buffer(11)]],
+  const device int32_t* VSUM [[buffer(12)]],
+  uint tid [[thread_index_in_threadgroup]],
+  uint sg [[simdgroup_index_in_threadgroup]],
+  uint lane [[thread_index_in_simdgroup]],
+  uint3 tg [[threadgroup_position_in_grid]]) {
+  using namespace mpp::tensor_ops;
+  constexpr int D = 128, TQ = 64, KEYS = 64, TS = H3_SLOTS, H = QI_HEADS;
+  constexpr int C1 = TQ * KEYS / 256, C2 = TQ * D / 256;
+#ifdef H3_W7
+  constexpr float TOPW = 127.0f;
+  constexpr int TOPI = 127, OFF = 0;
+#else
+  constexpr float TOPW = 255.0f;
+  constexpr int TOPI = 255, OFF = 128;
+#endif
+  const int NQ = P[0], KSEL = P[1];
+  const int head = int(tg.y), r0 = (P[2] + int(tg.x)) * TQ;
+  const long hb = long(head) * TS;
+  const device int32_t* list = IDX + (P[3] ? (long(head) * NQ + tg.x) * KSEL : 0);
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> q((device int8_t*)Q + hb * D, dextents<int32_t, 2>(D, TS));
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> k((device int8_t*)K + hb * D, dextents<int32_t, 2>(D, TS));
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> v((device int8_t*)V + hb * D, dextents<int32_t, 2>(D, TS));
+  threadgroup int8_t pt[TQ * KEYS];
+  threadgroup float tops[TQ * 4];
+  threadgroup float staged[2 * D];                 // the key tile's summed values, read from the device once
+  tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> p((threadgroup int8_t*)pt, dextents<int32_t, 2>(KEYS, TQ));
+  constexpr auto d1 = matmul2d_descriptor(TQ, KEYS, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto d2 = matmul2d_descriptor(TQ, D, KEYS, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d1, execution_simdgroups<8>> op1;
+  matmul2d<d2, execution_simdgroups<8>> op2;
+  auto a = q.slice<D, TQ>(0, r0);
+  auto b0 = k.slice<D, KEYS>(0, 0);
+  auto v0 = v.slice<D, KEYS>(0, 0);
+  auto acc = op1.template get_destination_cooperative_tensor<decltype(a), decltype(b0), int32_t>();
+  auto prod = op2.template get_destination_cooperative_tensor<decltype(p), decltype(v0), int32_t>();
+  // element i of the scores is row group i / 4, column c0 + i % 4; of the values, row group 2 (i / 16) + (i / 4) % 2,
+  // column c0 + i % 4 + 64 ((i / 8) % 2)
+  const auto first = acc.get_multidimensional_index(ushort(0));
+  const int c0 = first[0];
+  int rws[4];
+  QI_UNROLL
+  for (ushort g = 0; g < 4; g++) rws[g] = acc.get_multidimensional_index(ushort(4 * g))[1];
+  const bool writer = (lane & 9) == 0;
+  const int slot = int(sg) & 3;
+  float out[C2];
+  QI_UNROLL
+  for (ushort i = 0; i < C2; i++) out[i] = 0.0f;
+  float4 qs, top = -1e30f, mass = 0.0f;
+  QI_UNROLL
+  for (ushort g = 0; g < 4; g++) qs[g] = QS[hb + r0 + rws[g]] * SC[0] * 1.4426950408889634f;
+#ifdef H3_PROBE_PAIR
+  // the two products over 128 keys at a time with no softmax between: what pairing key tiles could reach
+  {
+    threadgroup int8_t pt2[TQ * 2 * KEYS];
+    tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> p2((threadgroup int8_t*)pt2, dextents<int32_t, 2>(2 * KEYS, TQ));
+    constexpr auto e1 = matmul2d_descriptor(TQ, 2 * KEYS, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto e2 = matmul2d_descriptor(TQ, D, 2 * KEYS, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<e1, execution_simdgroups<8>> o1;
+    matmul2d<e2, execution_simdgroups<8>> o2;
+    auto kb0 = k.slice<D, 2 * KEYS>(0, 0);
+    auto wide = o1.template get_destination_cooperative_tensor<decltype(a), decltype(kb0), int32_t>();
+    auto both = o2.template get_destination_cooperative_tensor<decltype(p2), decltype(kb0), int32_t>();
+    for (int sel = 0; sel + 1 < KSEL; sel += 2) {
+      const int k0 = min(list[sel], H3_TILES - 2) * KEYS;
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) wide[i] = 0;
+      auto kb = k.slice<D, 2 * KEYS>(0, k0);
+#ifndef H3_KO_SCORES
+      o1.run(a, kb, wide);
+#endif
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) both[i] = 0;
+      auto vb = v.slice<D, 2 * KEYS>(0, k0);
+#ifndef H3_KO_VALUES
+      o2.run(p2, vb, both);
+#endif
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) out[i] += float(both[i]) + float(wide[i]);
+    }
+    QI_UNROLL
+    for (ushort i = 0; i < C2; i++) {
+      const ushort g = 2 * (i / 16) + (i / 4) % 2;
+      const int to = ROWOF[r0 + rws[g]];
+      if (to >= 0) Y[(long(to) * H + head) * D + c0 + (i & 3) + 64 * ((i / 8) % 2)] = bfloat(out[i]);
+    }
+    return;
+  }
+#endif
+  // With H3_PAIR two key tiles next to each other in slot order go through one 128-key product. 60% of chosen tiles
+  // follow the one before and the paired products are faster alone (0.81 s against 0.94 s a forward for all of
+  // them), but the kernel with both paths was slower (1.47 s against 1.23 s), so it is off.
+  threadgroup int8_t pt2[TQ * 2 * KEYS];
+  tensor<threadgroup int8_t, dextents<int32_t, 2>, tensor_inline> p2((threadgroup int8_t*)pt2, dextents<int32_t, 2>(2 * KEYS, TQ));
+  constexpr auto e1 = matmul2d_descriptor(TQ, 2 * KEYS, D, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto e2 = matmul2d_descriptor(TQ, D, 2 * KEYS, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<e1, execution_simdgroups<8>> o1;
+  matmul2d<e2, execution_simdgroups<8>> o2;
+  auto kb0 = k.slice<D, 2 * KEYS>(0, 0);
+  auto wide = o1.template get_destination_cooperative_tensor<decltype(a), decltype(kb0), int32_t>();
+  auto both = o2.template get_destination_cooperative_tensor<decltype(p2), decltype(kb0), int32_t>();
+#define H3_MERGE(T) \
+  QI_UNROLL \
+  for (ushort i = 0; i < C2; i++) { \
+    const ushort g = 2 * (i / 16) + (i / 4) % 2; \
+    out[i] = out[i] * f[g] + (float(T[i]) + sv[(i & 3) + 4 * ((i / 8) % 2)]) * c[g]; \
+  }
+  for (int sel = 0, turn = 0; sel < KSEL; turn++) {
+    const int tile = list[sel];
+#ifdef H3_PAIR
+    const bool pair = sel + 1 < KSEL && list[sel + 1] == tile + 1;
+#else
+    const bool pair = false;
+#endif
+    const int k0 = tile * KEYS, size = SIZES[tile];
+    const float ks = KS[hb + k0], vs = VS[hb + k0];
+    float4 m, ls, lm;
+    float span = vs;
+#ifndef H3_W7
+    // alternate halves: a thread still merging the turn before reads the other one
+    if (tid < D) {
+      const device int32_t* sums = VSUM + (long(head) * H3_TILES + tile) * D + tid;
+      staged[(turn & 1) * D + tid] = 128.0f * float(pair ? sums[0] + sums[D] : sums[0]);
+    }
+#endif
+    if (pair) {
+      const int size1 = SIZES[tile + 1];
+      const float ks1 = KS[hb + k0 + KEYS], vs1 = VS[hb + k0 + KEYS];
+      span = max(vs, vs1);
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) wide[i] = 0;
+      auto kb = k.slice<D, 2 * KEYS>(0, k0);
+      o1.run(a, kb, wide);
+      // s[2 g + h]: row group g against the first (h = 0) or second tile's four columns
+      const float4 open0 = float4(c0 < size ? 0.0f : -1e30f, c0 + 1 < size ? 0.0f : -1e30f, c0 + 2 < size ? 0.0f : -1e30f, c0 + 3 < size ? 0.0f : -1e30f);
+      const float4 open1 = float4(c0 < size1 ? 0.0f : -1e30f, c0 + 1 < size1 ? 0.0f : -1e30f, c0 + 2 < size1 ? 0.0f : -1e30f, c0 + 3 < size1 ? 0.0f : -1e30f);
+      float4 s[8];
+      QI_UNROLL
+      for (ushort j = 0; j < 8; j++) {
+        const ushort g = 2 * (j / 4) + j % 2, h = (j / 2) % 2;
+        s[2 * g + h] = float4(float(wide[4 * j]), float(wide[4 * j + 1]), float(wide[4 * j + 2]), float(wide[4 * j + 3])) * (qs[g] * (h ? ks1 : ks)) + (h ? open1 : open0);
+      }
+      QI_UNROLL
+      for (ushort g = 0; g < 4; g++) {
+        const float4 t = max(s[2 * g], s[2 * g + 1]);
+        lm[g] = max(max(t.x, t.y), max(t.z, t.w));
+      }
+      lm = max(lm, simd_shuffle_xor(lm, 1));
+      lm = max(lm, simd_shuffle_xor(lm, 8));
+      if (writer) {
+        QI_UNROLL
+        for (ushort g = 0; g < 4; g++) tops[rws[g] * 4 + slot] = lm[g];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // one value scale for the pair: the tile with the smaller one has its weights scaled down to match
+      const float2 share = float2(vs, vs1) / span;
+      QI_UNROLL
+      for (ushort g = 0; g < 4; g++) {
+        const threadgroup float* t = tops + rws[g] * 4;
+        m[g] = max(max(t[0], t[1]), max(t[2], t[3]));
+        ls[g] = 0.0f;
+        QI_UNROLL
+        for (ushort h = 0; h < 2; h++) {
+          const int4 u = min(int4(TOPI), int4(fast::exp2(s[2 * g + h] - m[g]) * (TOPW * share[h]) + 0.5f));
+          ls[g] += float(u.x + u.y + u.z + u.w) / share[h];
+          threadgroup int8_t* w = pt2 + rws[g] * 2 * KEYS + h * KEYS + c0;
+          w[0] = int8_t(u.x - OFF);
+          w[1] = int8_t(u.y - OFF);
+          w[2] = int8_t(u.z - OFF);
+          w[3] = int8_t(u.w - OFF);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) both[i] = 0;
+      auto vb = v.slice<D, 2 * KEYS>(0, k0);
+      o2.run(p2, vb, both);
+    } else {
+      QI_UNROLL
+      for (ushort i = 0; i < C1; i++) acc[i] = 0;
+      auto b = k.slice<D, KEYS>(0, k0);
+#ifndef H3_KO_SCORES
+      op1.run(a, b, acc);
+#endif
+      const float4 open = float4(c0 < size ? 0.0f : -1e30f, c0 + 1 < size ? 0.0f : -1e30f, c0 + 2 < size ? 0.0f : -1e30f, c0 + 3 < size ? 0.0f : -1e30f);
+      float4 s[4];
+      QI_UNROLL
+      for (ushort g = 0; g < 4; g++) {
+        s[g] = float4(float(acc[4 * g]), float(acc[4 * g + 1]), float(acc[4 * g + 2]), float(acc[4 * g + 3])) * (qs[g] * ks) + open;
+        lm[g] = max(max(s[g].x, s[g].y), max(s[g].z, s[g].w));
+      }
+      lm = max(lm, simd_shuffle_xor(lm, 1));
+      lm = max(lm, simd_shuffle_xor(lm, 8));
+      if (writer) {
+        QI_UNROLL
+        for (ushort g = 0; g < 4; g++) tops[rws[g] * 4 + slot] = lm[g];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      QI_UNROLL
+      for (ushort g = 0; g < 4; g++) {
+        const threadgroup float* t = tops + rws[g] * 4;
+        m[g] = max(max(t[0], t[1]), max(t[2], t[3]));
+        const int4 u = min(int4(TOPI), int4(fast::exp2(s[g] - m[g]) * TOPW + 0.5f));
+        ls[g] = float(u.x + u.y + u.z + u.w);
+        threadgroup int8_t* w = pt + rws[g] * KEYS + c0;
+        w[0] = int8_t(u.x - OFF);
+        w[1] = int8_t(u.y - OFF);
+        w[2] = int8_t(u.z - OFF);
+        w[3] = int8_t(u.w - OFF);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      QI_UNROLL
+      for (ushort i = 0; i < C2; i++) prod[i] = 0;
+      auto vb = v.slice<D, KEYS>(0, k0);
+#ifndef H3_KO_VALUES
+      op2.run(p, vb, prod);
+#endif
+    }
+    const float4 next = max(top, m);
+    const float4 f = fast::exp2(top - next), e = fast::exp2(m - next);
+    const float4 c = e * span;
+    mass = mass * f + e * ls;
+    top = next;
+    float sv[8];
+#ifdef H3_W7
+    QI_UNROLL
+    for (ushort j = 0; j < 8; j++) sv[j] = 0.0f;
+#else
+    const threadgroup float* sums = staged + (turn & 1) * D + c0;
+    QI_UNROLL
+    for (ushort j = 0; j < 8; j++) sv[j] = sums[(j & 3) + 64 * (j >> 2)];
+#endif
+    if (pair) {
+      H3_MERGE(both)
+    } else {
+      H3_MERGE(prod)
+    }
+    sel += pair ? 2 : 1;
+  }
+#undef H3_MERGE
+  // a row's mass is the sum of its sixteen holders' parts
+  mass += simd_shuffle_xor(mass, 1);
+  mass += simd_shuffle_xor(mass, 8);
+  if (writer) {
+    QI_UNROLL
+    for (ushort g = 0; g < 4; g++) tops[rws[g] * 4 + slot] = mass[g];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float4 inv;
+  QI_UNROLL
+  for (ushort g = 0; g < 4; g++) {
+    const threadgroup float* t = tops + rws[g] * 4;
+    inv[g] = 1.0f / max(t[0] + t[1] + t[2] + t[3], 1e-30f);
+  }
+  QI_UNROLL
+  for (ushort i = 0; i < C2; i++) {
+    const ushort g = 2 * (i / 16) + (i / 4) % 2;
+    const int to = ROWOF[r0 + rws[g]];
+    if (to >= 0) Y[(long(to) * H + head) * D + c0 + (i & 3) + 64 * ((i / 8) % 2)] = bfloat(out[i] * inv[g]);
+  }
+}
+
 // The pooled branch gated into the attention output: Y[row, h] += C[h, tile of row] * G[row, h], one thread per
 // (row, head). Y, G: (R, H * 128) bf16. C: (H, tiles, 128) float. SLOT: (R). P: R, H, tiles. Threads [R, H, 1].
 [[kernel]] void h3_gate_mix(

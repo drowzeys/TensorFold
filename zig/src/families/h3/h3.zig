@@ -62,7 +62,10 @@ const Block = struct { q: Quant, k: Quant, v: Quant, compress: Quant, out: Quant
 /// Kernel shapes under test; `defines` goes ahead of the kernels' source.
 /// `tile_scales` rounds k and v with one scale a (tile, head) rather than one a row: 0.09 s a forward less at
 /// 864x480x124f, the attention kernel reading two scales a key tile instead of 128.
-pub const Options = struct { swiglu_rows: usize = 128, tile_scales: bool = true, defines: []const u8 = "" };
+/// `weights`: how the attention's softmax weights meet the int8 values: `.w8` rounds them to 0..255 less 128 and
+/// `.w7` to 0..127, both int8 x int8 products; `.half` keeps them in half precision (the first kernel).
+pub const Weights = enum { w8, w7, half };
+pub const Options = struct { swiglu_rows: usize = 128, tile_scales: bool = true, weights: Weights = .w8, defines: []const u8 = "" };
 
 pub const Timing = struct { wall: f64, gpu: f64 };
 
@@ -142,6 +145,7 @@ pub const Model = struct {
     kp: mtl.Buffer,
     vp: mtl.Buffer,
     tile_scores: mtl.Buffer,
+    value_sums: mtl.Buffer,
     chosen: mtl.Buffer,
     coarse: mtl.Buffer,
     video_latents: mtl.Buffer,
@@ -153,6 +157,7 @@ pub const Model = struct {
     dense: bool = false,
     /// One k and one v scale a key tile instead of one a key (the kernels' H3_TILE_SCALES).
     tile_scales: bool = false,
+    weights: Weights = .w8,
     /// Rows one threadgroup of the SwiGLU's first product owns.
     swiglu_rows: usize = 128,
     profile: bool = false,
@@ -183,6 +188,8 @@ pub const Model = struct {
         self.dense = false;
         self.swiglu_rows = options.swiglu_rows;
         self.tile_scales = options.tile_scales;
+        // the int8 weights read one value scale a key tile
+        self.weights = if (options.tile_scales) options.weights else .half;
         self.profile = false;
         self.spent = @splat(0);
         self.checkpoint = try Checkpoint.open(gpa, device, checkpoint_dir, shards);
@@ -217,7 +224,7 @@ pub const Model = struct {
         const times = (case.names.get("final") orelse return error.MissingTensor).shape[0];
 
         // the kernels take the model's sizes as compile-time values
-        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n#define H3_SWT {d}\n{s}{s}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, options.swiglu_rows, if (options.tile_scales) "#define H3_TILE_SCALES\n" else "", options.defines, kernels.source });
+        const source = try std.fmt.allocPrint(gpa, "#define QI_HIDDEN {d}\n#define QI_MLP {d}\n#define QI_WIDE_GROUP {d}\n#define QI_HEADS {d}\n#define QI_ROWS {d}\n#define QI_KEYS {d}\n#define H3_INNER {d}\n#define H3_SLOTS {d}\n#define H3_TILES {d}\n#define H3_SWT {d}\n{s}{s}{s}\n{s}", .{ hidden, self.mlp, wide_group, heads, rows, rows, inner, self.slots(), self.tiles, options.swiglu_rows, if (options.tile_scales) "#define H3_TILE_SCALES\n" else "", if (options.weights == .w7) "#define H3_W7\n" else "", options.defines, kernels.source });
         defer gpa.free(source);
         const lib = try mtl.Library.fromSource(device, source, mtl.CompileOptions.mlx());
         defer lib.deinit();
@@ -272,6 +279,7 @@ pub const Model = struct {
         }
         inline for (.{ "qp", "kp", "vp", "coarse" }) |f| @field(self, f) = try device.buffer(heads * self.tiles * head_dim * 4, shared);
         self.tile_scores = try device.buffer(heads * self.tiles * self.tiles * 4, shared);
+        self.value_sums = try device.buffer(heads * self.tiles * head_dim * 4, shared);
         self.chosen = try device.buffer(heads * (self.tiles - self.prefix_tiles) * (self.prefix_tiles + self.keep) * 4, shared);
         self.video_latents = try device.buffer(self.video * self.video_in * 4, shared);
         self.audio_latents = try device.buffer(self.audio * self.audio_in * 4, shared);
@@ -421,8 +429,21 @@ pub const Model = struct {
         enc.dispatchGroups(mtl.Size.of(self.rows, self.heads, 1), mtl.Size.of(32, 1, 1));
     }
 
+    /// Of the video tiles' chosen key tiles after a forward, how many directly follow the one before in their list.
+    pub fn adjacency(self: *const Model) struct { chosen: usize, following: usize } {
+        const keys = self.prefix_tiles + self.keep;
+        const lists = self.heads * (self.tiles - self.prefix_tiles);
+        const all = self.chosen.slice(i32, lists * keys);
+        var following: usize = 0;
+        for (0..lists) |l| {
+            for (1..keys) |i| following += @intFromBool(all[l * keys + i] == all[l * keys + i - 1] + 1);
+        }
+        return .{ .chosen = lists * keys, .following = following };
+    }
+
     fn attend(self: *const Model, enc: mtl.ComputeEncoder, list: mtl.Buffer, queries: usize, keys: usize, first: usize, per_query: bool) void {
-        enc.setPipeline(self.pipeline("h3_attention_tiles"));
+        enc.setPipeline(if (self.weights == .half) self.pipeline("h3_attention_tiles") else self.pipeline("h3_attention_w8"));
+        if (self.weights != .half) enc.setBuffer(self.value_sums, 0, 12);
         enc.setBuffer(self.tq8, 0, 0);
         enc.setBuffer(self.tqs, 0, 1);
         enc.setBuffer(self.tk8, 0, 2);
@@ -481,6 +502,13 @@ pub const Model = struct {
                 enc.barrier();
                 self.headsLayout(enc.*, b, 2);
             } else self.headsLayout(enc.*, b, 0);
+            if (self.weights == .w8) {
+                enc.barrier();
+                enc.setPipeline(self.pipeline("h3_value_sums"));
+                enc.setBuffer(self.tv8, 0, 0);
+                enc.setBuffer(self.value_sums, 0, 1);
+                enc.dispatchGroups(mtl.Size.of(self.tiles, heads, 1), mtl.Size.of(32, 1, 1));
+            }
             self.lap(&pass, "heads");
             if (self.dense) {
                 self.attend(enc.*, self.all_tiles, self.tiles, self.tiles, 0, false);

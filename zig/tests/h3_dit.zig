@@ -50,7 +50,7 @@ fn advance(x: []f32, velocity: []const f32, seen: f32, ratio: f32) void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 5 and args.len != 6) {
-        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | row-scales | DEFINE, ...]\n", .{});
+        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | row-scales | half | w7 | profile | DEFINE, ...]\n", .{});
         return error.BadArguments;
     }
     const gpa = init.gpa;
@@ -63,10 +63,11 @@ pub fn main(init: std.process.Init) !void {
     var defines: [256]u8 = undefined;
     var used: usize = 0;
     var dense = false;
+    var profile = false;
     if (args.len == 6) {
         var it = std.mem.splitScalar(u8, args[5], ',');
         while (it.next()) |word| {
-            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else if (std.mem.eql(u8, word, "row-scales")) options.tile_scales = false else {
+            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else if (std.mem.eql(u8, word, "row-scales")) options.tile_scales = false else if (std.mem.eql(u8, word, "half")) options.weights = .half else if (std.mem.eql(u8, word, "w7")) options.weights = .w7 else if (std.mem.eql(u8, word, "profile")) profile = true else {
                 const text = try std.fmt.bufPrint(defines[used..], "#define {s}\n", .{word});
                 used += text.len;
             }
@@ -90,7 +91,8 @@ pub fn main(init: std.process.Init) !void {
 
     const vv = try gpa.alloc(f32, nv);
     const av = try gpa.alloc(f32, na);
-    const quick = args.len == 6 and std.mem.indexOf(u8, args[5], "H3_KO") != null;
+    // a knock-out or a probe only wants the profile
+    const quick = args.len == 6 and (std.mem.indexOf(u8, args[5], "H3_KO") != null or std.mem.indexOf(u8, args[5], "H3_PROBE") != null);
     for (0..if (quick) 0 else steps) |step| {
         const took = try model.forward(video, audio, step, vv, av);
         if (step == 0) {
@@ -102,9 +104,14 @@ pub fn main(init: std.process.Init) !void {
         advance(video, vv, video_step[2 * step], video_step[2 * step + 1]);
         advance(audio, av, audio_step[2 * step], audio_step[2 * step + 1]);
         std.debug.print("step {d}/{d}: {d:.3} s wall, {d:.3} s on the GPU\n", .{ step + 1, steps, took.wall, took.gpu });
+        if (step == 0 and !dense) {
+            const adj = model.adjacency();
+            std.debug.print("last block's chosen key tiles: {d}, {d} of them directly after the one before\n", .{ adj.chosen, adj.following });
+        }
     }
     try write(gpa, args[4], ".video.f32", video);
     try write(gpa, args[4], ".audio.f32", audio);
+    if (!profile and !quick) return;
     model.profile = true;
     _ = try model.forward(video_start, audio_start, 0, vv, av);
     std.debug.print("one forward by stage, each in its own command buffer:\n", .{});
