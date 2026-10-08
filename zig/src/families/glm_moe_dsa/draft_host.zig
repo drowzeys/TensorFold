@@ -39,7 +39,7 @@ fn jint(v: ?std.json.Value) ?i64 {
     const x = v orelse return null;
     return switch (x) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| @as(i64, @intFromFloat(f)),
         else => null,
     };
 }
@@ -47,7 +47,7 @@ fn jint(v: ?std.json.Value) ?i64 {
 fn jfloat(v: ?std.json.Value) ?f64 {
     const x = v orelse return null;
     return switch (x) {
-        .integer => |i| @floatFromInt(i),
+        .integer => |i| @as(f64, @floatFromInt(i)),
         .float => |f| f,
         else => null,
     };
