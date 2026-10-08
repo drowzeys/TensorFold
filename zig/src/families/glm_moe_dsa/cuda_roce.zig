@@ -51,6 +51,13 @@ pub const Settings = struct {
     spin_limit: u32 = 20_000_000,
 };
 
+/// A trimmed environment value (null when unset or blank).
+fn envValue(name: [:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    const t = std.mem.trim(u8, std.mem.span(v), " ");
+    return if (t.len == 0) null else t;
+}
+
 /// roce_oneshot._grid_blocks: a power-of-two grid with about two 16-byte packs a thread.
 pub fn gridBlocks(size_packs: usize, threads: usize, max_blocks: usize) usize {
     const per = 2 * threads;
@@ -107,6 +114,14 @@ pub const Roce = struct {
     slot_bytes: usize,
     set: Settings,
     names: [max_hcas][64:0]u8 = @splat(@splat(0)),
+    /// TF_GLM53_ROCE_HEALTH_LOCAL=1: healthyEverywhere checks this rank's own poison word only (no NCCL all-gather a
+    /// window). Sound for the lead's tokens: a rank's sums are stale only when one of its own waits timed out (then
+    /// its poison word is set), and a poisoned peer rings no further doorbell, so every other rank's next wait times
+    /// out and poisons too - the failure surfaces one window later (after the spin limit) instead of at once.
+    health_local: bool = false,
+    /// TF_GLM53_ROCE_BF16=1: decode-window reductions (Forward.gather) send bf16 partials (allReduceBf16) - half the
+    /// bytes; changes the bits (each partial rounded to bf16 before the fp32 rank-order sum). Off: the exact path.
+    bf16_wire: bool = false,
 
     /// Every rank calls it at the same point (the TP world's rendezvous carries the setup); error.RoceUnavailable on
     /// every rank when any rank failed (the caller keeps NCCL, as start_everywhere).
@@ -114,7 +129,12 @@ pub const Roce = struct {
         if (world < 2 or world > 16) return error.RoceUnavailable;
         const self = try gpa.create(Roce);
         errdefer gpa.destroy(self);
-        self.* = .{ .d = d, .module = undefined, .kernel = undefined, .region = undefined, .dev = 0, .lay = undefined, .counters = undefined, .classes = 0, .ctx = null, .rank = rank, .world = world, .n_hca = @min(set.hcas.len, max_hcas), .slot_bytes = alignUp(set.max_bytes, 4096), .set = set };
+        var set_e = set;
+        if (envValue("TF_GLM53_ROCE_BLOCKS")) |v| set_e.blocks = std.fmt.parseInt(u32, v, 10) catch set.blocks;
+        if (!std.math.isPowerOfTwo(set_e.blocks) or set_e.blocks > 64) set_e.blocks = set.blocks;
+        self.* = .{ .d = d, .module = undefined, .kernel = undefined, .region = undefined, .dev = 0, .lay = undefined, .counters = undefined, .classes = 0, .ctx = null, .rank = rank, .world = world, .n_hca = @min(set.hcas.len, max_hcas), .slot_bytes = alignUp(set.max_bytes, 4096), .set = set_e };
+        if (envValue("TF_GLM53_ROCE_HEALTH_LOCAL")) |v| self.health_local = std.mem.eql(u8, v, "1");
+        if (envValue("TF_GLM53_ROCE_BF16")) |v| self.bf16_wire = std.mem.eql(u8, v, "1");
         var err_buf: [512]u8 = @splat(0);
         const built = if (self.setup(&err_buf)) true else |e| blk: {
             const why = if (err_buf[0] != 0) std.mem.sliceTo(&err_buf, 0) else @errorName(e);
@@ -130,7 +150,7 @@ pub const Roce = struct {
         @memset(mine, 0);
         var ok = built;
         if (ok and roce_local_blob(self.ctx.?, mine[@sizeOf(Config)..].ptr, blob_n) != 0) ok = false;
-        const cfg: Config = .{ .abi = @intCast(roce_abi_version()), .world = @intCast(world), .hcas = @intCast(self.n_hca), .slot_bytes = self.slot_bytes, .slots = if (built) self.lay.slots else 0, .flag_stride = if (built) self.lay.flag_stride else 0, .max_bytes = set.max_bytes, .spin_limit = set.spin_limit, .threads = set.threads, .blocks = set.blocks, .ok = @intFromBool(ok) };
+        const cfg: Config = .{ .abi = @intCast(roce_abi_version()), .world = @intCast(world), .hcas = @intCast(self.n_hca), .slot_bytes = self.slot_bytes, .slots = if (built) self.lay.slots else 0, .flag_stride = if (built) self.lay.flag_stride else 0, .max_bytes = set.max_bytes, .spin_limit = set.spin_limit, .threads = set.threads, .blocks = set_e.blocks, .ok = @intFromBool(ok) };
         @memcpy(mine[0..@sizeOf(Config)], std.mem.asBytes(&cfg));
         const all = try gpa.alloc(u8, world * rec_n);
         defer gpa.free(all);
@@ -278,6 +298,13 @@ pub const Roce = struct {
         return self.launch(s, in, out, nbytes, 0, 0);
     }
 
+    /// glm53-comm-probe (TF_GLM53_ROCE_BF16): out [n fp32] = the rank-order fp32 sum of every rank's in [n fp32]
+    /// rounded to bf16 first (half the bytes on the wire; not the bits of allReduce). n a multiple of 8.
+    pub fn allReduceBf16(self: *const Roce, s: cuda.Stream, in: u64, out: u64, n: usize) !void {
+        if (n % 8 != 0) return error.BadRoceMessage;
+        return self.launch(s, in, out, n * 2, 0, 2);
+    }
+
     /// out [world * nbytes] = every rank's in [nbytes] in rank order (RoceReduce.all_gather, dim 0).
     pub fn allGather(self: *const Roce, s: cuda.Stream, in: u64, out: u64, nbytes: usize) !void {
         return self.launch(s, in, out, nbytes, nbytes / pack_bytes, 1);
@@ -287,6 +314,13 @@ pub const Roce = struct {
     /// `flag` / `every`: int32 device words [1] and [world]; synchronizes `s`.
     pub fn healthyEverywhere(self: *const Roce, comm: *const cuda.nccl.Communicator, s: cuda.Stream, flag: u64, every: u64) !void {
         const mine: u32 = @intFromBool(self.poisoned());
+        if (self.health_local) {
+            if (mine != 0) {
+                self.logHealth();
+                return error.RocePoisoned;
+            }
+            return;
+        }
         try self.d.check(self.d.api.cuMemsetD32Async(flag, mine, 1, s.handle), "cuMemsetD32Async");
         try comm.allGather(flag, every, 1, .i32, s.handle);
         var got: [16]u32 = @splat(0);
@@ -358,7 +392,7 @@ pub const Roce = struct {
 
 /// Microseconds a collective, measured as roce.py's callers see them: `iters` launches captured in one CUDA graph
 /// and replayed (decode rounds are graphs), the best of `reps` replays, on every rank in lockstep.
-pub const BenchRow = struct { rows: usize, bytes: usize, roce_us: f64, roce_eager_us: f64, nccl_gather_us: f64 };
+pub const BenchRow = struct { rows: usize, bytes: usize, roce_us: f64, roce_eager_us: f64, nccl_gather_us: f64, roce_bf16_us: f64 = 0 };
 
 pub fn bench(r: *const Roce, comm: *const cuda.nccl.Communicator, s: cuda.Stream, d: usize, rows: usize, iters: usize, reps: usize) !BenchRow {
     const dr = r.d;
@@ -380,7 +414,7 @@ pub fn bench(r: *const Roce, comm: *const cuda.nccl.Communicator, s: cuda.Stream
             try cuda.graph.beginCapture(st, .thread_local);
             var i: usize = 0;
             while (i < cnt) : (i += 1) {
-                if (which == 0) try rr.allReduce(st, x, o, nb) else try cm.allGather(x, g, nb / 4, .f32, st.handle);
+                if (which == 0) try rr.allReduce(st, x, o, nb) else if (which == 2) try rr.allReduceBf16(st, x, o, nb / 4) else try cm.allGather(x, g, nb / 4, .f32, st.handle);
             }
             var gr = try cuda.graph.endCapture(st);
             defer gr.deinit();
@@ -403,6 +437,7 @@ pub fn bench(r: *const Roce, comm: *const cuda.nccl.Communicator, s: cuda.Stream
     };
     const roce_us = try Timed.graphUs(r, comm, s, &e0, &e1, bx.ptr, bo.ptr, bg.ptr, n * 4, iters, reps, 0);
     const nccl_us = try Timed.graphUs(r, comm, s, &e0, &e1, bx.ptr, bo.ptr, bg.ptr, n * 4, iters, reps, 1);
+    const bf16_us = try Timed.graphUs(r, comm, s, &e0, &e1, bx.ptr, bo.ptr, bg.ptr, n * 4, iters, reps, 2);
     // eager launches (no graph): the host's launch cost included
     try s.synchronize();
     try e0.record(s);
@@ -414,7 +449,116 @@ pub fn bench(r: *const Roce, comm: *const cuda.nccl.Communicator, s: cuda.Stream
         r.logHealth();
         return error.RocePoisoned;
     }
-    return .{ .rows = rows, .bytes = n * 4, .roce_us = roce_us, .roce_eager_us = eager, .nccl_gather_us = nccl_us };
+    return .{ .rows = rows, .bytes = n * 4, .roce_us = roce_us, .roce_eager_us = eager, .nccl_gather_us = nccl_us, .roce_bf16_us = bf16_us };
+}
+
+/// glm53-comm-probe: a synthetic decode "layer" timed on this rank. `layers` repetitions of each variant captured in
+/// one CUDA graph, best of `reps` replays, microseconds a layer:
+///   read      - glm53_bench_read over `read_bytes` (DRAM-bound, a stand-in for a layer half's weight reads)
+///   read_ar   - read, then the one-shot all-reduce of `ar_bytes` (fp32 [rows, D] as the decode windows)
+///   ar        - the all-reduce alone, back to back (the lockstep floor)
+///   spin_ar   - glm53_bench_spin (base + per-iteration hash % jitter ns, different per rank) then the all-reduce
+///   spin      - the spin alone (subtract from spin_ar)
+/// read_ar - read is what an all-reduce costs a layer once the ranks' natural skew is in; every rank prints its own
+/// row, so the rank with the smallest (read_ar - read) is the one the others wait for.
+pub const LayerRow = struct { read_us: f64, read_ar_us: f64, ar_us: f64, spin_ar_us: f64, spin_us: f64 };
+
+pub fn benchLayer(r: *const Roce, s: cuda.Stream, read_bytes: usize, ar_bytes: usize, layers: usize, reps: usize, spin_base_ns: u32, spin_jitter_ns: u32) !LayerRow {
+    const dr = r.d;
+    const fread = try r.module.function("glm53_bench_read");
+    const fspin = try r.module.function("glm53_bench_spin");
+    const rb = std.mem.alignForward(usize, @max(read_bytes, 16), 16);
+    var buf = try cuda.DeviceBuffer.alloc(dr, rb);
+    defer buf.free();
+    try buf.fill32(0x01020304, s.handle);
+    var sink = try cuda.DeviceBuffer.alloc(dr, 64);
+    defer sink.free();
+    var bx = try cuda.DeviceBuffer.alloc(dr, ar_bytes);
+    defer bx.free();
+    try bx.fill32(0x3f800000, s.handle);
+    var bo = try cuda.DeviceBuffer.alloc(dr, ar_bytes);
+    defer bo.free();
+    var e0 = try cuda.Event.init(dr, true);
+    defer e0.deinit();
+    var e1 = try cuda.Event.init(dr, true);
+    defer e1.deinit();
+    const Ctx = struct {
+        r: *const Roce,
+        fread: cuda.Function,
+        fspin: cuda.Function,
+        buf: u64,
+        packs: u64,
+        sink: u64,
+        x: u64,
+        o: u64,
+        nb: usize,
+        base: u32,
+        jit: u32,
+        fn read(c: *const @This(), st: cuda.Stream) !void {
+            var a: cuda.Args = .{};
+            a.add(c.buf);
+            a.add(c.packs);
+            a.add(c.sink);
+            a.add(@as(u32, 0xdeadbeef));
+            try cuda.launch.launch(c.fread, .{ .grid = .{ .x = 192 }, .block = .{ .x = 512 } }, st, &a);
+        }
+        fn spin(c: *const @This(), st: cuda.Stream, it: usize) !void {
+            var a: cuda.Args = .{};
+            a.add(c.base);
+            a.add(c.jit);
+            a.add(@as(u32, @intCast(it)));
+            a.add(@as(u32, @intCast(c.r.rank)));
+            try cuda.launch.launch(c.fspin, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, st, &a);
+        }
+        fn timed(c: *const @This(), st: cuda.Stream, ea: *cuda.Event, eb: *cuda.Event, which: u8, cnt: usize, rp: usize) !f64 {
+            try st.synchronize();
+            try cuda.graph.beginCapture(st, .thread_local);
+            for (0..cnt) |i| {
+                switch (which) {
+                    0 => try c.read(st),
+                    1 => {
+                        try c.read(st);
+                        try c.r.allReduce(st, c.x, c.o, c.nb);
+                    },
+                    2 => try c.r.allReduce(st, c.x, c.o, c.nb),
+                    3 => {
+                        try c.spin(st, i);
+                        try c.r.allReduce(st, c.x, c.o, c.nb);
+                    },
+                    else => try c.spin(st, i),
+                }
+            }
+            var gr = try cuda.graph.endCapture(st);
+            defer gr.deinit();
+            var ex = try gr.instantiate();
+            defer ex.deinit();
+            try ex.upload(st);
+            try ex.launchOn(st);
+            try st.synchronize();
+            var best: f64 = std.math.inf(f64);
+            for (0..rp) |_| {
+                try ea.record(st);
+                try ex.launchOn(st);
+                try eb.record(st);
+                try eb.synchronize();
+                const ms = try cuda.Event.elapsedMs(ea.*, eb.*);
+                best = @min(best, @as(f64, ms) * 1000.0 / @as(f64, @floatFromInt(cnt)));
+            }
+            return best;
+        }
+    };
+    const cx: Ctx = .{ .r = r, .fread = fread, .fspin = fspin, .buf = buf.ptr, .packs = rb / 16, .sink = sink.ptr, .x = bx.ptr, .o = bo.ptr, .nb = ar_bytes, .base = spin_base_ns, .jit = spin_jitter_ns };
+    // the all-reduce variants run on every rank in the same order (each is a collective sequence)
+    const read_us = try cx.timed(s, &e0, &e1, 0, layers, reps);
+    const read_ar_us = try cx.timed(s, &e0, &e1, 1, layers, reps);
+    const ar_us = try cx.timed(s, &e0, &e1, 2, layers, reps);
+    const spin_ar_us = try cx.timed(s, &e0, &e1, 3, layers, reps);
+    const spin_us = try cx.timed(s, &e0, &e1, 4, layers, reps);
+    if (r.poisoned()) {
+        r.logHealth();
+        return error.RocePoisoned;
+    }
+    return .{ .read_us = read_us, .read_ar_us = read_ar_us, .ar_us = ar_us, .spin_ar_us = spin_ar_us, .spin_us = spin_us };
 }
 
 test "grid blocks as roce_oneshot._grid_blocks" {

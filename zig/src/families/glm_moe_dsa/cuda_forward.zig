@@ -764,7 +764,7 @@ pub const Forward = struct {
         const o = f.ops();
         if (f.fast) |r| {
             if (R <= b.small) {
-                try r.allReduce(f.s, b.part, b.red, R * D * 4);
+                if (r.bf16_wire) try r.allReduceBf16(f.s, b.part, b.red, R * D) else try r.allReduce(f.s, b.part, b.red, R * D * 4);
                 return .{ .ptr = b.red, .world = 1 };
             }
         }

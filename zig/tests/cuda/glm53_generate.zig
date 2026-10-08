@@ -176,6 +176,11 @@ const Args = struct {
     bench_rows: []const u8 = "1,2,3,4,8,16,32",
     bench_iters: usize = 200,
     dims: usize = 6144,
+    // glm53-comm-probe: roce-bench's synthetic layers (0 MB: skipped); bench_layer_bytes: all-reduce sizes a layer
+    bench_layer_mb: usize = 0,
+    bench_layers: usize = 156,
+    bench_layer_bytes: []const u8 = "73728,36864",
+    bench_jitter_ns: []const u8 = "0,10000,20000",
     // Phase 4 (--mode 4; list-variants: the drafters' launches too)
     dspark: []const u8 = "",
     dflash: []const u8 = "",
@@ -349,6 +354,14 @@ pub fn main(init: std.process.Init) !u8 {
             a.bench_iters = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, k, "--dims")) {
             a.dims = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--bench-layer-mb")) {
+            a.bench_layer_mb = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--bench-layers")) {
+            a.bench_layers = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--bench-layer-bytes")) {
+            a.bench_layer_bytes = v;
+        } else if (std.mem.eql(u8, k, "--bench-jitter-ns")) {
+            a.bench_jitter_ns = v;
         } else if (std.mem.eql(u8, k, "--dspark")) {
             a.dspark = v;
         } else if (std.mem.eql(u8, k, "--dflash")) {
@@ -1158,11 +1171,26 @@ fn roceBench(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         try rdv.sync("bench", rows, a.timeout_s);
         const row = try glm.roce.bench(r, &comm, stream, a.dims, rows, a.bench_iters, 5);
         if (rows <= 3) worst = @max(worst, row.roce_us);
-        std.debug.print("ROCE-BENCH rank {d} rows {d} bytes {d}: roce {d:.1} us (graph), {d:.1} us (eager), nccl all-gather {d:.1} us\n", .{ a.rank, rows, row.bytes, row.roce_us, row.roce_eager_us, row.nccl_gather_us });
+        std.debug.print("ROCE-BENCH rank {d} rows {d} bytes {d}: roce {d:.1} us (graph), {d:.1} us (eager), nccl all-gather {d:.1} us, roce bf16 wire {d:.1} us\n", .{ a.rank, rows, row.bytes, row.roce_us, row.roce_eager_us, row.nccl_gather_us, row.roce_bf16_us });
         const line = try std.fmt.allocPrint(gpa, "{s}\n {{\"rows\": {d}, \"bytes\": {d}, \"roce_us\": {d:.2}, \"roce_eager_us\": {d:.2}, \"nccl_gather_us\": {d:.2}}}", .{ if (first) "" else ",", rows, row.bytes, row.roce_us, row.roce_eager_us, row.nccl_gather_us });
         defer gpa.free(line);
         try out.appendSlice(gpa, line);
         first = false;
+    }
+    if (a.bench_layer_mb > 0) {
+        var bit = std.mem.tokenizeScalar(u8, a.bench_layer_bytes, ',');
+        var case: usize = 0;
+        while (bit.next()) |btxt| {
+            const nb = try std.fmt.parseInt(usize, btxt, 10);
+            var jit_it = std.mem.tokenizeScalar(u8, a.bench_jitter_ns, ',');
+            while (jit_it.next()) |jtxt| {
+                const jit = try std.fmt.parseInt(u32, jtxt, 10);
+                case += 1;
+                try rdv.sync("layer", case, a.timeout_s);
+                const lr = try glm.roce.benchLayer(r, stream, a.bench_layer_mb << 20, nb, a.bench_layers, 5, 20_000, jit);
+                std.debug.print("ROCE-LAYER rank {d} mb {d} ar_bytes {d} jitter_ns {d}: read {d:.1} us, read+ar {d:.1} (ar in layer {d:.1}), ar alone {d:.1}, spin(20us+j)+ar {d:.1} spin {d:.1} (ar under jitter {d:.1})\n", .{ a.rank, a.bench_layer_mb, nb, jit, lr.read_us, lr.read_ar_us, lr.read_ar_us - lr.read_us, lr.ar_us, lr.spin_ar_us, lr.spin_us, lr.spin_ar_us - lr.spin_us });
+            }
+        }
     }
     const st = r.stats();
     const tail = try std.fmt.allocPrint(gpa, "\n], \"rank\": {d}, \"world\": {d}, \"hcas\": {d}, \"bit_check\": {s}, \"decode_worst_us\": {d:.2}, \"ops_posted\": {d}, \"writes_completed\": {d}}}\n", .{ a.rank, a.world, hcas.len, tf(good), worst, st[0], st[1] });

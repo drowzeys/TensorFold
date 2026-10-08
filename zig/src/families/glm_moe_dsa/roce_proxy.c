@@ -479,8 +479,28 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
     return 0;
 }
 
+// Probe knobs (glm53-comm-probe): ROCE_PROXY_CPU=<n> pins the proxy thread to CPU n; ROCE_PROXY_FIFO=<prio> asks for
+// SCHED_FIFO at that priority (needs CAP_SYS_NICE; a refusal is reported on stderr and the thread stays SCHED_OTHER).
+static void proxy_tune(void) {
+    const char *cpu = getenv("ROCE_PROXY_CPU");
+    if (cpu && *cpu) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(atoi(cpu), &set);
+        int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        fprintf(stderr, "roce proxy: pinned to cpu %s (rc %d)\n", cpu, rc);
+    }
+    const char *fifo = getenv("ROCE_PROXY_FIFO");
+    if (fifo && *fifo && atoi(fifo) > 0) {
+        struct sched_param sp = {.sched_priority = atoi(fifo)};
+        int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+        fprintf(stderr, "roce proxy: SCHED_FIFO %s (rc %d)\n", fifo, rc);
+    }
+}
+
 static void *proxy_main(void *arg) {
     roce_ctx_t *c = (roce_ctx_t *)arg;
+    proxy_tune();
     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
     // Spin while ops are flowing.  After ROCE_IDLE_SPINS polls without a
     // doorbell, request a short nanosleep between polls (the OS decides the

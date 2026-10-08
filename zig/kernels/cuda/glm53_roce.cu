@@ -82,8 +82,24 @@ __device__ __forceinline__ void st_v4(unsigned long long a, uint4 v) {
                  : "memory");
 }
 
+// 8 fp32 at a (two 16-byte packs) -> 8 bf16, round to nearest even (NaN kept quiet), lower address in the low half
+__device__ __forceinline__ unsigned bf16_bits(float f) {
+    const unsigned u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ uint4 pack_bf16(unsigned long long a) {
+    const uint4 x = ld_v4(a), y = ld_v4(a + kPack);
+    return make_uint4(bf16_bits(__uint_as_float(x.x)) | (bf16_bits(__uint_as_float(x.y)) << 16),
+                      bf16_bits(__uint_as_float(x.z)) | (bf16_bits(__uint_as_float(x.w)) << 16),
+                      bf16_bits(__uint_as_float(y.x)) | (bf16_bits(__uint_as_float(y.y)) << 16),
+                      bf16_bits(__uint_as_float(y.z)) | (bf16_bits(__uint_as_float(y.w)) << 16));
+}
+
 }  // namespace
 
+// mode 2 (glm53-comm-probe, TF_GLM53_ROCE_BF16): as mode 0 with fp32 in / out but bf16 on the wire - size_packs and
+// nbytes count the wire's bf16 packs (8 values each), every rank's partial rounded to bf16 before the rank-order sum.
 // mode 0: out [packs] fp32 = rank-order sum of every rank's in [packs]; mode 1: all-gather, shard s -> column block s
 // of each of the shard's rows (row_packs packs a row; dim-0 concat: row_packs = size_packs). Grid: a power of two
 // <= 8 blocks of `threads` threads (threads >= world * hcas: one thread a stripe flag).
@@ -105,9 +121,14 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
 
     if (ld_relaxed_gpu(poison_ptr) != 0u) return;   // a recorded timeout: later launches do nothing
 
-    // 1. stage the local input into the pinned send slot
-    for (int i = index; i < size_packs; i += stride)
-        st_v4(send_slot + (unsigned long long)i * kPack, ld_v4(in + (unsigned long long)i * kPack));
+    // 1. stage the local input into the pinned send slot (mode 2: fp32 in -> bf16 on the wire, 8 values a pack)
+    if (mode == 2) {
+        for (int i = index; i < size_packs; i += stride)
+            st_v4(send_slot + (unsigned long long)i * kPack, pack_bf16(in + (unsigned long long)i * 2 * kPack));
+    } else {
+        for (int i = index; i < size_packs; i += stride)
+            st_v4(send_slot + (unsigned long long)i * kPack, ld_v4(in + (unsigned long long)i * kPack));
+    }
     __syncthreads();
 
     // 2. the last block to finish staging rings the proxy's doorbell
@@ -142,7 +163,33 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
 
     // 4. data, unless a wait of this block timed out (a peer slot is then unreliable)
     if (ld_relaxed_gpu(poison_ptr) == 0u) {
-        if (mode == 0) {
+        if (mode == 2) {
+            // every rank sums the same bf16-rounded partials (its own re-rounded from `in`) in rank order in fp32
+            for (int i = index; i < size_packs; i += stride) {
+                const unsigned long long off = (unsigned long long)i * kPack;
+                float acc[8];
+                for (int s = 0; s < world; ++s) {
+                    const uint4 w = s == rank ? pack_bf16(in + off * 2)
+                                              : ld_relaxed_sys_v4(recv_base + ((unsigned long long)s * kSlots + slot) *
+                                                                                  slot_bytes + off);
+                    const unsigned u[4] = {w.x, w.y, w.z, w.w};
+                    for (int q = 0; q < 4; ++q) {
+                        const float lo = __uint_as_float(u[q] << 16), hi = __uint_as_float(u[q] & 0xffff0000u);
+                        if (s == 0) {
+                            acc[2 * q] = lo;
+                            acc[2 * q + 1] = hi;
+                        } else {
+                            acc[2 * q] = __fadd_rn(acc[2 * q], lo);
+                            acc[2 * q + 1] = __fadd_rn(acc[2 * q + 1], hi);
+                        }
+                    }
+                }
+                st_v4(out + off * 2, make_uint4(__float_as_uint(acc[0]), __float_as_uint(acc[1]), __float_as_uint(acc[2]),
+                                                __float_as_uint(acc[3])));
+                st_v4(out + off * 2 + kPack, make_uint4(__float_as_uint(acc[4]), __float_as_uint(acc[5]),
+                                                        __float_as_uint(acc[6]), __float_as_uint(acc[7])));
+            }
+        } else if (mode == 0) {
             for (int i = index; i < size_packs; i += stride) {
                 const unsigned long long off = (unsigned long long)i * kPack;
                 float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
@@ -193,4 +240,32 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
             if (ld_relaxed_sys(ctrl_base + 8) == 0u) st_release_gpu(epoch_ptr, seq);
         }
     }
+}
+
+// ---- glm53-comm-probe bench kernels (roce-bench --bench-layer-mb): not used by the engine --------------------------
+// A memory-bound stand-in for a decode layer's weight reads: n_packs 16-byte loads, folded so the loads stay live.
+extern "C" __global__ void __launch_bounds__(512) glm53_bench_read(unsigned long long p, unsigned long long n_packs,
+                                                                   unsigned long long sink, unsigned magic) {
+    unsigned acc = 0;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
+        const uint4 v = ld_v4(p + i * kPack);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == magic) st_v4(sink, make_uint4(acc, 0u, 0u, 0u));
+}
+
+// Spin `base_ns + (hash(iter, rank) % jitter_ns)` ns on %globaltimer (one thread): per-rank launch skew / jitter.
+extern "C" __global__ void glm53_bench_spin(unsigned base_ns, unsigned jitter_ns, unsigned iter, unsigned rank) {
+    if (threadIdx.x != 0) return;
+    unsigned h = (iter + 1u) * 2654435761u ^ (rank + 7u) * 40503u;
+    h ^= h >> 13;
+    h *= 2246822519u;
+    h ^= h >> 16;
+    const unsigned long long want = (unsigned long long)base_ns + (jitter_ns ? (h % jitter_ns) : 0u);
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < want);
 }
