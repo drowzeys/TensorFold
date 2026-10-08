@@ -58,7 +58,7 @@ pub const Tri = struct {
     probe: ?*aot.Probe = null,
 
     fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const, opts: aot.Launch) !void {
-        if (t.probe) |p| return p.add(name, args, consts, opts);
+        if (t.probe) |pr| return pr.add(name, args, consts, opts);
         const set = t.set orelse return error.NoTritonSet;
         try set.runWith(t.s, name, .{ u(grid[0]), u(grid[1]), u(grid[2]) }, args, consts, opts);
     }
