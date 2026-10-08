@@ -35,6 +35,7 @@
 # the server's log or PROGRESS_MIN minutes without progress ("PHASE4B FAIL <reason>", this run's containers removed).
 #
 # Environment (defaults in brackets):
+#   TREE [tf-conc] (the tree under PORT_DIR that is built and whose tools run: the 4b worktree; tf once merged)
 #   NODES [10.100.10.1 .2 .3 .5] MODEL IMAGE PORT_DIR PYSRC [~/tf-wt/dspark: the served image's tree] ZIG_DIR ZIG_FROM
 #   MASTER IF RAILS DROP_CACHES ALLOW_GPU_BUSY   PARALLEL [4]  CONTEXT [32768]  K [2]  TOKENS [512]  SAMPLED [1]
 #   SINGLE [1]  RATIO [0.97]  REUSE_ON [1] (TF_GLM53_PROMPT_REUSE on both servers)  MEM_CAP [110g]
@@ -51,6 +52,7 @@ MASTER=${MASTER:-${NODES[0]}}
 MODEL=${MODEL:-/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit}
 IMAGE=${IMAGE:-ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05}
 PORT_DIR=${PORT_DIR:-$HOME/zig-port}
+TREE=${TREE:-tf-conc}                         # the source tree under zig-port/ that is built and whose tools run
 PYSRC=${PYSRC:-$HOME/tf-wt/dspark}
 ZIG_DIR=${ZIG_DIR:-$HOME/opt/zig}
 ZIG_FROM=${ZIG_FROM:-10.100.10.5}
@@ -187,7 +189,8 @@ nccl_env() {
 
 # ---- 0. preflight ------------------------------------------------------------------------------------------------
 phase preflight
-say "phase 4b: nodes ${NODES[*]} (rank 0 first), model $MODEL, image $IMAGE, --parallel $PARALLEL, context $CONTEXT, k $K, $TOKENS tokens, work $WORK"
+say "phase 4b: nodes ${NODES[*]} (rank 0 first), tree $PORT_DIR/$TREE, model $MODEL, image $IMAGE, --parallel $PARALLEL, context $CONTEXT, k $K, $TOKENS tokens, work $WORK"
+[ -f "$PORT_DIR/$TREE/zig/src/families/glm_moe_dsa/cuda_multi.zig" ] || summary FAIL "no $PORT_DIR/$TREE/zig/src/families/glm_moe_dsa/cuda_multi.zig (TREE=?)" 2
 (( PARALLEL >= 2 )) || summary FAIL "PARALLEL=$PARALLEL: concurrent streams need 2 or more" 2
 (( PARALLEL * (K + 1) <= 32 )) || summary FAIL "PARALLEL x (K + 1) = $((PARALLEL * (K + 1))) > 32: not a decode window" 2
 (( CONTEXT < 200000 )) || summary FAIL "CONTEXT=$CONTEXT would turn DCP on: concurrent streams need it off" 2
@@ -244,7 +247,7 @@ CACHE_ENV="-e TORCH_EXTENSIONS_DIR=/cache/torch_ext -e CUDA_CACHE_PATH=/cache/cu
 # a CPU container on rank 0's node: the prompt makers and the gate (host network: the servers on 127.0.0.1)
 cpu_job() {
   rsh "${NODES[0]}" "docker run --rm $COMMON --network host --memory 8g -v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro \
-    -v $RPORT/tf:/tf:ro -v $WORK:/work -e PYTHONPATH=/opt/tensorfold/src --entrypoint python3 $IMAGE -B $*"
+    -v $RPORT/$TREE:/tf:ro -v $WORK:/work -e PYTHONPATH=/opt/tensorfold/src --entrypoint python3 $IMAGE -B $*"
 }
 to_all() { local f=$1 n; rsh "${NODES[0]}" "cat $WORK/$f" > "$LOCAL/$(basename "$f")" || return 1; for n in "${NODES[@]:1}"; do rsh "$n" "cat > $WORK/$f" < "$LOCAL/$(basename "$f")" || return 1; done; }
 
@@ -272,7 +275,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
   say "build: zig build test-glm53, then fatbins + tf-glm53-generate + native (tensorfold-native) on all four nodes (docker --memory 24g)"
   for r in 0 1 2 3; do
     rsh "${NODES[$r]}" "timeout 3600 docker run --rm $COMMON --network none --memory 24g --memory-swap 24g \
-      -v $RPORT/tf:/work/tf -v $WORK:/out -v $RPORT/cache:/cache -v $ZIG_DIR:/opt/z:ro -w /work/tf \
+      -v $RPORT/$TREE:/work/tf -v $WORK:/out -v $RPORT/cache:/cache -v $ZIG_DIR:/opt/z:ro -w /work/tf \
       -e ZIG_LOCAL_CACHE_DIR=/cache/zig-local -e ZIG_GLOBAL_CACHE_DIR=/cache/zig-global -e PATH=/opt/z:/usr/local/cuda/bin:/usr/bin:/bin \
       --entrypoint bash $IMAGE -c 'set -u; rc=0; zig version
         zig build test-glm53 --summary all || rc=10
@@ -292,7 +295,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
   while read -r sym; do
     case "$sym" in "#"*|"") continue ;; esac
     grep -q -- "$sym" "$LOCAL/symbols-glm53.txt" || { say "kernel symbol missing from the fatbins: $sym"; missing=$((missing + 1)); }
-  done < "$PORT_DIR/tf/tools/glm53/expected_symbols.txt"
+  done < "$PORT_DIR/$TREE/tools/glm53/expected_symbols.txt"
   [ "$missing" = 0 ] || summary FAIL "build: $missing kernel symbols missing (symbols-glm53.txt)" 1
   say "build: OK on all four nodes, every expected kernel symbol present"
 fi
@@ -372,7 +375,7 @@ client_watch() {
   local label=$1 srv=$2; shift 2
   local cname="zp4b-c-$label" t=0 last="" still=0 h="" now r st errs rc=0 cpid reason=""
   rsh "${NODES[0]}" "docker rm -f $cname" >/dev/null 2>&1
-  rsh "${NODES[0]}" "docker run --rm --name $cname $COMMON --network host --memory 4g -v $RPORT/tf:/tf:ro -v $WORK:/work \
+  rsh "${NODES[0]}" "docker run --rm --name $cname $COMMON --network host --memory 4g -v $RPORT/$TREE:/tf:ro -v $WORK:/work \
     --entrypoint python3 $IMAGE -B /tf/tools/glm53/gate4b.py client $* --idle $((PROGRESS_MIN * 60))" > "$LOCAL/client-$label.log" 2>&1 &
   cpid=$!
   while kill -0 "$cpid" 2>/dev/null; do
@@ -425,7 +428,7 @@ elif [ "${SKIP_REF:-0}" != 1 ]; then
   [ -n "$rneed" ] || summary FAIL "prompts.json has no context_needed" 1
   REF_CONTEXT=$(( (rneed + 1023) / 1024 * 1024 ))
   ref_main() {
-    echo "-v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/tf:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
+    echo "-v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/$TREE:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
       -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/work/ref/triton $CACHE_ENV -w /tmp --entrypoint python3 $IMAGE \
       -B /tf/tools/glm53/reference3a.py --model /model --rank $1 --master $MASTER --port $REF_PORT \
       --prompts /work/prompts.json --context $REF_CONTEXT --k $K --out /work/ref --record"
@@ -471,7 +474,7 @@ if [ "${SKIP_COVER:-0}" != 1 ]; then
   [ $rc = 0 ] || [ $rc = 3 ] || fatal "aot: list-variants failed (exit $rc, cover-listv-needs.log)"
   say "aot: compiling the missing variants (sweep_aot.py on ${NODES[0]}, template: the reference)"
   rsh "${NODES[0]}" "timeout $SWEEP_TIMEOUT docker run --rm $COMMON --gpus all --network none --memory $SWEEP_MEM --memory-swap $SWEEP_MEM \
-    -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/tf:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
+    -v $RPORT/pysrc/src:/opt/tensorfold/src:ro -v $RPORT/$TREE:/tf:ro -v $WORK:/work -v $RPORT/cache:/cache \
     -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/work/cover/triton $CACHE_ENV -w /tmp --entrypoint python3 $IMAGE \
     -B /tf/tools/glm53/sweep_aot.py --needs /work/cover/needs.json --template /work/ref --out /work/cover/sweep --merged /work/aot-full" \
     > "$LOCAL/cover-sweep.log" 2>&1 || fatal "aot: sweep_aot.py failed (cover-sweep.log: $(grep -E 'FAILED|Error' "$LOCAL/cover-sweep.log" | tail -2 | tr '\n' ' ' | cut -c1-300))"
@@ -571,7 +574,7 @@ fi
 
 # ---- 9. the gates (gate4b.py on rank 0's node, in a CPU container) -----------------------------------------------
 phase gate
-rsh "${NODES[0]}" "docker run --rm $COMMON --network none --memory 4g -v $RPORT/tf:/tf:ro -v $WORK:/work --entrypoint python3 $IMAGE \
+rsh "${NODES[0]}" "docker run --rm $COMMON --network none --memory 4g -v $RPORT/$TREE:/tf:ro -v $WORK:/work --entrypoint python3 $IMAGE \
   -B /tf/tools/glm53/gate4b.py gate --work /work/gate --parallel $PARALLEL --ratio $RATIO" > "$LOCAL/gate.log" 2>&1
 grc=$?
 for f in cli-4b.json py-prose.json py-code.json zig-prose.json zig-code.json py-prose-s.json py-code-s.json zig-prose-s.json zig-code-s.json dump-zig.jsonl; do
