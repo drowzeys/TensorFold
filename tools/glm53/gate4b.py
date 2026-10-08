@@ -13,7 +13,7 @@ Subcommands:
       conc_chat.py's runs (the same request bodies and timing: aggregate tok/s = every reply's completion tokens over
       the wall time from the first request sent to the last reply finished; per-stream tok/s = a reply's tokens after
       its first over its own decode time; TTFT = the first content / reasoning delta), recording each stream's text
-  gate --work DIR [--parallel 4] [--ratio 0.97]
+  gate --work DIR [--parallel 4] [--ratio 0.97] [--drafter mtp|dflash|dspark] [--bar-ratio 1.0]
       every gate from the files the run left; prints "GATE <name> PASS|FAIL ..." and "REPORT ..." lines:
         cli            tf-glm53-generate --mode 4b: every stream's tokens == its alone run == its one-stream run, every
                        group (greedy and sampled), and every rank agreed
@@ -22,6 +22,15 @@ Subcommands:
         speed-prose / speed-code the Zig server's aggregate tok/s at N streams >= ratio x the Python server's
         served-cli     the Zig server's replies (TF_GLM53_DUMP: its prompt ids and tokens) == the CLI's concurrent
                        tokens of the same prompt ids (when the ids match; else a REPORT)
+      Phase 4c (--drafter dflash | dspark; run_phase4c_cluster.sh): every stream drafts with that drafter.
+        cli            also: the CLI ran that draft mode (cli-4b.json "draft_mode")
+        conc-prose / conc-code   the Zig server's 1-stream reply == its reply of the same prompt and seed among N
+                       concurrent streams (greedy): single-stream vs concurrent identity through the server
+        text-*         against py-<kind>.json (the Python server with the same drafter: dflash, mtp) or, without it
+                       (dspark: Python refuses --parallel with DSpark), py-mtp-<kind>.json (greedy replies do not
+                       depend on the drafts)
+        speed-*        against the Python server with the same drafter (--ratio); dspark: against the Python MTP
+                       server, the speed bar (--bar-ratio; 0: reported only). dflash also reports the MTP bar.
 """
 
 from __future__ import annotations
@@ -204,6 +213,9 @@ def gate(a) -> int:
         result("cli", False, "no cli-4b.json (tf-glm53-generate --mode 4b failed?)")
     else:
         bad = []
+        ran = cli.get("draft_mode", "mtp")
+        if ran != a.drafter:
+            bad.append(f"draft mode {ran}, not {a.drafter}")
         for g in cli.get("groups", []):
             if not g.get("concurrent_eq_alone") or (g.get("single_run") and not g.get("alone_eq_single")):
                 bad.append(g["name"])
@@ -222,10 +234,28 @@ def gate(a) -> int:
 
     # -- the servers: Zig == Python reply by reply (greedy), speed at N streams
     for kind in ("prose", "code"):
-        py = load(work / f"py-{kind}.json")
+        same_py = load(work / f"py-{kind}.json")       # the Python server with the same drafter (mtp, dflash)
+        bar = load(work / f"py-mtp-{kind}.json")        # Phase 4c: the Python MTP server (the speed bar)
+        py = same_py if same_py is not None else bar
         zg = load(work / f"zig-{kind}.json")
+        if zg is not None and a.drafter != "mtp":       # single-stream vs concurrent identity through the Zig server
+            zr0 = {r["streams"]: r for r in zg["runs"]}
+            one_ = {x["seed"]: x for x in zr0.get(1, {}).get("replies", [])}
+            checked = equal = 0
+            for n in sorted(zr0):
+                if n == 1:
+                    continue
+                for x in zr0[n]["replies"]:
+                    y = one_.get(x["seed"])
+                    if y is None:
+                        continue
+                    checked += 1
+                    equal += int(x["text_sha256"] == y["text_sha256"] and x["tokens"] == y["tokens"]
+                                 and not x["error"] and not y["error"])
+            result(f"conc-{kind}", checked > 0 and equal == checked,
+                   f"{equal}/{checked} concurrent {a.drafter} replies == the same prompt and seed alone (greedy)")
         if py is None or zg is None:
-            result(f"text-{kind}", False, f"missing {'py' if py is None else 'zig'}-{kind}.json")
+            result(f"text-{kind}", False, f"missing {'py(-mtp)' if py is None else 'zig'}-{kind}.json")
             result(f"speed-{kind}", False, "no client results")
             continue
         pr = {r["streams"]: r for r in py["runs"]}
@@ -243,14 +273,27 @@ def gate(a) -> int:
                f"{same}/{total} replies equal (greedy){'; differ: ' + ', '.join(diffs[:4]) if diffs else ''}"
                f"{f'; {errs} request errors' if errs else ''}")
         N = a.parallel
+        # the speed gate: against the Python server with the same drafter (--ratio); without one (dspark) against
+        # the Python MTP bar (--bar-ratio; 0: reported only)
+        need = a.ratio if same_py is not None else a.bar_ratio
+        what = f"python {a.drafter}" if same_py is not None else "python mtp (the bar)"
         if N in pr and N in zr:
             pt, zt = pr[N]["aggregate_tps"], zr[N]["aggregate_tps"]
             ratio = zt / pt if pt else 0.0
-            result(f"speed-{kind}", ratio >= a.ratio,
-                   f"{N} streams aggregate: zig {zt:.1f} tok/s, python {pt:.1f} ({ratio:.3f}x, need {a.ratio}); "
-                   f"TTFT max zig {zr[N]['ttft_max_s']:.2f} s, python {pr[N]['ttft_max_s']:.2f} s")
+            line = (f"{N} streams aggregate: zig {a.drafter} {zt:.1f} tok/s, {what} {pt:.1f} ({ratio:.3f}x, need "
+                    f"{need}); TTFT max zig {zr[N]['ttft_max_s']:.2f} s, python {pr[N]['ttft_max_s']:.2f} s")
+            if need > 0:
+                result(f"speed-{kind}", ratio >= need, line)
+            else:
+                print(f"REPORT speed-{kind}: {line}", flush=True)
         else:
             result(f"speed-{kind}", False, f"no {N}-stream run in both")
+        if same_py is not None and bar is not None and a.drafter != "mtp":
+            br = {r["streams"]: r for r in bar["runs"]}
+            if N in br and N in zr:
+                print(f"REPORT bar-{kind}: {N} streams aggregate zig {a.drafter} {zr[N]['aggregate_tps']:.1f} tok/s vs "
+                      f"python mtp {br[N]['aggregate_tps']:.1f} ({zr[N]['aggregate_tps'] / max(br[N]['aggregate_tps'], 1e-9):.3f}x); "
+                      f"python {a.drafter} {pr[N]['aggregate_tps'] if N in pr else '-'}", flush=True)
         pub1, pubN = PUBLISHED[kind]
         for n in sorted(set(pr) | set(zr)):
             z, p = zr.get(n), pr.get(n)
@@ -261,7 +304,8 @@ def gate(a) -> int:
                   f"{pub1 if n == 1 else pubN} (README, {'1 stream' if n == 1 else f'{N} streams aggregate'})",
                   flush=True)
         for label in ("s",):   # sampled client runs, when the run made them: reported, not gated
-            ps, zs = load(work / f"py-{kind}-{label}.json"), load(work / f"zig-{kind}-{label}.json")
+            ps = load(work / f"py-{kind}-{label}.json") or load(work / f"py-mtp-{kind}-{label}.json")
+            zs = load(work / f"zig-{kind}-{label}.json")
             if ps and zs:
                 a_ = {r["streams"]: r for r in ps["runs"]}
                 b_ = {r["streams"]: r for r in zs["runs"]}
@@ -325,6 +369,8 @@ def main() -> int:
     p.add_argument("--work", required=True)
     p.add_argument("--parallel", type=int, default=4)
     p.add_argument("--ratio", type=float, default=0.97)
+    p.add_argument("--drafter", default="mtp", choices=("mtp", "dflash", "dspark"))
+    p.add_argument("--bar-ratio", type=float, default=1.0)
     a = ap.parse_args()
     return {"make-prompts": make_prompts, "client": client, "gate": gate}[a.cmd](a)
 
