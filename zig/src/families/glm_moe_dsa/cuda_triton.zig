@@ -83,8 +83,25 @@ pub const Tri = struct {
 
     /// glue.residual_add: X = bf16(X + bf16(the world partials summed rank 0 first)); g [world, rows, d] fp32.
     pub fn residualAdd(t: Tri, x: u64, g: u64, rows: usize, d: usize, world: usize) !void {
+        return t.residualAddOf(x, g, "*fp32", rows, d, world);
+    }
+
+    /// glue.residual_add with the partials' dtype named: "*fp32" (gathered partials, the RoCE / ring sums in b.red) or
+    /// "*bf16" (Phase 3a: a prompt half's bf16 ring all-reduce / reduce-scatter, b.hred).
+    pub fn residualAddOf(t: Tri, x: u64, g: u64, g_ty: []const u8, rows: usize, d: usize, world: usize) !void {
         const block = @min(1024, d);
-        try t.run("_residual_add", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", x), p("G", "*fp32", g), int("RS", rows * d) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", block) }, .{ .num_warps = 4 });
+        try t.run("_residual_add", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", x), p("G", g_ty, g), int("RS", rows * d) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", block) }, .{ .num_warps = 4 });
+    }
+
+    /// fused._qrope: q_rot of every row at POS + r (the wide window's companion of the batched absorb).
+    pub fn qrope(t: Tri, q: u64, inv: u64, qr: u64, pos: u64, rows: usize, m: Mla) !void {
+        try t.run("_qrope", .{ rows, m.heads, 1 }, &.{ p("Q", "*bf16", q), p("INV", "*fp32", inv), p("QR", "*bf16", qr), p("POS", "*i32", pos) }, &.{ ci("H", m.heads), ci("QD", m.nope + m.rope), ci("NOPE", m.nope), ci("RD", m.rope), cb("ROWS", false) }, .{ .num_warps = 1 });
+    }
+
+    /// x3prefill._gemm: OUT[m, block] = ((xh[m] @ W_q[:, block]) @ H) * SCALE * svh (no bias), a 128-column block a
+    /// program; tiles from x3prefill.tiles (the shape's alone). `out_ty` "*bf16" or "*fp32" (the out tensor's dtype).
+    pub fn prefillGemm(t: Tri, xh: u64, wq: u64, h: u64, svh: u64, out: u64, out_ty: []const u8, M: usize, o_stride: usize, K: usize, N: usize, bm: usize, bk: usize, group: usize, warps: u32, stages: u32, scale: f32) !void {
+        try t.run("_gemm", .{ cdiv(M, bm) * (N / 128), 1, 1 }, &.{ p("X", "*fp16", xh), p("W", "*fp16", wq), p("H", "*bf16", h), p("SVH", "*fp16", svh), p("BIAS", "*fp16", svh), p("OUT", out_ty, out), int("M", M), int("o_stride", o_stride) }, &.{ ci("K", K), ci("N", N), ci("BM", bm), ci("BK", bk), ci("GROUP", group), cb("HAS_BIAS", false), aot.cf("SCALE", scale) }, .{ .num_warps = warps, .num_stages = stages });
     }
 
     /// fused._kv_write (bf16 cache, DCP 1, one stream): row r's latent RMSNorm and rotated key into cache row POS + r.

@@ -25,6 +25,7 @@ pub const Api = struct {
     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+    ncclReduceScatter: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
     ncclGroupStart: *const fn () callconv(.c) R,
     ncclGroupEnd: *const fn () callconv(.c) R,
 };
@@ -105,5 +106,27 @@ pub const Communicator = struct {
     /// recv <- the sum of every rank's send (NCCL's ring: ranks alike, the order depends on the size).
     pub fn allReduce(self: *const Communicator, send: D, recv: D, count: usize, dt: DataType, op: RedOp, stream: abi.Stream) Error!void {
         try self.lib.check(self.lib.api.ncclAllReduce(send, recv, count, dt, op, self.comm, stream), "ncclAllReduce");
+    }
+
+    /// recv [count] <- block `rank` of the sum of every rank's send [world * count] (comm.NCCL.reduce_scatter: NCCL's
+    /// ring, so the summation order depends on the size; every rank of one configuration gets the same bits).
+    pub fn reduceScatter(self: *const Communicator, send: D, recv: D, count: usize, dt: DataType, op: RedOp, stream: abi.Stream) Error!void {
+        try self.lib.check(self.lib.api.ncclReduceScatter(send, recv, count, dt, op, self.comm, stream), "ncclReduceScatter");
+    }
+
+    /// One in-place all-gather a buffer, as one NCCL group (comm.NCCL.all_gather_group, fused._ag_rows): buffer i
+    /// holds world blocks of `counts[i]` elements and this rank's block (rank * counts[i]) is the send.
+    pub fn allGatherInPlace(self: *const Communicator, bufs: []const D, counts: []const usize, dts: []const DataType, elem_bytes: []const usize, stream: abi.Stream) Error!void {
+        try self.lib.check(self.lib.api.ncclGroupStart(), "ncclGroupStart");
+        var failed: ?Error = null;
+        for (bufs, counts, dts, elem_bytes) |b, n, dt, eb| {
+            const send = b + @as(D, self.rank * n * eb);
+            self.lib.check(self.lib.api.ncclAllGather(send, b, n, dt, self.comm, stream), "ncclAllGather") catch |e| {
+                failed = e;
+                break;
+            };
+        }
+        try self.lib.check(self.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        if (failed) |e| return e;
     }
 };

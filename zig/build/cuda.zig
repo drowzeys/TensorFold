@@ -35,6 +35,12 @@ const kernels = [_]Kernel{
     .{ .name = "glm53_rope", .flags = &.{"-O3"} },
     // ours: the torch steps of a decode window (argmax records, the rank resolve, embedding rows, fp32 -> bf16)
     .{ .name = "glm53_head", .flags = &.{"-O3"} },
+    // Phase 3a. ours: b12x RoCEnante's one-shot all-reduce / all-gather kernels in plain CUDA (no fast math: the
+    // rank-order fp32 sum is add.rn); the torch steps of prompt chunks (transposed copies, casts, add_); the device
+    // copy of cuda/exl3/prompt_experts.cu (tensorfold_exl3_prompt_experts_v5's flags)
+    .{ .name = "glm53_roce", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } },
+    .{ .name = "glm53_prompt", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } },
+    .{ .name = "glm53_prompt_experts", .flags = &.{ "-O3", "-lineinfo" } },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -79,6 +85,11 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const glm53 = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm_moe_dsa/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     glm53.addImport("cuda", cuda);
     glm53.addImport("core", core);
+    // Phase 3a: b12x RoCEnante's RDMA proxy (plain C over libibverbs, Apache-2.0), compiled by Zig as b12x compiles it
+    // with gcc (-O2 -std=gnu11 -libverbs -lpthread); the node image has rdma-core's headers and libibverbs.so
+    glm53.addCSourceFile(.{ .file = b.path("zig/src/families/glm_moe_dsa/roce_proxy.c"), .flags = &.{ "-O2", "-std=gnu11" } });
+    glm53.linkSystemLibrary("ibverbs", .{});
+    glm53.linkSystemLibrary("pthread", .{});
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .glm53 = glm53 };
 }
 

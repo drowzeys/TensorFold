@@ -168,6 +168,23 @@ pub const Rendezvous = struct {
         try recvAll(self.fds[0], bytes, 600_000);
     }
 
+    /// Every rank's `mine` (the same length on every rank) into `all` [world * mine.len] in rank order (the RoCE
+    /// setup's exchange of connection records: b12x's dist.all_gather_object over gloo). Rank 0 collects, then sends
+    /// the whole to every rank.
+    pub fn allGather(self: *Rendezvous, mine: []const u8, all: []u8) !void {
+        const n = mine.len;
+        if (all.len != self.world * n) return error.BadPeer;
+        @memcpy(all[self.rank * n ..][0..n], mine);
+        if (self.world == 1) return;
+        if (self.rank != 0) {
+            try sendAll(self.fds[0], mine);
+            try recvAll(self.fds[0], all, 600_000);
+            return;
+        }
+        for (1..self.world) |r| try recvAll(self.fds[r], all[r * n ..][0..n], 600_000);
+        for (1..self.world) |r| try sendAll(self.fds[r], all);
+    }
+
     /// Every rank reaches `label` before any goes on; each passes `digest` (its settings) and all must agree, else
     /// error.Disagree on every rank. Waits up to `timeout_s`, naming the missing ranks every minute (loads finish
     /// minutes apart).

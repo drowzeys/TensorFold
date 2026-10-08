@@ -13,8 +13,21 @@ pub const Kernels = struct {
     experts_mod: cuda.Module,
     triton: cuda.aot.Set,
     rot_in: cuda.Function,
-    /// linear_kernel<K2, 2 (mul1), WK, G, V> by [K2 index][WK 4 / 8][G 1 / 2]
-    linear: [n_k2][2][2]cuda.Function,
+    /// linear_kernel<K2, 2 (mul1), WK, G, V> by [K2 index][WK 2 / 4 / 8][G 1 / 2]
+    linear: [n_k2][3][2]cuda.Function,
+    /// Phase 3a: unpack_kernel<K2, 2> by K2 index (x3prefill.matmul's W_q decode)
+    unpack: [n_k2]cuda.Function,
+    prompt_mod: cuda.Module, // glm53_prompt.cu: transposed copies, bf16 -> fp32, add_, the Hadamard matrix
+    bhx_to_hbx: cuda.Function,
+    bf16_f32: cuda.Function,
+    add_f32: cuda.Function,
+    hadamard: cuda.Function,
+    pe_mod: cuda.Module, // glm53_prompt_experts.cu (prompt_experts.cu's device part)
+    pe_route: cuda.Function,
+    pe_gateup: cuda.Function,
+    pe_down: cuda.Function,
+    pe_slot_sum16: cuda.Function,
+    pe: PeConsts,
     group: cuda.Function,
     expert_rot_in: cuda.Function,
     gateup_epilogue: cuda.Function,
@@ -43,9 +56,10 @@ pub const Kernels = struct {
         errdefer k.experts_mod.unload();
         k.rot_in = try k.linear_mod.function(exl3.rot_in_symbol);
         var buf: [256]u8 = undefined;
-        for (exl3.linear_k2s, 0..) |k2, i| for ([_]usize{ 4, 8 }, 0..) |wk, j| for ([_]usize{ 1, 2 }, 0..) |g, h| {
+        for (exl3.linear_k2s, 0..) |k2, i| for ([_]usize{ 2, 4, 8 }, 0..) |wk, j| for ([_]usize{ 1, 2 }, 0..) |g, h| {
             k.linear[i][j][h] = try k.linear_mod.function(try exl3.linearSymbol(&buf, k2, .mul1, wk, g, exl3.vecOk(k2)));
         };
+        for (exl3.linear_k2s, 0..) |k2, i| k.unpack[i] = try k.linear_mod.function(try exl3.unpackSymbol(&buf, k2, .mul1));
         k.group = try k.experts_mod.function(exl3.group_symbol);
         k.expert_rot_in = try k.experts_mod.function(exl3.expert_rot_in_symbol);
         k.gateup_epilogue = try k.experts_mod.function(exl3.gateup_epilogue_symbol);
@@ -66,12 +80,30 @@ pub const Kernels = struct {
         k.q4_group = try k.qmm_mod.function(q4_group_symbol);
         try k.q4_group.allowDynamicShared(q4_group_smem);
         k.gb10 = (try ctx.capability()) == 121;
+        // Phase 3a: the prompt path's own kernels and the device copy of prompt_experts.cu
+        k.prompt_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt);
+        errdefer k.prompt_mod.unload();
+        k.bhx_to_hbx = try k.prompt_mod.function("glm53_bhx_to_hbx");
+        k.bf16_f32 = try k.prompt_mod.function("glm53_bf16_f32");
+        k.add_f32 = try k.prompt_mod.function("glm53_add_f32");
+        k.hadamard = try k.prompt_mod.function("glm53_hadamard");
+        k.pe_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt_experts);
+        errdefer k.pe_mod.unload();
+        k.pe_route = try k.pe_mod.function(exl3.pe_route_symbol);
+        k.pe_gateup = try k.pe_mod.function(exl3.pe_gateup_symbol);
+        k.pe_down = try k.pe_mod.function(exl3.pe_down_symbol);
+        k.pe_slot_sum16 = try k.pe_mod.function(exl3.pe_slot_sum16_symbol);
+        k.pe = try PeConsts.read(d, k.pe_mod);
+        try k.pe_gateup.allowDynamicShared(k.pe.gu_smem);
+        try k.pe_down.allowDynamicShared(k.pe.dn_smem);
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.pe_mod.unload();
+        k.prompt_mod.unload();
         k.qmm_mod.unload();
         k.head_mod.unload();
         k.rope_mod.unload();
@@ -95,8 +127,9 @@ pub const Kernels = struct {
     fn linearFn(k: *const Kernels, k2: usize, wk: usize, g: usize) !cuda.Function {
         const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, k2) orelse return error.UnsupportedExl3Width;
         const j: usize = switch (wk) {
-            4 => 0,
-            8 => 1,
+            2 => 0,
+            4 => 1,
+            8 => 2,
             else => return error.UnsupportedExl3Warps,
         };
         return k.linear[i][j][g - 1];
@@ -108,6 +141,45 @@ pub const Kernels = struct {
         if (r[1] == 10) return k.grouped[1];
         return k.grouped[2];
     }
+};
+
+/// prompt_experts.cu's launch constants (glm53_pe_consts): dynamic shared memory and threads of its two GEMM kernels,
+/// routed pairs an item.
+pub const PeConsts = struct {
+    gu_smem: u32,
+    dn_smem: u32,
+    gu_threads: u32,
+    dn_threads: u32,
+    ipm: u32,
+
+    fn read(d: *const cuda.Driver, m: cuda.Module) !PeConsts {
+        const f = try m.function("glm53_pe_consts");
+        var buf = try cuda.DeviceBuffer.alloc(d, 8 * 4);
+        defer buf.free();
+        var a: cuda.Args = .{};
+        a.add(buf.ptr);
+        const s: cuda.Stream = .{ .d = d, .handle = null };
+        try cuda.launch.launch(f, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, s, &a);
+        try s.synchronize();
+        var v: [8]i32 = undefined;
+        try buf.download(0, std.mem.sliceAsBytes(&v));
+        return .{ .gu_smem = @intCast(v[0]), .dn_smem = @intCast(v[1]), .gu_threads = @intCast(v[2]), .dn_threads = @intCast(v[3]), .ipm = @intCast(v[4]) };
+    }
+};
+
+/// prompt_experts.PromptScratch for `rows` rows of `slots` slots (TF_EXL3_PROMPT_DET=slots16: fp16 pair rows, summed
+/// in slot order), plus the fp32 sums and their bf16 rounding (SharedExperts._prefill_tf's bf16 `out`).
+pub const PromptExpertScratch = struct {
+    rows: usize,
+    slots: usize,
+    max_items: usize,
+    sorted: u64, // int32 [rows * slots]
+    items: u64, // int32 [3 * max_items]
+    count: u64, // int32 [1]
+    xd: u64, // fp16 [rows * slots, I]
+    pairs: u64, // fp16 [rows * slots, D] (mode 4) / unused in mode 0
+    acc: u64, // fp32 [rows, D]
+    out16: u64, // bf16 [rows, D]
 };
 
 /// qmm_group.cu's group_kernel<64, 16, 64, 1, 4, 8, F32 = true> (tile 2, the instantiation added for the draft head).
@@ -384,6 +456,153 @@ pub const Ops = struct {
             .cluster = if (sk > 1) .{ .x = u(sk) } else null,
             .pdl = o.k.gb10,
         }, o.s, &a);
+    }
+
+    // ---- Phase 3a: the prompt path ----------------------------------------------------------------------------
+
+    /// x3prefill.matmul's ext.rot_in(x, [suh], [xh], pdl=0): xh fp16 [m, K] = fp16(((x suh) H) / sqrt(128)).
+    pub fn rotIn(o: Ops, x: u64, x_dtype: exl3.DType, suh: u64, xh: u64, m: usize, kk: usize) !void {
+        var rj: exl3.RotJobs = std.mem.zeroes(exl3.RotJobs);
+        rj.suh[0] = suh;
+        rj.xh[0] = xh;
+        var ra: cuda.Args = .{};
+        ra.add(x);
+        ra.add(@as(c_int, @intFromEnum(x_dtype)));
+        ra.add(rj);
+        ra.add(int(kk));
+        try cuda.launch.launch(o.k.rot_in, .{ .grid = .{ .x = u((kk / 128 + 3) / 4), .y = u(m), .z = 1 }, .block = .{ .x = 128 } }, o.s, &ra);
+    }
+
+    /// Exl3Linear.unpack (ext.unpack): W_q [K, N] fp16 decoded from the strips words, one warp a 16 x 16 tile.
+    pub fn unpack(o: Ops, l: *const exl3.Linear, w: u64) !void {
+        const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, l.k2) orelse return error.UnsupportedExl3Width;
+        if (l.cb != .mul1) return error.UnsupportedExl3Codebook;
+        const st = l.strides();
+        var a: cuda.Args = .{};
+        a.add(l.words);
+        a.add(w);
+        a.add(int(l.n));
+        a.add(st[0]);
+        a.add(st[1]);
+        try cuda.launch.launch(o.k.unpack[i], .{ .grid = .{ .x = u(l.n / 16), .y = u(l.k / 16) }, .block = .{ .x = 32 } }, o.s, &a);
+    }
+
+    /// out [R, H, X] = in [H, R, X] (bf16): the copy_ of a torch.bmm result into fused's row-major view.
+    pub fn bhxToHbx(o: Ops, in: u64, out: u64, H: usize, R: usize, X: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(in);
+        a.add(out);
+        a.add(int(H));
+        a.add(int(R));
+        a.add(int(X));
+        try cuda.launch.launch(o.k.bhx_to_hbx, .{ .grid = .{ .x = u(R), .y = u(H) }, .block = .{ .x = 128 } }, o.s, &a);
+    }
+
+    /// out[:n] = float(in[:n]) (bf16 -> fp32, exact).
+    pub fn bf16ToF32(o: Ops, in: u64, out: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(in);
+        a.add(out);
+        a.add(@as(i64, @intCast(n)));
+        try cuda.launch.launch(o.k.bf16_f32, .{ .grid = .{ .x = u((n + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// a[:n] += b[:n] (fp32: Tensor.add_).
+    pub fn addF32(o: Ops, a_ptr: u64, b_ptr: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(a_ptr);
+        a.add(b_ptr);
+        a.add(@as(i64, @intCast(n)));
+        try cuda.launch.launch(o.k.add_f32, .{ .grid = .{ .x = u((n + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// x3prefill.Workspace.hadamard: the 128 x 128 +-1 matrix (bf16) the prompt GEMM's epilogue multiplies by.
+    pub fn hadamard(o: Ops, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(out);
+        try cuda.launch.launch(o.k.hadamard, .{ .grid = .{ .x = 128 }, .block = .{ .x = 128 } }, o.s, &a);
+    }
+
+    /// prompt_experts.supported: gate and up at one width, widths 2 / 3 / 4 bits, I % 128, D % 256.
+    pub fn promptSupported(ex: *const Experts) bool {
+        const ok = struct {
+            fn k2(r: [2]usize) bool {
+                return r[0] >= 4 and r[1] <= 8 and r[0] % 2 == 0;
+            }
+        };
+        return ok.k2(ex.k2_gu) and ok.k2(ex.k2_d) and ex.width % 128 == 0 and ex.dims % 256 == 0;
+    }
+
+    /// SharedExperts._prefill_tf -> prompt_experts.prompt_routed (TF_EXL3_PROMPT_DET=slots16, act fp32, no limit,
+    /// codebook 2): the routed experts of rows x [R, D] (bf16, row stride x_stride) with picks [R, S] int32 and
+    /// weights [R, S] fp32 -> out [R, D] fp32 = float(bf16(the slots' outputs summed in slot order)) (b.part.copy_ of
+    /// the bf16 result). Chunks of up to CHUNK_ROWS rows; each row's bits never depend on its chunk.
+    pub fn promptRouted(o: Ops, x: u64, x_stride: usize, pick: u64, wts: u64, ex: *const Experts, sc: PromptExpertScratch, out: u64, R: usize, det16: bool) !void {
+        const D = ex.dims;
+        const I = ex.width;
+        const S = sc.slots;
+        const E = ex.count;
+        const pe = o.k.pe;
+        var r0: usize = 0;
+        const step = @min(sc.rows, exl3.pe_chunk_rows);
+        while (r0 < R) : (r0 += step) {
+            const n = @min(step, R - r0);
+            const pairs_n = n * S;
+            const items = @min(sc.max_items, pairs_n / pe.ipm + @min(pairs_n, E));
+            const xr = x + r0 * x_stride * 2;
+            const pk = pick + r0 * S * 4;
+            const wr = wts + r0 * S * 4;
+            // route: one block, pairs grouped by expert into items of <= IPM
+            var ra: cuda.Args = .{};
+            ra.add(pk);
+            ra.add(int(pairs_n));
+            ra.add(int(E));
+            ra.add(sc.sorted);
+            ra.add(sc.items);
+            ra.add(sc.count);
+            ra.add(int(items));
+            ra.add(@as(c_int, 0)); // TF_EXL3_PROMPT_ORDER 0
+            try cuda.launch.launch(o.k.pe_route, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = u(3 * E * 4) }, o.s, &ra);
+            const mode: c_int = if (det16) 4 else 0;
+            const dst = if (det16) sc.pairs else sc.acc;
+            // gate|up (+ SwiGLU and down's input rotation into xd; mode 0 also zeroes the fp32 sums)
+            var ga: cuda.Args = .{};
+            ga.add(xr);
+            ga.add(int(x_stride));
+            ga.add(sc.sorted);
+            ga.add(sc.items);
+            ga.add(sc.count);
+            for ([_]u64{ ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.suh_g, ex.suh_u, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |p| ga.add(p);
+            for ([_]usize{ D, I, I / 16, S }) |v| ga.add(int(v));
+            ga.add(std.math.inf(f32));
+            ga.add(exl3.act_f32);
+            ga.add(dst);
+            ga.add(@as(i64, if (det16) 0 else @intCast(n * D * 4 / 16)));
+            try cuda.launch.launch(o.k.pe_gateup, .{ .grid = .{ .x = u(I / 128), .y = u(items) }, .block = .{ .x = pe.gu_threads }, .shared = pe.gu_smem }, o.s, &ga);
+            // down (+ svh, routing weight): mode 4 a pair's own fp16 row, mode 0 red.add into the fp32 sums
+            const ncb = exl3.autoNcb(n, D, 4);
+            var da: cuda.Args = .{};
+            for ([_]u64{ sc.xd, sc.sorted, sc.items, sc.count, ex.down_ptr, ex.down_k2, ex.svh_d, wr, dst }) |p| da.add(p);
+            for ([_]usize{ I, D, S, ncb }) |v| da.add(int(v));
+            da.add(mode);
+            try cuda.launch.launch(o.k.pe_down, .{ .grid = .{ .x = u(items), .y = u(D / 256 / ncb) }, .block = .{ .x = pe.dn_threads }, .shared = pe.dn_smem }, o.s, &da);
+            if (det16) {
+                // slot_sum16: a row's fp16 pair rows added in fp32 in slot order (picks outside [0, E) skipped)
+                const n4 = n * D / 4;
+                var sa: cuda.Args = .{};
+                sa.add(sc.pairs);
+                sa.add(pk);
+                sa.add(sc.acc);
+                sa.add(@as(i64, @intCast(n4)));
+                sa.add(int(S));
+                sa.add(int(D / 4));
+                sa.add(int(E));
+                try cuda.launch.launch(o.k.pe_slot_sum16, .{ .grid = .{ .x = u((n4 + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &sa);
+            }
+            // out.copy_(fp32 sums) into the bf16 result, then b.part.copy_(bf16) into fp32
+            try o.f32ToBf16(sc.acc, sc.out16, n * D);
+            try o.bf16ToF32(sc.out16, out + r0 * D * 4, n * D);
+        }
     }
 
     pub fn copy(o: Ops, dst: u64, src: u64, bytes: usize) !void {

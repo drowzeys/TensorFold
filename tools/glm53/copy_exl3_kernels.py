@@ -9,6 +9,9 @@ From the Python engine's src/tensorfold/cuda/exl3/{linear.cu, experts.cu, expert
                                                (kernels need a stable symbol), plus the explicit instantiations below
 * zig/kernels/cuda/glm53_exl3_experts.cu       experts.cu's device kernels (namespace tf_exl3x_k) plus the grouped
                                                kernel instantiations GLM-5.3's decode windows launch
+* zig/kernels/cuda/glm53_prompt_experts.cu     prompt_experts.cu's device part (Phase 3a: namespace tf_exl3p, the
+                                               codebook-2 gate|up / down instantiations, a launch-constants kernel);
+                                               linear.cu's copy also gains WK 2 and the unpack_kernel instantiations
 
 Only text moves: every kernel body is the Python build's, so tests/cuda/nemotron/sass_compare.py-style checks against
 the Python extension's .cuda.o can prove the SASS. ``--check`` compares instead of writing (exit 1 on drift).
@@ -28,6 +31,9 @@ OUT = REPO / "zig" / "kernels" / "cuda"
 # also has 3/4-bit (K2 6/8) dense parts in other packs. WK from x3linear.plan (4 or 8), G 1 (<= 8 rows) or 2, V = vec_ok.
 LINEAR_K2 = (6, 8, 10, 16)   # 16: the MTP layer's 8-bit dense projections (layer 78)
 LINEAR_CB = (2,)
+# warps a block: x3linear.plan picks 4 or 8; Phase 3a's served tiles (fused.tune_linears / tune_groups, saved with
+# TF_GLM53_TILES=save:) may also pick 2
+LINEAR_WK = (2, 4, 8)
 # grouped_kernel<CB, NT, W, PF, V, LO, HI> with GLM's tiles (8 n tiles, 4 warps), 16-byte loads (V 1, PF 1) and every
 # K2 range the launcher picks
 EXPERT_RANGES = ((8, 8), (2, 10), (2, 16))
@@ -69,10 +75,16 @@ def linear_cu(src: str) -> str:
     lines_inst = []
     for k2 in LINEAR_K2:
         for cb in LINEAR_CB:
-            for wk in (4, 8):
+            for wk in LINEAR_WK:
                 for g in (1, 2):
                     lines_inst.append(inst[-1] % (k2, cb, wk, g, vec_ok(k2)))
-    return "\n".join(head + out + inst[:-1] + lines_inst) + "\n"
+    # Phase 3a: the prompt GEMM's weight decode (x3prefill.matmul -> ext.unpack, fp16 W_q [K, N])
+    unpack = ["", "// unpack_kernel instantiations x3prefill.matmul launches (W_q decoded once a prompt chunk)."]
+    for k2 in LINEAR_K2:
+        for cb in LINEAR_CB:
+            unpack.append(f"template __global__ void tf_exl3_linear::unpack_kernel<{k2}, {cb}>(const uint32_t*, half*, "
+                          "int, int64_t, int64_t);")
+    return "\n".join(head + out + inst[:-1] + lines_inst + unpack) + "\n"
 
 
 def grouped_cuh(src: str) -> str:
@@ -137,6 +149,67 @@ def experts_cu(src: str) -> str:
     return "\n".join(head + out + inst) + "\n"
 
 
+def prompt_experts_cu(src: str) -> str:
+    """prompt_experts.cu's device part (Phase 3a: the served prompt path's routed experts): ATen includes and the host
+    launchers cut (launch_cb, the exl3p_*_cuda functions), the anonymous namespace named tf_exl3p (kernels need a
+    stable symbol), the codebook-2 (mul1) instantiations of the two templated kernels, and a constants kernel the Zig
+    launcher reads its dynamic shared memory sizes from."""
+    lines = strip_includes(src.splitlines())
+    out, named, skip, host = [], False, False, False
+    for ln in lines:
+        if ln == '#include "experts_grouped.cuh"':
+            ln = '#include "glm53/experts_grouped.cuh"'
+        if ln == "namespace {" and not named:
+            ln, named = "namespace tf_exl3p {", True
+        if ln.startswith("void launch_cb("):          # the host launcher; its "template <int CB>" line is out[-1]
+            if not out or out[-1] != "template <int CB>":
+                raise SystemExit("prompt_experts.cu: launch_cb without its template line")
+            out.pop()
+            skip = True
+            continue
+        if skip:
+            if ln == "}  // namespace":
+                skip = False
+                out.append("}  // namespace tf_exl3p")
+                out.append("")
+                out.append("using namespace tf_exl3p;   // FIX_BITS for the kernels below")
+            continue
+        if host:                                      # a host function after the namespace: up to its closing brace
+            if ln == "}":
+                host = False
+            continue
+        if ln.startswith(("void exl3p_", "int64_t exl3p_")):
+            host = not ln.rstrip().endswith("}")
+            continue
+        out.append(ln)
+    if not named or skip or host:
+        raise SystemExit("prompt_experts.cu: the namespace / host part did not parse")
+    text = "\n".join(out)
+    if "at::" in text or "C10_" in text or "TORCH_CHECK" in text:
+        raise SystemExit("prompt_experts.cu: host code left in the device copy")
+    while out and out[-1].strip() == "":
+        out.pop()
+    head = ["// Device code of src/tensorfold/cuda/exl3/prompt_experts.cu (ATen includes and the host launchers dropped, "
+            "the", "// anonymous namespace named tf_exl3p), generated by tools/glm53/copy_exl3_kernels.py: do not edit.",
+            ""]
+    inst = ["", "// the codebook-2 (mul1) kernels GLM-5.3's prompt chunks launch (SharedExperts.prefill -> prompt_routed)",
+            "template __global__ void tf_exl3p::prompt_gateup_kernel<2>(const __nv_bfloat16*, int, const int*, "
+            "const int*, const int*, const int64_t*, const int64_t*, const int*, const half*, const half*, const half*, "
+            "const half*, const half*, half*, int, int, int, int, float, int, float4*, long long);",
+            "template __global__ void tf_exl3p::prompt_down_kernel<2>(const half*, const int*, const int*, const int*, "
+            "const int64_t*, const int*, const half*, const float*, float*, int, int, int, int, int);",
+            "",
+            "// the launch constants prompt_experts.cpp's launch_cb uses: GU_SMEM, DN_SMEM, GU_THREADS, NTHREADS, IPM",
+            'extern "C" __global__ void glm53_pe_consts(int* out) {',
+            "    out[0] = (int)tf_exl3p::GU_SMEM;",
+            "    out[1] = (int)tf_exl3p::DN_SMEM;",
+            "    out[2] = tf_exl3p::GU_THREADS;",
+            "    out[3] = tf_exl3p::NTHREADS;",
+            "    out[4] = tf_exl3p::IPM;",
+            "}"]
+    return "\n".join(head + out + inst) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", required=True, help="the Python engine's src/tensorfold/cuda/exl3")
@@ -148,6 +221,7 @@ def main() -> int:
         OUT / "glm53" / "experts_grouped.cuh": grouped_cuh((src / "experts_grouped.cuh").read_text()),
         OUT / "glm53_exl3_linear.cu": linear_cu((src / "linear.cu").read_text()),
         OUT / "glm53_exl3_experts.cu": experts_cu((src / "experts.cu").read_text()),
+        OUT / "glm53_prompt_experts.cu": prompt_experts_cu((src / "prompt_experts.cu").read_text()),
     }
     bad = 0
     for path, text in files.items():

@@ -19,8 +19,11 @@
 //! Phase 2b: the device head (`headDevice`: fused.head "argmax" / "local" / "draft" with no host step, so a window
 //! replays as a CUDA graph), ids on the device (b.ids, torch.index_select's rows), the MTP layer (`mtpCompute`,
 //! fused.mtp_compute with TF_GLM53_MTP_REUSE's keep / reuse) and the decode-class buffers (`BufOpts.decode`).
-//! TODO(P3): the RoCE one-shot / exact reduce-scatter exchanges, prompt chunks over 128 rows (x3prefill GEMM, bmm
-//! absorb/expand), DCP, int8/int4 latent caches.
+//! Phase 3a: the served configuration's exchanges - decode windows over the RoCE one-shot (`Forward.fast`: the
+//! rank-order sum into b.red, the head's records and sampled candidates gathered over it), wider windows over NCCL's
+//! bf16 ring all-reduce (`Forward.ring`, TF_GLM53_PREFILL_REDUCE=ring) - and windows over 128 rows (`Forward.wide`:
+//! the prompt GEMM, torch.bmm absorb / expand, prompt experts); the sequence-parallel prompt chunk itself is
+//! cuda_prompt.zig's. TODO(3b): DCP, int8/int4 latent caches, the exact reduce-scatter (TF_GLM53_PREFILL_REDUCE=rs).
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -29,6 +32,8 @@ const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
 const W = @import("cuda_weights.zig");
 const smp = @import("sampling.zig");
+const roce = @import("cuda_roce.zig");
+const prompt = @import("cuda_prompt.zig");
 
 /// The widest TP world the head's exchange records hold.
 pub const max_world: usize = 16;
@@ -44,8 +49,10 @@ pub const Pick = struct {
 
 /// fused.FAST_ROWS: windows up to this many rows use the decode attention tiling (non-decode Buffers).
 pub const fast_rows: usize = 16;
-/// fused.MAX_ROWS: the widest window of the row-invariant EXL3 linear (this port's limit for now).
+/// fused.MAX_ROWS: the widest window of the row-invariant EXL3 linear; wider prompt chunks take the prompt GEMM.
 pub const max_rows: usize = 128;
+/// fused.PROMPT_ROWS' default: the widest prompt chunk the served path's buffers take.
+pub const max_prompt_rows: usize = 8192;
 /// fused.DECODE_ROWS: the widest decode-class buffer set.
 pub const decode_rows: usize = 32;
 
@@ -54,6 +61,14 @@ pub const BufOpts = struct {
     decode: bool = false,
     /// the MTP layer's scratch (hin, me, mh, mcat, mx32, eh_proj partials)
     mtp: bool = false,
+    /// Phase 3a: prompt chunks of more than max_rows rows (the served path's 8192 / 4096-row buffers): the EXL3
+    /// linear scratch stays at max_rows rows (wider calls take the prompt GEMM's workspace), plus the sequence-
+    /// parallel and ring-reduce buffers (bpart, bred, xo)
+    prompt: bool = false,
+    /// weights.EXPERTS_IMPL == "shared" (experts_cx.SharedExperts): the decode experts' scratch holds min(rows,
+    /// MAX_ROWS) rows and wider windows take the prompt experts kernel (prompt_experts.cu); false ("tf"): the decode
+    /// kernel at every width, its scratch for every row
+    shared_experts: bool = false,
 };
 
 /// What a window's head computes (fused.head's modes; `none`: no head).
@@ -118,10 +133,17 @@ pub const Buffers = struct {
     gsum: u64 = 0, // fp32 [head_rows, D / 64]: the draft head's input group sums
     head_v: usize = 0, // b.lg holds head_rows rows of up to this many logits (max(vocab_part, draft rows))
     cand_words: usize = 0, // words a rank sends for sampled candidates: head_rows * 2 * max_candidates + 1
-    cand_send: u64 = 0, // fp32 [cand_words]
-    cand_all: u64 = 0, // fp32 [world * cand_words]
+    cand_send: u64 = 0, // fp32 [cand_words rounded up to 4]
+    cand_all: u64 = 0, // fp32 [world * cand_words rounded up to 4]
     lin: kern.LinearScratch = undefined,
     xs: ?kern.ExpertScratch = null,
+    // Phase 3a
+    red: u64 = 0, // fp32 [rows, D]: the RoCE sum (decode windows) / the ring all-reduce's bf16 sum widened (prompts)
+    bpart: u64 = 0, // bf16 [rows, D]: a prompt chunk's partial for the bf16 ring all-reduce / reduce-scatter
+    bred: u64 = 0, // bf16 [rows, D]
+    xo: u64 = 0, // bf16 [ceil(rows / world), D]: sequence-parallel own rows of the residual stream
+    xs_rows: usize = 0, // rows the decode experts' scratch holds
+    pe: ?kern.PromptExpertScratch = null, // prompt experts (SharedExperts.prefill), prompt buffers of the shared impl
 
     fn alloc(b: *Buffers, bytes: usize) !u64 {
         var m = try cuda.DeviceBuffer.alloc(b.d, @max(bytes, 16));
@@ -139,7 +161,8 @@ pub const Buffers = struct {
     /// whatever its width: the decode attention tiling and head rows up to max(rows, FAST_ROWS).
     pub fn initWith(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, rows: usize, score_cols: usize, opts: BufOpts) !Buffers {
         const c = w.config;
-        if (rows > max_rows) return error.WindowTooWide;
+        if (rows > max_rows and !opts.prompt) return error.WindowTooWide;
+        if (rows > max_prompt_rows) return error.WindowTooWide;
         if (opts.decode and rows > decode_rows) return error.WindowTooWide;
         var b: Buffers = .{ .d = d, .gpa = gpa, .rows = rows, .score_cols = score_cols, .small = if (opts.decode) @max(rows, fast_rows) else fast_rows };
         errdefer b.deinit();
@@ -193,8 +216,15 @@ pub const Buffers = struct {
             b.argmax = try b.alloc(hr * 8);
             b.gsum = try b.alloc(hr * (D / 64) * 4);
             b.cand_words = hr * 2 * smp.max_candidates + 1;
-            b.cand_send = try b.alloc(b.cand_words * 4);
-            b.cand_all = try b.alloc(w.world * b.cand_words * 4);
+            const padded = std.mem.alignForward(usize, b.cand_words, 4); // fused.small_gather's 16-byte RoCE packs
+            b.cand_send = try b.alloc(padded * 4);
+            b.cand_all = try b.alloc(w.world * padded * 4);
+        }
+        b.red = try b.alloc(rows * D * 4);
+        if (rows > b.small) {
+            b.bpart = try b.alloc(rows * D * 2);
+            b.bred = try b.alloc(rows * D * 2);
+            if (opts.prompt) b.xo = try b.alloc((rows + w.world - 1) / w.world * D * 2);
         }
         b.ids = try b.alloc(rows * 8);
         b.hidden = try b.alloc(rows * D * 2);
@@ -207,18 +237,22 @@ pub const Buffers = struct {
             b.mx32 = try b.alloc(rows * D * 4);
             b.epart = try b.alloc(tri.router_ks * rows * D * 4);
         }
-        // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N]
+        // EXL3 linear scratch: per job fp16 Xh [rows, K] and fp32 Z [SK, rows, N] (the row-invariant kernel: up to
+        // max_rows rows; prompt chunks' wider calls take the prompt GEMM's workspace)
         const ext = w.linearExtents();
-        b.lin.xh_bytes = rows * ext.k * 2;
-        b.lin.z_bytes = rows * ext.zn * 4;
+        const lrows = @min(rows, max_rows);
+        b.lin.xh_bytes = lrows * ext.k * 2;
+        b.lin.z_bytes = lrows * ext.zn * 4;
         for (0..exl3.max_jobs) |j| {
             b.lin.xh[j] = try b.alloc(b.lin.xh_bytes);
             b.lin.z[j] = try b.alloc(b.lin.z_bytes);
         }
-        // experts.Scratch(ex, rows, slots = top_k)
+        // experts.Scratch(ex, rows, slots = top_k); SharedExperts.scratch: min(rows, MAX_ROWS) rows
+        const xrows = if (opts.shared_experts) @min(rows, max_rows) else rows;
+        b.xs_rows = xrows;
         for (w.layers) |*L| {
             const ex = if (L.experts) |*e| e else continue;
-            const P = rows * c.top_k;
+            const P = xrows * c.top_k;
             const gu = try exl3.defaultTiles(ex.dims, ex.width, true);
             const dn = try exl3.defaultTiles(ex.width, ex.dims, false);
             const maxu = @min(P, ex.count);
@@ -230,17 +264,36 @@ pub const Buffers = struct {
                 .y = try b.alloc(P * ex.dims * 4),
                 .ids = try b.alloc(maxu * 4),
                 .count = try b.alloc(4),
-                .members = try b.alloc(maxu * rows * 4),
-                .done_gu = try b.alloc(maxu * ((rows + 15) / 16) * @max(ex.width / 128, 1) * 4),
-                .done_d = try b.alloc(rows * @max(ex.dims / 128, 1) * 4),
-                .rows = rows,
+                .members = try b.alloc(maxu * xrows * 4),
+                .done_gu = try b.alloc(maxu * ((xrows + 15) / 16) * @max(ex.width / 128, 1) * 4),
+                .done_d = try b.alloc(xrows * @max(ex.dims / 128, 1) * 4),
+                .rows = xrows,
                 .slots = c.top_k,
                 .gu = gu,
                 .dn = dn,
             };
             // members_buf starts at -1 (torch.full(..., -1))
-            try b.d.check(b.d.api.cuMemsetD32_v2(xs.members, 0xFFFFFFFF, maxu * rows), "cuMemsetD32");
+            try b.d.check(b.d.api.cuMemsetD32_v2(xs.members, 0xFFFFFFFF, maxu * xrows), "cuMemsetD32");
             b.xs = xs;
+            // prompt_experts.PromptScratch(ex, min(rows, CHUNK_ROWS), top_k) + the slot-order sums' rows
+            if (opts.shared_experts and rows > xrows) {
+                const pr = @min(rows, exl3.pe_chunk_rows);
+                const n = pr * c.top_k;
+                const ipm: usize = 112; // prompt_experts.cu IPM (TF_PE_GPM); Kernels.pe.ipm checks it at launch
+                const max_items = n / ipm + @min(n, ex.count);
+                b.pe = .{
+                    .rows = pr,
+                    .slots = c.top_k,
+                    .max_items = max_items,
+                    .sorted = try b.alloc(n * 4),
+                    .items = try b.alloc(3 * max_items * 4),
+                    .count = try b.alloc(4),
+                    .xd = try b.alloc(n * ex.width * 2),
+                    .pairs = try b.alloc(n * ex.dims * 2),
+                    .acc = try b.alloc(pr * ex.dims * 4),
+                    .out16 = try b.alloc(pr * ex.dims * 2),
+                };
+            }
             break; // one scratch serves every MoE layer (the same shapes)
         }
         return b;
@@ -322,6 +375,19 @@ pub const Forward = struct {
     inv: u64, // fp32 [rope / 2]: fused.inv_freq (Phase 1: the oracle's bytes; Phase 2a: Kernels.invFreq's)
     /// the world's NCCL communicator (rank and world as the weights' cut); null: the identity exchange of Phase 1
     comm: ?*const cuda.nccl.Communicator = null,
+    /// Phase 3a: the RoCE one-shot runtime (roce.RoceReduce, w.fast): decode windows (R <= b.small) reduce over it,
+    /// and the head's records and sampled candidates gather over it; null: NCCL
+    fast: ?*const roce.Roce = null,
+    /// Phase 3a: TF_GLM53_PREFILL_REDUCE=ring - windows wider than b.small (prompt chunks) reduce with NCCL's bf16
+    /// ring all-reduce (fused.gather's ring branch); false: the all-gather + rank-order sum of Phase 2
+    ring: bool = false,
+    /// Phase 3a: what windows over max_rows rows need (the prompt GEMM's workspace on this stream, cuBLAS for the
+    /// batched absorb / expand); null: no window over max_rows rows
+    wide: ?*const prompt.Wide = null,
+    /// weights.EXPERTS_IMPL == "shared": windows over b.xs_rows rows take prompt_experts (SharedExperts.prefill)
+    shared_experts: bool = false,
+    /// TF_EXL3_PROMPT_DET=slots16 (reproducible prompt experts); false: fp32 red.add in arrival order (the default)
+    pe_det16: bool = true,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -361,27 +427,61 @@ pub const Forward = struct {
         const t_ = f.t();
         try t_.rmsnorm(b.x, D, L.input_norm, b.normed, D, R, D, c.eps);
         try f.attentionPart(b, L, kc, ic, pos, R, T, reuse);
-        try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
+        const g1 = try f.gather(b, R);
+        try t_.residualAdd(b.x, g1.ptr, R, D, g1.world);
         try t_.rmsnorm(b.x, D, L.post_attn_norm, b.normed, D, R, D, c.eps);
         try f.ffnPart(b, L, R);
-        try t_.residualAdd(b.x, try f.gather(b, R), R, D, f.w.world);
+        const g2 = try f.gather(b, R);
+        try t_.residualAdd(b.x, g2.ptr, R, D, g2.world);
     }
 
-    /// fused.gather: [world, R, D] fp32 partials in rank order for residual_add. World 1: b.part itself. NCCL:
-    /// comm.all_gather(b.part[:R], b.gath[:world R D]) on the compute stream. Phase 1 (other ranks absent,
-    /// LocalComm): zeros in every slot but this rank's, which holds b.part[:R].
-    pub fn gather(f: *const Forward, b: *const Buffers, R: usize) !u64 {
+    /// What residual_add sums: `world` fp32 slots of [R, D] in rank order.
+    pub const Gathered = struct { ptr: u64, world: usize };
+
+    /// fused.gather. World 1: b.part itself. RoCE (decode windows, R <= b.small): the one-shot rank-order sum into
+    /// b.red ([1, R, D]). Ring (Phase 3a, wider windows): b.part to bf16, NCCL's bf16 ring all-reduce, widened into
+    /// b.red ([1, R, D]). Otherwise NCCL comm.all_gather(b.part[:R], b.gath[:world R D]) on the compute stream ([world,
+    /// R, D], summed in rank order by residual_add). Phase 1 (other ranks absent, LocalComm): zeros in every slot but
+    /// this rank's, which holds b.part[:R].
+    pub fn gather(f: *const Forward, b: *const Buffers, R: usize) !Gathered {
         const world = f.w.world;
-        if (world == 1) return b.part;
+        if (world == 1) return .{ .ptr = b.part, .world = 1 };
         const D = f.w.config.hidden;
-        if (f.comm) |c| {
-            try c.allGather(b.part, b.gath, R * D, .f32, f.s.handle);
-            return b.gath;
-        }
         const o = f.ops();
+        if (f.fast) |r| {
+            if (R <= b.small) {
+                try r.allReduce(f.s, b.part, b.red, R * D * 4);
+                return .{ .ptr = b.red, .world = 1 };
+            }
+        }
+        if (f.comm) |c| {
+            if (f.ring and R > b.small) {
+                if (b.bpart == 0) return error.NoRingBuffers;
+                try o.f32ToBf16(b.part, b.bpart, R * D);
+                try c.allReduce(b.bpart, b.bred, R * D, .bf16, .sum, f.s.handle);
+                try o.bf16ToF32(b.bred, b.red, R * D);
+                return .{ .ptr = b.red, .world = 1 };
+            }
+            try c.allGather(b.part, b.gath, R * D, .f32, f.s.handle);
+            return .{ .ptr = b.gath, .world = world };
+        }
         try o.fill32(b.gath, 0, world * R * D);
         try o.copy(b.gath + f.w.rank * R * D * 4, b.part, R * D * 4);
-        return b.gath;
+        return .{ .ptr = b.gath, .world = world };
+    }
+
+    /// fused.lin: an EXL3 linear of x [R, K] (bf16, contiguous rows) into out [R, N] of dtype y - the row-invariant
+    /// kernel up to max_rows rows, the prompt GEMM (x3prefill.matmul, weights decoded once) above.
+    pub fn lin(f: *const Forward, b: *const Buffers, l: *const exl3.Linear, x: u64, R: usize, out: u64, y: exl3.DType) !void {
+        if (R <= max_rows) return f.ops().linear(l, x, .bf16, out, y, R, b.lin);
+        const wd = f.wide orelse return error.WindowTooWide;
+        return wd.matmul(f, l, x, R, out, y);
+    }
+
+    /// fused.lins: linears of one input in one launch when groupable (up to max_rows rows), else one `lin` each.
+    pub fn lins(f: *const Forward, b: *const Buffers, ls: []const *const exl3.Linear, x: u64, R: usize, outs: []const u64, ys: []const exl3.DType) !void {
+        if (R <= max_rows) return f.ops().linears(ls, x, .bf16, outs, ys, R, b.lin);
+        for (ls, outs, ys) |l, out, y| try f.lin(b, l, x, R, out, y);
     }
 
     /// fused.attention_part (side "") and attention_core: this rank's fp32 partial in b.part[:R]. `reuse` 1 / 2
@@ -394,7 +494,7 @@ pub const Forward = struct {
         const m = f.mla();
         const D = c.hidden;
         if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
-        try o.linears(&.{ &L.q_a, &L.kv_a }, b.normed, .bf16, &.{ b.qa, b.kva }, &.{ .bf16, .bf16 }, R, b.lin);
+        try f.lins(b, &.{ &L.q_a, &L.kv_a }, b.normed, R, &.{ b.qa, b.kva }, &.{ .bf16, .bf16 });
         try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
         // keys(False): the latent and rope key, and on indexer layers (not under reuse) the index key
         try t_.kvWrite(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, m);
@@ -410,21 +510,39 @@ pub const Forward = struct {
             if (T) |tt| {
                 if (reuse == 0) {
                     try t_.router(b.normed, D, ix.weights_proj, b.iw, b.rpart, R, D, c.index_heads);
-                    try o.linears(&.{ &ix.wq_b, &L.q_b }, b.qn, .bf16, &.{ b.iq, b.q }, &.{ .bf16, .bf16 }, R, b.lin);
+                    try f.lins(b, &.{ &ix.wq_b, &L.q_b }, b.qn, R, &.{ b.iq, b.q }, &.{ .bf16, .bf16 });
                     q_done = true;
                     try t_.iqRope(b.iq, f.inv, pos, R, c.index_heads, c.index_dim, c.rope);
-                    try f.select(b, ic, pos, R, tt);
+                    try f.select(b, ic, pos, 0, R, tt);
                 }
             }
         }
-        // attention_core
-        if (!q_done) try o.linear(&L.q_b, b.qn, .bf16, b.q, .bf16, R, b.lin);
-        if (R > max_rows) return error.WindowTooWide; // TODO(P3): prompt chunks' bmm absorb / expand
-        try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+        try f.attentionCore(b, L, kc, pos, R, q_done);
+    }
+
+    /// fused.attention_core for rows b.qn[:R] (selection in b.tok): q_b (unless attention_part ran it grouped with
+    /// wq_b), absorb, attention over the cache, expand, o_proj -> this rank's fp32 partial b.part[:R]. Windows over
+    /// max_rows rows (prompt chunks): q_b / o_proj through the prompt GEMM, absorb and expand as torch.bmm (cuBLAS,
+    /// tensor cores: not row-exact, as the Python engine's) with _qrope beside.
+    pub fn attentionCore(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, pos: u64, R: usize, q_done: bool) !void {
+        const t_ = f.t();
+        const m = f.mla();
+        if (!q_done) try f.lin(b, &L.q_b, b.qn, R, b.q, .bf16);
+        const wide = R > max_rows;
+        if (wide) {
+            const wd = f.wide orelse return error.WindowTooWide;
+            try wd.absorb(f, b, L, pos, R);
+        } else {
+            try t_.absorb(b.q, L.wk, f.inv, b.qlat, b.qrot, pos, R, m);
+        }
         const tiling = if (R <= b.small) tri.attn_decode else tri.attn_prompt;
         try t_.attention(b.qlat, b.qrot, kc, b.tok, pos, b.po, b.pm, b.pl, b.ol, b.dummy, R, m, tiling);
-        try t_.expand(b.ol, L.wv, b.o, R, m);
-        try o.linear(&L.o_proj, b.o, .bf16, b.part, .f32, R, b.lin);
+        if (wide) {
+            try f.wide.?.expand(f, b, L, R);
+        } else {
+            try t_.expand(b.ol, L.wv, b.o, R, m);
+        }
+        try f.lin(b, &L.o_proj, b.o, R, b.part, .f32);
     }
 
     // ------------------------------------------------------------------------------- Phase 2b: device windows ---
@@ -471,7 +589,9 @@ pub const Forward = struct {
                 try o.argmaxRec(b.lg, dh.n, dh.n, dh.ids, 0, b.amax, n);
             },
         }
-        if (f.comm) |cm| {
+        if (f.fast != null and world > 1) {
+            try f.fast.?.allGather(f.s, b.amax, b.amax_all, n * 16); // fused.head: w.fast.all_gather(a, g)
+        } else if (f.comm) |cm| {
             try cm.allGather(b.amax, b.amax_all, n * 4, .f32, f.s.handle);
         } else if (world > 1) {
             try o.fill32(b.amax_all, 0, world * n * 4);
@@ -480,6 +600,27 @@ pub const Forward = struct {
             try o.copy(b.amax_all, b.amax, n * 16);
         }
         try o.pickRank(b.amax_all, world, n, b.argmax);
+    }
+
+    /// fused.small_gather: every rank's fp32 words x [n] -> out [world, n_padded] in rank order over the RoCE gather
+    /// when it is up and the whole result fits its buffers (n padded to whole 16-byte packs; the pad words are this
+    /// rank's zeros), else NCCL ([world, n]). Returns the row stride in words. A gather only moves words.
+    pub fn smallGather(f: *const Forward, x: u64, out: u64, n: usize) !usize {
+        const world = f.w.world;
+        const np = std.mem.alignForward(usize, n, 4);
+        if (f.fast) |r| {
+            if (world > 1 and world * np * 4 <= roce.max_bytes) {
+                if (np > n) try f.ops().fill32(x + n * 4, 0, np - n);
+                try r.allGather(f.s, x, out, np * 4);
+                return np;
+            }
+        }
+        if (f.comm) |cm| {
+            try cm.allGather(x, out, n, .f32, f.s.handle);
+        } else {
+            try f.ops().copy(out, x, n * 4);
+        }
+        return n;
     }
 
     /// The MTP head's mode: the reduced 4-bit draft vocabulary when loaded, else the full share's argmax.
@@ -532,15 +673,16 @@ pub const Forward = struct {
         try f.t().rmsnorm(src.hidden + row0 * D * 2, D, f.w.final_norm, out, D, n, D, c.eps);
     }
 
-    /// fused.select (DCP 1) through the radix select for every window size: b.tok[:R] ascending.
-    fn select(f: *const Forward, b: *const Buffers, ic: u64, pos: u64, R: usize, T: usize) !void {
+    /// fused.select (DCP 1) through the radix select for every window size: b.tok[row0 : row0 + R] ascending, window
+    /// rows row0 .. (row0 > 0: a sequence-parallel prompt half's own rows) in blocks of SEL_ROWS = 128 from row0.
+    pub fn select(f: *const Forward, b: *const Buffers, ic: u64, pos: u64, row0: usize, R: usize, T: usize) !void {
         const c = f.w.config;
         const t_ = f.t();
         if (T > b.score_cols) return error.ScoreBufferTooSmall;
         if (T < c.index_topk) return error.Invalid;
-        var r0: usize = 0;
-        while (r0 < R) : (r0 += 128) {
-            const n = @min(128, R - r0);
+        var r0: usize = row0;
+        while (r0 < row0 + R) : (r0 += 128) {
+            const n = @min(128, row0 + R - r0);
             const iq = b.iq + r0 * c.index_heads * c.index_dim * 2;
             const iw = b.iw + r0 * c.index_heads * 4;
             try t_.indexScores(iq, iw, ic, pos, b.sc, T, r0, n, c.index_heads, c.index_dim);
@@ -587,31 +729,64 @@ pub const Forward = struct {
         return p;
     }
 
-    /// fused.ffn_part: the dense MLP, or the router, the shared expert (folded) and the routed experts.
+    /// fused.ffn_part: the dense MLP, or the router (fused.route) and experts_part.
     fn ffnPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
-        const c = f.w.config;
-        const t_ = f.t();
-        const D = c.hidden;
-        if (L.experts) |*ex| {
-            // route
-            try t_.router(b.normed, D, L.router_w, b.mlog, b.rpart, R, D, c.experts);
-            try t_.topk(b.mlog, L.router_bias, b.pick, b.wts, R, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
-            // experts_part, FOLD_SHARED: the shared expert first (into sy), then routed + sy
-            try f.mlp(b, L, R, b.sy);
-            const xs = b.xs orelse return error.NoExpertScratch;
-            try f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R);
-            return;
+        if (L.experts != null) {
+            try f.route(b, L, 0, R);
+            return f.expertsPart(b, L, R);
         }
         try f.mlp(b, L, R, b.part);
     }
 
-    /// fused.mlp: gate and up (one launch), SwiGLU, down into `out` (fp32).
-    fn mlp(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, out: u64) !void {
-        const o = f.ops();
+    /// fused.route: router logits and top-k of rows b.normed[r0 : r0 + n] -> b.pick / b.wts rows r0 ..
+    pub fn route(f: *const Forward, b: *const Buffers, L: *const W.Layer, r0: usize, n: usize) !void {
+        const c = f.w.config;
+        const t_ = f.t();
+        const D = c.hidden;
+        try t_.router(b.normed + r0 * D * 2, D, L.router_w, b.mlog + r0 * c.experts * 4, b.rpart, n, D, c.experts);
+        try t_.topk(b.mlog + r0 * c.experts * 4, L.router_bias, b.pick + r0 * c.top_k * 4, b.wts + r0 * c.top_k * 4, n, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
+    }
+
+    /// fused.experts_part (shared expert not on a side stream): routed experts (picks in b.pick) + the shared expert
+    /// of rows b.normed[:R] -> fp32 partial b.part[:R]. FOLD_SHARED with the decode kernel (the tf impl at every width,
+    /// the shared impl up to its scratch's rows): the shared expert into b.sy first, the routed combine adds it.
+    /// Wider windows of the shared impl (prompt chunks): SharedExperts.prefill (prompt_experts.cu) into b.part, then
+    /// the shared expert into b.sy and b.part += b.sy.
+    pub fn expertsPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
+        const D = f.w.config.hidden;
+        const ex = if (L.experts) |*e| e else return error.Invalid;
+        if (!f.shared_experts or R <= b.xs_rows) {
+            try f.mlp(b, L, R, b.sy);
+            const xs = b.xs orelse return error.NoExpertScratch;
+            return f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R);
+        }
+        if (b.pe != null and kern.Ops.promptSupported(ex)) {
+            if (f.k.pe.ipm != 112) return error.PromptExpertsUnsupported; // Buffers sized PromptScratch for IPM 112
+            try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16);
+            try f.mlp(b, L, R, b.sy);
+            try f.ops().addF32(b.part, b.sy, R * D);
+            return;
+        }
+        // widths prompt_experts does not take (the MTP layer's 8-bit experts): the Python engine runs cuda-exl3's
+        // grouped GEMM (not ported; its split-K atomics make it irreproducible run to run anyway). Here: the decode
+        // kernel in blocks of its scratch's rows, every row its one-row bits. Only MTP prompt rows take this: drafts
+        // only propose and the target verifies each, so no token depends on it (acceptance may move a little).
+        const xs = b.xs orelse return error.NoExpertScratch;
+        const K = f.w.config.top_k;
+        try f.mlp(b, L, R, b.sy);
+        var r0: usize = 0;
+        while (r0 < R) : (r0 += xs.rows) {
+            const n = @min(xs.rows, R - r0);
+            try f.ops().routed(b.normed + r0 * D * 2, D, b.pick + r0 * K * 4, b.wts + r0 * K * 4, ex, xs, b.part + r0 * D * 4, b.sy + r0 * D * 4, n);
+        }
+    }
+
+    /// fused.mlp: gate and up (one launch up to max_rows rows, else one prompt GEMM each), SwiGLU, down into `out`.
+    pub fn mlp(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, out: u64) !void {
         const width = L.mlp.gate.n;
-        try o.linears(&.{ &L.mlp.gate, &L.mlp.up }, b.normed, .bf16, &.{ b.g, b.u }, &.{ .bf16, .bf16 }, R, b.lin);
+        try f.lins(b, &.{ &L.mlp.gate, &L.mlp.up }, b.normed, R, &.{ b.g, b.u }, &.{ .bf16, .bf16 });
         try f.t().swiglu2(b.g, b.u, b.act, R, width);
-        try o.linear(&L.mlp.down, b.act, .bf16, out, .f32, R, b.lin);
+        try f.lin(b, &L.mlp.down, b.act, R, out, .f32);
     }
 };
 

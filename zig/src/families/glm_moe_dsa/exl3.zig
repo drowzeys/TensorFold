@@ -195,6 +195,71 @@ pub const gateup_epilogue_symbol = "_ZN10tf_exl3x_k22gateup_epilogue_kernelEPKfP
 /// experts.py ACT_F32: fused.experts_part calls routed() with the default fp32 SwiGLU, no limit.
 pub const act_f32: c_int = 1;
 
+// -- Phase 3a: the prompt path (x3prefill.matmul's weight decode, prompt_experts.cu) -------------------------------
+
+/// tf_exl3_linear::unpack_kernel<K2, CB>(const uint32_t*, half*, int, int64_t, int64_t): W_q [K, N] fp16.
+pub fn unpackSymbol(buf: []u8, k2: usize, cb: Codebook) ![:0]const u8 {
+    return fmtZ(buf, "_ZN14tf_exl3_linear13unpack_kernelILi{d}ELi{d}EEEvPKjP6__halfill", .{ k2, @intFromEnum(cb) });
+}
+
+/// prompt_experts.cu (tf_exl3p, codebook 2 = mul1): route, gate|up (+ SwiGLU, down's input rotation), down, and
+/// slot_sum16 (TF_EXL3_PROMPT_DET=slots16's slot-order sum).
+pub const pe_route_symbol = "_ZN8tf_exl3p12route_kernelEPKiiiPiS2_S2_ii";
+pub const pe_gateup_symbol = "_ZN8tf_exl3p20prompt_gateup_kernelILi2EEEvPK13__nv_bfloat16iPKiS5_S5_PKlS7_S5_PK6__halfSA_SA_SA_SA_PS8_iiiifiP6float4x";
+pub const pe_down_symbol = "_ZN8tf_exl3p18prompt_down_kernelILi2EEEvPK6__halfPKiS5_S5_PKlS5_S3_PKfPfiiiii";
+pub const pe_slot_sum16_symbol = "_Z17slot_sum16_kernelPK5uint2PKiP6float4xiii";
+/// prompt_experts.py PROMPT_K2: the widths its kernels take (2, 3 and 4 bits a value)
+pub const prompt_k2s = [_]usize{ 4, 6, 8 };
+/// prompt_experts.py CHUNK_ROWS / SLAB_BYTES
+pub const pe_chunk_rows: usize = 4096;
+pub const pe_slab_bytes: usize = 9 << 20;
+
+/// prompt_experts.auto_ncb: column blocks (of 256) a down pass - the widest slab of out within SLAB_BYTES.
+pub fn autoNcb(R: usize, D: usize, elem: usize) usize {
+    const blocks = D / 256;
+    var best: usize = 1;
+    var d: usize = 1;
+    while (d <= blocks) : (d += 1) {
+        if (blocks % d == 0 and R * d * 256 * elem <= pe_slab_bytes) best = d;
+    }
+    return best;
+}
+
+/// x3prefill.tiles: (rows a program, K step, warps, stages, row blocks a raster group) for a K x N prompt GEMM.
+pub const PrefillTiles = struct { bm: usize, bk: usize, warps: u32, stages: u32, group: usize };
+pub fn prefillTiles(k: usize, n: usize) PrefillTiles {
+    const T = struct { k: usize, n: usize, t: PrefillTiles };
+    const tuned = [_]T{
+        .{ .k = 2048, .n = 4096, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 4, .group = 8 } },
+        .{ .k = 6144, .n = 3072, .t = .{ .bm = 64, .bk = 64, .warps = 8, .stages = 4, .group = 8 } },
+        .{ .k = 3072, .n = 6144, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 3, .group = 8 } },
+        .{ .k = 6144, .n = 512, .t = .{ .bm = 64, .bk = 64, .warps = 4, .stages = 4, .group = 8 } },
+        .{ .k = 6144, .n = 640, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 4, .group = 8 } },
+        .{ .k = 6144, .n = 2048, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 4, .group = 8 } },
+        .{ .k = 512, .n = 6144, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 4, .group = 8 } },
+        .{ .k = 4096, .n = 6144, .t = .{ .bm = 128, .bk = 64, .warps = 8, .stages = 3, .group = 8 } },
+    };
+    for (tuned) |x| if (x.k == k and x.n == n) return x.t;
+    return .{ .bm = 128, .bk = 32, .warps = 8, .stages = 4, .group = 8 };
+}
+
+/// x3prefill.HAD_SCALE (1 / sqrt(128)) as the fp32 constexpr Triton compiled.
+pub const had_scale: f32 = @floatCast(@as(f64, 0.08838834764831845));
+
+test "prompt experts' column slabs (prompt_experts.auto_ncb)" {
+    try std.testing.expectEqual(@as(usize, 2), autoNcb(4096, 6144, 4)); // 4096 x 256 x 4 = 4 MiB a block, 9 MiB a slab
+    try std.testing.expectEqual(@as(usize, 4), autoNcb(2048, 6144, 4));
+    try std.testing.expectEqual(@as(usize, 24), autoNcb(16, 6144, 4));
+}
+
+test "the prompt GEMM's tiles and the weight decode's symbol" {
+    try std.testing.expectEqual(PrefillTiles{ .bm = 64, .bk = 64, .warps = 8, .stages = 4, .group = 8 }, prefillTiles(6144, 3072));
+    try std.testing.expectEqual(PrefillTiles{ .bm = 128, .bk = 32, .warps = 8, .stages = 4, .group = 8 }, prefillTiles(6144, 4096));
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("_ZN14tf_exl3_linear13unpack_kernelILi10ELi2EEEvPKjP6__halfill", try unpackSymbol(&buf, 10, .mul1));
+    try std.testing.expectEqual(@as(u32, 0x3db504f3), @as(u32, @bitCast(had_scale)));
+}
+
 test "x3linear.plan for GLM-5.3's dense shapes at world 1 and per rank of world 4" {
     const T = struct { k: usize, n: usize, want: [2]usize };
     const cases = [_]T{

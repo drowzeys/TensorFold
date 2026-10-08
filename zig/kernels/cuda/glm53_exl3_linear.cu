@@ -441,19 +441,33 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
 
 // rot_in_kernel and the linear_kernel instantiations GLM-5.3's dense EXL3 linears launch (loads 35:
 // transposed walk, 16-byte weight loads where vec_ok, PDL).
+template __global__ void tf_exl3_linear::linear_kernel<6, 2, 2, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<6, 2, 2, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<6, 2, 4, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<6, 2, 4, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<6, 2, 8, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<6, 2, 8, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<8, 2, 2, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<8, 2, 2, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<8, 2, 4, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<8, 2, 4, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<8, 2, 8, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<8, 2, 8, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<10, 2, 2, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<10, 2, 2, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 4, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 4, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 8, 1, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<10, 2, 8, 2, 1>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 2, 1, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+template __global__ void tf_exl3_linear::linear_kernel<16, 2, 2, 2, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<16, 2, 4, 1, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<16, 2, 4, 2, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<16, 2, 8, 1, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
 template __global__ void tf_exl3_linear::linear_kernel<16, 2, 8, 2, 0>(const __grid_constant__ tf_exl3_linear::Jobs, int, int);
+
+// unpack_kernel instantiations x3prefill.matmul launches (W_q decoded once a prompt chunk).
+template __global__ void tf_exl3_linear::unpack_kernel<6, 2>(const uint32_t*, half*, int, int64_t, int64_t);
+template __global__ void tf_exl3_linear::unpack_kernel<8, 2>(const uint32_t*, half*, int, int64_t, int64_t);
+template __global__ void tf_exl3_linear::unpack_kernel<10, 2>(const uint32_t*, half*, int, int64_t, int64_t);
+template __global__ void tf_exl3_linear::unpack_kernel<16, 2>(const uint32_t*, half*, int, int64_t, int64_t);

@@ -11,8 +11,11 @@
 //! A verify row computes what a serial step at its position computes and draws are keyed by (seed, position, id), so
 //! a drafted reply equals the serial one (k = 0) and the Python engine's.
 //!
-//! Not here (Phase 3+): RoCE one-shot exchanges, copy drafts, DFlash2, the depth policy, prompt reuse, stop votes,
-//! streaming (EOS is not a stop: every request makes `max_tokens` picks), concurrency.
+//! Phase 3a (Settings.served): the served prompt path (chunks of PROMPT_ROWS / PROMPT_ROWS_SHORT rows, the two-micro-
+//! batch sequence-parallel chunk of cuda_prompt.zig), the RoCE one-shot for decode windows through Forward.fast (the
+//! head's records and the sampled candidates gathered over it too) and runner.healthy after each window's picks.
+//! Not here (Phase 3b+): copy drafts, DFlash2, the depth policy, prompt reuse, stop votes, streaming (EOS is not a
+//! stop: every request makes `max_tokens` picks), concurrency, DCP.
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
@@ -20,6 +23,7 @@ const kern = @import("cuda_kernels.zig");
 const tri = @import("cuda_triton.zig");
 const smp = @import("sampling.zig");
 const W = @import("cuda_weights.zig");
+const prompt = @import("cuda_prompt.zig");
 
 pub const Settings = struct {
     /// MTP drafts a round the buffers and graphs are built for (a request may ask fewer; 0: serial only)
@@ -33,6 +37,17 @@ pub const Settings = struct {
     /// TF_GLM53_MTP "normed/normed": the MTP layer reads final-normed target rows, chains shared_head-normed rows
     hid_normed: bool = true,
     chain_normed: bool = true,
+    /// Phase 3a: the served prompt path - chunks of fused.PROMPT_ROWS (TF_GLM53_PROMPT_ROWS 8192; PROMPT_ROWS_SHORT
+    /// 4096 under 3 x PROMPT_ROWS), the two-micro-batch sequence-parallel chunk where it fits (TF_GLM53_PROMPT_SP),
+    /// wider windows through Forward.wide; false: Phase 2b's chunks of `window` rows
+    served: bool = false,
+    prompt_rows: usize = 8192,
+    prompt_rows_short: usize = 4096,
+    prompt_sp: bool = true,
+    /// TF_GLM53_ROCE_HEALTH: after each window's picks are read, every rank agrees no RoCE runtime timed out
+    roce_health: bool = true,
+    /// the sequence-parallel chunk (its comm stream and events), owned by the caller; null: no overlap
+    sp: ?*prompt.Sp = null,
 };
 
 pub const Stats = struct {
@@ -101,15 +116,22 @@ pub const Runner = struct {
     graphs: std.AutoHashMapUnmanaged(u64, cuda.graph.Exec) = .empty,
     capture_s: f64 = 0,
     cands: []smp.Cand,
+    // Phase 3a (Settings.served): the second micro-batch's buffers, the sequence-parallel chunk, the prompt ids on
+    // the device (uploaded once a request), the RoCE health words
+    pb1: ?fw.Buffers = null,
+    sp: ?*prompt.Sp = null,
+    ids_dev: ?cuda.DeviceBuffer = null, // int64 [capacity]
+    health: ?cuda.DeviceBuffer = null, // int32 [1 + world]
 
     fn pinLayout(r: *const Runner) struct { lg: usize, send: usize, all: usize, ids: usize, rd: usize, total: usize } {
         const V = r.w.vocab_part;
         const hr = r.vb.head_rows;
         const lg_b = std.mem.alignForward(usize, @max(hr, 1) * V * 4, 256);
-        const words = r.vb.cand_words;
+        const words = std.mem.alignForward(usize, r.vb.cand_words, 4);
         const send_b = std.mem.alignForward(usize, words * 4, 256);
         const all_b = std.mem.alignForward(usize, r.w.world * words * 4, 256);
-        const ids_b = std.mem.alignForward(usize, @max(r.set.window, 64) * 8, 256);
+        const id_rows = if (r.set.served) r.capacity else @max(r.set.window, 64);
+        const ids_b = std.mem.alignForward(usize, id_rows * 8, 256);
         const rd_b: usize = 2 * fw.decode_rows * 8;
         return .{ .lg = 0, .send = lg_b, .all = lg_b + send_b, .ids = lg_b + send_b + all_b, .rd = lg_b + send_b + all_b + ids_b, .total = lg_b + send_b + all_b + ids_b + rd_b };
     }
@@ -119,6 +141,7 @@ pub const Runner = struct {
         const c = w.config;
         if (set.k > 0 and w.mtp == null) return error.NoMtpLayer;
         if (set.window == 0 or set.window > fw.max_rows) return error.WindowTooWide;
+        if (set.served and (set.prompt_rows == 0 or set.prompt_rows > fw.max_prompt_rows or set.prompt_rows_short == 0)) return error.WindowTooWide;
         const topk = c.index_topk;
         const cols = bucketOf(capacity, topk) orelse 1;
         var r: Runner = undefined;
@@ -133,14 +156,29 @@ pub const Runner = struct {
         r.reuse = if (set.k > 0 and w.mtp.?.layer.indexer != null) set.reuse else 0;
         r.graphs = .empty;
         r.capture_s = 0;
+        r.pb1 = null;
+        r.sp = null;
+        r.ids_dev = null;
+        r.health = null;
+        const shared = f.shared_experts;
         r.st = try fw.State.init(gpa, d, w, capacity);
         errdefer r.st.deinit();
-        r.pb = try fw.Buffers.initWith(gpa, d, w, set.window, @max(capacity, 1), .{ .mtp = set.k > 0 });
+        if (set.served) {
+            // Runner.__init__: pb (prompt_rows, exact key range), pb1 (the second micro-batch) when chunks overlap
+            r.pb = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows, @max(capacity, 1), .{ .mtp = set.k > 0, .prompt = true, .shared_experts = shared });
+        } else {
+            r.pb = try fw.Buffers.initWith(gpa, d, w, set.window, @max(capacity, 1), .{ .mtp = set.k > 0 });
+        }
         errdefer r.pb.deinit();
-        r.vb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true });
+        if (set.served and set.prompt_sp and set.sp != null and w.world > 1) {
+            r.pb1 = try fw.Buffers.initWith(gpa, d, w, set.prompt_rows - set.prompt_rows / 2, @max(capacity, 1), .{ .prompt = true, .shared_experts = shared });
+            r.sp = set.sp;
+        }
+        errdefer if (r.pb1) |*b| b.deinit();
+        r.vb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true, .shared_experts = shared });
         errdefer r.vb.deinit();
         r.mb = null;
-        if (set.k > 0) r.mb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true, .mtp = true });
+        if (set.k > 0) r.mb = try fw.Buffers.initWith(gpa, d, w, set.k + 1, cols, .{ .decode = true, .mtp = true, .shared_experts = shared });
         errdefer if (r.mb) |*m| m.deinit();
         r.carry = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
         errdefer r.carry.free();
@@ -148,6 +186,12 @@ pub const Runner = struct {
         const lay = r.pinLayout();
         r.pin = try cuda.HostBuffer.alloc(d, lay.total);
         errdefer r.pin.free();
+        if (set.served) {
+            r.ids_dev = try cuda.DeviceBuffer.alloc(d, capacity * 8);
+            r.health = try cuda.DeviceBuffer.alloc(d, (1 + w.world) * 4);
+        }
+        errdefer if (r.ids_dev) |*b| b.free();
+        errdefer if (r.health) |*b| b.free();
         r.cands = try gpa.alloc(smp.Cand, w.world * smp.max_candidates);
         return r;
     }
@@ -157,6 +201,9 @@ pub const Runner = struct {
         while (it.next()) |e| e.deinit();
         r.graphs.deinit(r.gpa);
         r.gpa.free(r.cands);
+        if (r.ids_dev) |*b| b.free();
+        if (r.health) |*b| b.free();
+        if (r.pb1) |*b| b.deinit();
         r.pin.free();
         r.carry.free();
         if (r.mb) |*m| m.deinit();
@@ -299,6 +346,17 @@ pub const Runner = struct {
     /// Runner.prewarm's captures: every decode graph (each bucket, windows of 1..k+1 rows, both picks, the MTP
     /// steps) up front, so no request pays a capture; the caches are zeroed after (they took scratch values).
     pub fn prewarm(r: *Runner) !usize {
+        if (r.set.served) {
+            // Runner.prewarm's first step: a prompt of a full chunk, a remainder and rows past index_topk
+            // (1000 + 7919 i mod 150000), so the prompt path's first use (cuBLAS's heuristics, NCCL's buffers for
+            // the prompt sizes, the unpack cache) is not inside a measured request, as in the Python engine
+            const n = @min(r.capacity - 1, r.set.prompt_rows + r.topk + 301);
+            const ids = try r.gpa.alloc(u32, n);
+            defer r.gpa.free(ids);
+            for (ids, 0..) |*v, i| v.* = @intCast(1000 + (i * 7919) % 150000);
+            _ = try r.prefill(ids, null);
+            try r.healthy();
+        }
         var bs: [24]?usize = undefined;
         for (r.buckets(&bs)) |T| {
             for (1..r.set.k + 2) |R| {
@@ -323,36 +381,67 @@ pub const Runner = struct {
 
     /// Runner.prefill + _mtp_prompt: the prompt's chunks through the target (and, when the runner drafts, the MTP
     /// layer's rows a - 1 .. e - 2); returns the first pick (position L0).
-    fn prefill(r: *Runner, prompt: []const u32, s: ?smp.Sampling) !u32 {
-        const L0 = prompt.len;
-        const chunks = try evenChunks(r.gpa, 0, L0, r.set.window, r.set.window);
+    /// Phase 2b: equal chunks of `window` rows. Served (Phase 3a): prefixes.even_chunks with PROMPT_ROWS /
+    /// PROMPT_ROWS_SHORT; a chunk of at least 2 MAX_ROWS + 2 rows that sp_fits takes compute_prompt_sp (two micro-
+    /// batches, the second's last row holds the head), any other chunk fused.compute; the prompt's ids go to the
+    /// device once, and each chunk takes its rows there (no host step between chunks).
+    fn prefill(r: *Runner, prompt_ids: []const u32, s: ?smp.Sampling) !u32 {
+        const L0 = prompt_ids.len;
+        const D = r.w.config.hidden;
+        const rows = if (r.set.served) r.set.prompt_rows else r.set.window;
+        const short = if (r.set.served) r.set.prompt_rows_short else r.set.window;
+        const chunks = try evenChunks(r.gpa, 0, L0, rows, short);
         defer r.gpa.free(chunks);
         const head: fw.HeadMode = if (s == null) .argmax else .local;
+        var hb: *const fw.Buffers = &r.pb; // the buffers whose head picked the first token
+        if (r.set.served) {
+            const ids = r.ids_dev orelse return error.Invalid;
+            try r.uploadIds(ids.ptr, prompt_ids);
+        }
         for (chunks) |ch| {
             const a = ch[0];
             const e = ch[1];
             const R = e - a;
             const T: ?usize = if (e > r.topk) e else null;
-            try r.uploadIds(r.pb.ids, prompt[a..e]);
+            const last = e == L0;
+            if (r.set.served) {
+                try r.ops().copy(r.pb.ids, r.ids_dev.?.ptr + a * 8, R * 8);
+            } else {
+                try r.uploadIds(r.pb.ids, prompt_ids[a..e]);
+            }
             try r.setI32(r.st.pos, a);
-            try r.f.compute(&r.pb, &r.st, R, T, if (e == L0) head else .none, true);
-            if (r.set.k > 0) try r.mtpPrompt(prompt, a, e, T);
-            try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
+            const sp_ok = if (r.sp != null and r.pb1 != null) R >= prompt.min_overlap_rows and prompt.spFits(r.w.world, r.pb.rows, r.pb1.?.rows, R) else false;
+            if (sp_ok) {
+                const b1 = &r.pb1.?;
+                try r.sp.?.chunk(&r.st, &r.pb, b1, a, R, T);
+                if (last) {
+                    const hR = R / 2;
+                    try r.f.headDevice(b1, b1.x + (R - hR - 1) * D * 2, r.w.final_norm, 1, head);
+                    hb = b1;
+                }
+            } else {
+                try r.f.compute(&r.pb, &r.st, R, T, if (last) head else .none, true);
+                if (last) hb = &r.pb;
+            }
+            if (r.set.k > 0) try r.mtpPrompt(prompt_ids, a, e, T);
+            if (!r.set.served) try r.f.s.synchronize(); // the pinned ids are reused by the next chunk
         }
         if (s) |smpl| {
             var pick: [1]u32 = undefined;
-            try r.sampleRows(&r.pb, 1, L0, smpl, &pick);
+            try r.sampleRows(hb, 1, L0, smpl, &pick);
             return pick[0];
         }
         const lay = r.pinLayout();
         const got = r.pinSlice(i64, lay.rd, 1);
-        try r.ops().download(std.mem.sliceAsBytes(got), r.pb.argmax);
+        try r.ops().download(std.mem.sliceAsBytes(got), hb.argmax);
         try r.f.s.synchronize();
         return @intCast(got[0]);
     }
 
     /// Runner._mtp_prompt: MTP rows for positions a - 1 .. e - 2 (hidden q, token q + 1); row e - 1 waits (carry).
-    fn mtpPrompt(r: *Runner, prompt: []const u32, a: usize, e: usize, T: ?usize) !void {
+    /// Served chunks run the MTP layer over all their rows at once (Forward.wide past MAX_ROWS rows, NCCL's ring
+    /// all-reduce past b.small).
+    fn mtpPrompt(r: *Runner, prompt_ids: []const u32, a: usize, e: usize, T: ?usize) !void {
         const D = r.w.config.hidden;
         const o = r.ops();
         const b = &r.pb;
@@ -371,12 +460,27 @@ pub const Runner = struct {
                 try o.copy(b.hin, r.carry.ptr, D * 2);
                 if (rows > 1) try o.copy(b.hin + D * 2, b.ht, (rows - 1) * D * 2);
             }
-            try r.f.s.synchronize(); // the pinned ids staging held this chunk's ids until its copy ran
-            try r.uploadIds(b.ids, if (first) prompt[a + 1 .. e] else prompt[a..e]);
+            if (r.set.served) {
+                const from: usize = if (first) a + 1 else a;
+                try o.copy(b.ids, r.ids_dev.?.ptr + from * 8, rows * 8);
+            } else {
+                try r.f.s.synchronize(); // the pinned ids staging held this chunk's ids until its copy ran
+                try r.uploadIds(b.ids, if (first) prompt_ids[a + 1 .. e] else prompt_ids[a..e]);
+            }
             try r.setI32(r.st.mpos, if (first) 0 else a - 1);
             try r.f.mtpCompute(b, &r.st, rows, T, .{ .head = false, .zero_first = first, .chain_normed = r.set.chain_normed });
         }
         try o.copy(r.carry.ptr, b.ht + (R - 1) * D * 2, D * 2);
+    }
+
+    /// runner.healthy: every rank agrees no RoCE runtime timed out (after a window's picks are read, before a token
+    /// leaves); nothing without RoCE. Synchronizes.
+    fn healthy(r: *Runner) !void {
+        const fast = r.f.fast orelse return;
+        if (!r.set.roce_health) return;
+        const hw = r.health orelse return;
+        const comm = r.f.comm orelse return;
+        try fast.healthyEverywhere(comm, r.f.s, hw.ptr, hw.ptr + 4);
     }
 
     // ---------------------------------------------------------------------------------------------- sampling ---
@@ -403,19 +507,16 @@ pub const Runner = struct {
         }
         send[words - 1] = 0; // the stop vote's spare word (no stops here)
         try o.upload(b.cand_send, std.mem.sliceAsBytes(send));
-        if (r.f.comm) |cm| {
-            try cm.allGather(b.cand_send, b.cand_all, words, .f32, r.f.s.handle);
-        } else {
-            try o.copy(b.cand_all, b.cand_send, words * 4);
-        }
-        const all = r.pinSlice(f32, lay.all, (if (r.f.comm != null) world else 1) * words);
+        // fused.small_gather: over the RoCE gather when it is up (rows padded to 16-byte packs), else NCCL
+        const stride = try r.f.smallGather(b.cand_send, b.cand_all, words);
+        const ranks = if (r.f.comm != null) world else 1;
+        const all = r.pinSlice(f32, lay.all, ranks * stride);
         try o.download(std.mem.sliceAsBytes(all), b.cand_all);
         try r.f.s.synchronize();
-        const ranks = if (r.f.comm != null) world else 1;
         for (0..R) |i| {
             var n: usize = 0;
             for (0..ranks) |k| {
-                const row = all[k * words + i * 2 * cnt ..][0 .. 2 * cnt];
+                const row = all[k * stride + i * 2 * cnt ..][0 .. 2 * cnt];
                 const ids: []const i32 = @ptrCast(row[cnt..]);
                 for (0..cnt) |q| {
                     r.cands[n] = .{ .v = row[q], .id = ids[q] };
@@ -430,20 +531,21 @@ pub const Runner = struct {
 
     /// Runner.generate (MTP mode normed/normed, no copies, no depth policy): `max_tokens` picks after the prompt
     /// (EOS is not a stop), `k` drafts a round (0: serial; at most Settings.k). Tokens go to `out`.
-    pub fn generate(r: *Runner, prompt: []const u32, max_tokens: usize, s: ?smp.Sampling, k_req: usize, out: *std.ArrayList(u32)) !Stats {
+    pub fn generate(r: *Runner, prompt_ids: []const u32, max_tokens: usize, s: ?smp.Sampling, k_req: usize, out: *std.ArrayList(u32)) !Stats {
         const k = @min(k_req, r.set.k);
         const D = r.w.config.hidden;
         const o = r.ops();
-        var st: Stats = .{ .prompt_len = prompt.len };
-        if (prompt.len == 0 or prompt.len + max_tokens + k + 1 > r.capacity) return error.ContextTooSmall;
+        var st: Stats = .{ .prompt_len = prompt_ids.len };
+        if (prompt_ids.len == 0 or prompt_ids.len + max_tokens + k + 1 > r.capacity) return error.ContextTooSmall;
         const cap0 = r.capture_s;
         try r.resetState();
         const t0 = r.now();
-        var tok = try r.prefill(prompt, s);
+        var tok = try r.prefill(prompt_ids, s);
+        try r.healthy(); // short prompts' chunks reduce over RoCE too
         st.prefill_s = r.since(t0);
         out.clearRetainingCapacity();
         try out.append(r.gpa, tok);
-        var P = prompt.len;
+        var P = prompt_ids.len;
         var m: usize = 1; // MTP rows pending: (carry = hidden P - 1, tok) at P - 1
         if (k > 0) {
             const mb = &r.mb.?;
@@ -479,6 +581,7 @@ pub const Runner = struct {
                 for (0..R) |i| picks[i] = @intCast(rd[fw.decode_rows + i]);
             }
             for (0..R - 1) |i| drafts[i] = @intCast(rd[i]);
+            try r.healthy(); // every rank: no RoCE timeout behind these picks
             var n: usize = 0;
             while (n < R - 1 and drafts[n] == picks[n]) n += 1;
             const emit = picks[0 .. n + 1];

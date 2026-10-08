@@ -7,6 +7,10 @@
 //! Phase 2b: the MTP layer, the 4-bit draft head, MTP-drafted rounds replayed as CUDA graphs and the Python engine's
 //! keyed sampling (cuda_runner.zig, sampling.zig), the O_DIRECT / io_uring load (cuda_source.zig);
 //! zig/tests/cuda/glm53_generate.zig --runner against tools/glm53/reference2b.py.
+//! Phase 3a: the RoCE one-shot all-reduce / gather for decode windows (cuda_roce.zig over roce_proxy.c and
+//! glm53_roce.cu), the served prompt path (cuda_prompt.zig: sequence-parallel chunks of thousands of rows, the prompt
+//! GEMM, torch.bmm through cuBLAS, prompt experts) and the served tile table (tiles.zig); zig/tests/cuda/
+//! glm53_generate.zig --mode 3a against tools/glm53/reference3a.py (the Python engine in its served configuration).
 //! Not yet a native family (native/cuda.zig's registry): no engine or server here.
 
 pub const Config = @import("config.zig").Config;
@@ -23,6 +27,9 @@ pub const sampling = @import("sampling.zig");
 pub const source = @import("cuda_source.zig");
 pub const runner = @import("cuda_runner.zig");
 pub const Runner = runner.Runner;
+pub const roce = @import("cuda_roce.zig");
+pub const prompt = @import("cuda_prompt.zig");
+pub const tiles = @import("tiles.zig");
 
 test {
     _ = @import("config.zig");
@@ -35,4 +42,7 @@ test {
     _ = sampling;
     _ = source;
     _ = runner;
+    _ = roce;
+    _ = prompt;
+    _ = tiles;
 }
