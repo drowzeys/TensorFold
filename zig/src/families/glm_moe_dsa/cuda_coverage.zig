@@ -271,6 +271,12 @@ test "every Triton function cuda_triton.zig launches is reached, a 41-row window
     };
     const sp: Space = .{ .cfg = c, .world = 4, .heads = c.heads / 4, .vocab_part = c.vocab / 4, .kva_n = 640, .max_rows = 160, .capacity = 4096, .dcps = &.{ 1, 4 }, .widths = &.{ 3072, 512 }, .gemms = &gemms, .drafters = &drafters };
     try enumerate(&p, sp);
+    // the concurrent drafters' launches (_dconv_seg / _dattn_seg) exist only with streams > 1
+    var sp4 = sp;
+    sp4.dcps = &.{1};
+    sp4.rows_windows = 32;
+    sp4.streams = 4;
+    try enumerate(&p, sp4);
     // the function names in cuda_triton.zig's launches: t.run("_name", ...)
     const src = @embedFile("cuda_triton.zig");
     var seen: usize = 0;
