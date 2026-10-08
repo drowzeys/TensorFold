@@ -222,7 +222,11 @@ test "pairwise sum: numpy's association" {
     var b: [300]f64 = undefined;
     for (&b, 0..) |*v, i| v.* = @as(f64, @floatFromInt(i % 17)) * 0.1;
     try std.testing.expectEqual(pairwiseSum(b[0..144]) + pairwiseSum(b[144..]), pairwiseSum(&b));
-    try std.testing.expectEqual(((0.0 + 0.1) + 0.2) + 0.3, pairwiseSum(&.{ 0.1, 0.2, 0.3 }));
+    // runtime f64 adds (literal arithmetic would be comptime_float, exact: 0.6); numpy: 0.6000000000000001
+    var x = [_]f64{ 0.1, 0.2, 0.3 };
+    _ = &x;
+    try std.testing.expectEqual((x[0] + x[1]) + x[2], pairwiseSum(&x));
+    try std.testing.expectEqual(@as(f64, 0.6000000000000001), pairwiseSum(&x));
 }
 
 test "seed_for is sha256 of the decimal ids" {
