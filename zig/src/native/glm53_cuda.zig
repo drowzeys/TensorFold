@@ -306,7 +306,7 @@ pub const Host = struct {
         if (!@import("builtin").is_test) {
             const ttft: f64 = if (live.first) |f| @as(f64, @floatFromInt(f - started)) / 1e9 else 0;
             const n_out = h.out.items.len;
-            std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} sampled={s}", .{ job.id, r.prompt.len, st.begin, n_out, reason, st.tokS(n_out), ttft, st.prefill_s, st.decode_s, st.rounds, st.accepted, st.drafted, if (outcome.sampling != null) "true" else "false" });
+            std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} sampled={s} seq={d}", .{ job.id, r.prompt.len, st.begin, n_out, reason, st.tokS(n_out), ttft, st.prefill_s, st.decode_s, st.rounds, st.accepted, st.drafted, if (outcome.sampling != null) "true" else "false", h.seq });
         }
         // --learn: the request's shared states reach the disk before its reply ends (a client that stops the server
         // right after the reply still finds them learned)
@@ -629,7 +629,7 @@ pub const Host = struct {
         const rounds_f: f64 = @floatFromInt(@max(st.rounds, 1));
         const round_ms = @as(f64, @floatFromInt(st.round_ns)) / 1e6 / rounds_f;
         const gap_ms = @as(f64, @floatFromInt(st.gap_ns)) / 1e6 / rounds_f;
-        std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} round_ms={d:.1} gap_ms={d:.2} graphs={d} eager={d} sampled={s}", .{ lv.job.id, st.prompt.len, st.begin, st.out.items.len, reason, st.tokS(), ttft, st.prefill_s, st.decodeS(), st.rounds, st.accepted_n, st.drafted, round_ms, gap_ms, st.graph_runs, st.eager_runs, if (st.sampling != null) "true" else "false" });
+        std.log.info("glm53: done req-{d} prompt={d} cached={d} tokens={d} finish={t} tok/s={d:.1} ttft={d:.2}s prefill={d:.2}s decode={d:.2}s rounds={d} accepted={d}/{d} round_ms={d:.1} gap_ms={d:.2} graphs={d} eager={d} sampled={s} sid={d}", .{ lv.job.id, st.prompt.len, st.begin, st.out.items.len, reason, st.tokS(), ttft, st.prefill_s, st.decodeS(), st.rounds, st.accepted_n, st.drafted, round_ms, gap_ms, st.graph_runs, st.eager_runs, if (st.sampling != null) "true" else "false", lv.sid });
     }
 
     /// Rank 0 after a failed round (multi.drop) or at shutdown: every live request ends with `reason`; the decoder
@@ -718,7 +718,11 @@ pub const Host = struct {
             .finish => {
                 const ws = try h.recvWords(head.at);
                 defer h.gpa.free(ws);
-                for (ws) |sid| mu.finish(sid);
+                for (ws) |sid| {
+                    // the follower's side of rank 0's done line (its sid=): where the stream stood when rank 0 ended it
+                    if (mu.find(sid)) |st| std.log.info("glm53 rank {d}: stream {d} finished by rank 0 ({s} at position {d}, {d} rounds)", .{ h.rank, sid, if (st.started) "decoding" else "filling", st.P, st.rounds });
+                    mu.finish(sid);
+                }
             },
             else => return error.ProtocolOutOfStep,
         }
@@ -749,6 +753,8 @@ pub const Host = struct {
             return;
         };
         h.gpa.free(done.kept);
+        // the follower's side of rank 0's done line (its seq=): the vote ends a cancelled or stop-string reply on every rank
+        std.log.info("glm53 rank {d}: request {d} ended: {s} tokens={d} rounds={d}", .{ h.rank, head.seq, if (done.stats.stopped) "stopped by rank 0" else if (done.stats.eos) "eos" else "length", out.items.len, done.stats.rounds });
         h.afterRequest();
     }
 
