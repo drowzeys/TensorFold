@@ -197,7 +197,9 @@ class Glm53Engine:
                 srows = scfg.block + 1
             self.runner = Runner(fw, self.limit + self.k + 1, self.k, graphs=GRAPHS, slots=self.parallel,
                                  draft_rows=srows, extra_bytes=sextra)
-            self.runner.tick = watch                     # a prompt chunk restarts the stall clock (multi.WATCHDOG_S)
+            # a prompt chunk of a request restarts the stall clock (multi.WATCHDOG_S); never outside one (prewarm's
+            # chunks would arm it with nothing to disarm it: an idle server exited WATCHDOG_S after start)
+            self.runner.tick = lambda: watch() if getattr(self, "busy_since", None) is not None else None
             if rank == 0 and self.runner.copy_on:
                 rn = self.runner
                 print(f"[tensorfold] copy drafts: a reply whose last {rn.copy_match} tokens occurred before verifies "
