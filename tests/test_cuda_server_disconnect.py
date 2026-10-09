@@ -434,3 +434,46 @@ def test_the_socket_check_reads_descriptors_past_1023():
             high.close()
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+# -- a client that stops reading without closing ------------------------------------------------
+
+class FastEngine(PacedEngine):
+    """PacedEngine without the pause: a stream fills any socket buffer quickly."""
+
+    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
+        call = {"prompt": list(prompt), "returned": [], "raised": None, "done": False}
+        self.calls.append(call)
+        try:
+            for _ in range(max_tokens):
+                stop = on_tokens([X])
+                call["returned"].append(bool(stop))
+                if stop:
+                    break
+        finally:
+            call["done"] = True
+        return {"rounds": len(call["returned"])}
+
+
+def test_a_stream_whose_client_stops_reading_ends_after_the_write_timeout(tmp_path, monkeypatch):
+    """One stream decodes on the writing thread: a client that keeps the socket open but never reads must not hold the
+    engine (and, on several ranks, every rank) - the blocked write times out and the reply ends as a disconnect."""
+
+    from tensorfold.cuda import http as cuda_http
+
+    monkeypatch.setattr(cuda_http, "STREAM_WRITE_TIMEOUT_S", 0.5)
+    engine = FastEngine()
+    app = app_for(tmp_path, engine)
+    with serving(app) as port:
+        data = json.dumps({"messages": MESSAGES, "max_tokens": 2_000_000, "stream": True}).encode()
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        conn.connect(("127.0.0.1", port))
+        conn.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+                     + f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+        try:                                              # never read: the server's writes block
+            until(lambda: engine.calls and engine.calls[0]["done"], "the stalled stream to end")
+        finally:
+            conn.close()
+    call = engine.calls[0]
+    assert stopped_at(call) is not None and len(call["returned"]) < 2_000_000
