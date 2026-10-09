@@ -65,7 +65,19 @@ const Head = extern struct {
     key: u64 = 0,
     at: u32 = 0,
     pad: u32 = 0,
+    /// the seal: a hash of this header (with sum 0) and its payload, checked by every follower (sealed by send)
+    sum: u64 = 0,
 };
+
+/// A message's seal: the header with `sum` zeroed, then its payload words.
+fn sealOf(head: *const Head, payload: []const u32) u64 {
+    var bare = head.*;
+    bare.sum = 0;
+    var x = std.hash.Wyhash.init(magic);
+    x.update(std.mem.asBytes(&bare));
+    x.update(std.mem.sliceAsBytes(payload));
+    return x.final();
+}
 
 // ---------------------------------------------------------------------------------------------------- host ---
 
@@ -117,6 +129,14 @@ pub const Host = struct {
     // routing to the same experts (Python's slower admission gets the same grouping by its message latency)
     admit_quiet_ns: i96 = 0,
     admit_cap_ns: i96 = 0,
+    // the stall watchdog (TF_GLM53_STALL_S, default 5400; 0: off), on every rank: while this rank has a request in
+    // hand (busy) and nothing moved it on (beat: a round's tokens, a --parallel step or message) for that long - a rank
+    // or a collective is stuck - the process exits, so a wedged world fails loudly instead of waiting for good
+    stall_ns: i64 = 0,
+    beat_ns: std.atomic.Value(i64) = .init(0),
+    busy: std.atomic.Value(bool) = .init(false),
+    stop_watch: std.atomic.Value(bool) = .init(false),
+    watcher: ?std.Thread = null,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -179,6 +199,36 @@ pub const Host = struct {
         h.lock();
         defer h.unlock();
         return h.closing or std.mem.indexOfScalar(api.Id, h.cancels.items, id) != null;
+    }
+
+    // ------------------------------------------------------------------------------------- the stall watchdog ---
+
+    fn beat(h: *Host) void {
+        h.beat_ns.store(@intCast(h.now()), .release);
+    }
+
+    fn setBusy(h: *Host, on: bool) void {
+        if (on) h.beat();
+        h.busy.store(on, .release);
+    }
+
+    /// Every rank's watchdog thread: a request in hand with no progress for stall_ns ends the process.
+    fn watch(h: *Host) void {
+        while (!h.stop_watch.load(.acquire)) {
+            std.Io.sleep(h.io, .fromMilliseconds(1000), .awake) catch {};
+            if (!h.busy.load(.acquire)) continue;
+            const idle: i64 = @as(i64, @intCast(h.now())) - h.beat_ns.load(.acquire);
+            if (idle <= h.stall_ns) continue;
+            std.log.err("glm53 rank {d}: no progress on the request in hand for {d} s (TF_GLM53_STALL_S): a rank or a collective is stuck; exiting so the ranks can be restarted instead of hanging", .{ h.rank, @divTrunc(idle, std.time.ns_per_s) });
+            std.process.exit(3);
+        }
+    }
+
+    /// A follower's tokens hook: progress for the watchdog (a follower's stop wish is never read).
+    fn followerBeat(ctx: *anyopaque, _: []const u32) bool {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        h.beat();
+        return false;
     }
 
     // --------------------------------------------------------------------------------------- rank 0's thread ---
@@ -246,6 +296,7 @@ pub const Host = struct {
 
         fn tokens(ctx: *anyopaque, toks: []const u32) bool {
             const lv: *Live = @ptrCast(@alignCast(ctx));
+            lv.h.beat();
             const first = lv.first == null;
             if (first) {
                 lv.first = lv.h.now();
@@ -289,6 +340,8 @@ pub const Host = struct {
         const started = h.now();
         var live: Live = .{ .h = h, .job = job, .started = started };
         defer live.emitted.deinit(h.gpa);
+        h.setBusy(true);
+        defer h.setBusy(false);
         const outcome = h.runRequest(job, &live) catch |e| {
             std.log.err("glm53: request {d} failed: {t}", .{ job.id, e });
             if (live.first == null) emit(job, .{ .prefilled = 0 });
@@ -359,6 +412,7 @@ pub const Host = struct {
     /// Rank 0's command and payload to ranks 1..
     fn send(h: *Host, head: *Head, payload: []const u32) !void {
         if (h.boot.o.world == 1) return;
+        head.sum = sealOf(head, payload);
         try h.boot.rdv.broadcast(std.mem.asBytes(head));
         if (payload.len > 0) try h.boot.rdv.broadcast(@constCast(std.mem.sliceAsBytes(payload)));
     }
@@ -464,6 +518,7 @@ pub const Host = struct {
     }
 
     fn setStreaming(h: *Host, n: usize) void {
+        h.setBusy(n > 0); // each call follows an admission or a step: progress
         h.lock();
         h.streaming = @intCast(n);
         h.unlock();
@@ -543,6 +598,7 @@ pub const Host = struct {
     /// acknowledgement).
     fn sendOne(h: *Host, head: *Head, payload: []const u32) !void {
         if (h.boot.o.world == 1) return;
+        head.sum = sealOf(head, payload);
         const bytes = try h.gpa.alloc(u8, @sizeOf(Head) + payload.len * 4);
         defer h.gpa.free(bytes);
         @memcpy(bytes[0..@sizeOf(Head)], std.mem.asBytes(head));
@@ -660,19 +716,24 @@ pub const Host = struct {
             if (head.magic != magic) return error.ProtocolOutOfStep;
             const kind = std.enums.fromInt(Kind, head.kind) orelse return error.ProtocolOutOfStep;
             switch (kind) {
-                .bye => return,
+                .bye => return h.verify(&head, &.{}),
                 .request => try h.followRequest(&head, &out),
                 .load => {
                     const ids = try h.recvWords(head.at);
                     defer h.gpa.free(ids);
+                    try h.verify(&head, ids);
                     _ = try h.learnLoad(head.key, ids);
                 },
                 .persist => {
                     const ids = try h.recvWords(head.at);
                     defer h.gpa.free(ids);
+                    try h.verify(&head, ids);
                     _ = try h.learnPersist(head.key, ids);
                 },
-                .forget => h.learnForget(head.key),
+                .forget => {
+                    try h.verify(&head, &.{});
+                    h.learnForget(head.key);
+                },
                 .admit, .fill, .round, .finish => try h.followMulti(&head),
             }
         }
@@ -681,6 +742,8 @@ pub const Host = struct {
     /// Ranks 1..: one of rank 0's --parallel messages, applied in order (multi._apply).
     fn followMulti(h: *Host, head: *const Head) !void {
         const mu = h.boot.multi orelse return error.ProtocolOutOfStep;
+        h.beat();
+        defer h.setBusy(mu.live() > 0);
         h.mseq += 1;
         if (head.seq != h.mseq) {
             std.log.err("glm53 rank {d}: expected rank 0's message {d}, received number {d}: the ranks are out of step; restart all ranks", .{ h.rank, h.mseq, head.seq });
@@ -691,6 +754,7 @@ pub const Host = struct {
                 const n = @as(usize, head.prompt_len) + head.n_stops + head.n_keeps + head.n_eos;
                 const ws = try h.recvWords(n);
                 defer h.gpa.free(ws);
+                try h.verify(head, ws);
                 const prompt = ws[0..head.prompt_len];
                 const stops = try h.gpa.alloc(usize, head.n_stops);
                 defer h.gpa.free(stops);
@@ -701,11 +765,13 @@ pub const Host = struct {
                 _ = try mu.admit(.{ .sid = @intCast(head.key), .slot = head.at, .mode = if (head.flags & flag_draft != 0) glm.multi.modeOf(h.boot.mode) else .serial, .sampling = s, .count = head.max_tokens, .prompt = prompt, .eos = eos, .begin = head.begin, .src = if (head.pad > 0) head.pad - 1 else null, .stops = stops, .keeps = keeps, .flush = head.flags & flag_flush != 0 });
             },
             .fill => {
+                try h.verify(head, &.{});
                 _ = try mu.applyFill(@intCast(head.key));
             },
             .round => {
                 const ws = try h.recvWords(head.at);
                 defer h.gpa.free(ws);
+                try h.verify(head, ws);
                 const plan = try glm.multi.Plan.decode(ws);
                 var res: [glm.multi.max_streams]glm.multi.Result = undefined;
                 var ds: [glm.multi.max_streams]usize = undefined;
@@ -718,6 +784,7 @@ pub const Host = struct {
             .finish => {
                 const ws = try h.recvWords(head.at);
                 defer h.gpa.free(ws);
+                try h.verify(head, ws);
                 for (ws) |sid| {
                     // the follower's side of rank 0's done line (its sid=): where the stream stood when rank 0 ended it
                     if (mu.find(sid)) |st| std.log.info("glm53 rank {d}: stream {d} finished by rank 0 ({s} at position {d}, {d} rounds)", .{ h.rank, sid, if (st.started) "decoding" else "filling", st.P, st.rounds });
@@ -726,6 +793,14 @@ pub const Host = struct {
             },
             else => return error.ProtocolOutOfStep,
         }
+    }
+
+    /// Ranks 1..: rank 0's message checks against its seal, else the ranks are out of step (a misread length, a
+    /// message lost or doubled) and this rank stops loudly rather than run the wrong collectives.
+    fn verify(h: *Host, head: *const Head, payload: []const u32) !void {
+        if (sealOf(head, payload) == head.sum) return;
+        std.log.err("glm53 rank {d}: rank 0's message (kind {d}, number {d}) does not match its seal: the ranks are out of step; restart all ranks", .{ h.rank, head.kind, head.seq });
+        return error.ProtocolOutOfStep;
     }
 
     fn recvWords(h: *Host, n: usize) ![]u32 {
@@ -739,6 +814,14 @@ pub const Host = struct {
         const n = @as(usize, head.prompt_len) + head.n_stops + head.n_keeps + head.n_eos;
         const words_ = try h.recvWords(n);
         defer h.gpa.free(words_);
+        try h.verify(head, words_);
+        h.seq += 1;
+        if (head.seq != h.seq) {
+            std.log.err("glm53 rank {d}: expected rank 0's request {d}, received number {d}: the ranks are out of step; restart all ranks", .{ h.rank, h.seq, head.seq });
+            return error.ProtocolOutOfStep;
+        }
+        h.setBusy(true);
+        defer h.setBusy(false);
         const prompt = words_[0..head.prompt_len];
         const stops = try h.gpa.alloc(usize, head.n_stops);
         defer h.gpa.free(stops);
@@ -748,7 +831,7 @@ pub const Host = struct {
         const s: ?smp.Sampling = if (head.flags & flag_greedy != 0) null else .{ .seed = head.seed, .temperature = head.temperature, .top_k = head.top_k, .top_p = head.top_p, .min_p = head.min_p };
         // a request that fails here fails on rank 0 too, at the same point (the same checks on the same arguments), and
         // rank 0 serves on: so does this rank - leaving would strand rank 0's next request in its collectives
-        const done = h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush }, out) catch |e| {
+        const done = h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush, .hooks = .{ .ctx = h, .tokens = followerBeat } }, out) catch |e| {
             std.log.err("glm53 rank {d}: request {d} failed: {t} (following on, as rank 0 serves on)", .{ h.rank, head.seq, e });
             return;
         };
@@ -993,6 +1076,8 @@ fn closeFn(ctx: *anyopaque) void {
         var bye: Head = .{ .kind = @intFromEnum(Kind.bye) };
         h.send(&bye, &.{}) catch {};
     }
+    h.stop_watch.store(true, .release);
+    if (h.watcher) |t| t.join();
     h.queue.deinit(h.gpa);
     h.cancels.deinit(h.gpa);
     h.out.deinit(h.gpa);
@@ -1086,11 +1171,28 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.admit_cap_ns = @intFromFloat(@max(0, cap_ms) * 1e6);
     h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, {d} concurrent stream{s}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, opts.parallel, if (opts.parallel > 1) "s" else "", if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
     h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup };
+    const stall_s = if (std.c.getenv("TF_GLM53_STALL_S")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 5400 else 5400;
+    h.stall_ns = @intFromFloat(@max(0, stall_s) * 1e9);
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
     ok = true;
+    if (h.stall_ns > 0) h.watcher = std.Thread.spawn(.{}, Host.watch, .{h}) catch |e| blk: {
+        std.log.warn("glm53 rank {d}: no stall watchdog ({t})", .{ h.rank, e });
+        break :blk null;
+    };
     return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn };
 }
 
 test "the header is a fixed little block" {
-    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Head));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(Head));
+}
+
+test "a sealed message checks, a changed one does not" {
+    var head: Head = .{ .kind = @intFromEnum(Kind.request), .seq = 7, .prompt_len = 3 };
+    const words_ = [_]u32{ 1, 2, 3 };
+    head.sum = sealOf(&head, &words_);
+    try std.testing.expectEqual(head.sum, sealOf(&head, &words_));
+    try std.testing.expect(head.sum != sealOf(&head, &[_]u32{ 1, 2, 4 }));
+    var later = head;
+    later.seq = 8;
+    try std.testing.expect(head.sum != sealOf(&later, &words_));
 }
