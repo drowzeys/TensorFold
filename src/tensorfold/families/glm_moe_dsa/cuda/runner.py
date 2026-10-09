@@ -360,10 +360,13 @@ class Runner:
         elif self.cap is not None:
             raise RuntimeError("a capture needs every prompt row: resuming a kept prompt state is off with it")
         cuts = set(int(p) for p in stops if begin < p < L0)
+        tick = getattr(self, "tick", None)              # the engine's stall watchdog, re-armed a chunk (multi.watch)
         for a, e in self.segments(L0, begin, cuts):
             lg = self.prefill_chunk(self.st, toks, a, e, L0, taps=True)
             if lg is not None:
                 logits = lg
+            if tick is not None:
+                tick()
             if e in cuts and keep is not None:
                 keep(e)
         return logits

@@ -75,11 +75,12 @@ PROBE = int(os.environ.get("TF_GLM53_AUTO_PROBE", "16"))
 # sequence number and a checksum, so a follower that falls out of step stops with a named error instead of applying
 # another round's ints; TF_GLM_MULTI_WATCHDOG_S > 0: a round (rank 0) or the handling of one message (ranks 1..3)
 # that takes longer dumps every thread's stack to stderr and exits the process (code 1), so a supervisor sees a stalled
-# rank instead of four ranks waiting on each other's collectives forever. 0 (default): off. Set it above the longest
-# prompt chunk (a whole 8,192-row chunk alone takes ~8 s) - the single-stream path re-arms it a round, so there it
-# must also exceed the longest prompt's prefill.
+# rank instead of four ranks waiting on each other's collectives forever. Default 900 s (0: off; before 2026-10-08 off
+# by default, so a stalled collective held the server for hours - Spark-Bench v7's 12-hour stall). It must exceed the
+# longest prompt chunk (a whole 8,192-row chunk alone takes ~8 s) and the longest round; both paths re-arm it a round
+# and a prompt chunk, and it is disarmed while a rank waits for work.
 SEAL_MOD = 2_147_483_647                   # a message's checksum, modulo this prime
-WATCHDOG_S = float(os.environ.get("TF_GLM_MULTI_WATCHDOG_S", "0") or 0)
+WATCHDOG_S = float(os.environ.get("TF_GLM_MULTI_WATCHDOG_S", "900") or 0)
 
 
 def digest(values: list[int], seq: int) -> int:

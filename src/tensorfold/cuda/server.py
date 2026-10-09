@@ -499,10 +499,14 @@ class App:
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
 
+        held = [False]                      # whether this request holds the engine's turn now
+
         def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool]) -> Any:
             if yielding and cached:                 # a run after a cut: foreground requests waiting go first
+                held[0] = False
                 turns.give()
-                turns.take(True, cancelled)
+                turns.take(True, cancelled)         # RequestCancelled here leaves no turn held: nothing to give back
+                held[0] = True
             extra = dict(options)
             if prepared.grammar is not None:    # response_format: a fresh grammar state, after </think> when thinking
                 spec, compiled = prepared.grammar
@@ -523,6 +527,7 @@ class App:
         # an engine that decodes concurrent requests together (``concurrent``) takes them as they come
         if turns is not None:
             turns.take(background, cancelled)
+            held[0] = True
         try:
             if cancelled is not None and cancelled():                # the client left while this request waited
                 raise RequestCancelled("the client left before the request started")
@@ -533,7 +538,7 @@ class App:
                 finally:
                     serving[0] = None
         finally:
-            if turns is not None:
+            if turns is not None and held[0]:
                 turns.give()
         if failed:
             raise failed[0]

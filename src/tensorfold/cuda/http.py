@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import traceback
 import uuid
@@ -38,6 +39,7 @@ def _log_error(exc: BaseException) -> None:
     traceback.print_exception(exc)
 
 
+STREAM_WRITE_TIMEOUT_S = float(os.environ.get("TF_STREAM_WRITE_TIMEOUT_S", "120") or 0)
 POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
 
 
@@ -156,6 +158,11 @@ def make_handler(app: App):
                         "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
 
             if stream:
+                # a client that stops reading without closing must not hold the engine: a write that cannot finish in
+                # TF_STREAM_WRITE_TIMEOUT_S ends the reply as a disconnect would (one stream decodes on the writing
+                # thread, so a blocked write held every rank at its next collective)
+                if STREAM_WRITE_TIMEOUT_S > 0:
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")

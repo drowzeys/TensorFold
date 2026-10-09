@@ -15,6 +15,7 @@ class Turns:
         self.busy = False
         self.waiting = 0                             # foreground requests waiting for the engine
         self.parked = 0                              # every request in take(), background included
+        self.owner: int | None = None                # the thread holding the engine (give() from any other: no-op)
 
     def take(self, background: bool, cancelled: Callable[[], bool] | None = None) -> None:
         """Wait for the engine (a background request also for no waiting foreground one); RequestCancelled if gone."""
@@ -31,10 +32,19 @@ class Turns:
                 self.parked -= 1
                 self.waiting -= not background
             self.busy = True
+            self.owner = threading.get_ident()
 
     def give(self) -> None:
+        """Hand the engine back - only from the thread that holds it. A request that gave its turn and was cancelled
+        while waiting to take it again (a background reply's replay) must not free the turn another request holds:
+        that double give let a second request into a TP engine beside the first, whose ranks then ran mismatched
+        collectives forever (field report on 2026-10-05: all four ranks hung, HTTP accept loop starved)."""
+
         with self.cv:
+            if not self.busy or self.owner != threading.get_ident():
+                return
             self.busy = False
+            self.owner = None
             self.cv.notify_all()
 
     def wanted(self) -> bool:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -24,7 +25,7 @@ import os
 from ..config import Config
 from . import fused, headq
 from .model import RankModel
-from .multi import unwatch, watch
+from .multi import digest, unwatch, watch
 from .runner import Runner
 from .weights import RankReader, load_layer, load_mtp
 
@@ -69,6 +70,7 @@ class Glm53Engine:
         of ``context`` tokens; 1: one request at a time, as before."""
 
         self.model_dir, self.rank = Path(model_dir), rank
+        self.tp = WORLD           # the server reads it: a multi-rank engine never yields a background reply mid-run
         self.cfg = cfg = Config.from_dict(json.loads((self.model_dir / "config.json").read_text()))
         if comm is None:
             from tensorfold.cuda.comm import NCCL
@@ -195,6 +197,7 @@ class Glm53Engine:
                 srows = scfg.block + 1
             self.runner = Runner(fw, self.limit + self.k + 1, self.k, graphs=GRAPHS, slots=self.parallel,
                                  draft_rows=srows, extra_bytes=sextra)
+            self.runner.tick = watch                     # a prompt chunk restarts the stall clock (multi.WATCHDOG_S)
             if rank == 0 and self.runner.copy_on:
                 rn = self.runner
                 print(f"[tensorfold] copy drafts: a reply whose last {rn.copy_match} tokens occurred before verifies "
@@ -242,6 +245,8 @@ class Glm53Engine:
               f"device free {free / 2**30:.1f} of {total / 2**30:.1f} GiB", flush=True)
         self.eos = tuple(cfg.eos_token_ids)
         self.busy_since: float | None = None            # one stream: the running request's last progress (/health)
+        self.shared = 0                                  # one stream: messages shared so far (each one sealed)
+        self.one = threading.Lock()                      # one stream: one request inside generate at a time
         self.capacity = self.limit
         self.concurrent = self.parallel > 1
         self.multi = self.scheduler = None
@@ -320,6 +325,19 @@ class Glm53Engine:
 
     # ---------------------------------------------------------------------------------------------- sharing ---
     def _share(self, values: list[int] | None) -> list[int]:
+        """Rank 0's int list on every rank, sealed: its sequence number and checksum (multi.digest) ride in front, so a
+        follower out of step with rank 0 stops with a named error instead of running another request's message."""
+        self.shared += 1
+        if self.rank == 0:
+            sealed = self._share_raw([self.shared, digest(values, self.shared) if values else 0, *values])
+            return sealed[2:]
+        got = self._share_raw(None)
+        if len(got) < 2 or got[0] != self.shared or got[1] != (digest(got[2:], self.shared) if got[2:] else 0):
+            raise RuntimeError(f"rank {self.rank}: out of step with rank 0 - message {got[:2]} where "
+                               f"{self.shared} was due (one-stream messages; ranks must restart together)")
+        return got[2:]
+
+    def _share_raw(self, values: list[int] | None) -> list[int]:
         """Rank 0's int list on every rank: its length, then the values, through the all-gather."""
         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
         got = torch.empty((WORLD,), dtype=torch.int32, device="cuda")
@@ -483,6 +501,13 @@ class Glm53Engine:
             dec = stats.get("decode_s") or 0.0
             stats["tok_s"] = round((len(got) - 1) / dec, 2) if dec > 0 and len(got) > 1 else 0.0
             return stats
+        # one stream: one request at a time inside, whatever the server's turns do - two at once would interleave
+        # their messages and collectives on rank 0 and hang all four ranks (field report on image 2026-10-05)
+        with self.one:
+            return self._generate_one(prompt, max_tokens, sampling, on_tokens, draft, stop_eos, mtp_mode)
+
+    def _generate_one(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool, stop_eos: bool,
+                      mtp_mode: str | None) -> dict[str, Any]:
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
