@@ -322,7 +322,7 @@ pub const Host = struct {
         const r = job.request;
         const sess = &h.session;
         const max_tokens = try sess.clampTokens(r.prompt.len, r.max_tokens);
-        const s: ?smp.Sampling = if (r.sampling) |x| (if (x.temperature > 0) smp.Sampling{ .seed = x.seed & 0x7FFFFFFFFFFFFFFF, .temperature = x.temperature, .top_k = x.top_k, .top_p = x.top_p, .min_p = x.min_p } else null) else null;
+        const s = try samplingOf(r);
         const draft = r.drafts;
         var flags: u32 = if (draft) flag_draft else 0;
         if (s == null) flags |= flag_greedy;
@@ -414,6 +414,12 @@ pub const Host = struct {
             for (admit_buf[0..n_admit]) |j| h.admitJob(j);
             h.setStreaming(mu.live());
             if (mu.live() == 0) continue;
+            h.endCancelledFills() catch |e| {
+                std.log.err("glm53: ending cancelled streams failed: {t}", .{e});
+                h.endAll(.failed, words(e));
+                continue;
+            };
+            if (mu.live() == 0) continue;
             const link: glm.multi.Link = .{ .ctx = h, .fill = linkFill, .round = linkRound };
             mu.step(link) catch |e| {
                 std.log.err("glm53: a concurrent round failed: {t} (every live request fails; restart all ranks if the ranks are out of step)", .{e});
@@ -478,7 +484,7 @@ pub const Host = struct {
         const r = job.request;
         const sess = &h.session;
         const max_tokens = try sess.clampTokens(r.prompt.len, r.max_tokens);
-        const s: ?smp.Sampling = if (r.sampling) |x| (if (x.temperature > 0) smp.Sampling{ .seed = x.seed & 0x7FFFFFFFFFFFFFFF, .temperature = x.temperature, .top_k = x.top_k, .top_p = x.top_p, .min_p = x.min_p } else null) else null;
+        const s = try samplingOf(r);
         const draft = r.drafts;
         var flags: u32 = if (draft) flag_draft else 0;
         if (s == null) flags |= flag_greedy;
@@ -566,6 +572,25 @@ pub const Host = struct {
             }
             mu.finish(sid);
         }
+    }
+
+    /// Rank 0: the streams whose client left while their prompt still fills end now, before the next fill step - a
+    /// decoding stream hears its cancel in its hook after each round, a filling one only at its first token, so a long
+    /// prompt would otherwise fill to the end for no one. FINISH tells every rank, as for any finished stream.
+    fn endCancelledFills(h: *Host) !void {
+        const mu = h.boot.multi.?;
+        var any = false;
+        for (mu.filling.items) |st| {
+            if (st.done) continue;
+            const i = h.liveOf(st.sid) orelse continue;
+            const lv = h.lives.items[i];
+            if (!h.cancelled(lv.job.id)) continue;
+            lv.cancel_hit = true;
+            st.stopped = true;
+            st.done = true;
+            any = true;
+        }
+        if (any) try h.endDone();
     }
 
     /// A finished stream's reply: its reason and stats (the dump when TF_GLM53_DUMP), then the Live goes.
@@ -717,7 +742,12 @@ pub const Host = struct {
         const keeps = words_[head.prompt_len + head.n_stops ..][0..head.n_keeps];
         const eos = words_[head.prompt_len + head.n_stops + head.n_keeps ..][0..head.n_eos];
         const s: ?smp.Sampling = if (head.flags & flag_greedy != 0) null else .{ .seed = head.seed, .temperature = head.temperature, .top_k = head.top_k, .top_p = head.top_p, .min_p = head.min_p };
-        const done = try h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush }, out);
+        // a request that fails here fails on rank 0 too, at the same point (the same checks on the same arguments), and
+        // rank 0 serves on: so does this rank - leaving would strand rank 0's next request in its collectives
+        const done = h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush }, out) catch |e| {
+            std.log.err("glm53 rank {d}: request {d} failed: {t} (following on, as rank 0 serves on)", .{ h.rank, head.seq, e });
+            return;
+        };
         h.gpa.free(done.kept);
         h.afterRequest();
     }
@@ -919,6 +949,16 @@ pub const Host = struct {
     }
 };
 
+/// A request's keyed sampling (null: greedy). A top_k past the candidates a rank sends a row (256 + MARGIN) is
+/// refused here, before any rank hears of the request: every rank would fail it at its first sampled window.
+fn samplingOf(r: *const api.Request) !?smp.Sampling {
+    const x = r.sampling orelse return null;
+    if (!(x.temperature > 0)) return null;
+    const s: smp.Sampling = .{ .seed = x.seed & 0x7FFFFFFFFFFFFFFF, .temperature = x.temperature, .top_k = x.top_k, .top_p = x.top_p, .min_p = x.min_p };
+    if (s.candidates() > smp.max_candidates) return error.TopKTooWide;
+    return s;
+}
+
 /// The words for a request the engine refuses.
 fn words(err: anyerror) []const u8 {
     return switch (err) {
@@ -927,6 +967,7 @@ fn words(err: anyerror) []const u8 {
         error.ReuseOutOfStep => "the ranks' kept prompt states are out of step (restart the server)",
         error.OutOfStep, error.RanksOutOfStep => "the ranks are out of step after a failed round (restart the server)",
         error.NoFreeSlot => "no free stream slot (the server admits at most --parallel streams)",
+        error.TopKTooWide => "top_k above 256 is not supported by this engine: send top_k 256 or less (0: top_p alone)",
         else => @errorName(err),
     };
 }
