@@ -19,7 +19,7 @@
 #   MODEL    checkpoint, same path on every node       [/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit]
 #   IMAGE    the TP4 image                             [ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05]
 #   PORT_DIR this folder on .4 (synced to ~/zig-port)  [$HOME/zig-port]
-#   PYSRC    the champion's Python source on .4        [$HOME/champions/glm53-ft8-dflash2/src] (-> nodes' zig-port/pysrc)
+#   PYSRC    the champion's Python source on .4        [required] (-> nodes' zig-port/pysrc)
 #   ZIG_DIR  zig 0.17.0 folder on the nodes            [$HOME/opt/zig]; copied from ZIG_FROM [10.100.10.5] if missing
 #   TOKENS [128]  CONTEXT [32768]  WINDOW [128]  LONG [4500] (the long prompt's tokens, 0: none)  LAYERS [0 = all]
 #   REF_PORT [29571] (TCPStore)  ZIG_PORT [29581] (tf-glm53-generate rendezvous)  IF [enp1s0f1np1]  RAILS [2]
@@ -34,7 +34,7 @@ MASTER=${MASTER:-${NODES[0]}}
 MODEL=${MODEL:-/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit}
 IMAGE=${IMAGE:-ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05}
 PORT_DIR=${PORT_DIR:-$HOME/zig-port}
-PYSRC=${PYSRC:-$HOME/champions/glm53-ft8-dflash2/src}
+PYSRC=${PYSRC:?PYSRC: the Python engine source tree on .4}
 ZIG_DIR=${ZIG_DIR:-$HOME/opt/zig}
 ZIG_FROM=${ZIG_FROM:-10.100.10.5}
 TOKENS=${TOKENS:-128}

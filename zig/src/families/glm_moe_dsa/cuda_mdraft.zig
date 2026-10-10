@@ -678,7 +678,7 @@ test "graph keys of the concurrent drafter passes stay apart from each other and
     try std.testing.expect((tapKey(0, 8) & 15) == 7 and (blockKey(1, 0b1011) & 15) == 8);
 }
 
-test "concurrent drafter coverage reaches the segment kernels (DFlash2 ft8, DSpark ft2 shapes at 4 streams)" {
+test "concurrent drafter coverage reaches the segment kernels (DFlash2, DSpark ft2 shapes at 4 streams)" {
     const gpa = std.testing.allocator;
     var p = aot.Probe.init(gpa);
     defer p.deinit();

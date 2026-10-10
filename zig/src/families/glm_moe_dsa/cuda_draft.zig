@@ -1,6 +1,6 @@
 //! Phase 4: GLM-5.3's speculative drafters on the device - DSpark (cuda/dspark.py SparkDrafter, the publishable
 //! drowzeys/keys-GLM-5.3-speculator.dspark-ft2) and DFlash2 (cuda/dflash.py GlmDrafter over glm5_next dflash2.Drafter;
-//! any DFlash2 checkpoint, loaded from a path: the incoai / ft7 / ft8 weights are CC BY-NC-ND and never shipped here).
+//! any DFlash2 checkpoint, loaded from a path; no drafter weights are shipped here).
 //!
 //! Both are a block pass over a sliding-window context the target's tap rows build:
 //!   * context (`tapsCompute`): rows of the target's tap layers [n, taps * D] -> c = hidden_norm(fc(taps)); every
@@ -1247,7 +1247,7 @@ test "q4 quantize + pack over threads equals one pass" {
     try std.testing.expectEqualSlices(u16, bo, got.b);
 }
 
-test "drafter coverage reaches every drafter kernel (DSpark ft2, DFlash2 ft8 shapes)" {
+test "drafter coverage reaches every drafter kernel (DSpark ft2, DFlash2 shapes)" {
     const gpa = std.testing.allocator;
     var p = aot.Probe.init(gpa);
     defer p.deinit();

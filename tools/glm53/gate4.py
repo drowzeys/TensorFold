@@ -2,8 +2,8 @@
 """Phase 4 gate: the Zig engine's speculative drafters (tf-glm53-generate --mode 4) against the Python engine's
 (reference4.py), one session per drafter configuration, every session run in the same cluster script.
 
-  gate4.py gate --work DIR --sessions ds,df[,mc][,ft8] [--ratio 0.97] [--tpr-tol 0.02]
-                [--py-dspark-32k prose=33.8,code=39.0] [--champion-ft8 ...]
+  gate4.py gate --work DIR --sessions ds,df[,mc][,priv] [--ratio 0.97] [--tpr-tol 0.02]
+                [--py-dspark-32k prose=33.8,code=39.0] [--champion-priv ...]
 
 A session S reads <work>/ref-S/ref-r*.json (Python, every rank) and <work>/gen-S/gen-r*.json (Zig, every rank). Runs
 are matched by (prompt name, run label); a label names the pick ("g" greedy / "s<top_k>" keyed sample), the drafts
@@ -18,7 +18,7 @@ GATE lines (all must PASS):
     drafters' arithmetic is the Python kernels' except a few small dots, so acceptance should match closely);
   * S-speed: on the 32K prompts' sampled drafted runs with copies ("s20:<drafter>+c", the served default), Zig's decode
     tok/s >= --ratio x Python's, prose and code separately (the mean over the class's prompts);
-  * ft8 (private, FT8=path in the run script): as above, plus REPORT lines against the champion's published numbers
+  * priv (private, PRIV_DFLASH=path in the run script): as above, plus REPORT lines against the champion's published numbers
     (prose 39.1 / 34.2 / 31.2, code 44.8 / 42.9 / 39.4 at short / 32K / ~120K; served, tfbench repeats - indicative).
 REPORT lines: every run side by side (tok/s, tokens a round, acceptance, copy rounds), DSpark's Python 32K figures
 against the 2026-10-07 reference (33.8 prose / 39.0 code; a gap there means the cluster, not the port).
@@ -77,7 +77,7 @@ def mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-CHAMPION_FT8 = {("prose", "short"): 39.1, ("prose", "32k"): 34.2, ("prose", "120k"): 31.2,
+CHAMPION_PRIV = {("prose", "short"): 39.1, ("prose", "32k"): 34.2, ("prose", "120k"): 31.2,
                 ("code", "short"): 44.8, ("code", "32k"): 42.9, ("code", "120k"): 39.4}
 
 
@@ -166,15 +166,15 @@ def session(work: str, s: str, a, gates: list, reports: list) -> None:
             if want:
                 reports.append(f"ds python {kind} 32K {py:.2f} tok/s vs the 2026-10-07 reference {want} "
                                f"({'ok' if py >= 0.95 * want else 'LOW: the cluster, not the port'})")
-    if s == "ft8":
+    if s == "priv":
         by: dict[tuple[str, str], list[float]] = {}
         for key, g in gen.items():
             if drafted(key[1]) and label_parts(key[1])[2]:
                 by.setdefault(klass(key[0]), []).append(float(g["tok_s"]))
-        for k, want in CHAMPION_FT8.items():
+        for k, want in CHAMPION_PRIV.items():
             got = by.get(k)
             if got:
-                reports.append(f"ft8 zig {k[0]} {k[1]}: {mean(got):.2f} tok/s vs the champion {want} "
+                reports.append(f"priv zig {k[0]} {k[1]}: {mean(got):.2f} tok/s vs the champion {want} "
                                f"({mean(got) / want:.3f})")
 
 

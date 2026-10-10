@@ -12,7 +12,7 @@ ssh <node> 'bash ~/zig-port/run_phase1_node.sh'           # prints: PHASE1 PASS|
 ```
 
 The script refuses to start below 30 GB MemAvailable, while a `tf-glm53` container runs, or while other compute
-apps hold the GPU (`ALLOW_GPU_BUSY=1` overrides the last). Defaults: `PYSRC=~/champion-ft8-src`,
+apps hold the GPU (`ALLOW_GPU_BUSY=1` overrides the last). `PYSRC` (the Python engine source tree) is required,
 `MODEL=/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit`, `ZIG_DIR=~/opt/zig` (node .5), output in
 `~/zig-port/runs/<utc>/` (build.log, oracle.log, sass.log, compare.log, aot/, fixtures/).
 
@@ -50,7 +50,7 @@ Frozen knobs (`oracle.FROZEN`, recorded in meta.json): `TF_GLM53_TUNE=0` (x3line
 ```sh
 # oracle: capture + fixtures (GPU). TRITON_CACHE_DIR must be fresh: the cubins are packed from it.
 docker run --rm --gpus all --network none --memory 64g --entrypoint python3 \
-  -v $MODEL:/model:ro -v ~/champion-ft8-src/src:/opt/tensorfold/src:ro -v ~/zig-port/tf:/tf:ro -v $OUT:/out \
+  -v $MODEL:/model:ro -v $PYSRC/src:/opt/tensorfold/src:ro -v ~/zig-port/tf:/tf:ro -v $OUT:/out \
   -e PYTHONPATH=/opt/tensorfold/src -e TRITON_CACHE_DIR=/out/triton -e TORCH_EXTENSIONS_DIR=/out/torch_ext \
   -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $IMAGE \
   -B /tf/tools/glm53/oracle.py --model /model --out /out --record --fixtures --layers 4 --world 4 --rank 0 --long 20000 --tools /tf

@@ -9,7 +9,7 @@
 #
 # Environment (defaults in brackets):
 #   PORT     the zig-port folder on this node                        [$HOME/zig-port]
-#   PYSRC    the champion's Python source (holds src/tensorfold)     [$HOME/champion-ft8-src]
+#   PYSRC    the champion's Python source (holds src/tensorfold)     [required]
 #   MODEL    the GLM-5.3 EXL3 checkpoint                             [/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit]
 #   IMAGE    the TP4 image (Triton 3.7.1, torch, CUDA 13)            [ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05]
 #   ZIG_DIR  folder holding the zig 0.17.0 binary (mounted /opt/z)   [$HOME/opt/zig]
@@ -19,7 +19,7 @@
 #   SKIP_BUILD=1 / SKIP_ORACLE=1   reuse WORK's zig-out / aot + fixtures from an earlier run (set WORK to it)
 set -u
 PORT="${PORT:-$HOME/zig-port}"
-PYSRC="${PYSRC:-$HOME/champion-ft8-src}"
+PYSRC="${PYSRC:?PYSRC: the Python engine source tree (holds src/tensorfold)}"
 MODEL="${MODEL:-/mnt/spark2-models-local/GLM-5.3-EXL3-2.75-mixedK-EXL3NE-ablit}"
 IMAGE="${IMAGE:-ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-05}"
 ZIG_DIR="${ZIG_DIR:-$HOME/opt/zig}"

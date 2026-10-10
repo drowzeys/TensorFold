@@ -23,7 +23,7 @@
 # first - this script stops nothing it did not start:
 #   DRAFTER=dflash bash ~/zig-port/run_phase4c_cluster.sh
 #   DRAFTER=dspark bash ~/zig-port/run_phase4c_cluster.sh
-#   DRAFTER=dflash DRAFTER_PATH=/mnt/spark2-models-local/<private ft8> PRIVATE=1 bash ~/zig-port/run_phase4c_cluster.sh
+#   DRAFTER=dflash DRAFTER_PATH=/mnt/spark2-models-local/<private checkpoint> PRIVATE=1 bash ~/zig-port/run_phase4c_cluster.sh
 # A memory watchdog runs from launch to exit (label tensorfold.glm53-phase4c=<stamp>): < 4 GB MemAvailable or > 2 GB
 # swap on any node removes this run's containers ("PHASE4C FAIL watchdog").
 #

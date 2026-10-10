@@ -6,7 +6,7 @@
 #   ds   DSpark alone (--mtp-drafts 0, TF_GLM53_DSPARK=$DSPARK, policy confidence 0.3 - the published recipe);
 #   df   DFlash2 alone (--mtp-drafts 0, TF_GLM53_DFLASH=$DFLASH; depth 7, confidence 0.3);
 #   mc   (MTPC=1) the MTP head (k 2) with copy drafts - the served default's path;
-#   ft8  (FT8=<path>, private, off by default) the ft8 DFlash2 at short / 32K / ~120K against the champion's numbers.
+#   priv  (PRIV_DFLASH=<path>, private, off by default) the priv DFlash2 at short / 32K / ~120K against the champion's numbers.
 # Runs a prompt (tfbench's prose_beekeeper and code_parser, short and with the 32K background): "s20:<d>+c" (drafts
 # with copies), "s20:<d>" (drafts alone), "s20:0" (serial), and on the short ones "g:<d>+c" / "g:0" (greedy).
 # Gates (tools/glm53/gate4.py): Zig == Python token for token on every run; drafted == serial in each engine; tokens a
@@ -30,8 +30,8 @@
 # Environment (defaults in brackets):
 #   NODES [10.100.10.1 .2 .3 .5] MODEL IMAGE PORT_DIR PYSRC ZIG_DIR ZIG_FROM MASTER IF RAILS DROP_CACHES ALLOW_GPU_BUSY
 #   DSPARK [/mnt/spark2-models-local/GLM-5.3-speculator.dspark-keys-ft2]  DFLASH [/mnt/spark2-models-local/GLM-5.3-DFlash2]
-#   FT8_120K [1] (0: the ft8 session at short + 32K only, context 33792)  FT8 [] (a private DFlash2 checkpoint: the ft8 session; never printed into a recipe)  MTPC [1]  WITH_120K [0]
-#   SESSIONS [ds,df + mc when MTPC=1 + ft8 when FT8 is set]  TOKENS [512]  CONTEXT32K [~/glm53-speed-20260920/context-32k.txt]
+#   PRIV_120K [1] (0: the priv session at short + 32K only, context 33792)  PRIV_DFLASH [] (a private DFlash2 checkpoint: the priv session; never printed into a recipe)  MTPC [1]  WITH_120K [0]
+#   SESSIONS [ds,df + mc when MTPC=1 + priv when PRIV_DFLASH is set]  TOKENS [512]  CONTEXT32K [~/glm53-speed-20260920/context-32k.txt]
 #   CONTEXT [auto: the prompts' need rounded up to 1024; < 200,000]  RATIO [0.97]  TPR_TOL [0.02]  MEM_CAP [110g]
 #   DSPARK_POLICY [confidence] DSPARK_CONFIDENCE [0.3] DFLASH_DEPTH [7] DFLASH_CONFIDENCE [0.3] COPY_MIN [8] COPY_MAX [15]
 #   Zig decode knobs as 3b: ZSIDE [af] ZL2PF [1] ZL2PF_MB [8] ZMULTI_SELECT [1] ZDEVICE_CANDS [1] ZMTP_DENSE [1]
@@ -51,7 +51,7 @@ CONTEXT32K=${CONTEXT32K-$HOME/glm53-speed-20260920/context-32k.txt}
 CONTEXT=${CONTEXT:-auto}
 DSPARK=${DSPARK:-/mnt/spark2-models-local/GLM-5.3-speculator.dspark-keys-ft2}
 DFLASH=${DFLASH:-/mnt/spark2-models-local/GLM-5.3-DFlash2}
-FT8=${FT8:-}
+PRIV_DFLASH=${PRIV_DFLASH:-}
 MTPC=${MTPC:-1}
 WITH_120K=${WITH_120K:-0}
 TOKENS=${TOKENS:-512}
@@ -84,7 +84,7 @@ ZERR_PAT=${ZERR_PAT:-'MissingTritonVariant|AmbiguousTritonVariant|NoTritonSet|No
 if [ -z "${SESSIONS:-}" ]; then
   SESSIONS=ds,df
   [ "$MTPC" = 1 ] && SESSIONS=$SESSIONS,mc
-  [ -n "$FT8" ] && SESSIONS=$SESSIONS,ft8
+  [ -n "$PRIV_DFLASH" ] && SESSIONS=$SESSIONS,priv
 fi
 IFS=, read -r -a SESS <<<"$SESSIONS"
 STAMP=${REUSE:-$(date -u +%Y%m%d-%H%M%S)}
@@ -187,7 +187,7 @@ nccl_env() {
 # ---- 0. preflight ------------------------------------------------------------------------------------------------
 phase preflight
 say "phase 4: nodes ${NODES[*]} (rank 0 first), model $MODEL, image $IMAGE, sessions $SESSIONS, work $WORK"
-say "drafters: DSpark $DSPARK, DFlash2 $DFLASH$([ -n "$FT8" ] && echo ', ft8 (private) set')"
+say "drafters: DSpark $DSPARK, DFlash2 $DFLASH$([ -n "$PRIV_DFLASH" ] && echo ', priv (private) set')"
 bad=0
 for r in 0 1 2 3; do n=${NODES[$r]}
   out=$(rsh "$n" "echo avail=\$(awk '/MemAvailable/ {print int(\$2 / 1048576)}' /proc/meminfo)
@@ -198,7 +198,7 @@ for r in 0 1 2 3; do n=${NODES[$r]}
     [ -f '$MODEL/config.json' ] && echo model=ok || echo model=missing
     [ -f '$DSPARK/config.json' ] && echo dspark=ok || echo dspark=missing
     [ -f '$DFLASH/config.json' ] && echo dflash=ok || echo dflash=missing
-    [ -z '$FT8' ] || { [ -f '$FT8/config.json' ] && echo ft8=ok || echo ft8=missing; }
+    [ -z '$PRIV_DFLASH' ] || { [ -f '$PRIV_DFLASH/config.json' ] && echo priv=ok || echo priv=missing; }
     docker image inspect '$IMAGE' >/dev/null 2>&1 && echo image=ok || echo image=missing
     [ -f ~/NODE_CLAIM.txt ] && sed 's/^/claim: /' ~/NODE_CLAIM.txt; true" 2>&1) || { say "rank $r ($n): ssh failed"; bad=1; continue; }
   say "rank $r ($n): $(grep -v '^claim:' <<<"$out" | tr '\n' ' ')"
@@ -211,7 +211,7 @@ for r in 0 1 2 3; do n=${NODES[$r]}
   grep -q model=missing <<<"$out" && { say "  REFUSE $n: no $MODEL/config.json"; bad=1; }
   grep -q dspark=missing <<<"$out" && [[ ",$SESSIONS," == *",ds,"* ]] && { say "  REFUSE $n: no DSpark drafter at $DSPARK"; bad=1; }
   grep -q dflash=missing <<<"$out" && [[ ",$SESSIONS," == *",df,"* ]] && { say "  REFUSE $n: no DFlash2 drafter at $DFLASH"; bad=1; }
-  grep -q ft8=missing <<<"$out" && { say "  REFUSE $n: FT8 is set but has no config.json on this node"; bad=1; }
+  grep -q priv=missing <<<"$out" && { say "  REFUSE $n: PRIV_DFLASH is set but has no config.json on this node"; bad=1; }
   grep -q image=missing <<<"$out" && { say "  REFUSE $n: image not pulled"; bad=1; }
 done
 [ $bad = 0 ] || summary FAIL "refused by the preflight (run.log)" 3
@@ -247,7 +247,7 @@ CACHE_ENV="-e TORCH_EXTENSIONS_DIR=/cache/torch_ext -e CUDA_CACHE_PATH=/cache/cu
 DMOUNTS=""   # only the drafters the sessions load (docker would create a missing host path)
 [[ ",$SESSIONS," == *",ds,"* ]] && DMOUNTS="$DMOUNTS -v $DSPARK:$DSPARK:ro"
 [[ ",$SESSIONS," == *",df,"* ]] && DMOUNTS="$DMOUNTS -v $DFLASH:$DFLASH:ro"
-[[ ",$SESSIONS," == *",ft8,"* ]] && DMOUNTS="$DMOUNTS -v $FT8:$FT8:ro"
+[[ ",$SESSIONS," == *",priv,"* ]] && DMOUNTS="$DMOUNTS -v $PRIV_DFLASH:$PRIV_DFLASH:ro"
 to_all() { local f=$1 n; rsh "${NODES[0]}" "cat $WORK/$f" > "$LOCAL/$f" || return 1; for n in "${NODES[@]:1}"; do rsh "$n" "cat > $WORK/$f" < "$LOCAL/$f" || return 1; done; }
 
 # ---- 2. prompts: one file a session (reference4.py --make-prompts, chat template with thinking on) ---------------
@@ -257,7 +257,7 @@ session_runs() {   # $1 = session -> "short|32k|120k" run lists and the drafts l
     ds)  echo "g:dspark+c,g:0,s20:dspark+c,s20:dspark,s20:0|s20:dspark+c,s20:dspark,s20:0|s20:dspark+c" ;;
     df)  echo "g:dflash+c,g:0,s20:dflash+c,s20:dflash,s20:0|s20:dflash+c,s20:dflash,s20:0|s20:dflash+c" ;;
     mc)  echo "g:2+c,g:0,s20:2+c,s20:2,s20:0|s20:2+c,s20:2,s20:0|s20:2+c" ;;
-    ft8) echo "s20:dflash+c,s20:dflash,s20:0|s20:dflash+c,s20:dflash,s20:0|s20:dflash+c" ;;
+    priv) echo "s20:dflash+c,s20:dflash,s20:0|s20:dflash+c,s20:dflash,s20:0|s20:dflash+c" ;;
   esac
 }
 if [ "${SKIP_REF:-0}" != 1 ] || [ ! -s "$LOCAL/prompts-${SESS[0]}.json" ]; then
@@ -265,7 +265,7 @@ if [ "${SKIP_REF:-0}" != 1 ] || [ ! -s "$LOCAL/prompts-${SESS[0]}.json" ]; then
   for n in "${NODES[@]}"; do rsh "$n" "cat > $WORK/context-32k.txt" < "$CONTEXT32K" || summary FAIL "could not copy $CONTEXT32K to $n" 3; done
   for s in "${SESS[@]}"; do
     IFS='|' read -r rs r32 r120 <<<"$(session_runs "$s")"
-    w120=""; { [ "$WITH_120K" = 1 ] || { [ "$s" = ft8 ] && [ "${FT8_120K:-1}" = 1 ]; }; } && w120="--with-120k --runs-120k $r120"
+    w120=""; { [ "$WITH_120K" = 1 ] || { [ "$s" = priv ] && [ "${PRIV_120K:-1}" = 1 ]; }; } && w120="--with-120k --runs-120k $r120"
     rsh "${NODES[0]}" "docker run --rm $COMMON --network none --memory 8g -v $MODEL:/model:ro -v $RPORT/pysrc/src:/opt/tensorfold/src:ro \
       -v $RPORT/tf:/tf:ro -v $WORK:/work -e PYTHONPATH=/opt/tensorfold/src --entrypoint python3 $IMAGE \
       -B /tf/tools/glm53/reference4.py --model /model --make-prompts /work/prompts-$s.json --context-file /work/context-32k.txt \
@@ -388,7 +388,7 @@ py_drafter() {
   case "$1" in
     ds) echo "--dspark $DSPARK --dspark-policy $DSPARK_POLICY --dspark-confidence $DSPARK_CONFIDENCE" ;;
     df) echo "--dflash $DFLASH --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
-    ft8) echo "--dflash $FT8 --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
+    priv) echo "--dflash $PRIV_DFLASH --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
     *) echo "" ;;
   esac
 }
@@ -396,7 +396,7 @@ zig_drafter() {
   case "$1" in
     ds) echo "--dspark $DSPARK --dspark-policy $DSPARK_POLICY --dspark-confidence $DSPARK_CONFIDENCE" ;;
     df) echo "--dflash $DFLASH --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
-    ft8) echo "--dflash $FT8 --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
+    priv) echo "--dflash $PRIV_DFLASH --dflash-depth $DFLASH_DEPTH --dflash-confidence $DFLASH_CONFIDENCE" ;;
     *) echo "" ;;
   esac
 }
@@ -415,7 +415,7 @@ if [ "${SKIP_REF:-0}" != 1 ]; then
     for n in "${NODES[@]}"; do rsh "$n" "rm -rf $WORK/ref-$s && mkdir -p $WORK/ref-$s/triton"; done
     wait_memory || fatal "a node is under 100 GB MemAvailable before the $s reference"
     phase "ref-$s"
-    say "python $s: reference4.py at TP4, context $CONTEXT, k $(sess_k $s) $([ "$s" = ft8 ] && echo '(ft8, private)' || py_drafter $s)"
+    say "python $s: reference4.py at TP4, context $CONTEXT, k $(sess_k $s) $([ "$s" = priv ] && echo '(priv, private)' || py_drafter $s)"
     start_ranks zp4-ref-$s ref_args || { cleanup; summary FAIL "the $s reference did not start" 1; }
     wait_ranks zp4-ref-$s "${REF_TIMEOUT:-10800}" "$STALL_MIN"; rrc=$?
     collect_ranks zp4-ref-$s
@@ -443,7 +443,7 @@ KMAX=0; for s in "${SESS[@]}"; do (( $(sess_k $s) > KMAX )) && KMAX=$(sess_k $s)
 LV_DRAFTERS=""
 [[ ",$SESSIONS," == *",ds,"* ]] && LV_DRAFTERS="$LV_DRAFTERS --dspark $DSPARK"
 if [[ ",$SESSIONS," == *",df,"* ]]; then LV_DRAFTERS="$LV_DRAFTERS --dflash $DFLASH"
-elif [ -n "$FT8" ]; then LV_DRAFTERS="$LV_DRAFTERS --dflash $FT8"; fi
+elif [ -n "$PRIV_DFLASH" ]; then LV_DRAFTERS="$LV_DRAFTERS --dflash $PRIV_DFLASH"; fi
 if [ "${SKIP_COVER:-0}" != 1 ]; then
   phase aot-cover
   sets=""; tmpl=""
@@ -506,7 +506,7 @@ if [ "${SKIP_ZIG:-0}" != 1 ]; then
     }
     for n in "${NODES[@]}"; do rsh "$n" "rm -rf $WORK/gen-$s && mkdir -p $WORK/gen-$s"; done
     wait_memory || fatal "zig $s: a node under 100 GB MemAvailable"
-    say "zig $s: tf-glm53-generate --mode 4 at TP4, context $CONTEXT, k $(sess_k $s) $([ "$s" = ft8 ] && echo '(ft8, private)' || zig_drafter $s), AOT /work/$ZAOT"
+    say "zig $s: tf-glm53-generate --mode 4 at TP4, context $CONTEXT, k $(sess_k $s) $([ "$s" = priv ] && echo '(priv, private)' || zig_drafter $s), AOT /work/$ZAOT"
     start_ranks zp4-zig-$s gen_args || { collect_ranks zp4-zig-$s; fatal "zig $s start failed"; }
     wait_ranks zp4-zig-$s "${GEN_TIMEOUT:-10800}" "$STALL_MIN" || { collect_ranks zp4-zig-$s; fatal "zig $s failed: $WAIT_REASON (zp4-zig-$s-r*.log)"; }
     collect_ranks zp4-zig-$s

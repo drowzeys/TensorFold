@@ -768,7 +768,7 @@ const ft2_config =
     \\   "use_sliding_window": true, "vocab_size": 154880}}
 ;
 
-const ft8_config =
+const dflash2_config =
     \\{"dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": 154856,
     \\   "selector_rank": 256, "selector_top_k": 16, "target_layer_ids": [5, 19, 33, 47, 61, 75]},
     \\ "head_dim": 128, "hidden_size": 6144, "intermediate_size": 12288, "is_causal": false,
@@ -786,11 +786,11 @@ test "DSpark config: the published ft2 drafter's fields and checks" {
     try std.testing.expectEqualSlices(usize, &.{ 1, 19, 38, 57, 74 }, c.tapLayers(&tl));
     try c.check(4, 6144, 154880, 78);
     try std.testing.expectError(error.DrafterMismatch, c.check(4, 6144, 151552, 78));
-    try std.testing.expectError(error.NotDSpark, DSparkConfig.parse(std.testing.allocator, ft8_config));
+    try std.testing.expectError(error.NotDSpark, DSparkConfig.parse(std.testing.allocator, dflash2_config));
 }
 
-test "DFlash2 config: the ft8 drafter's fields" {
-    const c = try DFlashConfig.parse(std.testing.allocator, ft8_config);
+test "DFlash2 config: the DFlash2 drafter's fields" {
+    const c = try DFlashConfig.parse(std.testing.allocator, dflash2_config);
     try std.testing.expectEqual(@as(usize, 6), c.n_taps);
     try std.testing.expectEqual(@as(usize, 2047), c.window);
     try std.testing.expect(!c.causal);
