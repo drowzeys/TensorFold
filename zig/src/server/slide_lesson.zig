@@ -28,6 +28,16 @@ const facts_prompt = "Read the text below and list the facts in it worth remembe
 
 const steady_prompt = "Tell me something interesting about the ocean.";
 
+// A fact in another language is also held against prompts in that language, which English ones leave free to move.
+const language_prompt = "What language is this written in? Reply with the language's name in English, one word.\n{s}";
+// The same prompts for a fact in another language: they keep the model writing in that language (English keeps its own).
+const questions_other = "Here is something you know: \"{s}\" Write {d} different short questions the person who told you might ask you later, in their own words, to see if you remember: ask it plainly, in other words and in passing (for example: What is my favourite colour? Which colour do I like best?), in the language they told you in, each saying \"my\" or \"I\" in that language as they would. Number them 1 to {d}, one per line, nothing else.";
+const remember_other = "Here are questions a person asked you about themselves. Rewrite each to start with \"Do you remember\" or \"Do you know\" (the same words in the question's own language), in the person's own words, keeping \"I\" and \"my\" (for example: What is my favourite colour? becomes Do you remember my favourite colour?). Number them, one per line, nothing else.\n{s}";
+const answer_other = "You know this: \"{s}\" The person who told you asks: \"{s}\" Answer them in their language, in one short sentence of fewer than 20 words. Speak to them: say \"your\" for what is theirs and \"I\" only for yourself (for example: Your sister is called Ana.)";
+const besides_other = "Here is something you know: \"{s}\" Write {d} short questions about the same person or thing that this does not answer, in the words of the person who told you (for example, for \"My sister is called Ana.\": How old is my sister? Where does my sister live?), in the language they told you in. Number them, one per line, nothing else.";
+const twins_other = "For each question below, write two questions worded almost the same way but asking about a different person or thing of the same type, so that the answer to the original would be wrong for them, each in its question's language. Number them, one per line, nothing else.\n{s}";
+const translate_prompt = "Translate each numbered line below into {s}, keeping its meaning and its number. Nothing else.\n{s}";
+
 const probes = 8;
 const besides = 6; // questions about the fact's subject that it leaves unanswered, kept as the model answers them
 const remember_probes = 4; // kept questions asked again as "Do you remember...?", which the model otherwise refuses
@@ -101,6 +111,7 @@ pub const Teacher = struct {
     learning: std.Io.Mutex = .init, // one /learn at a time: a lesson's later rounds continue its rows
     keep: ?[]const api.Example = null,
     turn_end: ?[]const u32 = null,
+    languages: std.StringHashMapUnmanaged(Local) = .empty, // keep and personal prompts in each other language told so far
     lessons: usize = 0, // lessons so far, which picks the questions about the user a check asks
 
     pub fn init(gpa: Allocator) Teacher {
@@ -111,6 +122,54 @@ pub const Teacher = struct {
         t.arena.deinit();
     }
 };
+
+/// The keep and personal prompts in one other language, with the model's answers to the keep prompts, written once.
+const Local = struct { keep: []const api.Example, personal: []const []const u8 };
+
+/// The language `fact` is told in, as the model names it, or null for English.
+fn languageOf(srv: *Server, cx: *Cx, fact: []const u8, gone: anytype) !?[]const u8 {
+    const said = try ask(srv, cx, null, try std.fmt.allocPrint(cx.a, language_prompt, .{fact}), 8, gone);
+    const name = std.mem.trim(u8, said.content, " \t\r\n.\"*");
+    if (name.len == 0 or std.ascii.startsWithIgnoreCase(name, "english")) return null;
+    return name;
+}
+
+/// A lesson prompt in the wording for the facts' language: English's own, or one that keeps the model in another.
+fn prompted(a: Allocator, comptime english: []const u8, comptime other: []const u8, args: anytype, language: ?[]const u8) ![]const u8 {
+    return if (language != null) std.fmt.allocPrint(a, other, args) else std.fmt.allocPrint(a, english, args);
+}
+
+/// Keep and personal prompts in the facts' language `name` (null when the model gives no translation).
+fn local(srv: *Server, cx: *Cx, teacher: *Teacher, name: []const u8, end: []const u32, gone: anytype) !?Local {
+    teacher.mutex.lockUncancelable(srv.io);
+    defer teacher.mutex.unlock(srv.io);
+    const ta = teacher.arena.allocator();
+    const key = try std.ascii.allocLowerString(ta, name);
+    if (teacher.languages.get(key)) |l| return l;
+    const keep_lines = try translated(srv, cx, ta, &keep_prompts, name, gone);
+    const personal = try translated(srv, cx, ta, &personal_prompts, name, gone);
+    if (keep_lines.len == 0 and personal.len == 0) return null;
+    const keep = try ta.alloc(api.Example, keep_lines.len);
+    for (keep_lines, keep) |p, *o| {
+        const reply = try ask(srv, cx, null, p, keep_tokens, gone);
+        o.* = try example(srv, cx, ta, null, p, reply.content, ending(reply, end));
+    }
+    const l: Local = .{ .keep = keep, .personal = personal };
+    try teacher.languages.put(teacher.arena.allocator(), key, l);
+    log.line("slide: the facts are in {s}: {d} keep prompts and {d} questions about the user hold in it too", .{ name, keep.len, personal.len });
+    return l;
+}
+
+/// `lines` as the model translates them into `language`, kept in `keep`.
+fn translated(srv: *Server, cx: *Cx, keep: Allocator, lines: []const []const u8, language: []const u8, gone: anytype) ![]const []const u8 {
+    const a = cx.a;
+    var numbered: std.ArrayList(u8) = .empty;
+    for (lines, 1..) |line, i| try numbered.print(a, "{d}. {s}\n", .{ i, line });
+    const reply = try ask(srv, cx, null, try std.fmt.allocPrint(a, translate_prompt, .{ language, numbered.items }), @intCast(40 * lines.len), gone);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (try wording.numbered(a, reply.content, lines.len)) |line| try out.append(keep, try keep.dupe(u8, line));
+    return out.items;
+}
 
 /// The facts in `text`: its sentences when it is short chat, else what the model finds worth remembering in it.
 pub fn facts(srv: *Server, cx: *Cx, text: []const u8, source: []const u8, gone: anytype) ![]const []const u8 {
@@ -158,8 +217,9 @@ pub fn lesson(srv: *Server, cx: *Cx, teacher: *Teacher, told: []const []const u8
     const end = try turnEnd(srv, cx, teacher);
     var parts: Parts = .{};
     var count: u32 = 0;
+    const language = try languageOf(srv, cx, told[0], gone);
     for (told, kept, 0..) |fact, *k, f| {
-        k.* = try factLesson(srv, cx, &parts, fact, f, end, gone);
+        k.* = try factLesson(srv, cx, &parts, fact, f, end, language, gone);
         count += @intFromBool(k.*);
     }
     if (count == 0) return null;
@@ -177,6 +237,17 @@ pub fn lesson(srv: *Server, cx: *Cx, teacher: *Teacher, told: []const []const u8
     for (try keepExamples(srv, cx, teacher, end, gone), keep_prompts) |ex, q| {
         if (!wording.toModel(q) and try answeredByAny(srv, cx, told, kept, q, gone)) continue;
         try keep.append(a, ex);
+    }
+    // a fact in another language: its own language's prompts held and checked as the English ones are
+    if (if (language) |name| try local(srv, cx, teacher, name, end, gone) else null) |l| {
+        for (l.personal, 0..) |q, i| {
+            if (try answeredByAny(srv, cx, told, kept, q, gone)) continue;
+            const reply = try ask(srv, cx, null, q, check_tokens, gone);
+            if (heldBack(teacher.lessons, i)) {
+                try checks.append(a, .{ .question = q, .before = reply.content });
+            } else try keep.append(a, try example(srv, cx, a, null, q, reply.content, ending(reply, end)));
+        }
+        try keep.appendSlice(a, l.keep);
     }
     // the near misses set aside, never trained on, check that the fact stays put
     try checks.appendSlice(a, parts.aside.items);
@@ -214,14 +285,18 @@ const Got = struct {
 };
 
 /// A question kept with the answer the model gives it from the fact, unless it gives that answer away or misses it.
-fn take(srv: *Server, cx: *Cx, got: *Got, fact: []const u8, f: usize, q: []const u8, end: []const u32, gone: anytype) !void {
+fn take(srv: *Server, cx: *Cx, got: *Got, fact: []const u8, f: usize, q: []const u8, end: []const u32, language: ?[]const u8, gone: anytype) !void {
     const a = cx.a;
     if (wording.yesNo(q) and wording.tells(fact, "", "", q)) {
         log.line("slide: \"{s}\" asks yes or no about the fact itself, so it is dropped", .{q});
         return;
     }
+    if (!wording.firstPerson(q) or !wording.sameScript(fact, q)) {
+        log.line("slide: \"{s}\" is not the user asking about themselves in the fact's language, so it is dropped", .{q});
+        return;
+    }
     for (got.refs.items) |r| if (std.mem.eql(u8, r.question, q)) return;
-    const reply = try ask(srv, cx, null, try std.fmt.allocPrint(a, answer_prompt, .{ fact, q }), 48, gone);
+    const reply = try ask(srv, cx, null, try prompted(a, answer_prompt, answer_other, .{ fact, q }, language), 48, gone);
     const answer = wording.clean(reply.content) orelse {
         log.line("slide: answer dropped for {s}: {s}", .{ q, reply.content });
         return;
@@ -237,23 +312,32 @@ fn take(srv: *Server, cx: *Cx, got: *Got, fact: []const u8, f: usize, q: []const
 }
 
 /// One fact's part: its questions and answers (two held out), and twins about other things as the model answers them.
-fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, end: []const u32, gone: anytype) !bool {
+fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, end: []const u32, language: ?[]const u8, gone: anytype) !bool {
     const a = cx.a;
-    const asked = try ask(srv, cx, null, try std.fmt.allocPrint(a, questions_prompt, .{ fact, probes, probes }), 32 * probes, gone);
+    const asked = try ask(srv, cx, null, try prompted(a, questions_prompt, questions_other, .{ fact, probes, probes }, language), 32 * probes, gone);
     const qs = try wording.questions(a, asked.content, probes);
     var got: Got = .{};
-    for (qs) |q| try take(srv, cx, &got, fact, f, q, end, gone);
+    for (qs) |q| try take(srv, cx, &got, fact, f, q, end, language, gone);
     // the kept questions asked again as "Do you remember...?", which the model otherwise refuses
     var plain: std.ArrayList(u8) = .empty;
     for (got.refs.items[0..@min(got.refs.items.len, remember_probes)], 1..) |r, i| try plain.print(a, "{d}. {s}\n", .{ i, r.question });
     if (plain.items.len > 0) {
-        const again = try ask(srv, cx, null, try std.fmt.allocPrint(a, remember_prompt, .{plain.items}), 32 * remember_probes, gone);
+        const again = try ask(srv, cx, null, try prompted(a, remember_prompt, remember_other, .{plain.items}, language), 32 * remember_probes, gone);
         for (try wording.questions(a, again.content, remember_probes)) |q| {
-            if (wording.firstPerson(q)) try take(srv, cx, &got, fact, f, q, end, gone) else log.line("slide: \"{s}\" is no longer the user's question, so it is dropped", .{q});
+            if (wording.firstPerson(q)) try take(srv, cx, &got, fact, f, q, end, language, gone) else log.line("slide: \"{s}\" is no longer the user's question, so it is dropped", .{q});
         }
     }
     const pairs = got.pairs;
     const refs = got.refs;
+    // all questions and answers together: a near miss gives the fact away only by an answer word no question says
+    var asked_list: std.ArrayList([]const u8) = .empty;
+    var answered_list: std.ArrayList([]const u8) = .empty;
+    for (refs.items) |r| {
+        try asked_list.append(a, r.question);
+        try answered_list.append(a, r.answer);
+    }
+    const asked_all = try std.mem.join(a, "\n", asked_list.items);
+    const answered_all = try std.mem.join(a, "\n", answered_list.items);
     const subjects = got.subjects;
     var told: std.ArrayList([]const u8) = .empty;
     for (refs.items) |r| try told.append(a, r.question);
@@ -269,25 +353,25 @@ fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
     // twins of each question about something else, kept as the model answers them now
     var numbered: std.ArrayList(u8) = .empty;
     for (refs.items[0..@min(refs.items.len, probes)], 1..) |r, i| try numbered.print(a, "{d}. {s}\n", .{ i, r.question });
-    const asked_twins = try ask(srv, cx, null, try std.fmt.allocPrint(a, twins_prompt, .{numbered.items}), 64 * probes, gone);
+    const asked_twins = try ask(srv, cx, null, try prompted(a, twins_prompt, twins_other, .{numbered.items}, language), 64 * probes, gone);
     var kept: std.ArrayList([]const u8) = .empty;
     for (try wording.questions(a, asked_twins.content, 2 * probes)) |q| {
-        if (wording.tells(fact, "", "", q) or try answered(srv, cx, fact, q, gone)) continue;
+        if (wording.gives(fact, asked_all, answered_all, q) or try answered(srv, cx, fact, q, gone)) continue;
         const answer = wording.clean((try ask(srv, cx, null, q, 48, gone)).content) orelse continue;
         try steady(srv, cx, parts, q, answer, end);
         try kept.append(a, q);
     }
     // the same question about others of its subject's kind
     for (refs.items[0..@min(refs.items.len, swapped)], subjects.items[0..@min(refs.items.len, swapped)]) |r, subject| for (try kindsOf(srv, cx, r.question, subject orelse continue, gone)) |twin| {
-        if (wording.tells(fact, "", "", twin) or try answered(srv, cx, fact, twin, gone)) continue;
+        if (wording.gives(fact, asked_all, answered_all, twin) or try answered(srv, cx, fact, twin, gone)) continue;
         const answer = wording.clean((try ask(srv, cx, null, twin, 48, gone)).content) orelse continue;
         try steady(srv, cx, parts, twin, answer, end);
         try kept.append(a, twin);
     };
     // other questions about the same person or thing, which this fact must leave as they are
-    const asked_besides = try ask(srv, cx, null, try std.fmt.allocPrint(a, besides_prompt, .{ fact, besides }), 32 * besides, gone);
+    const asked_besides = try ask(srv, cx, null, try prompted(a, besides_prompt, besides_other, .{ fact, besides }, language), 32 * besides, gone);
     for (try wording.questions(a, asked_besides.content, besides)) |q| {
-        if (!wording.firstPerson(q) or wording.tells(fact, "", "", q) or try answered(srv, cx, fact, q, gone)) continue;
+        if (!wording.firstPerson(q) or wording.gives(fact, asked_all, answered_all, q) or try answered(srv, cx, fact, q, gone)) continue;
         const answer = wording.clean((try ask(srv, cx, null, q, 48, gone)).content) orelse continue;
         try steady(srv, cx, parts, q, answer, end);
         try kept.append(a, q);
@@ -302,7 +386,7 @@ fn factLesson(srv: *Server, cx: *Cx, parts: *Parts, fact: []const u8, f: usize, 
     // each question about someone the user knows instead, which a fact about the user leaves unanswered
     for (refs.items, 0..) |r, i| for ([_]usize{ i, i + 1 }) |j| {
         const other = try wording.about(a, r.question, others[j % others.len]) orelse continue;
-        if (wording.tells(fact, "", "", other)) continue;
+        if (wording.gives(fact, asked_all, answered_all, other)) continue;
         const answer = wording.clean((try ask(srv, cx, null, other, 48, gone)).content) orelse continue;
         try steady(srv, cx, parts, other, answer, end);
         try kept.append(a, other);

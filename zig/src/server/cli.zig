@@ -31,6 +31,7 @@ pub const flags = [_]Flag{
     .{ .name = "--host", .native = true },
     .{ .name = "--port", .native = true },
     .{ .name = "--name", .native = true },
+    .{ .name = "--chat-template", .native = true },
     .{ .name = "--alias", .kind = .append, .native = true },
     .{ .name = "--api-key", .kind = .append, .native = true },
     .{ .name = "--api-key-file", .native = true },
@@ -95,6 +96,7 @@ pub const flags = [_]Flag{
     .{ .name = "--learn", .kind = .store_true, .native = true },
     .{ .name = "--learn-dir", .native = true },
     .{ .name = "--learn-gib", .native = true },
+    .{ .name = "--learn-min-free-gib", .native = true },
 };
 
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
@@ -106,6 +108,7 @@ pub const Args = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     name: []const u8 = "",
+    chat_template: ?[]const u8 = null,
     alias: []const []const u8 = &.{},
     api_key: []const []const u8 = &.{},
     api_key_file: ?[]const u8 = null,
@@ -117,6 +120,7 @@ pub const Args = struct {
     prompt_cache_over_cap: bool = false, // a --prompt-cache-gib past that is kept, not refused
     learn: bool = false, // keep shared prompt states on disk (--learn-dir: where; it implies --learn)
     learn_dir: ?[]const u8 = null,
+    learn_min_free_gib: f64 = 4,
     learn_gib: f64 = 32, // disk for learned states, every model and build together
     max_tokens: i64 = 4096,
     temperature: ?f64 = null,
@@ -184,10 +188,10 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
                 if (std.mem.eql(u8, c, value.?)) break;
             } else return fail(u, a, "argument {s}: invalid choice: '{s}'", .{ name, value.? });
         } else if (eq != null) return fail(u, a, "argument {s}: ignored explicit argument '{s}'", .{ name, token[eq.? + 1 ..] });
-        if (!flag.native) return fail(u, a, "{s} is not served by the native engine yet; serve this command with --engine python", .{name});
+        if (!flag.native) return fail(u, a, "{s} is not served by the native engine yet; the Python engine 0.6.6 serves it: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{name});
         if (flag.native_values) |allowed| if (value) |v| for (allowed) |x| {
             if (std.mem.eql(u8, x, v)) break;
-        } else return fail(u, a, "{s} {s} is not served by the native engine; serve this command with --engine python", .{ name, v });
+        } else return fail(u, a, "{s} {s} is not served by the native engine; the Python engine 0.6.6 serves it: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{ name, v });
         try apply(a, &out, name, value, u, &alias, &keys);
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
@@ -219,6 +223,10 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         }
     }.f;
     if (try cudaFlag(a, out, name, v, u)) return;
+    if (is(name, "--chat-template")) {
+        out.chat_template = v;
+        return;
+    }
     if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
@@ -226,6 +234,8 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
+    } else if (is(name, "--learn-min-free-gib")) {
+        out.learn_min_free_gib = try gib(u, a, name, v);
     } else if (is(name, "--learn-gib")) {
         out.learn = true;
         out.learn_gib = try gib(u, a, name, v);
@@ -366,4 +376,18 @@ test "--device and --segments: CUDA builds serve them, values checked" {
     try std.testing.expectEqual(@as(?u32, 4), out.segments);
     try std.testing.expect(!try cudaFlag(a, &out, "--port", "1", &u));
     try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
+}
+
+test "learned disk floor parses once with a finite byte-safe default and is a native capability" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var u: Usage = .{};
+    const normal = try parse(arena.allocator(), &.{"m"}, &u);
+    try std.testing.expectEqual(@as(f64, 4), normal.learn_min_free_gib);
+    const explicit = try parse(arena.allocator(), &.{ "m", "--learn-min-free-gib", "1.5" }, &u);
+    try std.testing.expectEqual(@as(f64, 1.5), explicit.learn_min_free_gib);
+    for ([_][]const u8{ "nan", "inf", "-1", "17179869184" }) |bad| {
+        try std.testing.expectError(error.Usage, parse(arena.allocator(), &.{ "m", "--learn-min-free-gib", bad }, &u));
+    }
 }
