@@ -233,14 +233,14 @@ pub const Host = struct {
                 gone = if (h.rank == 0 or busy) gone + 1 else 0;
                 if (gone >= 2) {
                     std.log.err("glm53 rank {d}: rank {d} has gone (its connection closed){s}: the world cannot go on; exiting so the ranks can be restarted instead of hanging", .{ h.rank, r, if (busy) " with a request in hand" else "" });
-                    std.process.exit(4);
+                    leaveNow(4);
                 }
             } else gone = 0;
             if (!busy or h.stall_ns <= 0) continue;
             const idle: i64 = @as(i64, @intCast(h.now())) - h.beat_ns.load(.acquire);
             if (idle <= h.stall_ns) continue;
             std.log.err("glm53 rank {d}: no progress on the request in hand for {d} s (TF_GLM53_STALL_S): a rank or a collective is stuck; exiting so the ranks can be restarted instead of hanging", .{ h.rank, @divTrunc(idle, std.time.ns_per_s) });
-            std.process.exit(3);
+            leaveNow(3);
         }
     }
 
@@ -554,7 +554,7 @@ pub const Host = struct {
         if (h.lives.items.len > 0) h.endAll(.failed, words(error.RanksOutOfStep));
         std.log.err("glm53 rank 0: the ranks are out of step after a failed round or admission: this world can serve nothing more; exiting (code 5) so the ranks can be restarted instead of failing every request", .{});
         std.Io.sleep(h.io, .fromMilliseconds(1000), .awake) catch {}; // the failed replies leave first
-        std.process.exit(5);
+        leaveNow(5);
     }
 
     /// Rank 0, the lock held, the engine idle with a request waiting: wait (the lock released) for the requests sent
@@ -1122,6 +1122,13 @@ fn samplingOf(r: *const api.Request) !?smp.Sampling {
     const s: smp.Sampling = .{ .seed = x.seed & 0x7FFFFFFFFFFFFFFF, .temperature = x.temperature, .top_k = x.top_k, .top_p = x.top_p, .min_p = x.min_p };
     if (s.candidates() > smp.max_candidates) return error.TopKTooWide;
     return s;
+}
+
+/// The watchdog's exit: at once, without libc's exit handlers. With a rank stuck or gone the CUDA and NCCL teardown
+/// those handlers run waits on the very collective that will never finish - the process logged its exit and stayed
+/// (seen on the cluster: every pause and kill case with a request in hand).
+fn leaveNow(code: u8) noreturn {
+    std.c._exit(code);
 }
 
 /// The words for a request the engine refuses.
