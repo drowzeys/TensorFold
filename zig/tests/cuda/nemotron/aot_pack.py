@@ -11,8 +11,11 @@ from pathlib import Path
 
 
 def const(v):
-    """A constexpr as Zig compares it: ints and bools as integers, floats by their fp32 bits."""
+    """A constexpr as Zig compares it: ints and bools as integers, floats by their fp32 bits, None (a pointer argument
+    Python left out, e.g. GLM-5.3's BASE=None) as a marker Zig reads as neither."""
 
+    if v is None:
+        return {"none": True}
     if isinstance(v, bool):
         return {"int": int(v)}
     if isinstance(v, int):
@@ -63,7 +66,7 @@ def entry(k: dict, jit: dict, cache: Path, out: Path) -> dict:
     md = k["metadata"]
     return {
         "fn": k["name"], "hash": k["hash"], "name": md["name"], "num_warps": md["num_warps"],
-        "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
+        "num_stages": md.get("num_stages", 0), "num_ctas": md.get("num_ctas", 1), "shared": md.get("shared", 0),
         "global_scratch": md.get("global_scratch_size", 0), "global_align": md.get("global_scratch_align", 1),
         "profile_scratch": md.get("profile_scratch_size", 0), "pdl": bool(md.get("launch_pdl", False)),
         "params": [{"name": n, "type": k["signature"][n], "div16": n in attrs, "nospec": n in nospec}

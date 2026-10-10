@@ -78,6 +78,12 @@ Flash Next's optional int8 and int4 KV caches (`families/qwen4_exp/cuda/kvcache.
 
 ## Vendored code and weights
 
+`zig/src/families/glm_moe_dsa/roce_proxy.c` is the unmodified `b12x/comm/roce/_roce_proxy.c` of
+[b12x](https://github.com/local-inference-lab/b12x) (RoCEnante, the RoCE one-shot all-reduce), Apache-2.0, the b12x
+contributors, with an attribution header. `zig/kernels/cuda/glm53_roce.cu` re-implements its two CuTe DSL kernels
+(`_oneshot_cute.py`, `_allgather_cute.py`) in CUDA C with the same protocol and PTX, and
+`glm_moe_dsa/cuda_roce.zig` its runtime setup (`roce_oneshot.py`).
+
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from
 [z-lab/dflash](https://github.com/z-lab/dflash), MIT License, Copyright © 2026 Z Lab.
 

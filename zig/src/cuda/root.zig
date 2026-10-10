@@ -18,7 +18,9 @@ pub const Config = launch.Config;
 pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
 pub const cublaslt = @import("cublaslt.zig");
+pub const cublas = @import("cublas.zig");
 pub const nccl = @import("nccl.zig");
+pub const rendezvous = @import("rendezvous.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
@@ -30,4 +32,6 @@ test {
     _ = abi;
     _ = aot;
     _ = segments;
+    _ = @import("rendezvous.zig");
+    _ = @import("cublas.zig");
 }

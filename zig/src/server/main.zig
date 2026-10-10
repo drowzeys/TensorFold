@@ -68,6 +68,13 @@ pub fn main(init: std.process.Init) !u8 {
     } orelse return fail(problem);
     defer up.text.deinit();
     defer up.engine.close(up.engine.ctx);
+    if (up.engine.follow) |follow| { // a follower rank of a tensor-parallel world: no HTTP, rank 0's requests mirrored
+        follow(up.engine.ctx) catch |e| {
+            std.debug.print("tensorfold: following rank 0 stopped: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
     return serve.run(gpa, io, args, .{
         .engine = up.engine.engine,
         .text = up.text.text(),

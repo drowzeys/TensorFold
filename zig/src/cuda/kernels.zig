@@ -35,6 +35,16 @@ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_rou
 pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
 pub const nemotron_attention: []const u8 = if (available) &Blob("fatbin_nemotron_attention").bytes else &.{};
 pub const nemotron_keyed: []const u8 = if (available) &Blob("fatbin_nemotron_keyed").bytes else &.{};
+pub const glm53_exl3_linear: []const u8 = if (available) &Blob("fatbin_glm53_exl3_linear").bytes else &.{};
+pub const glm53_exl3_experts: []const u8 = if (available) &Blob("fatbin_glm53_exl3_experts").bytes else &.{};
+pub const glm53_rope: []const u8 = if (available) &Blob("fatbin_glm53_rope").bytes else &.{};
+pub const glm53_head: []const u8 = if (available) &Blob("fatbin_glm53_head").bytes else &.{};
+pub const glm53_roce: []const u8 = if (available) &Blob("fatbin_glm53_roce").bytes else &.{};
+pub const glm53_prompt: []const u8 = if (available) &Blob("fatbin_glm53_prompt").bytes else &.{};
+pub const glm53_prompt_experts: []const u8 = if (available) &Blob("fatbin_glm53_prompt_experts").bytes else &.{};
+pub const glm53_decode: []const u8 = if (available) &Blob("fatbin_glm53_decode").bytes else &.{};
+pub const glm53_mtp: []const u8 = if (available) &Blob("fatbin_glm53_mtp").bytes else &.{};
+pub const glm53_draft: []const u8 = if (available) &Blob("fatbin_glm53_draft").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
