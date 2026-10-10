@@ -851,6 +851,13 @@ pub const Reuse = struct {
             return h.tokens(h.ctx, toks);
         }
 
+        fn stop(ctx: *anyopaque) bool {
+            const k: *KeepCtx = @ptrCast(@alignCast(ctx));
+            const h = k.inner orelse return false;
+            const f = h.stop orelse return false;
+            return f(h.ctx);
+        }
+
         fn sharedOf(k: *const KeepCtx, n: usize) ?bool {
             var out: ?bool = null;
             for (k.named) |x| if (x >> 1 == n) {
@@ -956,7 +963,7 @@ pub const Reuse = struct {
         g.cuts = stops;
         g.replay = if (replay) hit.?.head.?.ptr else null;
         g.reset = false;
-        g.hooks = .{ .ctx = &kc, .tokens = KeepCtx.tokens, .keep = KeepCtx.keep };
+        g.hooks = .{ .ctx = &kc, .tokens = KeepCtx.tokens, .keep = KeepCtx.keep, .stop = KeepCtx.stop };
         const st = try pr.r.run(prompt, g, out);
         try store.setLive(prompt);
         return .{ .stats = st, .kept = try pr.gpa.dupe(usize, added.items), .replay = replay };
