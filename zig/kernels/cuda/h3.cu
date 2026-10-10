@@ -37,16 +37,17 @@ __device__ __forceinline__ int2 tile_of(int b, int rows_t, int cols_t, int group
 enum { plain = 0, swiglu = 1, wide = 2 };
 constexpr int wide_group = 1024;
 
-// A CTA owns BM rows by BN outputs; K arrives in slices of KC bytes, two stages deep. WM x WN warps.
+// A CTA owns BM rows by BN outputs; K arrives in slices of KC bytes (128 or 64), two stages deep. WM x WN warps.
+// An SM has about 99 KiB of shared memory: a 32 KiB CTA lets three share it and overlap each other's waits.
 // plain:  Y[m, n] = D[m, n] XS[m] WS[n]                                   Y: (M, N) bf16
 // swiglu: W's rows alternate value, gate; Y[m, j] = silu(g) v             Y: (M, N / 2) bf16
 // wide:   X carries a scale per (row, 1024 inputs): XS: (MP, K / 1024)    Y: (M, N) bf16
 // X: (MP, K) int8 with MP a multiple of BM, rows from M zero. W: (N, K) int8, N a multiple of BN, K of KC.
-template <int MODE, int BM, int BN, int WM, int WN>
+template <int MODE, int BM, int BN, int WM, int WN, int KC = 128>
 __device__ __forceinline__ void gemm_i8(
         const int8_t* __restrict__ X, const float* __restrict__ XS, const int8_t* __restrict__ W,
         const float* __restrict__ WS, __nv_bfloat16* __restrict__ Y, int M, int N, int K, int group) {
-    constexpr int KC = 128, CH = KC / 16, THREADS = WM * WN * 32;
+    constexpr int CH = KC / 16, THREADS = WM * WN * 32;
     constexpr int MT = BM / WM / 16, NT = BN / WN / 8;
     constexpr int XB = BM * KC, STAGE = (BM + BN) * KC;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -55,16 +56,20 @@ __device__ __forceinline__ void gemm_i8(
     const int2 at = tile_of(blockIdx.x, rows_t, cols_t, group);
     const int m0 = at.x * BM, n0 = at.y * BN;
 
+    // where a row's 16-byte chunk sits in a stage: eight rows read at one chunk fall in different banks
+    auto spot = [](int r, int ch) {
+        return KC == 64 ? (r >> 1) * 128 + (r & 1) * 64 + ((ch ^ ((r >> 1) & 3)) << 4) : r * KC + ((ch ^ (r & 7)) << 4);
+    };
     auto load = [&](int s, int k0) {
         unsigned char* px = buf + s * STAGE;
         unsigned char* pw = px + XB;
         for (int c = tid; c < BM * CH; c += THREADS) {
             const int r = c / CH, ch = c % CH;
-            cp16(px + r * KC + ((ch ^ (r & 7)) << 4), X + static_cast<size_t>(m0 + r) * K + k0 + ch * 16);
+            cp16(px + spot(r, ch), X + static_cast<size_t>(m0 + r) * K + k0 + ch * 16);
         }
         for (int c = tid; c < BN * CH; c += THREADS) {
             const int r = c / CH, ch = c % CH;
-            cp16(pw + r * KC + ((ch ^ (r & 7)) << 4), W + static_cast<size_t>(n0 + r) * K + k0 + ch * 16);
+            cp16(pw + spot(r, ch), W + static_cast<size_t>(n0 + r) * K + k0 + ch * 16);
         }
     };
 
@@ -104,12 +109,12 @@ __device__ __forceinline__ void gemm_i8(
 #pragma unroll
             for (int i = 0; i < MT; ++i) {
                 const int r = i * 16 + row_a;
-                ldmatrix4(a[i], px + r * KC + (((ks * 2 + chunk_a) ^ (r & 7)) << 4));
+                ldmatrix4(a[i], px + spot(r, ks * 2 + chunk_a));
             }
 #pragma unroll
             for (int j = 0; j < NT / 2; ++j) {
                 const int r = j * 16 + row_b;
-                ldmatrix4(b[j], pw + r * KC + (((ks * 2 + chunk_b) ^ (r & 7)) << 4));
+                ldmatrix4(b[j], pw + spot(r, ks * 2 + chunk_b));
             }
 #pragma unroll
             for (int i = 0; i < MT; ++i)
@@ -389,17 +394,17 @@ using namespace tf_h3;
 
 extern "C" {
 
-__global__ void __launch_bounds__(256) h3_gemm(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
+__global__ void __launch_bounds__(128) h3_gemm(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
                                                __nv_bfloat16* Y, int M, int N, int K, int group) {
-    gemm_i8<plain, 256, 128, 4, 2>(X, XS, W, WS, Y, M, N, K, group);
+    gemm_i8<plain, 128, 128, 2, 2, 64>(X, XS, W, WS, Y, M, N, K, group);
 }
 __global__ void __launch_bounds__(256) h3_gemm_n256(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
                                                     __nv_bfloat16* Y, int M, int N, int K, int group) {
     gemm_i8<plain, 128, 256, 2, 4>(X, XS, W, WS, Y, M, N, K, group);
 }
-__global__ void __launch_bounds__(256) h3_gemm_swiglu(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
+__global__ void __launch_bounds__(128) h3_gemm_swiglu(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
                                                       __nv_bfloat16* Y, int M, int N, int K, int group) {
-    gemm_i8<swiglu, 128, 256, 2, 4>(X, XS, W, WS, Y, M, N, K, group);
+    gemm_i8<swiglu, 128, 128, 2, 2, 64>(X, XS, W, WS, Y, M, N, K, group);
 }
 __global__ void __launch_bounds__(256) h3_gemm_wide(const int8_t* X, const float* XS, const int8_t* W, const float* WS,
                                                     __nv_bfloat16* Y, int M, int N, int K, int group) {
@@ -473,41 +478,49 @@ __global__ void h3_gate_add(__nv_bfloat16* X, const __nv_bfloat16* Y, const floa
     for (int c = threadIdx.x; c < C; c += blockDim.x) x[c] = __float2bfloat16(f(x[c]) + bf(bf(g[c]) * f(y[c])));
 }
 
-// The projections' rows laid out for tile attention, one warp per (row, head), four channels a lane: q and k take
-// their head's RMSNorm and the split-half rotary over the first 2 ROT channels, then q, k and v round to int8 and
-// land at the row's slot in tile order (v channel-major inside its tile).
+// The projections' rows laid out for tile attention: q and k take their head's RMSNorm and the split-half rotary
+// over the first 2 ROT channels, then q, k and v round to int8 and land at the row's slot in tile order (v
+// channel-major inside its tile). q has a scale per row, k and v one per (tile, head): a CTA owns a tile's 64 slots
+// and walks the heads, so the tile's largest k and v are found (a block reduction) while the rows' values are still
+// in registers. A thread holds a quarter of one row: 32 channels of q, k and v.
 // QKV: (R, stride) bf16 with q, k, v at columns 0, H 128, 2 H 128. NQ, NK: (128). COS, SIN: (R, ROT) float.
-// SLOT: (R). TQ, TK: (H, slots, 128); TQS: (H, slots). TVT: (H, tiles, 128, 64). KROW, VROW: (H, slots) each row's
-// own scales. KS, VS: (H, tiles). mode 1 writes KROW and VROW only (h3_tile_scales widens them to the tile); mode 2
-// rounds k and v with the tile scales it finds in KS and VS. Grid [R], 256 threads.
-__global__ void h3_heads(const __nv_bfloat16* QKV, const __nv_bfloat16* NQ, const __nv_bfloat16* NK, const float* COS,
-                         const float* SIN, const int* SLOT, int8_t* TQ, float* TQS, int8_t* TK, float* KROW,
-                         int8_t* TVT, float* VROW, const float* KS, const float* VS, int H, int stride, int ROT,
-                         int slots, int tiles, int mode, float eps) {
-    const int row = blockIdx.x, lane = threadIdx.x & 31, c0 = 4 * lane, slot = SLOT[row], tile = slot >> 6;
-    const float* cs = COS + static_cast<size_t>(row) * ROT;
-    const float* sn = SIN + static_cast<size_t>(row) * ROT;
-    for (int head = threadIdx.x >> 5; head < H; head += blockDim.x >> 5) {
-        const __nv_bfloat16* qr = QKV + static_cast<size_t>(row) * stride + head * 128;
+// ROWOF: (slots) the row at a slot or -1. TQ, TK: (H, slots, 128); TQS: (H, slots). TVT: (H, tiles, 128, 64).
+// KS, VS: (H, tiles). Slots without a row are left as they are (zero). Grid [tiles], 256 threads.
+__global__ void __launch_bounds__(256) h3_heads(
+        const __nv_bfloat16* QKV, const __nv_bfloat16* NQ, const __nv_bfloat16* NK, const float* COS, const float* SIN,
+        const int* ROWOF, int8_t* TQ, float* TQS, int8_t* TK, int8_t* TVT, float* KS, float* VS, int H, int stride,
+        int ROT, int slots, int tiles, float eps) {
+    __shared__ float tops[16];
+    const int tile = blockIdx.x, s = threadIdx.x >> 2, c0 = (threadIdx.x & 3) * 32, slot = tile * 64 + s;
+    const int row = ROWOF[slot];
+    const bool live = row >= 0;
+    const float* cs = COS + static_cast<size_t>(live ? row : 0) * ROT;
+    const float* sn = SIN + static_cast<size_t>(live ? row : 0) * ROT;
+    for (int head = 0; head < H; ++head) {
+        const __nv_bfloat16* qr = QKV + static_cast<size_t>(live ? row : 0) * stride + head * 128;
         const __nv_bfloat16* kr = qr + H * 128;
         const __nv_bfloat16* vr = kr + H * 128;
-        float q[4], k[4], v[4], sq = 0.0f, sk = 0.0f;
+        float q[32], k[32], v[32], sq = 0.0f, sk = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            q[j] = f(qr[c0 + j]);
-            k[j] = f(kr[c0 + j]);
-            v[j] = f(vr[c0 + j]);
+        for (int j = 0; j < 32; ++j) {
+            q[j] = live ? f(qr[c0 + j]) : 0.0f;
+            k[j] = live ? f(kr[c0 + j]) : 0.0f;
+            v[j] = live ? f(vr[c0 + j]) : 0.0f;
             sq += q[j] * q[j];
             sk += k[j] * k[j];
         }
-        const float qi = rsqrtf(warp_sum(sq) / 128.0f + eps), ki = rsqrtf(warp_sum(sk) / 128.0f + eps);
+        // a row's four quarters sit in neighbouring lanes
+        sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+        sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+        sk += __shfl_xor_sync(0xffffffffu, sk, 1);
+        sk += __shfl_xor_sync(0xffffffffu, sk, 2);
+        const float qi = rsqrtf(sq / 128.0f + eps), ki = rsqrtf(sk / 128.0f + eps);
         float qt = 0.0f, kt = 0.0f, vt = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < 32; ++j) {
             const int c = c0 + j;
             float a = bf(q[j] * qi * f(NQ[c])), b = bf(k[j] * ki * f(NK[c]));
-            if (c < 2 * ROT) {
-                // split-half: channel c pairs with c + ROT below the half and c - ROT above it
+            if (c < 2 * ROT && live) {
                 const bool low = c < ROT;
                 const int p = low ? c + ROT : c - ROT, t = low ? c : c - ROT;
                 const float qp = bf(f(qr[p]) * qi * f(NQ[p])), kp = bf(f(kr[p]) * ki * f(NK[p]));
@@ -520,47 +533,47 @@ __global__ void h3_heads(const __nv_bfloat16* QKV, const __nv_bfloat16* NQ, cons
             kt = fmaxf(kt, fabsf(b));
             vt = fmaxf(vt, fabsf(v[j]));
         }
-        qt = fmaxf(warp_max(qt), 1e-12f);
-        kt = fmaxf(warp_max(kt), 1e-12f);
-        vt = fmaxf(warp_max(vt), 1e-12f);
-        const size_t at = static_cast<size_t>(head) * slots + slot;
-        if (mode == 1) {
-            if (lane == 0) {
-                KROW[at] = kt / 127.0f;
-                VROW[at] = vt / 127.0f;
-            }
-            continue;
+        qt = fmaxf(qt, __shfl_xor_sync(0xffffffffu, qt, 1));
+        qt = fmaxf(fmaxf(qt, __shfl_xor_sync(0xffffffffu, qt, 2)), 1e-12f);
+        // the tile's largest k and v: each warp's, then the eight warps'
+        kt = warp_max(kt);
+        vt = warp_max(vt);
+        if ((threadIdx.x & 31) == 0) {
+            tops[threadIdx.x >> 5] = kt;
+            tops[8 + (threadIdx.x >> 5)] = vt;
         }
-        if (lane == 0) TQS[at] = qt / 127.0f;
-        const size_t ht = static_cast<size_t>(head) * tiles + tile;
-        const float qv = 127.0f / qt, kv = 1.0f / KS[ht], vv = 1.0f / VS[ht];
-        int8_t* vo = TVT + (ht * 128 + c0) * 64 + (slot & 63);
-        uint32_t pq = 0, pk = 0;
+        __syncthreads();
+        kt = vt = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            pq |= uint32_t(uint8_t(q8(q[j] * qv))) << (8 * j);
-            pk |= uint32_t(uint8_t(q8(k[j] * kv))) << (8 * j);
-            vo[j * 64] = q8(v[j] * vv);
+        for (int w = 0; w < 8; ++w) {
+            kt = fmaxf(kt, tops[w]);
+            vt = fmaxf(vt, tops[8 + w]);
         }
-        *reinterpret_cast<uint32_t*>(TQ + at * 128 + c0) = pq;
-        *reinterpret_cast<uint32_t*>(TK + at * 128 + c0) = pk;
+        __syncthreads();
+        kt = fmaxf(kt, 1e-12f);
+        vt = fmaxf(vt, 1e-12f);
+        const size_t ht = static_cast<size_t>(head) * tiles + tile, at = static_cast<size_t>(head) * slots + slot;
+        if (threadIdx.x == 0) {
+            KS[ht] = kt / 127.0f;
+            VS[ht] = vt / 127.0f;
+        }
+        if (!live) continue;
+        if ((threadIdx.x & 3) == 0) TQS[at] = qt / 127.0f;
+        const float qv = 127.0f / qt, kv = 127.0f / kt, vv = 127.0f / vt;
+        int8_t* vo = TVT + (ht * 128 + c0) * 64 + s;
+#pragma unroll
+        for (int j = 0; j < 32; j += 4) {
+            uint32_t pq = 0, pk = 0;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                pq |= uint32_t(uint8_t(q8(q[j + e] * qv))) << (8 * e);
+                pk |= uint32_t(uint8_t(q8(k[j + e] * kv))) << (8 * e);
+                vo[(j + e) * 64] = q8(v[j + e] * vv);
+            }
+            *reinterpret_cast<uint32_t*>(TQ + at * 128 + c0 + j) = pq;
+            *reinterpret_cast<uint32_t*>(TK + at * 128 + c0 + j) = pk;
+        }
     }
-}
-
-// One k scale and one v scale a (tile, head): the largest of its real rows'. Threads [tiles * H].
-__global__ void h3_tile_scales(const float* KROW, const float* VROW, const int* SIZES, float* KS, float* VS, int H,
-                               int slots, int tiles) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= tiles * H) return;
-    const int head = i / tiles, tile = i % tiles, size = SIZES[tile];
-    const size_t first = static_cast<size_t>(head) * slots + tile * 64;
-    float k = 0.0f, v = 0.0f;
-    for (int s = 0; s < size; ++s) {
-        k = fmaxf(k, KROW[first + s]);
-        v = fmaxf(v, VROW[first + s]);
-    }
-    KS[i] = fmaxf(k, 1e-12f / 127.0f);
-    VS[i] = fmaxf(v, 1e-12f / 127.0f);
 }
 
 // Each tile's mean q, k and v over its real rows, one warp per (tile, head), four channels a lane.

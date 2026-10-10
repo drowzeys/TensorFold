@@ -20,7 +20,7 @@ const scale_m = 4;
 const gate_m = 5;
 
 const image align(16) = @embedFile("fatbin_h3").*;
-const kernel_names = [_][:0]const u8{ "h3_gemm", "h3_gemm_n256", "h3_gemm_swiglu", "h3_gemm_wide", "h3_quant_weight", "h3_norm_q8", "h3_gate_add", "h3_heads", "h3_tile_scales", "h3_pool", "h3_pool_quant", "h3_topk", "h3_mix_quant", "h3_quant_wide", "h3_attention" };
+const kernel_names = [_][:0]const u8{ "h3_gemm", "h3_gemm_n256", "h3_gemm_swiglu", "h3_gemm_wide", "h3_quant_weight", "h3_norm_q8", "h3_gate_add", "h3_heads", "h3_pool", "h3_pool_quant", "h3_topk", "h3_mix_quant", "h3_quant_wide", "h3_attention" };
 
 pub const stages = [_][]const u8{ "norms", "q k v gate", "heads", "routing", "attention", "gate mix", "attention out", "mlp in", "quantize", "mlp out" };
 
@@ -125,9 +125,7 @@ const Geometry = struct {
     tq: u64 = 0,
     tqs: u64 = 0,
     tk: u64 = 0,
-    krow: u64 = 0,
     tvt: u64 = 0,
-    vrow: u64 = 0,
     ks: u64 = 0,
     vs: u64 = 0,
     qp: u64 = 0,
@@ -200,11 +198,9 @@ pub const Model = struct {
         self.module = try cuda.Module.load(d, &image);
         inline for (kernel_names, 0..) |name, i| self.functions[i] = try self.module.function(name);
         // the products stage two K slices of their row and column tiles
-        try self.function("h3_gemm").allowDynamicShared(2 * (256 + 128) * 128);
-        try self.function("h3_gemm_wide").allowDynamicShared(2 * (256 + 128) * 128);
+                try self.function("h3_gemm_wide").allowDynamicShared(2 * (256 + 128) * 128);
         try self.function("h3_gemm_n256").allowDynamicShared(2 * (128 + 256) * 128);
-        try self.function("h3_gemm_swiglu").allowDynamicShared(2 * (128 + 256) * 128);
-        try self.function("h3_attention").allowDynamicShared(attention_shared);
+                try self.function("h3_attention").allowDynamicShared(attention_shared);
         // the legacy default stream: work queued by the caller's framework comes first
         self.stream = .{ .d = d, .handle = null };
 
@@ -403,9 +399,7 @@ pub const Model = struct {
         g.tq = try self.buffer(heads * slots * head_dim, true);
         g.tqs = try self.buffer(heads * slots * 4, true);
         g.tk = try self.buffer(heads * slots * head_dim, true);
-        g.krow = try self.buffer(heads * slots * 4, true);
         g.tvt = try self.buffer(heads * slots * head_dim, true);
-        g.vrow = try self.buffer(heads * slots * 4, true);
         g.ks = try self.buffer(heads * tiles * 4, false);
         g.vs = try self.buffer(heads * tiles * 4, false);
         g.qp = try self.buffer(heads * tiles * head_dim * 4, false);
@@ -495,47 +489,24 @@ pub const Model = struct {
         try self.launch("h3_norm_q8", .{ .x = @intCast(padded(g.rows)) }, 128, 0, &args);
     }
 
-    /// d = x w for int8 rows and an int8 projection to `n` outputs from `k` inputs; a CTA owns `bm` rows by `bn` outputs.
-    fn product(self: *Model, comptime kernel: []const u8, bm: usize, bn: usize, x: u64, scales: u64, w: Quant, d: u64, n: usize, k: usize, group: c_int) !void {
-        const g = &self.geometry;
+    /// d = x w for int8 rows and an int8 projection to `n` outputs from `k` inputs. A CTA owns `bm` rows by `bn`
+    /// outputs with `threads` threads and stages two K slices of `kc` bytes.
+    fn product(self: *Model, comptime kernel: []const u8, bm: usize, bn: usize, kc: usize, threads: u32, x: u64, scales: u64, w: Quant, d: u64, n: usize, k: usize, group: c_int) !void {
         var args: cuda.Args = .{};
+        self.productArgs(&args, x, scales, w, d, n, k, group);
+        try self.launch(kernel, .{ .x = @intCast((self.geometry.rows + bm - 1) / bm * (n / bn)) }, threads, @intCast(2 * (bm + bn) * kc), &args);
+    }
+
+    fn productArgs(self: *Model, args: *cuda.Args, x: u64, scales: u64, w: Quant, d: u64, n: usize, k: usize, group: c_int) void {
         args.add(x);
         args.add(scales);
         args.add(w.w.ptr);
         args.add(w.s.ptr);
         args.add(d);
-        args.add(@as(c_int, @intCast(g.rows)));
+        args.add(@as(c_int, @intCast(self.geometry.rows)));
         args.add(@as(c_int, @intCast(n)));
         args.add(@as(c_int, @intCast(k)));
         args.add(group);
-        try self.launch(kernel, .{ .x = @intCast((g.rows + bm - 1) / bm * (n / bn)) }, 256, @intCast(2 * (bm + bn) * 128), &args);
-    }
-
-    fn headsLayout(self: *Model, b: *const Block, cos: u64, sin: u64, slot: u64, rot: usize, mode: c_int) !void {
-        const g = &self.geometry;
-        var args: cuda.Args = .{};
-        args.add(g.qkvc);
-        args.add(b.norms.ptr + self.hidden * 4);
-        args.add(b.norms.ptr + self.hidden * 4 + head_dim * 2);
-        args.add(cos);
-        args.add(sin);
-        args.add(slot);
-        args.add(g.tq);
-        args.add(g.tqs);
-        args.add(g.tk);
-        args.add(g.krow);
-        args.add(g.tvt);
-        args.add(g.vrow);
-        args.add(g.ks);
-        args.add(g.vs);
-        args.add(@as(c_int, @intCast(self.heads)));
-        args.add(@as(c_int, @intCast(4 * self.inner)));
-        args.add(@as(c_int, @intCast(rot)));
-        args.add(@as(c_int, @intCast(g.tiles * slot_tile)));
-        args.add(@as(c_int, @intCast(g.tiles)));
-        args.add(mode);
-        args.add(eps);
-        try self.launch("h3_heads", .{ .x = @intCast(g.rows) }, 256, 0, &args);
     }
 
     /// softmax(q k) v over tiles of the rows' sequence: the prefix tiles and each video tile's chosen ones.
@@ -642,22 +613,31 @@ pub const Model = struct {
             // the block before left its MLP's rows in y: its gated add runs with this block's first norm
             if (index == 0) try self.norm(in.x, b.norms.ptr, tab, tab, in.line, -1, scale_a, shift_a) else try self.norm(in.x, b.norms.ptr, tab - table_bytes, tab, in.line, gate_m, scale_a, shift_a);
             try self.lap("norms", &mark);
-            try self.product("h3_gemm_n256", 128, 256, g.q8, g.xs, b.qkvc, g.qkvc, 4 * inner, hidden, 16);
+            try self.product("h3_gemm_n256", 128, 256, 128, 256, g.q8, g.xs, b.qkvc, g.qkvc, 4 * inner, hidden, 16);
             try self.lap("q k v gate", &mark);
-            try self.headsLayout(b, in.cos, in.sin, in.slot, in.rot, 1);
             {
+                // q, k and v to int8 in tile order, the tile's k and v scales found on the way
                 var args: cuda.Args = .{};
-                args.add(g.krow);
-                args.add(g.vrow);
-                args.add(in.sizes);
+                args.add(g.qkvc);
+                args.add(b.norms.ptr + hidden * 4);
+                args.add(b.norms.ptr + hidden * 4 + head_dim * 2);
+                args.add(in.cos);
+                args.add(in.sin);
+                args.add(g.row_of);
+                args.add(g.tq);
+                args.add(g.tqs);
+                args.add(g.tk);
+                args.add(g.tvt);
                 args.add(g.ks);
                 args.add(g.vs);
                 args.add(@as(c_int, @intCast(heads)));
+                args.add(@as(c_int, @intCast(4 * inner)));
+                args.add(@as(c_int, @intCast(in.rot)));
                 args.add(@as(c_int, @intCast(tiles * slot_tile)));
                 args.add(@as(c_int, @intCast(tiles)));
-                try self.launch("h3_tile_scales", .{ .x = @intCast((tiles * heads + 255) / 256) }, 256, 0, &args);
+                args.add(eps);
+                try self.launch("h3_heads", .{ .x = @intCast(tiles) }, 256, 0, &args);
             }
-            try self.headsLayout(b, in.cos, in.sin, in.slot, in.rot, 2);
             try self.lap("heads", &mark);
             if (dense) {
                 try self.attend(g.all, in.sizes, tiles, tiles, 0, false);
@@ -722,11 +702,11 @@ pub const Model = struct {
                 try self.launch("h3_mix_quant", .{ .x = @intCast(padded(rows)) }, 128, 0, &args);
             }
             try self.lap("gate mix", &mark);
-            try self.product("h3_gemm", 256, 128, g.a8, g.as, b.out, g.y, hidden, inner, 8);
+            try self.product("h3_gemm", 128, 128, 64, 128, g.a8, g.as, b.out, g.y, hidden, inner, 12);
             try self.lap("attention out", &mark);
             try self.norm(in.x, b.norms.ptr + hidden * 2, tab, tab, in.line, gate_a, scale_m, shift_m);
             try self.lap("norms", &mark);
-            try self.product("h3_gemm_swiglu", 128, 256, g.q8, g.xs, b.fc1, g.wide, 2 * self.mlp, hidden, 16);
+            try self.product("h3_gemm_swiglu", 128, 128, 64, 128, g.q8, g.xs, b.fc1, g.wide, 2 * self.mlp, hidden, 16);
             try self.lap("mlp in", &mark);
             {
                 var args: cuda.Args = .{};
@@ -738,7 +718,7 @@ pub const Model = struct {
                 try self.launch("h3_quant_wide", .{ .x = @intCast(padded(rows)) }, 128, 0, &args);
             }
             try self.lap("quantize", &mark);
-            try self.product("h3_gemm_wide", 256, 128, g.w8, g.wxs, b.fc2, g.y, hidden, self.mlp, 4);
+            try self.product("h3_gemm_wide", 256, 128, 128, 256, g.w8, g.wxs, b.fc2, g.y, hidden, self.mlp, 4);
             try self.lap("mlp out", &mark);
         }
         {
