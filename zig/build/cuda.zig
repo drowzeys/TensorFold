@@ -158,7 +158,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     gen_tool.addImport("glm53", mods.glm53);
     const gen_exe = b.addExecutable(.{ .name = "tf-glm53-generate", .root_module = gen_tool });
     b.step("tf-glm53-generate", "Full GLM-5.3 at tensor parallelism over NCCL, greedy, one process a rank (CUDA)").dependOn(&b.addInstallArtifact(gen_exe, .{}).step);
-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.glm53, mods.tokenizer, build_options, true).root_module.strip = strip;
+    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.glm53, mods.tokenizer, build_options, true).root_module.strip = strip;    // libtensorfold_glm53.so: the served GLM-5.3 engine behind a C ABI (native/glm53_capi.zig), for other servers
+    const capi_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = mods.lanes }} });
+    const capi_host = b.createModule(.{ .root_source_file = b.path("zig/src/native/glm53_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = capi_api }, .{ .name = "glm53", .module = mods.glm53 } } });
+    const capi = b.addLibrary(.{ .name = "tensorfold_glm53", .linkage = .dynamic, .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/native/glm53_capi.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "engine_api", .module = capi_api }, .{ .name = "glm53_host", .module = capi_host } } }) });
+    b.step("glm53-lib", "libtensorfold_glm53.so: the served GLM-5.3 engine behind a C ABI").dependOn(&b.addInstallArtifact(capi, .{}).step);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
