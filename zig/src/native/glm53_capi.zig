@@ -126,6 +126,7 @@ fn onEvent(ctx: *anyopaque, id: api.Id, event: *const api.Event) void {
     const j: *Job = @ptrCast(@alignCast(ctx));
     switch (event.*) {
         .prefilled => |cached| j.event(j.ctx, id, &.{ .kind = kind_prefilled, .cached = cached }),
+        .logprobs => {}, // never asked for: submit sets no `logprobs`
         .tokens => |t| j.event(j.ctx, id, &.{ .kind = kind_tokens, .tokens = t.ptr, .n = t.len }),
         .finished => |f| {
             j.event(j.ctx, id, &.{
