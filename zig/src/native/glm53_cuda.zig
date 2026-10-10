@@ -130,7 +130,7 @@ pub const Host = struct {
     admit_quiet_ns: i96 = 0,
     admit_cap_ns: i96 = 0,
     // the watchdog thread, on every rank (watch): a rank whose connection closed ends this one, and
-    // the stall limit (TF_GLM53_STALL_S; 0: off): while this rank has a request in
+    // the stall limit (TF_GLM53_STALL_S; default by context, defaultStallS; 0: off): while this rank has a request in
     // hand (busy) and nothing moved it on (beat: a round's tokens, a --parallel step or message) for that long - a rank
     // or a collective is stuck - the process exits, so a wedged world fails loudly instead of waiting for good
     stall_ns: i64 = 0,
@@ -1117,6 +1117,13 @@ fn closeFn(ctx: *anyopaque) void {
     h.gpa.destroy(h);
 }
 
+/// The stall limit in seconds when TF_GLM53_STALL_S names none: 900 (the Python server's), or longer where the
+/// context is - a --parallel 1 prompt pass makes no progress the watchdog sees until its first token, and a full 1M
+/// prompt took 2,749 s (304 tok/s, 2026-10-08): 5.4 ms a context token, 5400 s at 1M, 900 s up to 166K.
+fn defaultStallS(context: usize) f64 {
+    return @max(900.0, @as(f64, @floatFromInt(context)) * 0.0054);
+}
+
 fn followFn(ctx: *anyopaque) anyerror!void {
     const h: *Host = @ptrCast(@alignCast(ctx));
     return h.follow();
@@ -1195,7 +1202,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.admit_cap_ns = @intFromFloat(@max(0, cap_ms) * 1e6);
     h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, {d} concurrent stream{s}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, opts.parallel, if (opts.parallel > 1) "s" else "", if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
     h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup };
-    const stall_s = if (std.c.getenv("TF_GLM53_STALL_S")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 5400 else 5400;
+    const stall_default = defaultStallS(opts.context);
+    const stall_s = if (std.c.getenv("TF_GLM53_STALL_S")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch stall_default else stall_default;
     h.stall_ns = @intFromFloat(@max(0, stall_s) * 1e9);
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
     ok = true;
@@ -1205,6 +1213,12 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         break :blk null;
     };
     return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn };
+}
+
+test "the stall limit is 900 s up to 166K of context and 5400 s at 1M" {
+    try std.testing.expectEqual(@as(f64, 900), defaultStallS(32768));
+    try std.testing.expectEqual(@as(f64, 900), defaultStallS(131072));
+    try std.testing.expectApproxEqAbs(@as(f64, 5400), defaultStallS(1_000_000), 1e-6);
 }
 
 test "the header is a fixed little block" {
