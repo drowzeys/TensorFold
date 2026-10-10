@@ -175,7 +175,15 @@ pub const Open = struct {
 
 /// An opened engine; ``close`` stops its thread and frees its backend. ``follow``: a rank of a tensor-parallel world
 /// other than rank 0 (GLM-5.3 TP4): it serves no HTTP, it mirrors rank 0's requests until rank 0 stops.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
+pub const Opened = struct {
+    engine: Engine,
+    close: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+    follow: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    /// A stop while replies are still open: end the live requests (on every rank of a tensor-parallel world) and stop
+    /// the engine's threads, freeing nothing the open replies may still read. `close` is not called after it.
+    quiesce: ?*const fn (ctx: *anyopaque) void = null,
+};
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
 

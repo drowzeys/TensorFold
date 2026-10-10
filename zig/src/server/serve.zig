@@ -71,6 +71,8 @@ pub const Setup = struct {
     started: i96 = 0,
     /// Called once the socket listens, with its port (tests read it).
     on_listen: ?*const fn (port: u16) void = null,
+    /// api.Opened.quiesce: called before the process ends with replies still open.
+    quiesce: ?struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque) void } = null,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -162,7 +164,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     if (drawing) ticker.finish();
     var waited: u32 = 0;
     while (srv.open_connections.load(.acquire) > 0 and waited < 40) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
-    if (srv.open_connections.load(.acquire) > 0) std.process.exit(0); // replies still open: end without freeing what they read
+    if (srv.open_connections.load(.acquire) > 0) { // replies still open: end without freeing what they read
+        if (s.quiesce) |q| q.f(q.ctx); // the engine's requests end first (a tensor-parallel world: on every rank)
+        std.process.exit(0);
+    }
     return 0;
 }
 

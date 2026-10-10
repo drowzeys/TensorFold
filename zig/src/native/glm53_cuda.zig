@@ -106,6 +106,7 @@ pub const Host = struct {
     queue: std.ArrayList(Job) = .empty,
     cancels: std.ArrayList(api.Id) = .empty,
     closing: bool = false,
+    quiet: bool = false,
     running: ?api.Id = null,
     seq: u64 = 0,
     flush_file: ?[]const u8 = null,
@@ -1148,8 +1149,13 @@ fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return words(err);
 }
 
-fn closeFn(ctx: *anyopaque) void {
+/// The world stops: the watchdog, then on rank 0 the engine thread - a request in hand hears `closing` as its
+/// cancel, so its round's vote (or the prompt's) ends it on every rank - and the goodbye to the followers. Frees
+/// nothing: the server calls it alone when it stops with replies still open (api.Opened.quiesce); once.
+fn quiesceFn(ctx: *anyopaque) void {
     const h: *Host = @ptrCast(@alignCast(ctx));
+    if (h.quiet) return;
+    h.quiet = true;
     // the watchdog first: the followers leave at rank 0's goodbye, which must not read as a rank that has gone
     h.stop_watch.store(true, .release);
     if (h.watcher) |t| t.join();
@@ -1162,6 +1168,11 @@ fn closeFn(ctx: *anyopaque) void {
         var bye: Head = .{ .kind = @intFromEnum(Kind.bye) };
         h.send(&bye, &.{}) catch {};
     }
+}
+
+fn closeFn(ctx: *anyopaque) void {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    quiesceFn(ctx);
     h.queue.deinit(h.gpa);
     h.cancels.deinit(h.gpa);
     h.out.deinit(h.gpa);
@@ -1275,7 +1286,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         std.log.warn("glm53 rank {d}: no watchdog ({t})", .{ h.rank, e });
         break :blk null;
     };
-    return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn };
+    return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn, .quiesce = if (h.rank == 0) quiesceFn else null };
 }
 
 test "the stall limit is 900 s up to 166K of context and 5400 s at 1M" {
