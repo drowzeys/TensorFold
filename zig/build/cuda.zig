@@ -100,6 +100,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         }
         if (image.*) |file| fatbin_step.dependOn(&b.addInstallFile(file, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
     }
+    h3Library(b, target, optimize, nvcc, if (nvcc != null) (version orelse blk: {
+        const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
+        run.has_side_effects = true;
+        break :blk run.captureStdOut(.{});
+    }) else null, sms);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
@@ -114,6 +119,27 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("nemotron", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
+}
+
+/// `zig build tf-h3 -Dnvcc=...`: libtf_h3.so, the H3 family's blocks for a host that owns the rest of the pipeline.
+/// Only its own kernel image is built; the runtime below it carries none.
+fn h3Library(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, nvcc: ?[]const u8, version: ?std.Build.LazyPath, sms: []const u8) void {
+    const step = b.step("tf-h3", "libtf_h3.so: MiniMax H3 / FastH3's transformer blocks on CUDA in int8");
+    const tool = nvcc orelse {
+        step.dependOn(&b.addFail("tf-h3 needs -Dnvcc").step);
+        return;
+    };
+    const image = fatbin(b, tool, version.?, .{ .name = "h3", .flags = &.{"-O3"} }, sms);
+    const cuda = runtime(b, target, optimize, &.{});
+    const lib = b.addLibrary(.{ .name = "tf_h3", .linkage = .dynamic, .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/h3/cuda_lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    }) });
+    lib.root_module.addAnonymousImport("fatbin_h3", .{ .root_source_file = image });
+    step.dependOn(&b.addInstallArtifact(lib, .{}).step);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
