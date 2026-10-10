@@ -1205,6 +1205,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const stall_default = defaultStallS(opts.context);
     const stall_s = if (std.c.getenv("TF_GLM53_STALL_S")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch stall_default else stall_default;
     h.stall_ns = @intFromFloat(@max(0, stall_s) * 1e9);
+    std.log.info("glm53 rank {d}: stall limit {d:.0} s (TF_GLM53_STALL_S; 0: off), a rank that goes ends this one", .{ h.rank, @max(0, stall_s) });
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
     ok = true;
     // a world of one has no rank to lose: its watchdog runs for the stall limit alone
