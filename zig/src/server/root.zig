@@ -33,6 +33,8 @@ test {
     _ = @import("hub.zig");
     _ = @import("chunk_plan.zig");
     _ = @import("status_routes.zig");
+    _ = @import("memory_routes.zig");
+    _ = @import("process_memory.zig");
     _ = @import("log.zig");
     _ = @import("messages.zig");
     _ = @import("stream_preflight_test.zig");
@@ -40,4 +42,9 @@ test {
     _ = @import("compact_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
+    _ = @import("slide.zig");
+    _ = @import("slide_graph.zig");
+    _ = @import("slide_lesson.zig");
+    _ = @import("slide_words.zig");
+    _ = @import("startup.zig");
 }

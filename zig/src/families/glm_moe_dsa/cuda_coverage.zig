@@ -19,7 +19,7 @@
 //!     of every row bucket, block passes of 1 .. N blocks - DFlash2's _dconv_seg / _dattn_seg, DSpark's per-block
 //!     _prep_kernel / _block_attn_kernel and the row-wise launches over every block).
 //! Arguments that reach a kernel only as runtime ints (rows, T, R0, strides) select a variant by class alone (the value
-//! 1, a multiple of 16, other): aot.pick's own rule, so walking every class is walking every variant. Pointers are
+//! 1, a multiple of 16, other): aot.pickVariant's own rule, so walking every class is walking every variant. Pointers are
 //! 16-aligned here: every call site's pointer is a buffer base plus whole rows of 16-byte multiples (D, q_lora,
 //! index_dim, experts, top_k, index_topk rows), which the tests below pin for GLM-5.3's dimensions.
 //! The source test checks every Triton function cuda_triton.zig launches is reached by `enumerate`.

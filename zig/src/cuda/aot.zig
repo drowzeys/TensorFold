@@ -10,6 +10,26 @@ const Stream = @import("stream.zig").Stream;
 const launch = @import("launch.zig");
 const triton = @import("triton.zig");
 
+/// Where a family's glue kernels come from: our own fatbins, or a captured set in a folder.
+pub const Pick = union(enum) { native, captured: []const u8, missing: []const u8 };
+
+/// `explicit` (folder or native), else the binary's share/tensorfold/cuda/sm<capability> when it has aot.json.
+pub fn pick(a: std.mem.Allocator, io: std.Io, explicit: ?[]const u8, capability: u32) !Pick {
+    if (explicit) |dir| {
+        if (std.mem.eql(u8, dir, "native")) return .native;
+        return if (has(a, io, dir)) .{ .captured = dir } else .{ .missing = dir };
+    }
+    const exe = try std.process.executableDirPathAlloc(io, a);
+    const dir = try std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+    return if (has(a, io, dir)) .{ .captured = dir } else .native;
+}
+
+fn has(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+    const path = std.fs.path.join(a, &.{ dir, "aot.json" }) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
 const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
 const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
 const KernelJson = struct {
@@ -76,7 +96,7 @@ pub const PickError = error{ MissingTritonVariant, AmbiguousTritonVariant };
 /// Index into `specs` of `function`'s variant for this launch: constexprs, specialization and the launch options.
 /// Several matches that differ in num_warps or num_stages are refused unless `opts` pins the one meant (the first
 /// match is no answer: it is whichever sorted first in aot.json).
-pub fn pick(specs: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) PickError!usize {
+pub fn pickVariant(specs: []const KernelJson, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) PickError!usize {
     var found: ?usize = null;
     for (specs, 0..) |k, i| {
         if (!std.mem.eql(u8, k.@"fn", function)) continue;
@@ -141,7 +161,7 @@ pub const Set = struct {
 
     pub fn findWith(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const, opts: Launch) !*const Variant {
         // variants[i] was loaded from parsed.value.kernels[i]
-        if (pick(self.parsed.value.kernels, function, args, consts, opts)) |i| return &self.variants[i] else |e| {
+        if (pickVariant(self.parsed.value.kernels, function, args, consts, opts)) |i| return &self.variants[i] else |e| {
             if (e == error.AmbiguousTritonVariant) {
                 std.log.err("several captured Triton variants of {s} match; pin num_warps/num_stages (Launch)", .{function});
                 return e;
@@ -239,7 +259,7 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
 
 // ---- coverage (no GPU): the launches an engine can make, checked against an aot.json ----
 
-/// aot.json alone (no cubins loaded): what `pick` chooses from, for host-side coverage checks.
+/// aot.json alone (no cubins loaded): what `pickVariant` chooses from, for host-side coverage checks.
 pub const Catalog = std.json.Parsed(SetJson);
 
 pub fn loadCatalog(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Catalog {
@@ -250,7 +270,7 @@ pub fn loadCatalog(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Catalog
     return std.json.parseFromSlice(SetJson, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
 }
 
-/// One launch shape an engine can request, reduced to what `pick` matches on: the function, its launch options, the
+/// One launch shape an engine can request, reduced to what `pickVariant` matches on: the function, its launch options, the
 /// constexprs it names and each runtime argument's type and specialization class (an int's value 1 / a multiple of
 /// 16 / other, a pointer's or u64's 16-byte alignment). `args` keeps the first launch seen with this key (its values
 /// are a valid representative of the class: tools/glm53/sweep_aot.py compiles the variant from them).
@@ -317,7 +337,7 @@ pub const Probe = struct {
         var out: std.ArrayList(usize) = .empty;
         errdefer out.deinit(gpa);
         for (p.needs.values(), 0..) |n, i| {
-            _ = pick(specs, n.function, n.args, n.consts, n.opts) catch {
+            _ = pickVariant(specs, n.function, n.args, n.consts, n.opts) catch {
                 try out.append(gpa, i);
                 continue;
             };
@@ -335,7 +355,7 @@ pub const Probe = struct {
             if (n.opts.num_warps) |w| try o.print(gpa, "\"num_warps\": {d}, ", .{w}) else try o.appendSlice(gpa, "\"num_warps\": null, ");
             if (n.opts.num_stages) |s| try o.print(gpa, "\"num_stages\": {d}, ", .{s}) else try o.appendSlice(gpa, "\"num_stages\": null, ");
             if (specs) |ks| {
-                const have = if (pick(ks, n.function, n.args, n.consts, n.opts)) |_| true else |_| false;
+                const have = if (pickVariant(ks, n.function, n.args, n.consts, n.opts)) |_| true else |_| false;
                 try o.print(gpa, "\"have\": {}, ", .{have});
             }
             try o.appendSlice(gpa, "\"consts\": {");
@@ -418,16 +438,16 @@ test "variants that differ only in num_warps / num_stages are told apart by the 
     const ks = parsed.value.kernels;
     const args = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 3) };
     const consts = [_]Const{ ci("CHK", 256), cf("SCALE", 0.0625) };
-    try std.testing.expectEqual(@as(usize, 0), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 2 }));
-    try std.testing.expectEqual(@as(usize, 1), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 2 }));
-    try std.testing.expectEqual(@as(usize, 2), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), try pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), try pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 2 }));
+    try std.testing.expectEqual(@as(usize, 2), try pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 8, .num_stages = 1 }));
     // warps alone: 4 has one variant here, 8 has two (stages 2 and 1)
-    try std.testing.expectEqual(@as(usize, 0), try pick(ks, "_attn", &args, &consts, .{ .num_warps = 4 }));
-    try std.testing.expectError(error.AmbiguousTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 8 }));
+    try std.testing.expectEqual(@as(usize, 0), try pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 4 }));
+    try std.testing.expectError(error.AmbiguousTritonVariant, pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 8 }));
     // no pin at all: the old first-match answer is refused
-    try std.testing.expectError(error.AmbiguousTritonVariant, pick(ks, "_attn", &args, &consts, .{}));
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 2 }));
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 3 }));
+    try std.testing.expectError(error.AmbiguousTritonVariant, pickVariant(ks, "_attn", &args, &consts, .{}));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 2 }));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_attn", &args, &consts, .{ .num_warps = 4, .num_stages = 3 }));
 }
 
 test "the specialization still decides: R == 1 folds to a constexpr, a wrong constexpr misses" {
@@ -436,12 +456,12 @@ test "the specialization still decides: R == 1 folds to a constexpr, a wrong con
     const ks = parsed.value.kernels;
     const consts = [_]Const{ ci("CHK", 256), cf("SCALE", 0.0625) };
     const one = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 1) };
-    try std.testing.expectEqual(@as(usize, 3), try pick(ks, "_attn", &one, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    try std.testing.expectEqual(@as(usize, 3), try pickVariant(ks, "_attn", &one, &consts, .{ .num_warps = 4, .num_stages = 2 }));
     const unaligned = [_]Arg{ ptr("Q", "*bf16", 0x1008), int("R", 3) };
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &unaligned, &consts, .{ .num_warps = 4, .num_stages = 2 }));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_attn", &unaligned, &consts, .{ .num_warps = 4, .num_stages = 2 }));
     const other = [_]Const{ ci("CHK", 2048), cf("SCALE", 0.0625) };
     const three = [_]Arg{ ptr("Q", "*bf16", 0x1000), int("R", 3) };
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_attn", &three, &other, .{ .num_warps = 4, .num_stages = 2 }));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_attn", &three, &other, .{ .num_warps = 4, .num_stages = 2 }));
 }
 
 test "a single captured variant needs no pin, and a set without num_stages matches any stage pin" {
@@ -450,8 +470,8 @@ test "a single captured variant needs no pin, and a set without num_stages match
     const ks = parsed.value.kernels;
     const x = [_]Arg{ptr("X", "*bf16", 0x2000)};
     const d = [_]Const{ci("D", 6144)};
-    try std.testing.expectEqual(@as(usize, 4), try pick(ks, "_norm", &x, &d, .{}));
-    try std.testing.expectEqual(@as(usize, 4), try pick(ks, "_norm", &x, &d, .{ .num_warps = 8, .num_stages = 3 }));
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_norm", &x, &d, .{ .num_warps = 4 }));
-    try std.testing.expectError(error.MissingTritonVariant, pick(ks, "_nope", &x, &d, .{}));
+    try std.testing.expectEqual(@as(usize, 4), try pickVariant(ks, "_norm", &x, &d, .{}));
+    try std.testing.expectEqual(@as(usize, 4), try pickVariant(ks, "_norm", &x, &d, .{ .num_warps = 8, .num_stages = 3 }));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_norm", &x, &d, .{ .num_warps = 4 }));
+    try std.testing.expectError(error.MissingTritonVariant, pickVariant(ks, "_nope", &x, &d, .{}));
 }

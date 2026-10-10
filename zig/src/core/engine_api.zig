@@ -56,6 +56,8 @@ pub const Request = struct {
     shared_prefixes: []const u32 = &.{},
     /// Where the prompt's prefill chunks start after 0 (Python's PrefillPlan at ``Info.prefill_step``); empty: the engine's own.
     chunks: []const u32 = &.{},
+    /// Decoded intervals [start,end), sorted, nonempty and strictly separated; an empty list uses prompt arithmetic.
+    decode_spans: []const [2]u32 = &.{},
     /// Most reply tokens inside a think block before the engine writes ``think_close`` (0: no limit).
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
@@ -119,6 +121,24 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
+    /// A prompt-only request (max_tokens 0) keeps its end state: the server prefills each reply for the next turn.
+    warm_turns: bool = false,
+    /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
+    plain_only: bool = false,
+    /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
+    prompt_cache_plan: ?PromptCachePlan = null,
+};
+
+pub const PromptCachePlan = struct {
+    source: enum { physical_footprint, explicit, metal_working_set },
+    budget_bytes: u64,
+    explicit_budget: bool = false,
+    over_cap: ?bool = null,
+    ram_bytes: ?u64 = null,
+    ready_footprint_bytes: ?u64 = null,
+    cap_bytes: ?u64 = null,
+    room_bytes: ?u64 = null,
+    margin_bytes: ?u64 = null,
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
@@ -133,6 +153,10 @@ pub const Open = struct {
     /// --parallel named a number: an engine whose memory fits fewer streams refuses instead of serving fewer.
     lanes_fixed: bool = false,
     drafts: bool = true,
+    /// --drafter: a draft model's directory for families that load one (Qwen3.8-27B's DFlash2); null: none.
+    drafter: ?[]const u8 = null,
+    /// --drafter-bits: 4 prepares the drafter's weights in 4 bits; 0 keeps them bf16.
+    drafter_bits: u8 = 4,
     speed_up: ?[]const u8 = null,
     prompt_cache_gib: ?f64 = null,
     prompt_cache_over_cap: bool = false,
@@ -140,6 +164,8 @@ pub const Open = struct {
     learn: ?[]const u8 = null,
     /// --learn-gib: what learned states may take on disk, every model and build together.
     learn_gib: f64 = 32,
+    /// --slide: Sliding Weights learns into the served weights, live (off: learn requests are refused).
+    slide: bool = false,
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
@@ -178,7 +204,50 @@ pub const Status = struct {
     generation_tokens: u64 = 0,
 };
 
-pub const SubmitError = error{ Closed, Busy };
+pub const SubmitError = error{ Closed, Busy, InvalidSpans };
+
+/// A worked example for the learner: token ids whose answer starts at `start` (rows from start - 1 on predict it).
+pub const Example = struct { ids: []const u32, start: u32 };
+
+/// One fact's lesson (Sliding Weights): answers, held-out answers, near misses, and prompts that must not move.
+pub const LearnRequest = struct {
+    train: []const Example = &.{},
+    held: []const Example = &.{},
+    near: []const Example = &.{},
+    keep: []const Example = &.{}, // answers of every kind this lesson's change must leave as they are
+    undo: bool = false, // instead take the last lesson's change back, as if it never ran
+    steps: u32 = 60, // bounded steps this time at most
+    more: bool = false, // more steps on the last lesson's rows, which are not captured again
+    commit: bool = false, // the last lesson made a plain change of the model's weights, then checked
+    save: bool = false, // every lesson's weight change written into the model's own shards
+};
+
+/// A lesson's outcome in order, ending with `done` (a message says why it failed); slices live only during the call.
+pub const LearnEvent = union(enum) {
+    learned: struct { recalled: bool, steps: u32, loss: f32 },
+    done: struct { message: []const u8 = "" },
+};
+
+/// Where a learn request's events go; called on the engine's thread, so it must return at once.
+pub const LearnSink = struct {
+    ctx: *anyopaque,
+    event: *const fn (ctx: *anyopaque, event: *const LearnEvent) void,
+};
+
+pub const LearnError = error{ Closed, Busy, Unsupported };
+
+/// A family's learner, which LaneHost steps one bounded unit at a time while no stream decodes.
+pub const Learner = struct {
+    ctx: *anyopaque,
+    /// Start a job; its events, `done` last, go to `sink` from later steps.
+    begin: *const fn (ctx: *anyopaque, request: *const LearnRequest, sink: LearnSink) anyerror!void,
+    /// One unit of the job: `changed` when weights moved (kept prompt states are then dropped), `done` when it ended.
+    step: *const fn (ctx: *anyopaque) Step,
+    /// End the open job now; it still sends `done`, with the reason.
+    abort: *const fn (ctx: *anyopaque) void,
+
+    pub const Step = struct { done: bool, changed: bool };
+};
 
 pub const Engine = struct {
     ctx: *anyopaque,
@@ -196,12 +265,15 @@ pub const Engine = struct {
         keepalive: ?*const fn (ctx: *anyopaque) ?keepalive.Target = null,
         /// One logit per label, and the vocabulary logsumexp. Null until a family scores decisions.
         score: ?*const fn (ctx: *anyopaque, prompt: []const u32, labels: []const u32, logits: []f64) error{Failed}!f64 = null,
+        /// Queue `request` for the family's learner; it stays valid until `done`. Null: this engine does not learn.
+        learn: ?*const fn (ctx: *anyopaque, request: *const LearnRequest, sink: LearnSink) LearnError!void = null,
     };
 
     pub fn info(e: Engine) Info {
         return e.vtable.info(e.ctx);
     }
     pub fn submit(e: Engine, id: Id, request: *const Request, sink: Sink) SubmitError!void {
+        try @import("cache_modes.zig").validate(request.decode_spans);
         return e.vtable.submit(e.ctx, id, request, sink);
     }
     pub fn cancel(e: Engine, id: Id) void {
@@ -224,6 +296,12 @@ pub const Engine = struct {
         const f = e.vtable.score orelse return error.Unsupported;
         return f(e.ctx, prompt, labels, logits);
     }
+
+    /// The Sliding Weights hook, or Unsupported when this engine does not learn.
+    pub fn learn(e: Engine, request: *const LearnRequest, sink: LearnSink) LearnError!void {
+        const f = e.vtable.learn orelse return error.Unsupported;
+        return f(e.ctx, request, sink);
+    }
 };
 
 /// A backend's own driver for a lone greedy stream (the GPU round), which LaneHost runs while the stream is alone.
@@ -242,6 +320,7 @@ pub const LoneHooks = struct {
 };
 
 /// The lane core served to the HTTP threads (lane_host.zig).
+pub const serial_host = @import("serial_host.zig");
 pub const LaneHost = @import("lane_host.zig").LaneHost;
 
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
@@ -254,7 +333,10 @@ pub const prompt_imprint = @import("prompt_imprint.zig");
 pub const keepalive = @import("keepalive.zig");
 
 test {
+    _ = serial_host;
+    _ = @import("serial_host_test.zig");
     _ = @import("lane_host.zig");
+    _ = @import("lane_host_test.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");
