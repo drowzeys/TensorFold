@@ -129,7 +129,8 @@ pub const Host = struct {
     // routing to the same experts (Python's slower admission gets the same grouping by its message latency)
     admit_quiet_ns: i96 = 0,
     admit_cap_ns: i96 = 0,
-    // the stall watchdog (TF_GLM53_STALL_S, default 5400; 0: off), on every rank: while this rank has a request in
+    // the watchdog thread, on every rank (watch): a rank whose connection closed ends this one, and
+    // the stall limit (TF_GLM53_STALL_S; 0: off): while this rank has a request in
     // hand (busy) and nothing moved it on (beat: a round's tokens, a --parallel step or message) for that long - a rank
     // or a collective is stuck - the process exits, so a wedged world fails loudly instead of waiting for good
     stall_ns: i64 = 0,
@@ -212,11 +213,25 @@ pub const Host = struct {
         h.busy.store(on, .release);
     }
 
-    /// Every rank's watchdog thread: a request in hand with no progress for stall_ns ends the process.
+    /// Every rank's watchdog thread. A rank that has gone (its rendezvous connection closed: the process died or
+    /// left) ends this one too - rank 0 whenever it sees one, a follower while it has a request in hand (idle, its
+    /// own loop reads rank 0's goodbye or its closed connection and leaves cleanly) - seen on two checks a second
+    /// apart, so a goodbye in flight is read first. And a request in hand with no progress for stall_ns ends the
+    /// process (a rank that stands still without closing: paused, or stuck in a collective).
     fn watch(h: *Host) void {
+        var gone: u32 = 0;
         while (!h.stop_watch.load(.acquire)) {
             std.Io.sleep(h.io, .fromMilliseconds(1000), .awake) catch {};
-            if (!h.busy.load(.acquire)) continue;
+            if (h.stop_watch.load(.acquire)) return;
+            const busy = h.busy.load(.acquire);
+            if (h.boot.rdv.peerClosed()) |r| {
+                gone = if (h.rank == 0 or busy) gone + 1 else 0;
+                if (gone >= 2) {
+                    std.log.err("glm53 rank {d}: rank {d} has gone (its connection closed){s}: the world cannot go on; exiting so the ranks can be restarted instead of hanging", .{ h.rank, r, if (busy) " with a request in hand" else "" });
+                    std.process.exit(4);
+                }
+            } else gone = 0;
+            if (!busy or h.stall_ns <= 0) continue;
             const idle: i64 = @as(i64, @intCast(h.now())) - h.beat_ns.load(.acquire);
             if (idle <= h.stall_ns) continue;
             std.log.err("glm53 rank {d}: no progress on the request in hand for {d} s (TF_GLM53_STALL_S): a rank or a collective is stuck; exiting so the ranks can be restarted instead of hanging", .{ h.rank, @divTrunc(idle, std.time.ns_per_s) });
@@ -1067,6 +1082,9 @@ fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 
 fn closeFn(ctx: *anyopaque) void {
     const h: *Host = @ptrCast(@alignCast(ctx));
+    // the watchdog first: the followers leave at rank 0's goodbye, which must not read as a rank that has gone
+    h.stop_watch.store(true, .release);
+    if (h.watcher) |t| t.join();
     if (h.rank == 0) {
         h.lock();
         h.closing = true;
@@ -1076,8 +1094,6 @@ fn closeFn(ctx: *anyopaque) void {
         var bye: Head = .{ .kind = @intFromEnum(Kind.bye) };
         h.send(&bye, &.{}) catch {};
     }
-    h.stop_watch.store(true, .release);
-    if (h.watcher) |t| t.join();
     h.queue.deinit(h.gpa);
     h.cancels.deinit(h.gpa);
     h.out.deinit(h.gpa);
@@ -1175,8 +1191,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.stall_ns = @intFromFloat(@max(0, stall_s) * 1e9);
     if (h.rank == 0) h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, Host.loop, .{h});
     ok = true;
-    if (h.stall_ns > 0) h.watcher = std.Thread.spawn(.{}, Host.watch, .{h}) catch |e| blk: {
-        std.log.warn("glm53 rank {d}: no stall watchdog ({t})", .{ h.rank, e });
+    // a world of one has no rank to lose: its watchdog runs for the stall limit alone
+    if (h.stall_ns > 0 or opts.world > 1) h.watcher = std.Thread.spawn(.{}, Host.watch, .{h}) catch |e| blk: {
+        std.log.warn("glm53 rank {d}: no watchdog ({t})", .{ h.rank, e });
         break :blk null;
     };
     return .{ .engine = h.engine(), .close = closeFn, .ctx = h, .follow = if (h.rank == 0) null else followFn };

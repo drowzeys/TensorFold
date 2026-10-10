@@ -70,6 +70,11 @@ fn recvAll(fd: posix.socket_t, buf: []u8, timeout_ms: i32) Error!void {
     }
 }
 
+/// Linux's POLLRDHUP (the peer closed, or shut its writing half; std.posix.POLL does not name it), and what poll
+/// reports for a connection that is gone: it, POLLHUP or POLLERR.
+const poll_rdhup: i16 = 0x2000;
+const poll_gone: i16 = 0x2000 | 0x0010 | 0x0008;
+
 fn putU32(buf: []u8, v: u32) void {
     std.mem.writeInt(u32, buf[0..4], v, .little);
 }
@@ -166,6 +171,21 @@ pub const Rendezvous = struct {
             if (fd.* >= 0) _ = posix.system.close(fd.*);
             fd.* = -1;
         }
+    }
+
+    /// The first rank whose connection has closed or failed, without reading from it (rank 0: any other rank's; the
+    /// others: rank 0's); null while every connection stands. Safe from another thread than the one that reads.
+    pub fn peerClosed(self: *const Rendezvous) ?usize {
+        if (self.world == 1) return null;
+        const first: usize = if (self.rank == 0) 1 else 0;
+        const last: usize = if (self.rank == 0) self.world else 1;
+        for (first..last) |r| {
+            if (self.fds[r] < 0) continue;
+            var fds = [_]posix.pollfd{.{ .fd = self.fds[r], .events = poll_rdhup, .revents = 0 }};
+            const ready = posix.poll(&fds, 0) catch continue;
+            if (ready > 0 and fds[0].revents & poll_gone != 0) return r;
+        }
+        return null;
     }
 
     /// Rank 0's `bytes` into every other rank's `bytes` (NCCL's unique id).
@@ -285,6 +305,14 @@ pub const Rendezvous = struct {
         if (bad) return error.Disagree;
     }
 };
+
+test "a world of one has no peer to lose" {
+    const one: Rendezvous = .{ .io = std.testing.io, .rank = 0, .world = 1 };
+    try std.testing.expectEqual(@as(?usize, null), one.peerClosed());
+    // connections not made yet (fds -1) are not reported as closed
+    const four: Rendezvous = .{ .io = std.testing.io, .rank = 0, .world = 4 };
+    try std.testing.expectEqual(@as(?usize, null), four.peerClosed());
+}
 
 test "master addresses" {
     const m = try parseMaster("10.100.10.1:29571");
