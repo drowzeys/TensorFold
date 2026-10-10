@@ -1256,7 +1256,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.admit_quiet_ns = if (opts.parallel > 1) @intFromFloat(@max(0, quiet_ms) * 1e6) else 0;
     h.admit_cap_ns = @intFromFloat(@max(0, cap_ms) * 1e6);
     h.startup = try std.fmt.allocPrint(gpa, "GLM-5.3 TP{d} rank 0 of {d}: context {d}, MTP drafts {d}, DCP {d}, {d} concurrent stream{s}, prompt reuse {s}{s}; loaded in {d:.0} s, {d} decode graphs", .{ opts.world, opts.world, opts.context, opts.k, boot.dcp, opts.parallel, if (opts.parallel > 1) "s" else "", if (opts.reuse.on) "on" else "off", if (learning) ", --learn" else "", boot.load_s, boot.prewarm_graphs });
-    h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup };
+    h.info_ = .{ .name = "glm_moe_dsa-cuda-tp", .lanes = @intCast(opts.parallel), .context_window = @intCast(opts.context), .startup = h.startup, .top_k_most = @intCast(smp.max_candidates - smp.margin) };
     const stall_default = defaultStallS(opts.context);
     const stall_s = if (std.c.getenv("TF_GLM53_STALL_S")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch stall_default else stall_default;
     h.stall_ns = @intFromFloat(@max(0, stall_s) * 1e9);

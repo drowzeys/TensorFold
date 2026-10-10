@@ -125,6 +125,8 @@ pub const Info = struct {
     warm_turns: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
+    /// The widest top_k a sampled request may ask (0: no limit); the server refuses a wider one with 400.
+    top_k_most: u32 = 0,
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
     prompt_cache_plan: ?PromptCachePlan = null,
 };

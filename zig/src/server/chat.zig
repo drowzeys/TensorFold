@@ -187,6 +187,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+    // an engine with a top_k limit: refused here (400), before the engine or any other rank hears of the request
+    if (srv.info.top_k_most > 0) if (request.sampling) |x| {
+        if (x.temperature > 0 and x.top_k > srv.info.top_k_most) return cx.fail(.request, "top_k above {d} is not supported by this engine: send top_k {d} or less (0: top_p alone)", .{ srv.info.top_k_most, srv.info.top_k_most });
+    };
     if (thinking) {
         const budget_field = f.get("thinking_budget");
         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
