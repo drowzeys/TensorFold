@@ -403,8 +403,9 @@ pub const Host = struct {
         const c = try sess.choose(r.prompt, draft);
         defer if (sess.reuse != null) c.deinit(h.gpa);
         live.begin = @intCast(c.begin);
-        h.seq += 1;
-        var head: Head = .{ .kind = @intFromEnum(Kind.request), .seq = h.seq, .max_tokens = @intCast(max_tokens), .flags = flags, .prompt_len = @intCast(r.prompt.len), .begin = @intCast(c.begin), .n_stops = @intCast(c.stops.len), .n_keeps = @intCast(c.keeps.len), .n_eos = @intCast(r.eos.len) };
+        // the request's number is taken when its header goes out (below): a request that fails before that - no
+        // memory for its payload - must not leave rank 0 a number ahead of the followers
+        var head: Head = .{ .kind = @intFromEnum(Kind.request), .seq = h.seq + 1, .max_tokens = @intCast(max_tokens), .flags = flags, .prompt_len = @intCast(r.prompt.len), .begin = @intCast(c.begin), .n_stops = @intCast(c.stops.len), .n_keeps = @intCast(c.keeps.len), .n_eos = @intCast(r.eos.len) };
         if (s) |x| {
             head.seed = x.seed;
             head.temperature = x.temperature;
@@ -419,6 +420,7 @@ pub const Host = struct {
         for (c.stops, 0..) |p, i| payload[r.prompt.len + i] = @intCast(p);
         @memcpy(payload[r.prompt.len + c.stops.len ..][0..c.keeps.len], c.keeps);
         @memcpy(payload[r.prompt.len + c.stops.len + c.keeps.len ..], r.eos);
+        h.seq += 1;
         try h.send(&head, payload);
         const done = try sess.exec(.{ .prompt = r.prompt, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = r.eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .flags = flags & flag_flush, .hooks = .{ .ctx = live, .tokens = Live.tokens } }, &h.out);
         return .{ .stats = done.stats, .kept = done.kept, .learned = learned, .sampling = s, .draft = draft, .begin = c.begin };
@@ -480,6 +482,9 @@ pub const Host = struct {
             }
             h.unlock();
             for (gone_buf[0..n_gone]) |j| emit(j, .{ .finished = .{ .reason = .cancelled } });
+            // an admission is a request in hand for the watchdog: its message (the prompt: megabytes at 1M tokens) to
+            // a follower that stands still would otherwise block an idle rank 0 for good, unwatched
+            if (n_admit > 0) h.setBusy(true);
             for (admit_buf[0..n_admit]) |j| h.admitJob(j);
             h.setStreaming(mu.live());
             if (mu.live() == 0) continue;
@@ -568,8 +573,8 @@ pub const Host = struct {
         const lv = try h.gpa.create(Live);
         errdefer h.gpa.destroy(lv);
         lv.* = .{ .h = h, .job = job, .started = job.submitted, .begin = @intCast(c.begin), .sid = sid, .sampling = s, .draft = draft };
-        h.mseq += 1;
-        var head: Head = .{ .kind = @intFromEnum(Kind.admit), .seq = h.mseq, .max_tokens = @intCast(max_tokens), .flags = flags, .prompt_len = @intCast(r.prompt.len), .begin = @intCast(c.begin), .n_stops = @intCast(c.stops.len), .n_keeps = @intCast(c.keeps.len), .n_eos = @intCast(r.eos.len), .key = sid, .at = @intCast(c.slot), .pad = if (c.src) |x| @intCast(x + 1) else 0 };
+        // the message's number is taken when it goes out (below), as a --parallel 1 request's
+        var head: Head = .{ .kind = @intFromEnum(Kind.admit), .seq = h.mseq + 1, .max_tokens = @intCast(max_tokens), .flags = flags, .prompt_len = @intCast(r.prompt.len), .begin = @intCast(c.begin), .n_stops = @intCast(c.stops.len), .n_keeps = @intCast(c.keeps.len), .n_eos = @intCast(r.eos.len), .key = sid, .at = @intCast(c.slot), .pad = if (c.src) |x| @intCast(x + 1) else 0 };
         if (s) |x| {
             head.seed = x.seed;
             head.temperature = x.temperature;
@@ -584,6 +589,7 @@ pub const Host = struct {
         for (c.stops, 0..) |p, i| payload[r.prompt.len + i] = @intCast(p);
         @memcpy(payload[r.prompt.len + c.stops.len ..][0..c.keeps.len], c.keeps);
         @memcpy(payload[r.prompt.len + c.stops.len + c.keeps.len ..], r.eos);
+        h.mseq += 1;
         try h.sendOne(&head, payload);
         _ = mu.admit(.{ .sid = sid, .slot = c.slot, .mode = if (draft) glm.multi.modeOf(h.boot.mode) else .serial, .sampling = s, .count = max_tokens, .prompt = r.prompt, .eos = r.eos, .begin = c.begin, .src = c.src, .stops = c.stops, .keeps = c.keeps, .flush = false, .hook = .{ .ctx = lv, .tokens = Live.tokens } }) catch |e| {
             mu.broken = h.boot.o.world > 1; // the followers took the admission
@@ -614,7 +620,9 @@ pub const Host = struct {
     fn sendOne(h: *Host, head: *Head, payload: []const u32) !void {
         if (h.boot.o.world == 1) return;
         head.sum = sealOf(head, payload);
-        const bytes = try h.gpa.alloc(u8, @sizeOf(Head) + payload.len * 4);
+        // no memory for the one buffer: the same bytes in two writes (the message's number is already taken, so a
+        // failure here would leave rank 0 a number ahead of the followers)
+        const bytes = h.gpa.alloc(u8, @sizeOf(Head) + payload.len * 4) catch return h.send(head, payload);
         defer h.gpa.free(bytes);
         @memcpy(bytes[0..@sizeOf(Head)], std.mem.asBytes(head));
         @memcpy(bytes[@sizeOf(Head)..], std.mem.sliceAsBytes(payload));
