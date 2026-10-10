@@ -732,6 +732,8 @@ pub const Exec = struct {
     /// Phase 4: the draft mode (null: the boot's default) and copy drafts (drafted requests only)
     mode: ?rn.Mode = null,
     copies: bool = true,
+    /// rn.Gen.prompt_votes (the server at --parallel 1, every rank alike)
+    prompt_votes: bool = false,
 };
 
 pub const Done = struct {
@@ -798,7 +800,7 @@ pub const Session = struct {
     pub fn exec(s: *Session, x: Exec, out: *std.ArrayList(u32)) !Done {
         const k = if (x.draft) s.boot.o.k else 0;
         const mode: rn.Mode = if (x.draft) x.mode orelse s.boot.mode else .mtp;
-        const g: rn.Gen = .{ .max_tokens = x.max_tokens, .sampling = x.sampling, .k = k, .eos = x.eos, .hooks = x.hooks, .mode = mode, .copies = x.draft and x.copies };
+        const g: rn.Gen = .{ .max_tokens = x.max_tokens, .sampling = x.sampling, .k = k, .eos = x.eos, .hooks = x.hooks, .mode = mode, .copies = x.draft and x.copies, .prompt_votes = x.prompt_votes };
         if (s.reuse) |pr| {
             const res = try pr.run(x.prompt, x.begin, x.stops, x.keeps, x.flags, x.draft, 0, g, out);
             return .{ .stats = res.stats, .kept = res.kept, .replay = res.replay };

@@ -92,6 +92,8 @@ pub const Hooks = struct {
     /// (queued on the compute stream), the MTP carry the target hidden n - 1; at the prompt's end (n = L0) also the
     /// head's local logits row (`head`: device fp32 [vocab_part]) its first token is picked from.
     keep: ?*const fn (ctx: *anyopaque, n: usize, head: ?u64) anyerror!void = null,
+    /// This rank's stop wish between two prompt chunks (Gen.prompt_votes; only rank 0's counts). Also progress.
+    stop: ?*const fn (ctx: *anyopaque) bool = null,
 };
 
 /// One request's schedule for `run` (Runner.generate's arguments).
@@ -114,6 +116,11 @@ pub const Gen = struct {
     /// Phase 4: the drafter (mtp: the MTP head with `k`) and copy drafts (Runner.generate's `copies`: drafted runs)
     mode: Mode = .mtp,
     copies: bool = false,
+    /// served, --parallel 1: after every prompt chunk but the last the ranks exchange rank 0's stop wish
+    /// (Hooks.stop: its client has gone) and, when it asked, every rank ends the run there with
+    /// error.PromptStopped - a long prompt no longer fills to its end for no one. One word gathered and one
+    /// synchronize a chunk; no row's value changes. Every rank must set it alike.
+    prompt_votes: bool = false,
 };
 
 pub const Stats = struct {
@@ -509,7 +516,7 @@ pub const Runner = struct {
             const ids = try r.gpa.alloc(u32, n);
             defer r.gpa.free(ids);
             for (ids, 0..) |*v, i| v.* = @intCast(1000 + (i * 7919) % 150000);
-            _ = try r.prefill(ids, null, 0, &.{}, null);
+            _ = try r.prefill(ids, null, 0, &.{}, null, null);
             try r.healthy();
         }
         if (!capture) {
@@ -776,7 +783,7 @@ pub const Runner = struct {
     /// Phase 3b: rows from `begin` (a kept state's rows and carry already in place), the chunks cut at `cuts`
     /// (prefixes.cut_chunks), `keep` called at each cut inside (begin, L0) once its chunk is queued and at L0 with the
     /// head's logits row. DCP > 1: never the sequence-parallel chunk (fused.compute_prompt_sp needs dcp 1).
-    fn prefill(r: *Runner, prompt_ids: []const u32, s: ?smp.Sampling, begin: usize, cuts: []const usize, keep: ?Keep) !u32 {
+    fn prefill(r: *Runner, prompt_ids: []const u32, s: ?smp.Sampling, begin: usize, cuts: []const usize, keep: ?Keep, votes: ?Hooks) !u32 {
         const L0 = prompt_ids.len;
         const rows = if (r.set.served) r.set.prompt_rows else r.set.window;
         const short = if (r.set.served) r.set.prompt_rows_short else r.set.window;
@@ -804,6 +811,14 @@ pub const Runner = struct {
                     break;
                 };
             };
+            // Gen.prompt_votes: rank 0's stop wish, heard by every rank before the next chunk
+            if (e != L0) if (votes) |h| {
+                const wish = if (h.stop) |f| f(h.ctx) else false;
+                if (try r.promptStop(wish)) {
+                    if (r.f.prof) |p| p.on = false;
+                    return error.PromptStopped;
+                }
+            };
         }
         if (r.f.prof) |p| {
             p.total(r.w.rank, L0 - begin);
@@ -811,6 +826,21 @@ pub const Runner = struct {
         }
         if (keep) |k| try k.at(L0, hb.lg); // Runner.generate: keep(L0, lg) before the first pick moves anything
         return r.pickFirst(hb, L0, s);
+    }
+
+    /// The prompt's stop vote: rank 0's wish to every rank over NCCL (the health words: nothing else uses them
+    /// between a chunk and the next). Synchronizes, so the chunks queued so far have run. One rank: its own wish.
+    fn promptStop(r: *Runner, wish: bool) !bool {
+        if (r.w.world < 2) return wish;
+        const comm = r.f.comm orelse return false;
+        const hw = r.health orelse return false;
+        const o = r.ops();
+        try o.fill32(hw.ptr, @intFromBool(wish and r.w.rank == 0), 1);
+        try comm.allGather(hw.ptr, hw.ptr + 4, 1, .i32, r.f.s.handle);
+        const word = r.pinSlice(u32, r.pinLayout().vote, 1);
+        try o.download(std.mem.sliceAsBytes(word), hw.ptr + 4); // rank 0's
+        try r.f.s.synchronize();
+        return word[0] != 0;
     }
 
     /// One prompt chunk [a, e) of prompt_ids (L0 = its length) into the caches of `st` (the Runner's State, or one
@@ -1073,7 +1103,7 @@ pub const Runner = struct {
         const t0 = r.now();
         const keep: ?Keep = if (g.hooks) |h| (if (h.keep != null) Keep{ .hooks = h } else null) else null;
         if (g.replay != null) try r.resetDrafters(prompt_ids.len);
-        var tok = if (g.replay) |lg| try r.replayHead(lg, prompt_ids.len, s) else try r.prefill(prompt_ids, s, g.begin, g.cuts, keep);
+        var tok = if (g.replay) |lg| try r.replayHead(lg, prompt_ids.len, s) else try r.prefill(prompt_ids, s, g.begin, g.cuts, keep, if (g.prompt_votes) g.hooks else null);
         try r.healthy(); // short prompts' chunks reduce over RoCE too
         st.prefill_s = r.since(t0);
         out.clearRetainingCapacity();

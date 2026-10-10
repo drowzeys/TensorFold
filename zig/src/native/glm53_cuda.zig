@@ -109,6 +109,11 @@ pub const Host = struct {
     running: ?api.Id = null,
     seq: u64 = 0,
     flush_file: ?[]const u8 = null,
+    /// TF_GLM53_FAIL_FILE (a test switch, --parallel N): when the file appears rank 0 takes it and marks the world
+    /// broken, as a failed round does
+    fail_file: ?[]const u8 = null,
+    /// --parallel 1: the stop vote between prompt chunks (TF_GLM53_PROMPT_VOTES=0 on every rank: off)
+    prompt_votes: bool = true,
     dump: ?[]const u8 = null,
     out: std.ArrayList(u32) = .empty,
     last_rate: f64 = 0,
@@ -246,6 +251,13 @@ pub const Host = struct {
         return false;
     }
 
+    /// A follower between two prompt chunks: progress (rank 0's wish reaches it through the vote).
+    fn followerChunk(ctx: *anyopaque) bool {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        h.beat();
+        return false;
+    }
+
     // --------------------------------------------------------------------------------------- rank 0's thread ---
 
     fn loop(h: *Host) void {
@@ -331,6 +343,15 @@ pub const Host = struct {
             return lv.stop_hit or lv.cancel_hit;
         }
 
+        /// Rank 0 between two prompt chunks (--parallel 1): progress, and the request's cancel as its stop wish - the
+        /// client left while its prompt fills, so every rank stops before the next chunk.
+        fn chunk(ctx: *anyopaque) bool {
+            const lv: *Live = @ptrCast(@alignCast(ctx));
+            lv.h.beat();
+            if (lv.h.cancelled(lv.job.id)) lv.cancel_hit = true;
+            return lv.cancel_hit;
+        }
+
         /// The emitted tokens the reply has not heard, in one event.
         fn flush(lv: *Live) void {
             if (lv.emitted.items.len <= lv.sent) return;
@@ -358,6 +379,13 @@ pub const Host = struct {
         h.setBusy(true);
         defer h.setBusy(false);
         const outcome = h.runRequest(job, &live) catch |e| {
+            if (e == error.PromptStopped) {
+                // the client left while its prompt filled: every rank stopped at the same chunk
+                std.log.info("glm53: done req-{d} prompt={d} tokens=0 finish=cancelled (during the prompt, after {d:.2}s) seq={d}", .{ job.id, job.request.prompt.len, @as(f64, @floatFromInt(h.now() - started)) / 1e9, h.seq });
+                emit(job, .{ .prefilled = 0 });
+                emit(job, .{ .finished = .{ .reason = .cancelled } });
+                return;
+            }
             std.log.err("glm53: request {d} failed: {t}", .{ job.id, e });
             if (live.first == null) emit(job, .{ .prefilled = 0 });
             emit(job, .{ .finished = .{ .reason = .failed, .message = words(e) } });
@@ -422,7 +450,7 @@ pub const Host = struct {
         @memcpy(payload[r.prompt.len + c.stops.len + c.keeps.len ..], r.eos);
         h.seq += 1;
         try h.send(&head, payload);
-        const done = try sess.exec(.{ .prompt = r.prompt, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = r.eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .flags = flags & flag_flush, .hooks = .{ .ctx = live, .tokens = Live.tokens } }, &h.out);
+        const done = try sess.exec(.{ .prompt = r.prompt, .max_tokens = max_tokens, .sampling = s, .draft = draft, .eos = r.eos, .begin = c.begin, .stops = c.stops, .keeps = c.keeps, .flags = flags & flag_flush, .hooks = .{ .ctx = live, .tokens = Live.tokens, .stop = Live.chunk }, .prompt_votes = h.prompt_votes }, &h.out);
         return .{ .stats = done.stats, .kept = done.kept, .learned = learned, .sampling = s, .draft = draft, .begin = c.begin };
     }
 
@@ -486,11 +514,17 @@ pub const Host = struct {
             // a follower that stands still would otherwise block an idle rank 0 for good, unwatched
             if (n_admit > 0) h.setBusy(true);
             for (admit_buf[0..n_admit]) |j| h.admitJob(j);
+            if (h.fail_file) |path| if (mu.live() > 0 and takeFlush(path)) {
+                std.log.err("glm53: TF_GLM53_FAIL_FILE {s}: this world is marked broken (a test of the restart path)", .{path});
+                mu.broken = h.boot.o.world > 1;
+            };
+            h.leaveIfBroken();
             h.setStreaming(mu.live());
             if (mu.live() == 0) continue;
             h.endCancelledFills() catch |e| {
                 std.log.err("glm53: ending cancelled streams failed: {t}", .{e});
                 h.endAll(.failed, words(e));
+                h.leaveIfBroken();
                 continue;
             };
             if (mu.live() == 0) continue;
@@ -498,14 +532,29 @@ pub const Host = struct {
             mu.step(link) catch |e| {
                 std.log.err("glm53: a concurrent round failed: {t} (every live request fails; restart all ranks if the ranks are out of step)", .{e});
                 h.endAll(.failed, words(e));
+                h.leaveIfBroken();
                 continue;
             };
             h.endDone() catch |e| {
                 std.log.err("glm53: ending finished streams failed: {t}", .{e});
                 h.endAll(.failed, words(e));
+                h.leaveIfBroken();
             };
             h.setStreaming(mu.live());
         }
+    }
+
+    /// Rank 0 (--parallel N): a world whose ranks are out of step (a failed round or admission: the decoder is
+    /// `broken`) can serve nothing more, yet /health stayed green and every later request failed with "restart the
+    /// server". It ends here instead: the live requests fail, then rank 0 exits with code 5, the followers leave at
+    /// its closed connection (the watchdog's `has gone`), and a restart policy sees the world down.
+    fn leaveIfBroken(h: *Host) void {
+        const mu = h.boot.multi.?;
+        if (!mu.broken or @import("builtin").is_test) return;
+        if (h.lives.items.len > 0) h.endAll(.failed, words(error.RanksOutOfStep));
+        std.log.err("glm53 rank 0: the ranks are out of step after a failed round or admission: this world can serve nothing more; exiting (code 5) so the ranks can be restarted instead of failing every request", .{});
+        std.Io.sleep(h.io, .fromMilliseconds(1000), .awake) catch {}; // the failed replies leave first
+        std.process.exit(5);
     }
 
     /// Rank 0, the lock held, the engine idle with a request waiting: wait (the lock released) for the requests sent
@@ -854,7 +903,11 @@ pub const Host = struct {
         const s: ?smp.Sampling = if (head.flags & flag_greedy != 0) null else .{ .seed = head.seed, .temperature = head.temperature, .top_k = head.top_k, .top_p = head.top_p, .min_p = head.min_p };
         // a request that fails here fails on rank 0 too, at the same point (the same checks on the same arguments), and
         // rank 0 serves on: so does this rank - leaving would strand rank 0's next request in its collectives
-        const done = h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush, .hooks = .{ .ctx = h, .tokens = followerBeat } }, out) catch |e| {
+        const done = h.session.exec(.{ .prompt = prompt, .max_tokens = head.max_tokens, .sampling = s, .draft = head.flags & flag_draft != 0, .eos = eos, .begin = head.begin, .stops = stops, .keeps = keeps, .flags = head.flags & flag_flush, .hooks = .{ .ctx = h, .tokens = followerBeat, .stop = followerChunk }, .prompt_votes = h.prompt_votes }, out) catch |e| {
+            if (e == error.PromptStopped) {
+                std.log.info("glm53 rank {d}: request {d} ended: stopped by rank 0 during the prompt", .{ h.rank, head.seq });
+                return;
+            }
             std.log.err("glm53 rank {d}: request {d} failed: {t} (following on, as rank 0 serves on)", .{ h.rank, head.seq, e });
             return;
         };
@@ -1193,6 +1246,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         if (h.rank == 0) std.log.info("glm53: learned prompt states in {s} ({d} known, {d} of {d} MiB)", .{ h.learned.?.dir, h.learned.?.metas.items.len, h.learned.?.total() >> 20, @as(u64, @intFromFloat(o.learn_gib * 1024)) });
     }
     h.flush_file = if (std.c.getenv("TF_GLM53_FLUSH_FILE")) |v| std.mem.span(v) else null;
+    h.fail_file = if (std.c.getenv("TF_GLM53_FAIL_FILE")) |v| std.mem.span(v) else null;
+    h.prompt_votes = if (std.c.getenv("TF_GLM53_PROMPT_VOTES")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     h.dump = if (std.c.getenv("TF_GLM53_DUMP")) |v| std.mem.span(v) else null;
     const defer_on = if (std.c.getenv("TF_GLM53_DEFER_EMITS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     h.defer_emits = opts.parallel > 1 and defer_on;
