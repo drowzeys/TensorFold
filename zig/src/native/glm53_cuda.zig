@@ -1076,7 +1076,7 @@ pub const Host = struct {
             defer h.gpa.free(bytes);
             x.update(bytes);
         } else |_| {}
-        const shape = [_]u64{ o.world, b.dcp, o.k, o.draft_vocab, o.mtp_reuse, o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.mtp_dense), @intCast(try b.driver.version()), @intCast(b.nccl_version), o.reuse.gap };
+        const shape = [_]u64{ o.world, b.dcp, o.k, o.draft_vocab, o.mtp_reuse, o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.mtp_dense), @intCast(try b.driver.version()), @intCast(b.nccl_version), o.reuse.gap, o.reuse.stride };
         x.update(std.mem.asBytes(&shape));
         x.update(o.experts);
         x.update(o.pe_det);

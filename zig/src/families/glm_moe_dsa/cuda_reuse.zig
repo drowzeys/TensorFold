@@ -34,6 +34,7 @@ pub const save_align: usize = 256; // prefixes.Saved.ALIGN
 pub const Settings = struct {
     on: bool = false,
     gap: usize = gap_default,
+    stride: usize = 0,
     entries: usize = entries_default,
     gib: f64 = cache_gib_default,
     loose: bool = false,
@@ -43,8 +44,8 @@ pub const Settings = struct {
         return std.mem.trim(u8, std.mem.span(v), " ");
     }
 
-    /// TF_GLM53_PROMPT_REUSE (0 | 1 | on | off), TF_GLM53_REUSE_GAP, TF_GLM53_CACHE_ENTRIES, TF_GLM53_CACHE_GIB,
-    /// TF_GLM53_REUSE_LOOSE.
+    /// TF_GLM53_PROMPT_REUSE (0 | 1 | on | off), TF_GLM53_REUSE_GAP, TF_GLM53_REUSE_STRIDE, TF_GLM53_CACHE_ENTRIES,
+    /// TF_GLM53_CACHE_GIB, TF_GLM53_REUSE_LOOSE.
     pub fn fromEnv() !Settings {
         var s: Settings = .{};
         if (env("TF_GLM53_PROMPT_REUSE")) |v| {
@@ -53,6 +54,7 @@ pub const Settings = struct {
             } else if (!(v.len == 0 or std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off"))) return error.BadPromptReuse;
         }
         if (env("TF_GLM53_REUSE_GAP")) |v| s.gap = std.fmt.parseInt(usize, v, 10) catch return error.BadPromptReuse;
+        if (env("TF_GLM53_REUSE_STRIDE")) |v| s.stride = std.fmt.parseInt(usize, v, 10) catch return error.BadPromptReuse;
         if (env("TF_GLM53_CACHE_ENTRIES")) |v| s.entries = std.fmt.parseInt(usize, v, 10) catch return error.BadPromptReuse;
         if (env("TF_GLM53_CACHE_GIB")) |v| s.gib = std.fmt.parseFloat(f64, v) catch return error.BadPromptReuse;
         if (env("TF_GLM53_REUSE_LOOSE")) |v| s.loose = std.mem.eql(u8, v, "1");
@@ -96,9 +98,13 @@ pub const Plan = struct {
     ids: Specials,
     gap: usize = gap_default,
     system_min: usize = system_min,
+    /// Not in the Python plan: a point every `stride` tokens past the last one (0: none), so a long turn that two
+    /// prompts share (a document, then different questions) has points inside it.
+    stride: usize = 0,
 
     /// PromptPlan.points: the first <|user|> when at least system_min in; then, at least `gap` after the last point,
-    /// the position after an <|assistant|> opener (after its <think> when one follows). Ascending.
+    /// the position after an <|assistant|> opener (after its <think> when one follows); with a stride, every
+    /// `stride` tokens past the last point short of the next opener's. Ascending.
     pub fn points(p: Plan, gpa: std.mem.Allocator, prompt: []const u32) ![]usize {
         var out: std.ArrayList(usize) = .empty;
         errdefer out.deinit(gpa);
@@ -119,12 +125,20 @@ pub const Plan = struct {
                 if (p.ids.think) |th| {
                     if (c < L and prompt[c] == th) c += 1;
                 }
+                if (p.stride > 0) while (last + p.stride < c) {
+                    last += p.stride;
+                    try out.append(gpa, last);
+                };
                 if (c >= last and c - last >= p.gap) {
                     try out.append(gpa, c);
                     last = c;
                 }
             }
         }
+        if (p.stride > 0) while (last + p.stride < L) {
+            last += p.stride;
+            try out.append(gpa, last);
+        };
         return out.toOwnedSlice(gpa);
     }
 
@@ -1013,6 +1027,29 @@ test "keep points as PromptPlan.points" {
     defer gpa.free(pts2);
     try std.testing.expectEqualSlices(usize, &.{ 7, 13 }, pts2); // the system block is too short to be a point
     try std.testing.expectEqual(@as(?usize, null), short.systemPoint(pts2, &p));
+}
+
+test "a stride puts points inside a long turn, the same ones for every prompt that shares it" {
+    const gpa = std.testing.allocator;
+    const U = 9;
+    const A = 7;
+    const T = 5;
+    const plan: Plan = .{ .ids = .{ .user = U, .assistant = A, .think = T }, .gap = 4, .system_min = 3, .stride = 5 };
+    //                0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18
+    const a = [_]u32{ U, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 6, A, T };
+    const b = [_]u32{ U, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 8, 8, 8, 8, 8, 8, A, T };
+    const pa = try plan.points(gpa, &a);
+    defer gpa.free(pa);
+    const pb = try plan.points(gpa, &b);
+    defer gpa.free(pb);
+    // every 5 short of the opener's point; the opener's own point when it is the gap past the last one
+    try std.testing.expectEqualSlices(usize, &.{ 5, 10, 15, 19 }, pa);
+    try std.testing.expectEqualSlices(usize, &.{ 5, 10, 15, 20 }, pb);
+    // an opener's point restarts the stride
+    const c = [_]u32{ U, 1, A, T, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4 };
+    const pc = try plan.points(gpa, &c);
+    defer gpa.free(pc);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 9, 14 }, pc);
 }
 
 test "cut_and_keep: the last stop, the system block and the fork, sorted as n * 2 + shared" {

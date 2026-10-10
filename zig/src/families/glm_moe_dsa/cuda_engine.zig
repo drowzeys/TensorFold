@@ -257,7 +257,7 @@ fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
     const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows, o.parallel };
     h.update(std.mem.asBytes(&cw));
     if (o.parallel > 1) o.multi_set.digest(&h);
-    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
+    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.stride, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
     h.update(std.mem.asBytes(&shape));
     for ([_][]const u8{ o.experts, o.pe_det, o.side, o.l2pf }) |t| {
         h.update(t);
@@ -754,7 +754,7 @@ pub const Session = struct {
     /// alike: the settings were compared at the rendezvous, the budget is agreed here).
     pub fn init(gpa: std.mem.Allocator, boot: *Boot) !Session {
         const o = boot.o;
-        var s: Session = .{ .gpa = gpa, .boot = boot, .eos = try eosIds(gpa, boot.io, o.model), .plan = .{ .ids = reuse.specialIds(gpa, boot.io, o.model), .gap = o.reuse.gap } };
+        var s: Session = .{ .gpa = gpa, .boot = boot, .eos = try eosIds(gpa, boot.io, o.model), .plan = .{ .ids = reuse.specialIds(gpa, boot.io, o.model), .gap = o.reuse.gap, .stride = o.reuse.stride } };
         errdefer gpa.free(s.eos);
         const wanted: u64 = @intFromFloat(o.reuse.gib * (1 << 30));
         var mine: u64 = 0;
