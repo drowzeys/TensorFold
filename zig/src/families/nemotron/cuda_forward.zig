@@ -8,14 +8,19 @@ const glue = @import("cuda_glue.zig");
 const weights = @import("cuda_weights.zig");
 const state = @import("cuda_state.zig");
 const Dump = @import("cuda_dump.zig").Dump;
+const train_ops = @import("cuda_train_ops.zig");
+const lesson_route = @import("lesson_route.zig");
 
-const Delta = enum { none, dense, moe };
+pub const Delta = enum { none, dense, moe };
 
 /// A second stream the shared expert runs on while the routed experts are chosen; fork and join are events.
 pub const Side = struct { s: cuda.Stream, fork: cuda.Event, join: cuda.Event };
 
 /// A verify window supplies its stream buffers and starting row.
-pub const Seg = struct { b: *const state.Buffers, row0: usize, rows: usize, sampled: bool };
+pub const Seg = struct { b: *const state.Buffers, row0: usize, rows: usize, sampled: bool, mask: Mask = .{}, slot: u32 = 0 };
+
+/// Structured output: a segment's rows' grammar bits (device-readable, `words` a row); bits 0: no grammar.
+pub const Mask = struct { bits: u64 = 0, words: usize = 0 };
 
 /// A prompt chunk carries rows, position, residual delta and mixer positions between blocks.
 pub const Walk = struct { rows: usize, pos: usize, x: u64 = 0, delta: Delta = .none, mj: usize = 0, aj: usize = 0 };
@@ -49,13 +54,15 @@ pub const Forward = struct {
     dump: ?*Dump = null,
     side: ?Side = null, // decode MoE layers run the shared expert here (null: one stream)
     marks: ?*Marks = null, // tf-cuda-test window-profile's events; null costs one check a class, no GPU work
+    route: lesson_route.Route = .{}, // which rows carry the lessons (none set: no row does)
+    slot: u32 = 0, // the bound sequence's lesson latch slot, which a window's rows read
 
     pub fn init(c: Config, w: *const weights.Weights, b: *const state.Buffers, ops: kern.Ops, max_len: usize, nch: usize, sampled: bool) Forward {
         return .{ .c = c, .w = w, .b = b, .ops = ops, .glue = .{ .set = if (ops.k.triton) |*t| t else null, .f = &ops.k.glue, .s = ops.s }, .max_len = max_len, .nch = nch, .sampled = sampled };
     }
 
     /// Rows of logits draw their next tokens into `out`, row r at position META[0] + r + 1, by `rule` when sampled.
-    fn sample(f: *const Forward, logits: u64, rows: usize, meta: u64, out: u64, sampled: bool, rule: u64) !void {
+    pub fn sample(f: *const Forward, logits: u64, rows: usize, meta: u64, out: u64, sampled: bool, rule: u64) !void {
         const v = f.c.vocab;
         if (!sampled) return f.ops.torch().argmax(logits, v, v, out, rows);
         try f.ops.draw(logits, v, rule, meta, 0, out, rows, null, null);
@@ -79,7 +86,7 @@ pub const Forward = struct {
     }
 
     /// Engine.norm: h = x + delta (dense, or the experts' slot-order sum), then the block's RMSNorm into y and xs.
-    fn norm(f: *const Forward, x: *u64, delta: Delta, w: u64, rows: usize, moe_f32: bool) !void {
+    pub fn norm(f: *const Forward, x: *u64, delta: Delta, w: u64, rows: usize, moe_f32: bool) !void {
         const b = f.b;
         const c = f.c;
         const next = if (x.* == b.h[0]) b.h[1] else b.h[0];
@@ -95,11 +102,17 @@ pub const Forward = struct {
 
     /// Engine._forward: rows tokens at meta's position; every row samples its next token into `sampled`.
     pub fn window(f: *const Forward, rows: usize) !void {
-        try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = rows, .sampled = f.sampled }});
+        try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = rows, .sampled = f.sampled, .slot = f.slot }});
     }
 
-    /// Shared matmuls, norms and experts retain each stream's mixer state.
+    /// Streams share matmuls, norms and experts but keep their mixer state; each row's latch alone picks its lessons.
     pub fn windowSegs(f: *const Forward, segs: []const Seg) !void {
+        var routed = f.*;
+        if (routed.route.count == 0) for (segs[0..@min(segs.len, lesson_route.max_segments)]) |s| routed.route.later(s.row0, s.rows, s.slot);
+        try routed.windowRows(segs);
+    }
+
+    fn windowRows(f: *const Forward, segs: []const Seg) !void {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
@@ -110,7 +123,7 @@ pub const Forward = struct {
         var rows: usize = 0;
         for (segs) |s| rows += s.rows;
         if (rows > state.max_rows) return error.WindowTooWide;
-        for (segs) |s| try t.embed(s.b.ids, f.w.embed.w, f.w.embed.s, f.w.embed.b, b.emb + s.row0 * D * 2, s.rows, c.hidden);
+        for (segs) |s| try f.embed(s.b.ids, b.emb + s.row0 * D * 2, s.rows);
         try f.mark(.embed);
         var x = b.emb;
         var delta: Delta = .none;
@@ -140,6 +153,7 @@ pub const Forward = struct {
                     try f.mark(.gnorm);
                     try o.dense(b.g, b.gxs, m.out_proj, b.delta, rows);
                     if (m.out_rest != 0) try o.restRows(b.g, c.inner(), m.out_rest, b.delta, c.hidden, false, rows, 1, 0, c.hidden, c.inner());
+                    if (m.adapter) |ad| try adapt(o, ad, b.g, c.inner(), b.delta, c.hidden, false, rows, &f.route);
                     try f.mark(.mamba_out);
                     delta = .dense;
                     mj += 1;
@@ -160,6 +174,7 @@ pub const Forward = struct {
                     try f.mark(.attention);
                     try o.dense(b.att, b.axs, a.o, b.delta, rows);
                     if (a.o_rest != 0) try o.restRows(b.att, qd, a.o_rest, b.delta, c.hidden, false, rows, 1, 0, c.hidden, qd);
+                    if (a.adapter) |ad| try adapt(o, ad, b.att, qd, b.delta, c.hidden, false, rows, &f.route);
                     try f.mark(.attn_o);
                     delta = .dense;
                     aj += 1;
@@ -174,9 +189,22 @@ pub const Forward = struct {
         for (segs) |s| try o.copy(s.b.hidden, b.y + s.row0 * D * 2, s.rows * c.hidden * 2);
         try o.dense(b.y, b.xs, f.w.head, b.logits, rows);
         try f.mark(.head);
+        for (segs) |s| if (s.mask.bits != 0) try o.grammarMask(b.logits + s.row0 * @as(u64, c.vocab) * 2, c.vocab, s.mask.bits, s.mask.words, s.rows);
         for (segs) |s| try f.sample(b.logits + s.row0 * @as(u64, c.vocab) * 2, s.rows, s.b.meta, s.b.sampled, s.sampled, s.b.rule);
         try f.mark(.sample);
         if (f.dump) |d| try d.tail(f.ops, b.logits, b.sampled, rows, c.vocab);
+    }
+
+    /// Token rows of the embedding table as the checkpoint stores it: MLX 4-bit words, or bf16.
+    pub fn embed(f: *const Forward, ids: u64, out: u64, rows: usize) !void {
+        const e = f.w.embed;
+        if (e.bf16) return f.glue.embed16(ids, e.w, out, rows, f.c.hidden);
+        return f.glue.embed(ids, e.w, e.s, e.b, out, rows, f.c.hidden);
+    }
+
+    /// The token rows up projections read, and the pair rows down projections read.
+    pub fn rowsIn(f: *const Forward, ex: kern.Experts) [2]cuda.experts.Rows {
+        return .{ .{ .x = f.b.y, .stride = f.c.hidden, .slots = f.c.slots() }, .{ .x = f.b.act, .stride = ex.width } };
     }
 
     /// Engine.moe / moe_rows: route each row's experts, group pairs by expert, then up (relu^2) and down.
@@ -189,27 +217,37 @@ pub const Forward = struct {
         if (!prompt) if (f.side) |sd| return f.forked(m, rows, sd);
         try f.glue.route(b.y, m.router, m.bias, b.part, b.pick, b.wts, rows, c.hidden, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
         try f.mark(.route);
-        const tile: usize = if (prompt) 64 else 16;
-        try o.plan(b.pick, pairs, ex.count, tile, b.plan);
+        const tile: usize = if (prompt) cuda.experts.promptTile(ex.format) else 16;
+        try o.plan(b.pick, pairs, ex.experts, tile, b.plan);
         try f.mark(.plan);
-        const items = kern.maxItems(pairs, ex.count, tile);
+        const items = kern.maxItems(pairs, ex.experts, tile);
+        const g = o.grouped();
+        const in = f.rowsIn(ex);
         if (prompt) {
-            try o.expertsPrefill(true, b.y, c.hidden, c.slots(), ex.up, ex.dims / 64, ex.width / 32, b.plan, b.act, ex.width, items);
-            try o.expertsPrefill(false, b.act, ex.width, 0, ex.down, ex.width / 64, ex.dims / 32, b.plan, b.ymoe, ex.dims, items);
+            try g.prompt(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
+            try g.prompt(o.s, .down_bf16, in[1], ex, b.plan, b.ymoe, items, -1);
+            if (f.dump) |d| for ([_][]const u8{ "pick", "act", "ymoe" }, [_]u64{ b.pick, b.act, b.ymoe }, [_]usize{ 4, ex.width * 2, ex.dims * 2 }) |l, p, w| try d.input(o, l, p, pairs * w);
         } else {
-            try o.experts(true, b.y, c.hidden, c.slots(), ex.up, ex.dims / 64, ex.width / 32, b.plan, b.act, ex.width, items * (ex.width / 32));
+            try g.decode(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
             try f.mark(.experts_up);
-            try o.experts(false, b.act, ex.width, 0, ex.down, ex.width / 64, ex.dims / 32, b.plan, b.ymoe, ex.dims, items * (ex.dims / 32));
+            try g.decode(o.s, .down_f32, in[1], ex, b.plan, b.ymoe, items, -1);
             try f.mark(.experts_down);
         }
         try f.sharedRest(o, m, rows, !prompt);
     }
 
-    /// A lesson's change to the shared expert's down projection, past its codes: into its two halves' pair rows.
+    /// A lesson's rest into the shared expert's halves' pair rows, a live change (--slide, 2W wide) into the first's.
     fn sharedRest(f: *const Forward, o: kern.Ops, m: weights.MoE, rows: usize, y_f32: bool) !void {
         const c = f.c;
         const ex = m.experts;
         for (m.rest, 0..) |r, h| if (r != 0) try o.restRows(f.b.act, ex.width, r, f.b.ymoe, ex.dims, y_f32, rows, c.slots(), c.top_k + h, ex.dims, ex.width);
+        // the pocket's learned neurons read the normed rows as the shared expert's own do, into its first half's output
+        if (m.pocket) |p| try o.pocketRows(f.b.y, ex.dims, p.up, p.down, p.n, f.b.ymoe, y_f32, rows, c.slots(), c.top_k);
+        // the learned change reads both halves (the whole shared activation) into the first half's output
+        const ad = m.adapter orelse return;
+        const x = f.b.act + @as(u64, c.top_k) * ex.width * 2;
+        const y = f.b.ymoe + @as(u64, c.top_k) * ex.dims * @as(u64, if (y_f32) 4 else 2);
+        try adapt(o, ad, x, c.slots() * ex.width, y, c.slots() * ex.dims, y_f32, rows, &f.route);
     }
 
     /// The decode MoE with its shared halves on the side stream: their pairs are fixed, so they need no routing.
@@ -219,11 +257,13 @@ pub const Forward = struct {
         const o = f.ops;
         const ex = m.experts;
         const so: kern.Ops = .{ .k = o.k, .s = sd.s };
+        const g = o.grouped();
+        const in = f.rowsIn(ex);
         try sd.fork.record(o.s);
         try sd.s.wait(sd.fork);
         const sp = b.sharedPlan(rows);
-        try so.experts(true, b.y, c.hidden, c.slots(), ex.up, ex.dims / 64, ex.width / 32, sp, b.act, ex.width, 2 * (ex.width / 32));
-        try so.experts(false, b.act, ex.width, 0, ex.down, ex.width / 64, ex.dims / 32, sp, b.ymoe, ex.dims, 2 * (ex.dims / 32));
+        try g.decode(sd.s, .up, in[0], ex, sp, b.act, 2, -1);
+        try g.decode(sd.s, .down_f32, in[1], ex, sp, b.ymoe, 2, -1);
         try f.sharedRest(so, m, rows, true);
         try sd.join.record(sd.s);
         try f.glue.route(b.y, m.router, m.bias, b.part, b.pick, b.wts, rows, c.hidden, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
@@ -231,9 +271,9 @@ pub const Forward = struct {
         try o.planRouted(b.pick, rows, c.slots(), c.top_k, c.experts, 16, b.plan);
         try f.mark(.plan);
         const items = kern.maxItems(rows * c.top_k, c.experts, 16);
-        try o.experts(true, b.y, c.hidden, c.slots(), ex.up, ex.dims / 64, ex.width / 32, b.plan, b.act, ex.width, items * (ex.width / 32));
+        try g.decode(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
         try f.mark(.experts_up);
-        try o.experts(false, b.act, ex.width, 0, ex.down, ex.width / 64, ex.dims / 32, b.plan, b.ymoe, ex.dims, items * (ex.dims / 32));
+        try g.decode(o.s, .down_f32, in[1], ex, b.plan, b.ymoe, items, -1);
         try f.mark(.experts_down);
         try o.s.wait(sd.join);
         try f.mark(.shared_wait);
@@ -254,7 +294,7 @@ pub const Forward = struct {
     /// A chunk's embedding, from p_ids.
     pub fn chunkBegin(f: *const Forward, w: *Walk) !void {
         const b = f.b;
-        try f.glue.embed(b.p_ids, f.w.embed.w, f.w.embed.s, f.w.embed.b, b.emb, w.rows, f.c.hidden);
+        try f.embed(b.p_ids, b.emb, w.rows);
         w.x = b.emb;
     }
 
@@ -307,15 +347,19 @@ pub const Forward = struct {
         switch (blk.kind) {
             .mamba => {
                 try f.glue.groupRmsnorm(b.sy, blk.mamba.gnorm, b.g, b.gxs, w.rows, c.inner(), c.groups, c.eps);
+                if (f.dump) |d| try d.input(f.ops, "g", b.g, w.rows * c.inner() * 2);
                 try f.ops.prefillDense(b.g, blk.mamba.out_proj, b.delta, w.rows);
                 if (blk.mamba.out_rest != 0) try f.ops.restRows(b.g, c.inner(), blk.mamba.out_rest, b.delta, c.hidden, false, w.rows, 1, 0, c.hidden, c.inner());
+                if (blk.mamba.adapter) |ad| try adapt(f.ops, ad, b.g, c.inner(), b.delta, c.hidden, false, w.rows, &f.route);
                 w.delta = .dense;
                 w.mj += 1;
             },
             .attention => {
+                if (f.dump) |d| try d.input(f.ops, "att", b.att, w.rows * c.heads * c.head_dim * 2);
                 try f.ops.prefillDense(b.att, blk.attn.o, b.delta, w.rows);
                 const qd = c.heads * c.head_dim;
                 if (blk.attn.o_rest != 0) try f.ops.restRows(b.att, qd, blk.attn.o_rest, b.delta, c.hidden, false, w.rows, 1, 0, c.hidden, qd);
+                if (blk.attn.adapter) |ad| try adapt(f.ops, ad, b.att, qd, b.delta, c.hidden, false, w.rows, &f.route);
                 w.delta = .dense;
                 w.aj += 1;
             },
@@ -324,6 +368,11 @@ pub const Forward = struct {
                 w.delta = .moe;
             },
         }
+    }
+
+    /// The chunk's last norm alone: w.x then holds the residual it read, b.y every row's normed hidden state.
+    pub fn finalNorm(f: *const Forward, w: *Walk) !void {
+        try f.norm(&w.x, w.delta, f.w.norm_f, w.rows, false);
     }
 
     /// The chunk's last norm, its rows' hidden states for the MTP head, and the token after its last row.
@@ -340,3 +389,13 @@ pub const Forward = struct {
         if (f.dump) |d| try d.tail(f.ops, b.p_logits, b.p_sampled, 1, c.vocab);
     }
 };
+
+/// y += scale (x a^T) b over the blocks `route` opens on each row (x and y rows their strides apart, y bf16 or fp32).
+fn adapt(o: kern.Ops, ad: weights.Adapter, x: u64, x_stride: usize, y: u64, y_stride: usize, y_f32: bool, rows: usize, route: *const lesson_route.Route) !void {
+    const t: train_ops.Ops = .{ .k = &o.k.train, .s = o.s };
+    try t.loraIn(x, x_stride, ad.a, ad.xa, rows, ad.in, ad.rank, ad.xn);
+    var r = route.*;
+    if (ad.whole) r.whole = 1;
+    try t.gate(ad.xa, ad.xn, ad.tau, ad.gates, rows, ad.rank, ad.unit, &r, ad.latch, ad.score);
+    try t.loraOut(ad.xa, ad.b, y, y_stride, y_f32, rows, ad.out, ad.rank, ad.scale);
+}

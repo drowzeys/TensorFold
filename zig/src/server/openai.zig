@@ -146,6 +146,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+    if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
@@ -181,14 +182,17 @@ fn legacyPrompt(srv: *Server, cx: *Cx, prompt: ?Value) errors.Refused!chat.Promp
     if (p == .array and p.array.len > 0 and allInts(p.array)) {
         const vocab = srv.text.vocabSize();
         const out = try cx.a.alloc(u32, p.array.len);
-        for (p.array, out) |t, *slot| {
-            const n = if (t == .int) t.int64() else null;
-            if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "prompt token ids must be integers in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
-            slot.* = @intCast(n.?);
-        }
+        for (p.array, out) |t, *slot| slot.* = try promptId(cx, vocab, t);
         return .{ .ids = out };
     }
     return .{ .text = try promptText(srv, cx, p) };
+}
+
+/// A prompt token id, refused unless it is an integer inside the vocabulary.
+fn promptId(cx: *Cx, vocab: u32, t: Value) errors.Refused!u32 {
+    const n = if (t == .int) t.int64() else null;
+    if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "prompt token ids must be integers in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
+    return @intCast(n.?);
 }
 
 fn allInts(items: []const Value) bool {
@@ -202,8 +206,9 @@ fn promptText(srv: *Server, cx: *Cx, p: Value) errors.Refused![]const u8 {
         .null => return "",
         .array => |items| {
             if (allInts(items)) {
+                const vocab = srv.text.vocabSize();
                 const toks = try cx.a.alloc(u32, items.len);
-                for (items, toks) |t, *slot| slot.* = if (t == .bool) @intFromBool(t.bool) else @intCast(@min(@max(0, t.int64() orelse 0), std.math.maxInt(u32)));
+                for (items, toks) |t, *slot| slot.* = try promptId(cx, vocab, t);
                 return srv.text.decode(cx.a, toks) catch return error.OutOfMemory;
             }
             var parts: std.ArrayList([]const u8) = .empty;
