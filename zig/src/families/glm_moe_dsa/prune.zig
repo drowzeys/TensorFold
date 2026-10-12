@@ -14,8 +14,9 @@
 //! (glm53_expert_prune, glm53_decode.cu), checked against tools/glm53/prune_ref.py's numpy cases.
 //!
 //! Settings: TF_GLM53_EXPERT_TOPP (0 < p < 1; unset or 0: off), TF_GLM53_EXPERT_MIN_K (default 3),
-//! TF_GLM53_EXPERT_RENORM (orig | kept, default orig), TF_GLM53_EXPERT_PRUNE_PROMPT (default 0: only windows the
-//! decode kernels run; 1: prompt chunks too, which changes the cached keys and values of a prompt).
+//! TF_GLM53_EXPERT_RENORM (orig | kept, default orig), TF_GLM53_EXPERT_PRUNE_PROMPT (default 0: generated tokens'
+//! windows only - a prompt chunk keeps every expert, except the short prompt tails concurrent streams fill together
+//! in a decode window; 1: prompt chunks too, which changes the cached keys and values of a prompt).
 const std = @import("std");
 
 pub const max_k = 16;
@@ -26,7 +27,7 @@ pub const Rule = struct {
     topp: f32 = 0,
     min_k: u32 = 3,
     renorm: Renorm = .orig,
-    /// prompt chunks prune too (else only the windows the decode kernels run)
+    /// prompt chunks prune too (else only generated tokens' windows)
     prompt: bool = false,
 
     pub fn on(r: Rule) bool {

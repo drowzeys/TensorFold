@@ -72,8 +72,9 @@
 //! --score-rows N: prompt chunks of N rows (0: the served prompt path's chunks; up to 16: the decode windows'
 //! kernels); --score-head-rows N: rows a head pass. Takes 3b's engine flags; --k is 0 whatever is given.
 //! --expert-topp P [--expert-min-k 3] [--expert-renorm orig|kept] [--expert-prune-prompt 0|1] (modes 3b, 4 and score):
-//! routed-expert pruning as TF_GLM53_EXPERT_* set it for the server; --score-rows 0 scores prompt chunks, which prune
-//! only with --expert-prune-prompt 1, and --score-rows 1..16 scores the decode kernels' windows, which always prune.
+//! routed-expert pruning as TF_GLM53_EXPERT_* set it for the server. Mode score prunes every scored row (they are
+//! all prompt rows, so it turns --expert-prune-prompt on): --score-rows 0 through the prompt kernels, 1..16 through
+//! the decode kernels.
 //! --score-route FILE (with --score-rows 1..16): every MoE layer's routed weights and picks of every window (RouteTap).
 //! --score-time N: before scoring, N timed launches of the bf16 head and of some EXL3 linears at 1..3 rows (TIME lines).
 //! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
@@ -1947,6 +1948,7 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = 0, .draft_vocab = 0, .mtp_reuse = a.mtp_reuse, .graphs = false, .prewarm = false, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = false, .dcp = 1, .timeout_s = a.timeout_s };
     o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
     o.reuse.on = false;
+    if (o.prune.on()) o.prune.prompt = true; // every scored row is a prompt row: --expert-topp alone scores the rule
     const boot = try glm.engine.Boot.init(gpa, io, o);
     defer boot.deinit();
     // every rank scores the same rows against the same reference, in the same chunks

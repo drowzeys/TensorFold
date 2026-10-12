@@ -645,6 +645,9 @@ pub const Forward = struct {
     route_tap: ?*RouteTap = null,
     /// routed-expert pruning (prune.zig); off (the default): nothing is launched
     prune: prune.Rule = .{},
+    /// this forward is running a prompt chunk (Runner.prefillChunk sets it on its copy): its rows prune only with
+    /// TF_GLM53_EXPERT_PRUNE_PROMPT=1
+    chunk: bool = false,
     /// Phase 3b: decode context parallelism (w.dcp: 1, or the world - every rank of the TP world is one of the DCP
     /// group, its rank w.rank). The State must be State.initDcp(.., dcp) and every Buffers BufOpts.dcp = dcp.
     dcp: usize = 1,
@@ -1307,7 +1310,7 @@ pub const Forward = struct {
                 }
             }
             try f.route(b, L, 0, R);
-            try f.pruneRows(b, L, 0, R, f.shared_experts and R > b.xs_rows);
+            try f.pruneRows(b, L, 0, R, f.chunk or (f.shared_experts and R > b.xs_rows));
             if (f.route_tap) |tap| try tap.take(f, b, L, R);
             try f.expertsPartWith(b, L, R, sy_ev);
             if (sd_used) |sd| sd.forked = false; // joined inside the routed chain (experts.routed's sy_ready)

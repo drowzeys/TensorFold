@@ -8,7 +8,7 @@ TensorFold (routed-expert pruning, the exchange trace) and from our own comm pro
 |---|---|---|
 | `TF_GLM53_EXPERT_TOPP=0.85` | A row keeps the routed experts that reach this share of its routed weight, at least `TF_GLM53_EXPERT_MIN_K` (3). Fewer expert bytes a decode window. | Lossy |
 | `TF_GLM53_EXPERT_RENORM=orig\|kept` | Kept weights left as routed (`orig`, default: the routed output shrinks by the dropped share) or rescaled to the full sum (`kept`). | |
-| `TF_GLM53_EXPERT_PRUNE_PROMPT=1` | Prompt chunks prune too. Default 0: only windows the decode kernels run (generated tokens, and prompt chunks of at most 16 rows). | Lossy |
+| `TF_GLM53_EXPERT_PRUNE_PROMPT=1` | Prompt chunks prune too. Default 0: only generated tokens' windows (and the short prompt tails that concurrent streams fill together in a decode window). | Lossy |
 | `TF_GLM53_ROCE_BF16=1` | Decode exchanges send bf16 partials: half the bytes. | Changes bits |
 | `TF_GLM53_ROCE_HEALTH_LOCAL=1` | The per-window health check reads this rank's own word: no NCCL all-gather a window. A failure surfaces one window later. | Same |
 | `TF_GLM53_L2PF_AFTER=1` | The L2 prefetch sites are queued after their exchange, not beside it. | Same |
@@ -33,8 +33,8 @@ Measured on the router's weights of 137,570 positions (`tools/glm53/prune_ref.py
 | 0.90 | 6.85 | 6.9 % |
 
 Quality is measured with the scorer (`docs/glm53-score.md`): `--expert-topp 0.85` on `tf-glm53-generate --mode score`.
-`--score-rows 16` scores the decode kernels' windows (always pruned); `--score-rows 0` scores prompt chunks, pruned
-only with `--expert-prune-prompt 1`.
+Scoring prunes every scored row: `--score-rows 0` through the prompt kernels, `--score-rows 16` through the decode
+kernels.
 
 ```sh
 python3 tools/glm53/prune_ref.py cases zig/src/families/glm_moe_dsa/prune_cases.bin --route ROUTE.bin   # the fixture

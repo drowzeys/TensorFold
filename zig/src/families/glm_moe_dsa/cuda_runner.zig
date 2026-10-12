@@ -874,7 +874,9 @@ pub const Runner = struct {
                 hb = b1;
             }
         } else {
-            try r.f.compute(&r.pb, st, R, T, if (last) head else .none, true);
+            var pf = r.f; // a prompt chunk: routed-expert pruning only with TF_GLM53_EXPERT_PRUNE_PROMPT=1
+            pf.chunk = true;
+            try pf.compute(&r.pb, st, R, T, if (last) head else .none, true);
             if (last) hb = &r.pb;
         }
         if (r.solo_feed) try r.feedPrompt(&r.pb, a, e, L0); // prefill_chunk: the drafters' contexts take this chunk's taps
