@@ -28,6 +28,7 @@ const copies = @import("copies.zig");
 const multi = @import("cuda_multi.zig");
 const mdraft = @import("cuda_mdraft.zig");
 const dcpm = @import("cuda_dcp.zig");
+const prune = @import("prune.zig");
 
 pub const world_default: usize = 4;
 /// engine.DCP_AUTO: contexts past this interleave the KV cache over the ranks (bf16 latent)
@@ -127,6 +128,8 @@ pub const Options = struct {
     multi_select: bool = true,
     device_cands: bool = true,
     mtp_dense: bool = true,
+    /// routed-expert pruning (lossy; TF_GLM53_EXPERT_TOPP / _MIN_K / _RENORM / _PRUNE_PROMPT, prune.zig), off by default
+    prune: prune.Rule = .{},
     /// TF_GLM53_DCP: 0 auto (the world past dcp_auto tokens of context, else 1), 1, or the world
     dcp: usize = 0,
     timeout_s: f64 = 5400,
@@ -187,6 +190,10 @@ pub const Options = struct {
         o.multi_select = try envFlag("TF_GLM53_MULTI_SELECT", true);
         o.device_cands = try envFlag("TF_GLM53_DEVICE_CANDS", true);
         o.mtp_dense = try envFlag("TF_GLM53_MTP_DENSE", true);
+        o.prune = prune.Rule.parse(env("TF_GLM53_EXPERT_TOPP"), env("TF_GLM53_EXPERT_MIN_K"), env("TF_GLM53_EXPERT_RENORM"), env("TF_GLM53_EXPERT_PRUNE_PROMPT")) catch {
+            std.log.err("TF_GLM53_EXPERT_TOPP (0 <= p < 1), _MIN_K (1 or more), _RENORM (orig | kept), _PRUNE_PROMPT (0 / 1)", .{});
+            return error.BadSetting;
+        };
         o.dcp = try envInt(usize, "TF_GLM53_DCP", 0);
         o.timeout_s = try envFloat("TF_GLM53_TIMEOUT", o.timeout_s);
         o.reuse = try reuse.Settings.fromEnv();
@@ -263,6 +270,7 @@ fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
         h.update(t);
         h.update("|");
     }
+    if (o.prune.on()) h.update(std.mem.asBytes(&o.prune.digest())); // off: the digest of a build without pruning
     return h.final();
 }
 
@@ -480,7 +488,8 @@ pub const Boot = struct {
             if (!(o.l2pf_mb > 0 and o.l2pf_mb <= 64)) return error.BadL2pfBudget;
             b.l2pf = try dec.L2pf.init(gpa, &b.driver, &b.w, .{ .mode = pf_mode, .mb = o.l2pf_mb });
         }
-        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan) };
+        b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan), .prune = o.prune };
+        if (o.prune.on()) std.log.info("glm53 rank {d}: routed-expert pruning on (lossy): top-p {d}, at least {d} experts, weights {t}, prompt chunks {s}", .{ o.rank, o.prune.topp, o.prune.min_k, o.prune.renorm, if (o.prune.prompt) "pruned" else "kept whole" });
         if (o.prompt_sp and o.world > 1 and b.dcp == 1) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
         b.stage = 17;
         const capacity = o.context + o.k + 1; // Glm53Engine: Runner(limit + k + 1)

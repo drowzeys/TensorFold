@@ -403,3 +403,47 @@ glm53_dcp_merge(const long long* __restrict__ cand, int rows, int K, int dcp, in
     for (int j = t; j < K; j += MERGE_THREADS) tok[(size_t)r * K + j] = (unsigned)j < own ? buf[j] : 0;
     if (t == 0) cnt[r] = (int)own;
 }
+
+// Routed-expert pruning (families/glm_moe_dsa/prune.zig, off unless TF_GLM53_EXPERT_TOPP is set): one thread a row,
+// in place on the router's picks [rows, K] and fp32 weights [rows, K], K <= 16. prune.zig's `row` is these statements
+// on the host: fp32 sums in slot order and IEEE divisions (no product is added to anything, so contraction cannot
+// change a bit). A row that keeps every slot is not written.
+extern "C" __global__ void glm53_expert_prune(int* __restrict__ pick, float* __restrict__ wts, int rows, int K,
+                                              float topp, int min_k, int kept_renorm, float scale, int drop) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float* w = wts + (size_t)r * K;
+    int* p = pick + (size_t)r * K;
+    float f[16], excl[16];
+    int rank[16];
+    float total = 0.f;
+    for (int i = 0; i < K; ++i) total += w[i];
+    for (int i = 0; i < K; ++i) f[i] = w[i] / total;
+    for (int i = 0; i < K; ++i) {
+        int n = 0;
+        for (int j = 0; j < K; ++j) n += (f[j] > f[i]) || (f[j] == f[i] && j < i);
+        rank[i] = n;
+    }
+    float acc = 0.f;
+    for (int q = 0; q < K; ++q) {
+        float fr = 0.f;
+        for (int i = 0; i < K; ++i)
+            if (rank[i] == q) { excl[i] = acc; fr = f[i]; }
+        acc += fr;
+    }
+    unsigned keep = 0;
+    int n_keep = 0;
+    for (int i = 0; i < K; ++i)
+        if (excl[i] < topp || rank[i] < min_k) { keep |= 1u << i; ++n_keep; }
+    if (n_keep == K) return;
+    float ks = 0.f;
+    for (int i = 0; i < K; ++i) ks += ((keep >> i) & 1u) ? w[i] : 0.f;
+    for (int i = 0; i < K; ++i) {
+        if ((keep >> i) & 1u) {
+            if (kept_renorm) w[i] = scale * (w[i] / ks);
+        } else {
+            w[i] = 0.f;
+            p[i] = drop;
+        }
+    }
+}

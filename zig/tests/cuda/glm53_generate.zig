@@ -71,6 +71,9 @@
 //! drafts and the head on every row; this rank's share of every position's sums goes to --out (a partials file).
 //! --score-rows N: prompt chunks of N rows (0: the served prompt path's chunks; up to 16: the decode windows'
 //! kernels); --score-head-rows N: rows a head pass. Takes 3b's engine flags; --k is 0 whatever is given.
+//! --expert-topp P [--expert-min-k 3] [--expert-renorm orig|kept] [--expert-prune-prompt 0|1] (modes 3b, 4 and score):
+//! routed-expert pruning as TF_GLM53_EXPERT_* set it for the server; --score-rows 0 scores prompt chunks, which prune
+//! only with --expert-prune-prompt 1, and --score-rows 1..16 scores the decode kernels' windows, which always prune.
 //! --score-route FILE (with --score-rows 1..16): every MoE layer's routed weights and picks of every window (RouteTap).
 //! --score-time N: before scoring, N timed launches of the bf16 head and of some EXL3 linears at 1..3 rows (TIME lines).
 //! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
@@ -199,6 +202,11 @@ const Args = struct {
     score_dump: []const u8 = "",
     score_dump_rows: []const u8 = "",
     score_route: []const u8 = "",
+    // routed-expert pruning (families/glm_moe_dsa/prune.zig), the engine-booted modes; unset: off
+    expert_topp: ?[]const u8 = null,
+    expert_min_k: ?[]const u8 = null,
+    expert_renorm: ?[]const u8 = null,
+    expert_prune_prompt: ?[]const u8 = null,
     score_time: usize = 0,
 };
 
@@ -385,6 +393,14 @@ pub fn main(init: std.process.Init) !u8 {
             a.score_dump_rows = v;
         } else if (std.mem.eql(u8, k, "--score-route")) {
             a.score_route = v;
+        } else if (std.mem.eql(u8, k, "--expert-topp")) {
+            a.expert_topp = v;
+        } else if (std.mem.eql(u8, k, "--expert-min-k")) {
+            a.expert_min_k = v;
+        } else if (std.mem.eql(u8, k, "--expert-renorm")) {
+            a.expert_renorm = v;
+        } else if (std.mem.eql(u8, k, "--expert-prune-prompt")) {
+            a.expert_prune_prompt = v;
         } else if (std.mem.eql(u8, k, "--score-time")) {
             a.score_time = try std.fmt.parseInt(usize, v, 10);
         } else {
@@ -1586,6 +1602,7 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         gpa.free(prompts);
     }
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s };
+    o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     // Phase 4: the drafters, their settings, copy drafts (on when --copy 1 or a run asks for them)
@@ -1769,6 +1786,7 @@ fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         try groups.append(gpa, .{ .name = gname.string, .members = members, .seeds = seeds, .greedy = greedy });
     }
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s, .parallel = a.parallel };
+    o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     o.multi_set = try glm.multi.Settings.fromEnv();
@@ -1899,6 +1917,7 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     if (longest > a.context) return error.ContextTooLong;
     std.debug.print("rank {d} of {d}: scoring {d} rows ({d} positions, {d} sets, the reference keeps {d} tokens a position), prompt chunks of {d} rows (0: the served chunks), head passes of {d} rows\n", .{ a.rank, a.world, ref.head.n_rows, ref.head.n_pos, ref.head.n_sets, ref.head.topk, a.score_rows, a.score_head_rows });
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = 0, .draft_vocab = 0, .mtp_reuse = a.mtp_reuse, .graphs = false, .prewarm = false, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = false, .dcp = 1, .timeout_s = a.timeout_s };
+    o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
     o.reuse.on = false;
     const boot = try glm.engine.Boot.init(gpa, io, o);
     defer boot.deinit();

@@ -42,6 +42,7 @@ const roce = @import("cuda_roce.zig");
 const prompt = @import("cuda_prompt.zig");
 const dec = @import("cuda_decode.zig");
 const dcpm = @import("cuda_dcp.zig");
+const prune = @import("prune.zig");
 
 /// The widest TP world the head's exchange records hold.
 pub const max_world: usize = 16;
@@ -642,6 +643,8 @@ pub const Forward = struct {
     mtp_dense: ?*prompt.MtpDense = null,
     /// scoring only (RouteTap): fused.ffn_part's routed weights and picks to the host; null everywhere else
     route_tap: ?*RouteTap = null,
+    /// routed-expert pruning (prune.zig); off (the default): nothing is launched
+    prune: prune.Rule = .{},
     /// Phase 3b: decode context parallelism (w.dcp: 1, or the world - every rank of the TP world is one of the DCP
     /// group, its rank w.rank). The State must be State.initDcp(.., dcp) and every Buffers BufOpts.dcp = dcp.
     dcp: usize = 1,
@@ -1301,6 +1304,7 @@ pub const Forward = struct {
                 }
             }
             try f.route(b, L, 0, R);
+            try f.pruneRows(b, L, 0, R, f.shared_experts and R > b.xs_rows);
             if (f.route_tap) |tap| try tap.take(f, b, L, R);
             try f.expertsPartWith(b, L, R, sy_ev);
             if (sd_used) |sd| sd.forked = false; // joined inside the routed chain (experts.routed's sy_ready)
@@ -1318,6 +1322,18 @@ pub const Forward = struct {
         const D = c.hidden;
         try t_.router(b.normed + r0 * D * 2, D, L.router_w, b.mlog + r0 * c.experts * 4, b.rpart, n, D, c.experts);
         try t_.topk(b.mlog + r0 * c.experts * 4, L.router_bias, b.pick + r0 * c.top_k * 4, b.wts + r0 * c.top_k * 4, n, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
+    }
+
+    /// Routed-expert pruning of rows r0 .. r0 + n of b.pick / b.wts, right after `route` (prune.zig). `chunk`: the
+    /// rows are a prompt chunk's (pruned only with TF_GLM53_EXPERT_PRUNE_PROMPT=1). The MTP layer's rows are never
+    /// pruned: its drafts only propose, and its dense experts index by pick.
+    pub fn pruneRows(f: *const Forward, b: *const Buffers, L: *const W.Layer, r0: usize, n: usize, chunk: bool) !void {
+        const c = f.w.config;
+        const rule = f.prune.of(c.top_k) orelse return;
+        if (L.index >= c.layers or (chunk and !rule.prompt)) return;
+        if (rule.renorm == .kept and !c.norm_topk) return error.PruneRenormNeedsNormTopk;
+        const ex = if (L.experts) |*e| e else return;
+        try f.ops().expertPrune(b.pick + r0 * c.top_k * 4, b.wts + r0 * c.top_k * 4, n, c.top_k, rule.topp, rule.min_k, rule.renorm == .kept, c.routed_scaling, @max(ex.count, c.experts));
     }
 
     /// fused.experts_part (shared expert not on a side stream): routed experts (picks in b.pick) + the shared expert

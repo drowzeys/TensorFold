@@ -44,6 +44,7 @@ pub const Kernels = struct {
     q4_group: cuda.Function, // qmm_group tile 2 with fp32 out: the draft head (headq q4)
     // Phase 3a speed (glm53_decode.cu): decode windows' multi-block top-k, sampled candidates, the L2 prefetch
     decode_mod: cuda.Module,
+    expert_prune: cuda.Function, // routed-expert pruning (prune.zig): launched only where a rule is on
     topk_hist: cuda.Function,
     topk_count: cuda.Function,
     topk_write: cuda.Function,
@@ -154,6 +155,7 @@ pub const Kernels = struct {
         k.topk_write = try k.decode_mod.function("glm53_topk_write");
         k.cands = try k.decode_mod.function("glm53_cands");
         k.l2pf = try k.decode_mod.function("glm53_l2pf");
+        k.expert_prune = try k.decode_mod.function("glm53_expert_prune");
         k.dcp_qpack = try k.decode_mod.function("glm53_dcp_qpack");
         k.dcp_cands = try k.decode_mod.function("glm53_dcp_cands");
         k.dcp_merge = try k.decode_mod.function("glm53_dcp_merge");
@@ -430,6 +432,24 @@ pub const Ops = struct {
 
     pub fn linear(o: Ops, l: *const exl3.Linear, x: u64, x_dtype: exl3.DType, out: u64, y: exl3.DType, m: usize, sc: LinearScratch) !void {
         return o.linears(&.{l}, x, x_dtype, &.{out}, &.{y}, m, sc);
+    }
+
+    /// prune.zig's rule in place on `rows` rows of picks [rows, k] / weights [rows, k]; `drop` the pick of a dropped
+    /// slot (the expert count: routed / promptRouted skip it).
+    pub fn expertPrune(o: Ops, pick: u64, wts: u64, rows: usize, k: usize, topp: f32, min_k: u32, kept: bool, scale: f32, drop: usize) !void {
+        if (rows == 0) return;
+        if (k > 16) return error.PruneTooWide;
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(wts);
+        a.add(int(rows));
+        a.add(int(k));
+        a.add(topp);
+        a.add(@as(c_int, @intCast(min_k)));
+        a.add(@as(c_int, @intFromBool(kept)));
+        a.add(scale);
+        a.add(int(drop));
+        try cuda.launch.launch(o.k.expert_prune, .{ .grid = .{ .x = u((rows + 127) / 128) }, .block = .{ .x = 128 } }, o.s, &a);
     }
 
     /// experts.routed with wts and sy (TF_EXL3_EXPERTS_FUSE 1, LOADS 1, PDL 0, fp32 SwiGLU, no limit):

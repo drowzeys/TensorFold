@@ -56,6 +56,7 @@ pub const draft_host = @import("draft_host.zig");
 pub const copies = @import("copies.zig");
 pub const multi = @import("cuda_multi.zig");
 pub const mdraft = @import("cuda_mdraft.zig");
+pub const prune = @import("prune.zig");
 pub const score = @import("score.zig");
 pub const score_cuda = @import("cuda_score.zig");
 
@@ -83,6 +84,7 @@ test {
     _ = copies;
     _ = multi;
     _ = mdraft;
+    _ = prune;
     _ = score;
     _ = score_cuda;
 }

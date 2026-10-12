@@ -528,7 +528,10 @@ pub const Sp = struct {
         const b = h.b;
         const p0 = try f.pbegin();
         try sp.tr().rmsnorm(b.xo, D, L.post_attn_norm, b.normed + h.o * D * 2, D, h.n, D, c.eps);
-        if (L.experts != null) try f.route(b, L, h.o, h.n);
+        if (L.experts != null) {
+            try f.route(b, L, h.o, h.n);
+            try f.pruneRows(b, L, h.o, h.n, true);
+        }
         try f.pend(p0, .front);
         const p1 = try f.pbegin();
         if (L.experts != null) {

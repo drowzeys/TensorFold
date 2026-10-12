@@ -1080,6 +1080,7 @@ pub const Host = struct {
         x.update(std.mem.asBytes(&shape));
         x.update(o.experts);
         x.update(o.pe_det);
+        if (o.prune.on()) x.update(std.mem.asBytes(&o.prune.digest())); // pruned states are not unpruned ones
         const probe = try h.session.probe();
         x.update(std.mem.asBytes(&probe));
         return x.final();
