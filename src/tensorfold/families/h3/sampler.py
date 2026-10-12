@@ -267,7 +267,8 @@ def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: 
     beside the audio that came with the clip, and each block's keys and values over them are kept; a step then
     runs the audio rows alone against those. That is the same computation except that the held rows do not see
     the audio changing between steps. ``audio_condition`` are the clean reference audio rows the clip was made
-    with (Ref2VA); they are held too, at their own timestep.
+    with (Ref2VA); they are held too, at their own timestep, and the held rows then go through the stack beside
+    the starting noise instead of the audio that came with the clip.
     """
 
     packed = latents.packed
@@ -308,7 +309,16 @@ def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: 
     table = mx.array(values)
     text = text.astype(mx.bfloat16)
     dit.cache_modulation(table, release=release)
-    context = None if exact else held_context(dit, video_rows, reference, text, table, held_plan, packed)
+    if exact:
+        context = None
+    elif held_audio:
+        # With reference audio the held rows are kept beside the audio as it starts (noise, at its own timestep),
+        # not beside the clip's finished audio at the keyframe level: next to clean reference audio that second,
+        # clean-looking track made the re-voiced sound come out near silent (a reference video's own sound:
+        # spectrogram correlation with the reference 0.22, against 0.98 this way and 0.98 with ``exact``).
+        context = held_context(dit, video_rows, mx.concatenate([clean, audio_rows]), text, table, plan[0], packed)
+    else:
+        context = held_context(dit, video_rows, reference, text, table, held_plan, packed)
 
     for index in range(len(schedule)):
         started = time.perf_counter()
