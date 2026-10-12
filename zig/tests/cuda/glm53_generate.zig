@@ -72,6 +72,7 @@
 //! --score-rows N: prompt chunks of N rows (0: the served prompt path's chunks; up to 16: the decode windows'
 //! kernels); --score-head-rows N: rows a head pass. Takes 3b's engine flags; --k is 0 whatever is given.
 //! --score-route FILE (with --score-rows 1..16): every MoE layer's routed weights and picks of every window (RouteTap).
+//! --score-time N: before scoring, N timed launches of the bf16 head and of some EXL3 linears at 1..3 rows (TIME lines).
 //! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
 //! tools/glm53/score_dump.py prints them beside the reference's).
 //! --mode score-combine (no GPU): --ref FILE --parts F0,F1,.. (every rank's partials, any order) -> KL(reference ||
@@ -198,6 +199,7 @@ const Args = struct {
     score_dump: []const u8 = "",
     score_dump_rows: []const u8 = "",
     score_route: []const u8 = "",
+    score_time: usize = 0,
 };
 
 fn flag(v: []const u8) !bool {
@@ -383,6 +385,8 @@ pub fn main(init: std.process.Init) !u8 {
             a.score_dump_rows = v;
         } else if (std.mem.eql(u8, k, "--score-route")) {
             a.score_route = v;
+        } else if (std.mem.eql(u8, k, "--score-time")) {
+            a.score_time = try std.fmt.parseInt(usize, v, 10);
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -1912,6 +1916,7 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     var sc = try glm.score_cuda.Scorer.init(gpa, &boot.driver, &boot.r, .{ .head_rows = a.score_head_rows, .chunk_rows = a.score_rows, .dump_rows = if (a.score_dump.len > 0) dump_rows.items else &.{}, .route = if (a.score_route.len > 0) &route_tap else null });
     defer sc.deinit();
     const t0 = now(io);
+    if (a.score_time > 0) try sc.timeHead(a.score_time);
     const parts = try sc.run(&ref, scoreProgress);
     defer gpa.free(parts);
     const wall = since(io, t0);

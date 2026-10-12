@@ -83,6 +83,41 @@ pub const Scorer = struct {
         return @as(f64, @floatFromInt(s.now() - t0)) / 1e9;
     }
 
+    /// --score-time N (a probe, not a score): N launches each of the bf16 head over this rank's vocabulary share and
+    /// of some EXL3 linears, at 1..3 rows, in milliseconds a launch (the stream synchronized around each batch).
+    pub fn timeHead(s: *Scorer, reps: usize) !void {
+        const r = s.r;
+        const w = r.w;
+        const D = w.config.hidden;
+        const V = w.vocab_part;
+        const t_: tri.Tri = .{ .set = &r.f.k.triton, .s = r.f.s };
+        const o = kern.Ops{ .k = r.f.k, .s = r.f.s };
+        try o.fill32(s.fnormed.ptr, 0x3c003c00, s.o.head_rows * D / 2); // bf16 ~0.0078 everywhere
+        try o.fill32(r.pb.normed, 0x3c003c00, 4 * D / 2);
+        for (1..4) |n| {
+            for (0..10) |_| try t_.router(s.fnormed.ptr, D, w.lm_head, s.lg.ptr, s.hpart.ptr, n, D, V);
+            try r.f.s.synchronize();
+            const t0 = s.now();
+            for (0..reps) |_| try t_.router(s.fnormed.ptr, D, w.lm_head, s.lg.ptr, s.hpart.ptr, n, D, V);
+            try r.f.s.synchronize();
+            std.debug.print("TIME rank {d} head bf16 [{d} x {d}] ({d} MB) rows {d}: {d:.3} ms\n", .{ w.rank, V, D, V * D * 2 >> 20, n, s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps)) });
+        }
+        const L0 = &w.layers[0];
+        const names = [_][]const u8{ "layer0 mlp.gate", "layer0 q_a", "layer0 kv_a" };
+        const lins = [_]*const @TypeOf(L0.q_a){ &L0.mlp.gate, &L0.q_a, &L0.kv_a };
+        const outs = [_]u64{ r.pb.g, r.pb.qa, r.pb.kva };
+        for (names, lins, outs) |name, l, out| {
+            for (1..4) |n| {
+                for (0..10) |_| try r.f.lin(&r.pb, l, r.pb.normed, n, out, .bf16);
+                try r.f.s.synchronize();
+                const t0 = s.now();
+                for (0..reps) |_| try r.f.lin(&r.pb, l, r.pb.normed, n, out, .bf16);
+                try r.f.s.synchronize();
+                std.debug.print("TIME rank {d} exl3 {s} [{d} x {d}] {d} half-bits ({d} MB) rows {d}: {d:.3} ms\n", .{ w.rank, name, l.n, l.k, l.k2, l.n * l.k * l.k2 / 16 >> 20, n, s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps)) });
+            }
+        }
+    }
+
     /// One row (`ri` in the file): `ids` its tokens, `ref` and `first_pos` where its positions' reference records
     /// are, `out` its len - 1 positions' shares (position t: the head row of token t against the reference for
     /// token t + 1).
