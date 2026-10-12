@@ -40,13 +40,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, w: *W.Weights, path: []const u8)
     var lins: std.ArrayList(*exl3.Linear) = .empty;
     defer lins.deinit(gpa);
     try tunable(w, &lins, gpa);
-    if (rows.len != lins.items.len) {
+    // an engine loaded without the MTP layer (scoring) takes the leading rows of a table recorded with it
+    if (rows.len < lins.items.len or (rows.len != lins.items.len and w.mtp != null)) {
         std.log.err("{s}: a table of {d} linears, this engine has {d}: refusing it", .{ path, rows.len, lins.items.len });
         return error.BadTileTable;
     }
-    var tiles = try gpa.alloc([2]usize, rows.len);
+    var tiles = try gpa.alloc([2]usize, lins.items.len);
     defer gpa.free(tiles);
-    for (rows, lins.items, 0..) |rv, l, i| {
+    for (rows[0..lins.items.len], lins.items, 0..) |rv, l, i| {
         const r = rv.array.items;
         if (r.len != 7) return error.BadTileTable;
         const k: usize = @intCast(r[0].integer);
