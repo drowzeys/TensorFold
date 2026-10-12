@@ -976,6 +976,7 @@ pub const Runner = struct {
     /// leaves); nothing without RoCE. Synchronizes.
     pub fn healthy(r: *Runner) !void {
         const fast = r.f.fast orelse return;
+        try fast.traceFlush(r.f.s); // TF_GLM53_ROCE_TRACE: the window's exchanges to the trace file (off: nothing)
         if (!r.set.roce_health) return;
         const hw = r.health orelse return;
         const comm = r.f.comm orelse return;

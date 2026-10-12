@@ -91,7 +91,9 @@ const Config = extern struct {
     threads: u32,
     blocks: u32,
     ok: u32, // this rank's proxy came up (0: setup failed here)
-    pad: u32 = 0, // no padding bytes: the record is compared field by field after the exchange
+    /// what must match on every rank beyond the layout: bit 0 TF_GLM53_ROCE_BF16, bit 1 TF_GLM53_ROCE_HEALTH_LOCAL
+    /// (also keeps the record free of padding bytes: it is compared field by field after the exchange)
+    wire: u32 = 0,
 };
 
 comptime {
@@ -122,6 +124,10 @@ pub const Roce = struct {
     /// TF_GLM53_ROCE_BF16=1: decode-window reductions (Forward.gather) send bf16 partials (allReduceBf16) - half the
     /// bytes; changes the bits (each partial rounded to bf16 before the fp32 rank-order sum). Off: the exact path.
     bf16_wire: bool = false,
+    /// TF_GLM53_ROCE_TRACE=<entries> (a power of two, 1024 .. 1 << 20) with TF_GLM53_ROCE_TRACE_FILE=<path>: every
+    /// exchange stamped on the GPU's timer into a ring, appended to <path>.r<rank> between windows (traceFlush).
+    /// tools/glm53/roce_trace.py reads the ranks' files. Off: the kernel gets a null ring and stamps nothing.
+    trace: ?*Trace = null,
 
     /// Every rank calls it at the same point (the TP world's rendezvous carries the setup); error.RoceUnavailable on
     /// every rank when any rank failed (the caller keeps NCCL, as start_everywhere).
@@ -135,6 +141,18 @@ pub const Roce = struct {
         self.* = .{ .d = d, .module = undefined, .kernel = undefined, .region = undefined, .dev = 0, .lay = undefined, .counters = undefined, .classes = 0, .ctx = null, .rank = rank, .world = world, .n_hca = @min(set.hcas.len, max_hcas), .slot_bytes = alignUp(set.max_bytes, 4096), .set = set_e };
         if (envValue("TF_GLM53_ROCE_HEALTH_LOCAL")) |v| self.health_local = std.mem.eql(u8, v, "1");
         if (envValue("TF_GLM53_ROCE_BF16")) |v| self.bf16_wire = std.mem.eql(u8, v, "1");
+        errdefer if (self.trace) |t| t.deinit(gpa);
+        if (envValue("TF_GLM53_ROCE_TRACE")) |v| {
+            const cap = std.fmt.parseInt(usize, v, 10) catch 0;
+            const file = envValue("TF_GLM53_ROCE_TRACE_FILE");
+            if (cap != 0) {
+                if (!std.math.isPowerOfTwo(cap) or cap < 1024 or cap > (1 << 20) or file == null) {
+                    std.log.err("TF_GLM53_ROCE_TRACE: a power of two from 1024 to 1048576, with TF_GLM53_ROCE_TRACE_FILE", .{});
+                    return error.BadSetting;
+                }
+                self.trace = try Trace.init(gpa, d, cap, file.?, rank, world, self.n_hca);
+            }
+        }
         var err_buf: [512]u8 = @splat(0);
         const built = if (self.setup(&err_buf)) true else |e| blk: {
             const why = if (err_buf[0] != 0) std.mem.sliceTo(&err_buf, 0) else @errorName(e);
@@ -150,7 +168,7 @@ pub const Roce = struct {
         @memset(mine, 0);
         var ok = built;
         if (ok and roce_local_blob(self.ctx.?, mine[@sizeOf(Config)..].ptr, blob_n) != 0) ok = false;
-        const cfg: Config = .{ .abi = @intCast(roce_abi_version()), .world = @intCast(world), .hcas = @intCast(self.n_hca), .slot_bytes = self.slot_bytes, .slots = if (built) self.lay.slots else 0, .flag_stride = if (built) self.lay.flag_stride else 0, .max_bytes = set.max_bytes, .spin_limit = set.spin_limit, .threads = set.threads, .blocks = set_e.blocks, .ok = @intFromBool(ok) };
+        const cfg: Config = .{ .abi = @intCast(roce_abi_version()), .world = @intCast(world), .hcas = @intCast(self.n_hca), .slot_bytes = self.slot_bytes, .slots = if (built) self.lay.slots else 0, .flag_stride = if (built) self.lay.flag_stride else 0, .max_bytes = set.max_bytes, .spin_limit = set.spin_limit, .threads = set.threads, .blocks = set_e.blocks, .ok = @intFromBool(ok), .wire = @as(u32, @intFromBool(self.bf16_wire)) | (@as(u32, @intFromBool(self.health_local)) << 1) };
         @memcpy(mine[0..@sizeOf(Config)], std.mem.asBytes(&cfg));
         const all = try gpa.alloc(u8, world * rec_n);
         defer gpa.free(all);
@@ -234,6 +252,11 @@ pub const Roce = struct {
     }
 
     pub fn deinit(self: *Roce, gpa: std.mem.Allocator) void {
+        _ = self.d.api.cuCtxSynchronize();
+        if (self.trace) |t| {
+            t.flush(self, true) catch |e| std.log.warn("rank {d}: RoCE trace not written: {t}", .{ self.rank, e });
+            t.deinit(gpa);
+        }
         self.release(); // after a device sync: no kernel may still ring the doorbell
         gpa.destroy(self);
     }
@@ -290,7 +313,17 @@ pub const Roce = struct {
         a.add(@as(c_int, @intCast(self.world)));
         a.add(@as(c_int, @intCast(self.rank)));
         a.add(@as(c_int, @intCast(self.n_hca)));
+        a.add(@as(u64, if (self.trace) |t| t.ring.ptr else 0));
+        a.add(@as(u32, if (self.trace) |t| @intCast(t.cap - 1) else 0));
         try cuda.launch.launch(self.kernel, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = self.set.threads } }, s, &a);
+    }
+
+    /// Between windows, the stream idle: the exchanges since the last call go to the trace file once half the ring
+    /// is new (nothing when tracing is off).
+    pub fn traceFlush(self: *const Roce, s: cuda.Stream) !void {
+        const t = self.trace orelse return;
+        try s.synchronize();
+        try t.flush(self, false);
     }
 
     /// out [n fp32] = every rank's in [n] summed in rank order (RoceReduce.all_reduce); nbytes = 4 n.
@@ -389,6 +422,102 @@ pub const Roce = struct {
         return same and order;
     }
 };
+
+/// The exchange trace's ring and file (Roce.trace). An entry is 16 little-endian u64 (glm53_roce.cu's trace_put).
+pub const Trace = struct {
+    pub const entry_bytes = 128;
+    pub const magic = "GLM53RT1";
+
+    ring: cuda.DeviceBuffer,
+    cap: usize,
+    host: []u8,
+    fd: std.c.fd_t,
+    done: u32 = 0, // the last sequence number written
+
+    fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, cap: usize, file: []const u8, rank: usize, world: usize, hcas: usize) !*Trace {
+        var path_buf: [1024]u8 = undefined;
+        const text = std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}.r{d}", .{ file, rank }) catch return error.BadSetting;
+        path_buf[text.len] = 0;
+        const path: [*:0]const u8 = @ptrCast(&path_buf);
+        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) {
+            std.log.err("TF_GLM53_ROCE_TRACE_FILE: cannot create {s}", .{text});
+            return error.BadSetting;
+        }
+        errdefer _ = std.c.close(fd);
+        const t = try gpa.create(Trace);
+        errdefer gpa.destroy(t);
+        const host = try gpa.alloc(u8, cap * entry_bytes);
+        errdefer gpa.free(host);
+        var ring = try cuda.DeviceBuffer.alloc(d, cap * entry_bytes);
+        errdefer ring.free();
+        try ring.fill8(0, null);
+        t.* = .{ .ring = ring, .cap = cap, .host = host, .fd = fd };
+        try t.put(&header(rank, world, hcas));
+        return t;
+    }
+
+    fn deinit(t: *Trace, gpa: std.mem.Allocator) void {
+        _ = std.c.close(t.fd);
+        t.ring.free();
+        gpa.free(t.host);
+        gpa.destroy(t);
+    }
+
+    pub fn header(rank: usize, world: usize, hcas: usize) [24]u8 {
+        var h: [24]u8 = undefined;
+        @memcpy(h[0..8], magic);
+        for ([_]usize{ rank, world, hcas, entry_bytes }, 0..) |v, i| std.mem.writeInt(u32, h[8 + 4 * i ..][0..4], @intCast(v), .little);
+        return h;
+    }
+
+    fn put(t: *Trace, bytes: []const u8) !void {
+        var at: usize = 0;
+        while (at < bytes.len) {
+            const n = std.c.write(t.fd, bytes.ptr + at, bytes.len - at);
+            if (n <= 0) return error.TraceWriteFailed;
+            at += @intCast(n);
+        }
+    }
+
+    /// The sequence numbers to write now: (first, count) after `done` up to `epoch`, at most the ring (older ones
+    /// were overwritten); nothing until half the ring is new unless `force`.
+    pub fn span(done: u32, epoch: u32, cap: usize, force: bool) ?[2]u32 {
+        const fresh = epoch -% done;
+        if (fresh == 0 or (!force and fresh < cap / 2)) return null;
+        const n: u32 = @intCast(@min(@as(usize, fresh), cap));
+        return .{ epoch -% n +% 1, n };
+    }
+
+    fn flush(t: *Trace, r: *const Roce, force: bool) !void {
+        var word: [4]u8 = undefined;
+        try r.counters.download(0, &word);
+        const epoch = std.mem.readInt(u32, &word, .little);
+        const sp = span(t.done, epoch, t.cap, force) orelse return;
+        try t.ring.download(0, t.host);
+        var i: u32 = 0;
+        while (i < sp[1]) : (i += 1) {
+            const seq = sp[0] +% i;
+            const at = (@as(usize, seq) & (t.cap - 1)) * entry_bytes;
+            try t.put(t.host[at..][0..entry_bytes]);
+        }
+        t.done = epoch;
+    }
+};
+
+test "trace spans" {
+    try std.testing.expectEqual(@as(?[2]u32, null), Trace.span(0, 0, 1024, true));
+    try std.testing.expectEqual(@as(?[2]u32, null), Trace.span(10, 500, 1024, false));
+    try std.testing.expectEqual(@as(?[2]u32, .{ 11, 490 }), Trace.span(10, 500, 1024, true));
+    try std.testing.expectEqual(@as(?[2]u32, .{ 11, 512 }), Trace.span(10, 522, 1024, false));
+    // more than a lap behind: the newest ring only
+    try std.testing.expectEqual(@as(?[2]u32, .{ 4977, 1024 }), Trace.span(10, 6000, 1024, false));
+    // the 32-bit epoch wraps
+    try std.testing.expectEqual(@as(?[2]u32, .{ 0xffff_fff1, 30 }), Trace.span(0xffff_fff0, 14, 1024, true));
+    const h = Trace.header(2, 4, 2);
+    try std.testing.expectEqualSlices(u8, "GLM53RT1", h[0..8]);
+    try std.testing.expectEqual(@as(u32, 128), std.mem.readInt(u32, h[20..24], .little));
+}
 
 /// Microseconds a collective, measured as roce.py's callers see them: `iters` launches captured in one CUDA graph
 /// and replayed (decode rounds are graphs), the best of `reps` replays, on every rank in lockstep.

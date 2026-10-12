@@ -113,6 +113,9 @@ pub const L2pfSettings = struct {
     blocks: u32 = 0,
     threads: u32 = 128,
     piece: usize = 32 << 10,
+    /// TF_GLM53_L2PF_AFTER=1: a site's prefetch is queued after the exchange it used to run beside, so it no longer
+    /// competes with the exchange's copies for memory bandwidth (it then overlaps the residual add and the norm)
+    after: bool = false,
 };
 
 pub const SiteName = enum(u2) { a = 0, f = 1, o = 2 };

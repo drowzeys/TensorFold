@@ -128,6 +128,8 @@ pub const Options = struct {
     multi_select: bool = true,
     device_cands: bool = true,
     mtp_dense: bool = true,
+    /// TF_GLM53_L2PF_AFTER: the L2 prefetch sites queued after their exchange instead of before it (timing only)
+    l2pf_after: bool = false,
     /// routed-expert pruning (lossy; TF_GLM53_EXPERT_TOPP / _MIN_K / _RENORM / _PRUNE_PROMPT, prune.zig), off by default
     prune: prune.Rule = .{},
     /// TF_GLM53_DCP: 0 auto (the world past dcp_auto tokens of context, else 1), 1, or the world
@@ -187,6 +189,7 @@ pub const Options = struct {
         o.side = env("TF_GLM53_SIDE") orelse o.side;
         o.l2pf = env("TF_GLM53_L2PF") orelse o.l2pf;
         o.l2pf_mb = try envFloat("TF_GLM53_L2PF_MB", o.l2pf_mb);
+        o.l2pf_after = try envFlag("TF_GLM53_L2PF_AFTER", false);
         o.multi_select = try envFlag("TF_GLM53_MULTI_SELECT", true);
         o.device_cands = try envFlag("TF_GLM53_DEVICE_CANDS", true);
         o.mtp_dense = try envFlag("TF_GLM53_MTP_DENSE", true);
@@ -486,7 +489,7 @@ pub const Boot = struct {
         const pf_mode = try l2pfMode(o.l2pf);
         if (pf_mode >= 0) {
             if (!(o.l2pf_mb > 0 and o.l2pf_mb <= 64)) return error.BadL2pfBudget;
-            b.l2pf = try dec.L2pf.init(gpa, &b.driver, &b.w, .{ .mode = pf_mode, .mb = o.l2pf_mb });
+            b.l2pf = try dec.L2pf.init(gpa, &b.driver, &b.w, .{ .mode = pf_mode, .mb = o.l2pf_mb, .after = o.l2pf_after });
         }
         b.fwd = .{ .w = &b.w, .k = &b.k, .s = b.stream, .inv = b.inv.ptr, .comm = &b.comm, .fast = b.fast, .ring = true, .wide = &b.main_wide, .shared_experts = shared, .pe_det16 = det16, .side = if (b.side) |*x| x else null, .l2pf = if (b.l2pf) |*x| x else null, .multi_select = o.multi_select, .prof = null, .mtp_dense = if (b.mtp_dense) |*x| x else null, .dcp = b.dcp, .taps = try fw.Taps.of(&b.plan), .prune = o.prune };
         if (o.prune.on()) std.log.info("glm53 rank {d}: routed-expert pruning on (lossy): top-p {d}, at least {d} experts, weights {t}, prompt chunks {s}", .{ o.rank, o.prune.topp, o.prune.min_k, o.prune.renorm, if (o.prune.prompt) "pruned" else "kept whole" });

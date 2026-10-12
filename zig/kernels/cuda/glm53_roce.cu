@@ -96,6 +96,19 @@ __device__ __forceinline__ uint4 pack_bf16(unsigned long long a) {
                       bf16_bits(__uint_as_float(y.z)) | (bf16_bits(__uint_as_float(y.w)) << 16));
 }
 
+// The exchange trace (TF_GLM53_ROCE_TRACE): the GPU's nanosecond timer and one 64-bit store into this exchange's
+// entry (16 words at trace + (seq & mask) * 128: seq | nbytes << 32, start, doorbell, end, then the time each
+// (peer, HCA) flag was seen - the first 8 - and the mode). Only block 0 stamps; trace == 0 stamps nothing.
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void trace_put(unsigned long long trace, unsigned mask, unsigned seq, int word,
+                                          unsigned long long v) {
+    *reinterpret_cast<unsigned long long*>(trace + ((unsigned long long)(seq & mask) * 16 + word) * 8) = v;
+}
+
 }  // namespace
 
 // mode 2 (glm53-comm-probe, TF_GLM53_ROCE_BF16): as mode 0 with fp32 in / out but bf16 on the wire - size_packs and
@@ -108,7 +121,7 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
     unsigned long long recv_base, unsigned long long flag_base, unsigned long long send_base,
     unsigned long long ctrl_base, unsigned long long slot_bytes, unsigned long long epoch_ptr,
     unsigned long long stage_ctr, unsigned long long tail_ctr, unsigned long long poison_ptr, unsigned spin_limit,
-    int world, int rank, int hcas) {
+    int world, int rank, int hcas, unsigned long long trace, unsigned trace_mask) {
     const int tid = threadIdx.x;
     const unsigned gdim = gridDim.x;
     // every block reads the epoch before any can advance it (the advance waits for all blocks at the tail)
@@ -120,6 +133,12 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
     const int stride = (int)gdim * (int)blockDim.x;
 
     if (ld_relaxed_gpu(poison_ptr) != 0u) return;   // a recorded timeout: later launches do nothing
+    const bool tracing = trace != 0ull && blockIdx.x == 0;
+    if (tracing && tid == 0) {
+        trace_put(trace, trace_mask, seq, 1, global_ns());
+        trace_put(trace, trace_mask, seq, 0, (unsigned long long)seq | ((unsigned long long)(unsigned)nbytes << 32));
+        trace_put(trace, trace_mask, seq, 12, (unsigned long long)mode);
+    }
 
     // 1. stage the local input into the pinned send slot (mode 2: fp32 in -> bf16 on the wire, 8 values a pack)
     if (mode == 2) {
@@ -140,6 +159,7 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
             st_relaxed_sys(ctrl_base + 16 + slot * 4, (unsigned)nbytes);
             fence_sc_sys();
             st_relaxed_sys(ctrl_base, seq);
+            if (trace != 0ull) trace_put(trace, trace_mask, seq, 2, global_ns());
         }
     }
 
@@ -157,6 +177,7 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
                 st_relaxed_sys(ctrl_base + 8, seq);
                 st_release_gpu(poison_ptr, seq);
             }
+            if (tracing && tid < 8) trace_put(trace, trace_mask, seq, 4 + tid, global_ns());
         }
     }
     __syncthreads();
@@ -237,6 +258,7 @@ extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
         const unsigned prior = atom_add_relaxed_gpu(tail_ctr, 1u);
         if ((prior + 1u) % gdim == 0u) {
             fence_sc_gpu();
+            if (trace != 0ull) trace_put(trace, trace_mask, seq, 3, global_ns());
             if (ld_relaxed_sys(ctrl_base + 8) == 0u) st_release_gpu(epoch_ptr, seq);
         }
     }

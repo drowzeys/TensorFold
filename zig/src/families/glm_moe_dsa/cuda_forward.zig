@@ -739,13 +739,16 @@ pub const Forward = struct {
         const t_ = f.t();
         try t_.rmsnorm(b.x, D, L.input_norm, b.normed, D, R, D, c.eps);
         try f.attentionPart(b, L, kc, ic, pos, R, T, reuse);
-        try f.site(L, .a); // the FFN's first weights, during the all-reduce
+        const late = if (f.l2pf) |p| p.set.after else false; // TF_GLM53_L2PF_AFTER: the sites after their exchange
+        if (!late) try f.site(L, .a); // the FFN's first weights, during the all-reduce
         const g1 = try f.gather(b, R);
+        if (late) try f.site(L, .a);
         try t_.residualAdd(b.x, g1.ptr, R, D, g1.world);
         try t_.rmsnorm(b.x, D, L.post_attn_norm, b.normed, D, R, D, c.eps);
         try f.ffnPart(b, L, R);
-        try f.site(L, .f); // the next layer's input projections, during the all-reduce
+        if (!late) try f.site(L, .f); // the next layer's input projections, during the all-reduce
         const g2 = try f.gather(b, R);
+        if (late) try f.site(L, .f);
         try t_.residualAdd(b.x, g2.ptr, R, D, g2.world);
     }
 
