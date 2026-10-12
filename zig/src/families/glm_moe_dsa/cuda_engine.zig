@@ -538,7 +538,11 @@ pub const Boot = struct {
             // several streams under DCP: the whole of what the slots allocate (index keys and the MTP layer too),
             // against a reserve that is not halved when little is free - a node that runs out here does not fail,
             // it swaps or panics
-            const sgb: f64 = if (std.c.getenv("TF_GLM53_DCP_STREAMS_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch dcpm.streams_reserve_gb) else dcpm.streams_reserve_gb;
+            // the default grows with the streams (the windows, the graphs and the rings do): 20 GiB at two, 40 at four.
+            // Measured 2026-10-12: two streams took 14 to 21 GiB after this check; four at 125K (the caches of 250K x 2)
+            // ran a node down to 4 GB with 24 GiB left here, so four streams are refused until that is measured smaller.
+            const sgb_default: f64 = dcpm.streams_reserve_gb * @as(f64, @floatFromInt(b.o.parallel)) / 2;
+            const sgb: f64 = if (std.c.getenv("TF_GLM53_DCP_STREAMS_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch sgb_default) else sgb_default;
             const per: u64 = fw.State.bytesForDcp(&b.w, capacity, b.dcp);
             const sf = dcpm.streamsFit(per, b.o.parallel, mem.free, sgb);
             const gib_f: f64 = 1 << 30;
