@@ -214,16 +214,28 @@ pub const Tri = struct {
 
     // ---- Phase 4b: several streams in one decode window (fused.Rows: ROWS=True, BASE an int32 table) ----------
     // Row r sits at position POS[r] (an int32 table, not the window's first position) of the stream whose cache rows
-    // start at row BASE[r]; every row computes what it computes alone (DCP 1, multi.GlmMultiDecoder's windows).
+    // start at row BASE[r]; every row computes what it computes alone (multi.GlmMultiDecoder's windows; *RowsDcp: the
+    // same under decode context parallelism, docs/glm53-dcp-streams.md).
 
     /// _kv_write ROWS: row r's latent and rotated key into cache row BASE[r] + POS[r].
     pub fn kvWriteRows(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, base: u64, inv: u64, eps: f32, rows: usize, m: Mla) !void {
-        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps), p("BASE", "*i32", base) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", 1), ci("RANK", 0), cb("ROWS", true) }, .{ .num_warps = 4 });
+        return t.kvWriteRowsDcp(kva, kva_stride, nw, cache, pos, base, inv, eps, rows, m, 1, 0);
+    }
+
+    /// _kv_write ROWS with DCP / RANK (several streams, the caches sharded): row r is stored only by the owner of its
+    /// position (POS[r] % DCP == RANK), at cache row BASE[r] + POS[r] // DCP (BASE: the stream's first local row).
+    pub fn kvWriteRowsDcp(t: Tri, kva: u64, kva_stride: usize, nw: u64, cache: u64, pos: u64, base: u64, inv: u64, eps: f32, rows: usize, m: Mla, dcp: usize, rank: usize) !void {
+        try t.run("_kv_write", .{ rows, 1, 1 }, &.{ p("KVA", "*bf16", kva), int("kva_stride", kva_stride), p("NW", "*bf16", nw), p("LC", "*bf16", cache), p("POS", "*i32", pos), p("INV", "*fp32", inv), aot.float("eps", eps), p("BASE", "*i32", base) }, &.{ ci("LW", m.lw), ci("RD", m.rope), ci("DCP", dcp), ci("RANK", rank), cb("ROWS", true) }, .{ .num_warps = 4 });
     }
 
     /// _ik_write ROWS: row r's index key into IC row BASE[r] + POS[r].
     pub fn ikWriteRows(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, base: u64, rows: usize, d: usize, rd: usize) !void {
-        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6), p("BASE", "*i32", base) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", 1), ci("RANK", 0), cb("ROWS", true) }, .{ .num_warps = 4 });
+        return t.ikWriteRowsDcp(ik, nw, nb, inv, ic, pos, base, rows, d, rd, 1, 0);
+    }
+
+    /// _ik_write ROWS with DCP / RANK: the owner's row BASE[r] + POS[r] // DCP only.
+    pub fn ikWriteRowsDcp(t: Tri, ik: u64, nw: u64, nb: u64, inv: u64, ic: u64, pos: u64, base: u64, rows: usize, d: usize, rd: usize, dcp: usize, rank: usize) !void {
+        try t.run("_ik_write", .{ rows, 1, 1 }, &.{ p("IK", "*fp32", ik), p("NW", "*bf16", nw), p("NB", "*bf16", nb), p("INV", "*fp32", inv), p("IC", "*bf16", ic), p("POS", "*i32", pos), aot.float("eps", 1e-6), p("BASE", "*i32", base) }, &.{ ci("D", d), ci("RD", rd), ci("DCP", dcp), ci("RANK", rank), cb("ROWS", true) }, .{ .num_warps = 4 });
     }
 
     /// _iq_rope ROWS: the index query of row r rotated at POS[r].
@@ -243,6 +255,24 @@ pub const Tri = struct {
     pub fn absorbRows(t: Tri, q: u64, wk: u64, inv: u64, qa: u64, qr: u64, pos: u64, rows: usize, m: Mla) !void {
         const rbk = if (rows > rb) rb else rows;
         try t.run("_absorb", .{ m.heads, m.lw / 32, cdiv(rows, rbk) }, &.{ p("Q", "*bf16", q), p("WK", "*bf16", wk), p("INV", "*fp32", inv), p("QA", "*bf16", qa), p("QR", "*bf16", qr), p("POS", "*i32", pos), int("R", rows) }, &.{ ci("H", m.heads), ci("QD", m.nope + m.rope), ci("NOPE", m.nope), ci("NOPE_P", pow2(m.nope)), ci("RD", m.rope), ci("LW", m.lw), ci("BN", 32), ci("RBK", rbk), cb("ROWS", true) }, .{ .num_warps = 4 });
+    }
+
+    /// _index_scores ROWS with DCP > 1 (PACK True): window row R0 + r scores this rank's slots t < Tl of its stream's
+    /// index-key rows from BASE[R0 + r] (global position t * DCP + RANK <= POS[R0 + r]); OUT [n, Tl] int64 packed keys.
+    pub fn indexScoresRowsDcp(t: Tri, q: u64, w: u64, ic: u64, pos: u64, base: u64, out: u64, Tl: usize, r0: usize, n: usize, nh: usize, d: usize, dcp: usize, rank: usize) !void {
+        const ws = f32of(std.math.pow(f64, @floatFromInt(nh), -0.5));
+        const qs = f32of(std.math.pow(f64, @floatFromInt(d), -0.5));
+        try t.run("_index_scores", .{ n, cdiv(Tl, bt), 1 }, &.{ p("Q", "*bf16", q), p("W", "*fp32", w), p("IC", "*bf16", ic), p("POS", "*i32", pos), p("OUT", "*i64", out), int("T", Tl), int("R0", r0), p("BASE", "*i32", base) }, &.{ ci("NH", nh), ci("D", d), ci("BTT", bt), aot.cf("WSCALE", ws), aot.cf("QSCALE", qs), ci("DCP", dcp), ci("RANK", rank), cb("PACK", true), cb("ROWS", true) }, .{ .num_warps = 2, .num_stages = 2 });
+    }
+
+    /// fused._attn_dcp_rows (tools/glm53/patch_fused_dcp_rows.py: _attn_dcp with a position and a cache base a row):
+    /// program (row, chunk, head group g) - rank g's gathered queries over this rank's keys of row r's stream (its
+    /// slots of positions 0..POS[r] while POS[r] < K, else its share of the row's selection, TOK / CNT), read from
+    /// the stream's cache rows at BASE[r]. A function of its own so no pack made before it can answer its launches.
+    pub fn attnDcpRows(t: Tri, qall: u64, cache: u64, tok: u64, cnt: u64, pos: u64, base: u64, po: u64, pm: u64, pl: u64, rows: usize, m: Mla, g: usize, rank: usize, tl: AttnTiling) !void {
+        const nch = @max(1, m.topk / tl.chk);
+        const scale = f32of(std.math.pow(f64, @floatFromInt(m.nope + m.rope), -0.5));
+        try t.run("_attn_dcp_rows", .{ rows, nch, g }, &.{ p("QALL", "*bf16", qall), p("LC", "*bf16", cache), p("TOK", "*i32", tok), p("CNT", "*i32", cnt), p("POS", "*i32", pos), p("BASE", "*i32", base), p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), int("R", rows) }, &.{ ci("H", m.heads), ci("G", g), ci("LW", m.lw), ci("RD", m.rope), ci("K", m.topk), ci("CHK", tl.chk), ci("KTT", tl.kt), aot.cf("SCALE", scale), ci("DCP", g), ci("RANK", rank) }, .{ .num_warps = tl.nw, .num_stages = tl.ns });
     }
 
     /// fused._attention_local ROWS: row r at POS[r] over its stream's cache rows from BASE[r] (its key list: keys

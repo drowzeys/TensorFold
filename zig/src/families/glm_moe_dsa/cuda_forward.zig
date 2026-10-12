@@ -486,11 +486,13 @@ pub const State = struct {
         return initSlots(gpa, d, w, capacity, dcp, 1);
     }
 
-    /// fused.State(w, capacity, slots): `slots` streams of ceil(capacity / dcp) + 1 rows each (slots > 1: DCP 1).
+    /// fused.State(w, capacity, slots): `slots` streams of ceil(capacity / dcp) + 1 rows each. Several streams with
+    /// the caches sharded (slots > 1, dcp > 1) are this port's own (docs/glm53-dcp-streams.md): each stream's shard of
+    /// this rank back to back, stream s's position p at row s * local + p / dcp on rank p % dcp.
     pub fn initSlots(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize, slots: usize) !State {
         const c = w.config;
         if (dcp == 0 or (dcp > 1 and dcp != w.world)) return error.Invalid;
-        if (slots == 0 or (slots > 1 and dcp > 1)) return error.Invalid; // concurrent streams need DCP off
+        if (slots == 0) return error.Invalid;
         const rows = dcpm.localCapacity(capacity, dcp);
         const all = rows * slots;
         var s: State = .{ .d = d, .gpa = gpa, .capacity = capacity, .dcp = dcp, .local = rows, .slots = slots, .kc = try gpa.alloc(u64, w.layers.len), .ic = try gpa.alloc(u64, w.layers.len), .pos = 0 };
@@ -653,7 +655,8 @@ pub const Forward = struct {
     /// Phase 4b (--parallel N, fused.Rows): several streams in one window - the `pos` a layer is given is then an int32
     /// table of each row's own position and this an int32 table of each row's cache base row (its stream's slot
     /// start), every position-dependent kernel launched with ROWS (cuda_triton *Rows); 0: one stream, `pos` the
-    /// window's first position. DCP 1 only (concurrent streams need it off).
+    /// window's first position. Under DCP (dcp > 1) the kernels are the *RowsDcp ones: a row's keys on the owner of its
+    /// position at BASE + POS // dcp, its attention over each rank's share of its own stream's rows.
     base: u64 = 0,
 
     fn ops(f: *const Forward) kern.Ops {
@@ -810,7 +813,7 @@ pub const Forward = struct {
         const t_ = f.t();
         const D = c.hidden;
         if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
-        if (f.base != 0 and (reuse != 0 or f.dcp > 1)) return error.Invalid; // several streams: no MTP index reuse, DCP 1
+        if (f.base != 0 and reuse != 0) return error.Invalid; // several streams: no MTP index reuse
         const sd = f.sideOn();
         const side_a = if (sd) |x| x.letters.a else false;
         const side_w = if (sd) |x| x.letters.w else false;
@@ -859,7 +862,7 @@ pub const Forward = struct {
         const t_ = f.t();
         const rank = f.dcpRank();
         if (f.base != 0) {
-            try t_.kvWriteRows(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.base, f.inv, c.eps, R, f.mla());
+            try t_.kvWriteRowsDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.base, f.inv, c.eps, R, f.mla(), f.dcp, rank);
         } else {
             try t_.kvWriteDcp(b.kva, b.kva_n, L.kv_a_norm, kc, pos, f.inv, c.eps, R, f.mla(), f.dcp, rank);
         }
@@ -867,7 +870,7 @@ pub const Forward = struct {
             if (reuse == 0) {
                 try t_.router(b.normed, c.hidden, ix.wk, b.ik, b.rpart, R, c.hidden, c.index_dim);
                 if (f.base != 0) {
-                    try t_.ikWriteRows(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, f.base, R, c.index_dim, c.rope);
+                    try t_.ikWriteRowsDcp(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, f.base, R, c.index_dim, c.rope, f.dcp, rank);
                 } else {
                     try t_.ikWriteDcp(b.ik, ix.k_norm_w, ix.k_norm_b, f.inv, ic, pos, R, c.index_dim, c.rope, f.dcp, rank);
                 }
@@ -1126,10 +1129,7 @@ pub const Forward = struct {
         const t_ = f.t();
         if (T > b.score_cols) return error.ScoreBufferTooSmall;
         if (T < c.index_topk) return error.Invalid;
-        if (f.dcp > 1) {
-            if (f.base != 0) return error.Invalid;
-            return f.selectDcp(b, ic, pos, row0, R, T);
-        }
+        if (f.dcp > 1) return f.selectDcp(b, ic, pos, row0, R, T);
         var r0: usize = row0;
         while (r0 < row0 + R) : (r0 += 128) {
             const n = @min(128, row0 + R - r0);
@@ -1193,8 +1193,17 @@ pub const Forward = struct {
             const n = @min(128, row0 + R - r0);
             const iq = b.iq + r0 * c.index_heads * c.index_dim * 2;
             const iw = b.iw + r0 * c.index_heads * 4;
-            const radix = n >= radix_min_rows; // fused.RADIX and n >= RADIX_MIN_ROWS (dcp > 1)
-            try t_.indexScoresDcp(iq, iw, ic, pos, b.sc, Tl, r0, n, c.index_heads, c.index_dim, G, rank);
+            // fused.RADIX and n >= RADIX_MIN_ROWS (dcp > 1). Several streams (a base table): never - a 32-row window of
+            // four streams must merge the candidates as each stream's own narrower window does (by the whole key: equal
+            // scores go to the lower position), or a tie at the cut would pick other keys than the stream picks alone
+            const radix = n >= radix_min_rows and f.base == 0;
+            if (f.base != 0) {
+                // several streams: each row's own position and its stream's index-key rows (the candidates, their
+                // gather and the merge below are a row's own: nothing in them knows the position)
+                try t_.indexScoresRowsDcp(iq, iw, ic, pos, f.base, b.sc, Tl, r0, n, c.index_heads, c.index_dim, G, rank);
+            } else {
+                try t_.indexScoresDcp(iq, iw, ic, pos, b.sc, Tl, r0, n, c.index_heads, c.index_dim, G, rank);
+            }
             const tok = b.tok + r0 * K * 4;
             const blocks = (Tl + kern.topk_chunk - 1) / kern.topk_chunk;
             if (n <= b.tsel.rows and blocks <= b.tsel.blocks) {
@@ -1236,7 +1245,11 @@ pub const Forward = struct {
         try o.dcpQpack(b.qlat, b.qrot, b.qpack, R * H, lw, rd);
         try f.dcpGather(b.qpack, b.qall, R * H * (lw + rd) * 2, R * H * (lw + rd), .bf16, small);
         const nch = @max(1, c.index_topk / tl.chk);
-        try t_.attnDcp(b.qall, kc, b.tok, b.cnt, pos, b.po, b.pm, b.pl, R, m, G, rank, tl);
+        if (f.base != 0) {
+            try t_.attnDcpRows(b.qall, kc, b.tok, b.cnt, pos, f.base, b.po, b.pm, b.pl, R, m, G, rank, tl);
+        } else {
+            try t_.attnDcp(b.qall, kc, b.tok, b.cnt, pos, b.po, b.pm, b.pl, R, m, G, rank, tl);
+        }
         try t_.mergeLse(b.po, b.pm, b.pl, b.osend, b.lsend, R, G, m, nch);
         if (small) {
             try f.dcpGather(b.osend, b.orecv, G * R * H * lw * 2, G * R * H * lw, .bf16, true);

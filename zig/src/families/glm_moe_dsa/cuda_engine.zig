@@ -137,6 +137,9 @@ pub const Options = struct {
     kvb_q: bool = false,
     /// TF_GLM53_DCP: 0 auto (the world past dcp_auto tokens of context, else 1), 1, or the world
     dcp: usize = 0,
+    /// TF_GLM53_DCP_STREAMS=1: --parallel N > 1 with decode context parallelism on (this port's own; unset: refused
+    /// as the Python engine refuses it). docs/glm53-dcp-streams.md
+    dcp_streams: bool = false,
     timeout_s: f64 = 5400,
     reuse: reuse.Settings = .{},
     /// Phase 4: the drafters (checkpoint directories, "" none: TF_GLM53_DSPARK / TF_GLM53_DFLASH), DSpark's settings
@@ -199,6 +202,7 @@ pub const Options = struct {
         o.head_q = headq.Setting.parse(env("TF_GLM53_HEAD_Q"));
         o.kvb_q = try envFlag("TF_GLM53_KVB_Q", false);
         o.dcp = try envInt(usize, "TF_GLM53_DCP", 0);
+        o.dcp_streams = try envFlag("TF_GLM53_DCP_STREAMS", false);
         o.timeout_s = try envFloat("TF_GLM53_TIMEOUT", o.timeout_s);
         o.reuse = try reuse.Settings.fromEnv();
         o.dspark = env("TF_GLM53_DSPARK") orelse "";
@@ -549,6 +553,25 @@ pub const Boot = struct {
         const reserve_gb: f64 = if (std.c.getenv("TF_GLM53_CACHE_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch 6) else 6;
         const row: u64 = b.cfg.layers * b.cfg.latentWidth() * 2;
         const local: u64 = dcpm.localCapacity(capacity, b.dcp);
+        if (b.o.parallel > 1 and b.dcp > 1) {
+            // several streams under DCP: the whole of what the slots allocate (index keys and the MTP layer too),
+            // against a reserve that is not halved when little is free - a node that runs out here does not fail,
+            // it swaps or panics
+            // the default grows with the streams (the windows, the graphs and the rings do): 20 GiB at two, 40 at four.
+            // Measured 2026-10-12: two streams took 14 to 21 GiB after this check; four at 125K (the caches of 250K x 2)
+            // ran a node down to 4 GB with 24 GiB left here, so four streams are refused until that is measured smaller.
+            const sgb_default: f64 = dcpm.streams_reserve_gb * @as(f64, @floatFromInt(b.o.parallel)) / 2;
+            const sgb: f64 = if (std.c.getenv("TF_GLM53_DCP_STREAMS_RESERVE_GB")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch sgb_default) else sgb_default;
+            const per: u64 = fw.State.bytesForDcp(&b.w, capacity, b.dcp);
+            const sf = dcpm.streamsFit(per, b.o.parallel, mem.free, sgb);
+            const gib_f: f64 = 1 << 30;
+            std.log.info("glm53 rank {d}: {d} streams x {d} tokens, cache split over {d} ranks: {d:.1} GiB of caches here, {d:.1} GiB free, {d:.1} GiB left after them (reserve {d:.1})", .{ b.o.rank, b.o.parallel, capacity, b.dcp, @as(f64, @floatFromInt(sf.need)) / gib_f, @as(f64, @floatFromInt(sf.free)) / gib_f, (@as(f64, @floatFromInt(sf.free)) - @as(f64, @floatFromInt(sf.need))) / gib_f, sgb });
+            if (!sf.ok) {
+                std.log.err("context {d} x {d} streams needs {d:.1} GiB of caches on this rank and {d:.1} GiB is free; {d:.1} GiB must stay free (TF_GLM53_DCP_STREAMS_RESERVE_GB): use --context <= {d} with --parallel {d}, TF_GLM53_MTP_DENSE=0, or fewer streams", .{ capacity, b.o.parallel, @as(f64, @floatFromInt(sf.need)) / gib_f, @as(f64, @floatFromInt(sf.free)) / gib_f, sgb, sf.fit_tokens(capacity), b.o.parallel });
+                return error.CacheDoesNotFit;
+            }
+            return;
+        }
         const x = cacheFit(row, local, b.o.parallel, b.dcp, 0, mem.free, reserve_gb) orelse return;
         const gib = 1 << 30;
         std.log.err("context {d} x {d} streams needs {d:.1} GiB of caches a rank, {d:.1} GiB is free (keeping {d:.0} GiB spare): use --context <= {d} with --parallel {d}, or fewer streams", .{ capacity, b.o.parallel, @as(f64, @floatFromInt(x.need)) / gib, @as(f64, @floatFromInt(x.free)) / gib, @as(f64, @floatFromInt(x.spare)) / gib, x.fit, b.o.parallel });
@@ -601,8 +624,16 @@ pub fn checkParallel(o: Options, dcp: usize) !void {
     if (o.parallel <= 1) return;
     const quiet = @import("builtin").is_test;
     if (dcp > 1) {
-        if (!quiet) std.log.err("--parallel {d} needs decode context parallelism off: a context of at most {d} tokens a stream (--context), TF_GLM53_DCP unset or 1", .{ o.parallel, dcp_auto });
-        return error.ParallelNeedsDcpOff;
+        if (!o.dcp_streams) {
+            if (!quiet) std.log.err("--parallel {d} needs decode context parallelism off: a context of at most {d} tokens a stream (--context), TF_GLM53_DCP unset or 1 - or TF_GLM53_DCP_STREAMS=1 on every rank (several streams with the cache split over the ranks)", .{ o.parallel, dcp_auto });
+            return error.ParallelNeedsDcpOff;
+        }
+        // nothing larger than the one-stream shape has ever been held: N streams share its tokens
+        if (!dcpm.streamsTokensOk(o.context, o.parallel)) {
+            if (!quiet) std.log.err("{d} streams x {d} tokens = {d} tokens of cache: at most {d} in all with the cache split over the ranks (--context <= {d} at --parallel {d})", .{ o.parallel, o.context, o.parallel * o.context, dcpm.streams_tokens, dcpm.streams_tokens / o.parallel, o.parallel });
+            return error.DcpStreamsTooManyTokens;
+        }
+        if (o.mtp_reuse != 0 and o.k > 0 and !quiet) std.log.info("several streams: MTP index reuse is off (each MTP step selects its own keys)", .{});
     }
     _ = multi.windowRows(o.parallel, o.k) catch {
         if (!quiet) std.log.err("{d} streams x {d} rows = {d} > {d}: a window that wide is not a decode window (lower --parallel or --mtp-drafts)", .{ o.parallel, o.k + 1, o.parallel * (o.k + 1), fw.decode_rows });
@@ -1048,6 +1079,12 @@ test "--parallel refusals: DCP, a window wider than a decode window; the drafter
     try checkParallel(.{ .parallel = 1, .dspark = "/x" }, 4);
     try checkParallel(.{ .parallel = 4, .k = 2 }, 1);
     try std.testing.expectError(error.ParallelNeedsDcpOff, checkParallel(.{ .parallel = 4 }, 4));
+    // TF_GLM53_DCP_STREAMS: several streams with the cache split, up to the one-stream shape's tokens in all
+    try checkParallel(.{ .parallel = 4, .context = 250_000, .dcp_streams = true, .dspark = "/x" }, 4);
+    try checkParallel(.{ .parallel = 2, .context = 500_000, .dcp_streams = true, .dspark = "/x" }, 4);
+    try std.testing.expectError(error.DcpStreamsTooManyTokens, checkParallel(.{ .parallel = 4, .context = 500_000, .dcp_streams = true }, 4));
+    try std.testing.expectError(error.DcpStreamsTooManyTokens, checkParallel(.{ .parallel = 2, .context = 1_000_000, .dcp_streams = true }, 4));
+    try std.testing.expectError(error.WindowTooWide, checkParallel(.{ .parallel = 16, .k = 2, .context = 60_000, .dcp_streams = true }, 4));
     try checkParallel(.{ .parallel = 4, .dspark = "/x" }, 1);
     try checkParallel(.{ .parallel = 2, .dflash = "/x", .mode = "dflash" }, 1);
     try checkParallel(.{ .parallel = 4, .dspark = "/x", .mode = "dspark", .k = 0 }, 1);

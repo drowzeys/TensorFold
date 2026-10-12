@@ -39,7 +39,9 @@
 //! (--single 1) each one through the one-stream path (Runner.run in slot 0, copy drafts off). Greedy or keyed
 //! sampled; every stream's tokens must equal its alone run's and its one-stream run's. Prints aggregate and per-stream
 //! tok/s and TTFT; `RESULT glm53-generate OK|FAIL` (FAIL: some stream differs). list-variants --parallel N adds the
-//! concurrent windows' launches (ROWS kernels, N x (k + 1) rows).
+//! concurrent windows' launches (ROWS kernels, N x (k + 1) rows). With TF_GLM53_DCP_STREAMS=1 and --dcp 4 (or a
+//! context past the auto point) the streams run with the cache split over the ranks (the *RowsDcp kernels): the same
+//! three runs must agree, and list-variants --dcp 4 --parallel N names the launches a pack needs for it.
 //! Phase 4c: --mode 4b with --dspark DIR / --dflash DIR (and their settings as --mode 4) and --draft-mode
 //! dflash|dspark|mtp (default: TF_GLM53_MTP's rule - a drafter alone with --mtp-drafts 0, else the MTP head): every
 //! stream drafts with that drafter (cuda_mdraft.zig) - concurrently, alone through the concurrent decoder, and through
@@ -1832,6 +1834,9 @@ fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s, .parallel = a.parallel };
     o.head_q = glm.headq.Setting.parse(a.head_q);
     o.kvb_q = a.kvb_q;
+    // several streams with the cache split over the ranks (--dcp 4, or a context past the auto point): the served
+    // engine's own opt-in, TF_GLM53_DCP_STREAMS=1 (docs/glm53-dcp-streams.md)
+    if (std.c.getenv("TF_GLM53_DCP_STREAMS")) |v| o.dcp_streams = std.mem.eql(u8, std.mem.span(v), "1");
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     o.multi_set = try glm.multi.Settings.fromEnv();

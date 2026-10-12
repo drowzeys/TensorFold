@@ -13,6 +13,7 @@ the files listed below is theirs, unchanged.
 | Its kernels | `zig/kernels/cuda/glm53_*.cu` (the EXL3 kernels are device-only copies of exllamav3's, by turboderp) |
 | `tensorfold-native serve` for the family (rank 0 serves, ranks 1..3 follow) and the same engine behind a C ABI (`libtensorfold_glm53.so`) | `zig/src/native/glm53_cuda.zig`, `glm53_capi.zig` |
 | The gate tool, with the as-served scorer | `zig/tests/cuda/glm53_generate.zig` (`tf-glm53-generate`), `docs/glm53-score.md` |
+| Several streams with the cache split across the ranks (`TF_GLM53_DCP_STREAMS`, off by default; r2) | `docs/glm53-dcp-streams.md` |
 | Off-by-default settings: a 6-bit output head, a local health check, the exchange trace, bf16 exchanges, an EXL3 `kv_b` decoded at load | `docs/glm53-speed.md` |
 | Gate and reference scripts as they were run on the author's cluster | `tools/glm53/` |
 
@@ -20,10 +21,11 @@ the files listed below is theirs, unchanged.
 
 | Image | Built from |
 |---|---|
-| `ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-mlx-serve` | this branch's tree, with one difference stated below |
+| `ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-mlx-serve` | the parent commit of this branch (fork branch `glm53-tp4-2026-10-12`), with one difference stated below |
+| `ghcr.io/drowzeys/keys-tensorfold-glm53-tp4-dgx-spark:2026-10-12-r2-mlx-serve` | this branch's tree (fork branch `glm53-tp4-2026-10-12-r2`), with the same difference |
 
-The image's engine was built from a commit of the working branch (`a4d016d4`, recorded in the image's
-`/opt/keys-glm53/VERSION`) that also held an experimental routed-expert pruning setting. That setting was never switched
+Each image's engine was built from a commit of the working branch (`a4d016d4` and, for r2, `7765bda0`, recorded in
+the image's `/opt/keys-glm53/VERSION`) that also held an experimental routed-expert pruning setting. That setting was never switched
 on in the image, was ruled out, and is not in this branch: `prune.zig`, its test fixture, its reference script, the
 kernel `glm53_expert_prune` and the lines that read `TF_GLM53_EXPERT_*` are removed. Nothing else in the source
 differs apart from documentation and the default paths in `tools/glm53/`. Built side by side, 37 of the 40 kernel packs
@@ -43,7 +45,8 @@ zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=safe test-glm53 te
 ```
 
 The engine also needs the family's precompiled Triton kernel pack and tile tables for the context and stream count it
-serves; the published image carries them for 32,768 tokens x 4 streams, 65,536 x 2 and 1,000,000 x 1.
+serves; the published images carry them for 32,768 tokens x 4 streams, 65,536 x 2 and 1,000,000 x 1, and r2 for
+250,000 x 2 as well.
 
 ## Measured
 
@@ -55,6 +58,8 @@ repository keeps the logs):
 | 32,768 x 4, one stream | 39.6 | 57.8 |
 | 32,768 x 4, four streams together | 68.5 | 80.5 |
 | 1,000,000 x 1 | 36.0 | 48.4 |
+| 250,000 x 2 (r2), one stream | 36.0 | 48.6 |
+| 250,000 x 2 (r2), two streams together | 47.1 | 47.7 |
 
 Each shape was loaded once. As served, the pack scores KL 0.1756 against the unquantized checkpoint (0.1757 with the
 6-bit head); `docs/glm53-score.md` has the sets.
@@ -62,8 +67,9 @@ Each shape was loaded once. As served, the pack scores KL 0.1756 against the unq
 ## Limits
 
 - GLM-5.3 at world 4 on GB10 only; no other machine or rank count has been run.
-- Several streams need decode context parallelism off, so each stream holds its whole cache on every rank: 32,768 x 4
-  and 65,536 x 2 are the measured shapes.
+- Without `TF_GLM53_DCP_STREAMS`, several streams need decode context parallelism off, so each stream holds its whole
+  cache on every rank: 32,768 x 4 and 65,536 x 2 are the measured shapes. With it, two streams share the split cache
+  (250,000 x 2 measured); four-stream shapes are refused at start, and 262,144 x 2 left only 8 GB free on a node.
 - A context or stream count outside the shapes above needs kernels the pack does not hold.
 - `kv_b` is read as bf16 in a window; `TF_GLM53_KVB_Q` only shrinks a pack that holds it as an EXL3 linear.
 - bf16 exchanges (`TF_GLM53_ROCE_BF16`) are faster and are left off: they moved the tool-call rows' KL by 0.0026.
