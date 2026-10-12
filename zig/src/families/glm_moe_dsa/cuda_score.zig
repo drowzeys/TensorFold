@@ -27,6 +27,8 @@ pub const Options = struct {
     chunk_rows: usize = 0,
     /// rows whose positions' largest local logits are kept too (score.DumpRec, in Scorer.dump): debugging
     dump_rows: []const u32 = &.{},
+    /// every MoE layer's routed weights and picks (fw.RouteTap); needs chunk_rows 1..16, the windows fused.ffn_part routes
+    route: ?*fw.RouteTap = null,
 };
 
 pub const Scorer = struct {
@@ -50,6 +52,8 @@ pub const Scorer = struct {
         if (!r.set.served or r.set.slots != 1) return error.Invalid;
         if (o.head_rows == 0 or o.head_rows > fw.max_rows) return error.WindowTooWide; // the router's widest block
         if (o.chunk_rows > r.pb.rows) return error.WindowTooWide;
+        if (o.route != null and (o.chunk_rows == 0 or o.chunk_rows > 16)) return error.Invalid;
+        r.f.route_tap = o.route;
         const D = w.config.hidden;
         const V = w.vocab_part;
         var fnormed = try cuda.DeviceBuffer.alloc(d, o.head_rows * D * 2);

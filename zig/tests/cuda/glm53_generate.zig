@@ -71,6 +71,7 @@
 //! drafts and the head on every row; this rank's share of every position's sums goes to --out (a partials file).
 //! --score-rows N: prompt chunks of N rows (0: the served prompt path's chunks; up to 16: the decode windows'
 //! kernels); --score-head-rows N: rows a head pass. Takes 3b's engine flags; --k is 0 whatever is given.
+//! --score-route FILE (with --score-rows 1..16): every MoE layer's routed weights and picks of every window (RouteTap).
 //! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
 //! tools/glm53/score_dump.py prints them beside the reference's).
 //! --mode score-combine (no GPU): --ref FILE --parts F0,F1,.. (every rank's partials, any order) -> KL(reference ||
@@ -196,6 +197,7 @@ const Args = struct {
     score_head_rows: usize = 64,
     score_dump: []const u8 = "",
     score_dump_rows: []const u8 = "",
+    score_route: []const u8 = "",
 };
 
 fn flag(v: []const u8) !bool {
@@ -379,6 +381,8 @@ pub fn main(init: std.process.Init) !u8 {
             a.score_dump = v;
         } else if (std.mem.eql(u8, k, "--score-dump-rows")) {
             a.score_dump_rows = v;
+        } else if (std.mem.eql(u8, k, "--score-route")) {
+            a.score_route = v;
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -1903,7 +1907,9 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     defer dump_rows.deinit(gpa);
     var dit = std.mem.tokenizeScalar(u8, a.score_dump_rows, ',');
     while (dit.next()) |x| try dump_rows.append(gpa, try std.fmt.parseInt(u32, x, 10));
-    var sc = try glm.score_cuda.Scorer.init(gpa, &boot.driver, &boot.r, .{ .head_rows = a.score_head_rows, .chunk_rows = a.score_rows, .dump_rows = if (a.score_dump.len > 0) dump_rows.items else &.{} });
+    var route_tap: glm.RouteTap = .{ .gpa = gpa };
+    defer route_tap.buf.deinit(gpa);
+    var sc = try glm.score_cuda.Scorer.init(gpa, &boot.driver, &boot.r, .{ .head_rows = a.score_head_rows, .chunk_rows = a.score_rows, .dump_rows = if (a.score_dump.len > 0) dump_rows.items else &.{}, .route = if (a.score_route.len > 0) &route_tap else null });
     defer sc.deinit();
     const t0 = now(io);
     const parts = try sc.run(&ref, scoreProgress);
@@ -1911,6 +1917,7 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     const wall = since(io, t0);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = parts });
     if (a.score_dump.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.score_dump, .data = sc.dump.items });
+    if (a.score_route.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.score_route, .data = route_tap.buf.items });
     const agree = boot.rdv.sync("done", sc.positions, a.timeout_s);
     if (agree) {
         std.debug.print("RESULT glm53-generate OK rank {d}: scored {d} positions in {d:.0} s ({d:.0} tokens/s; engine {d:.0} s, host sums {d:.0} s), load {d:.0} s; wrote {s}\n", .{ a.rank, sc.positions, wall, @as(f64, @floatFromInt(sc.positions)) / @max(wall, 1e-9), sc.engine_s, sc.host_s, boot.load_s, a.out });

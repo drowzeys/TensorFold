@@ -37,6 +37,7 @@ pub const triton = @import("cuda_triton.zig");
 pub const forward = @import("cuda_forward.zig");
 pub const Forward = forward.Forward;
 pub const Buffers = forward.Buffers;
+pub const RouteTap = forward.RouteTap;
 pub const State = forward.State;
 pub const sampling = @import("sampling.zig");
 pub const source = @import("cuda_source.zig");

@@ -588,6 +588,25 @@ pub const State = struct {
     }
 };
 
+/// Scoring only (tf-glm53-generate --mode score --score-route): every MoE layer's routed weights and picks of a
+/// decode-sized window, copied to the host after fused.route. Records: u32 layer, u32 rows, fp32 [rows, top_k]
+/// weights, i32 [rows, top_k] picks. It synchronizes the stream, so nothing captured or served may hold one.
+pub const RouteTap = struct {
+    gpa: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+
+    pub fn take(t: *RouteTap, f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize) !void {
+        const n = R * f.w.config.top_k * 4;
+        const at = t.buf.items.len;
+        try t.buf.resize(t.gpa, at + 8 + 2 * n);
+        const head = [2]u32{ @intCast(L.index), @intCast(R) };
+        @memcpy(t.buf.items[at..][0..8], std.mem.asBytes(&head));
+        try f.ops().download(t.buf.items[at + 8 ..][0..n], b.wts);
+        try f.ops().download(t.buf.items[at + 8 + n ..][0..n], b.pick);
+        try f.s.synchronize();
+    }
+};
+
 pub const Forward = struct {
     w: *const W.Weights,
     k: *const kern.Kernels,
@@ -621,6 +640,8 @@ pub const Forward = struct {
     /// eh_proj and its routed experts as dense bf16 GEMMs (cuda_prompt.MtpDense); null: the router kernel and the
     /// decode expert kernel in blocks. Drafts only: the target verifies every token, so no output token moves.
     mtp_dense: ?*prompt.MtpDense = null,
+    /// scoring only (RouteTap): fused.ffn_part's routed weights and picks to the host; null everywhere else
+    route_tap: ?*RouteTap = null,
     /// Phase 3b: decode context parallelism (w.dcp: 1, or the world - every rank of the TP world is one of the DCP
     /// group, its rank w.rank). The State must be State.initDcp(.., dcp) and every Buffers BufOpts.dcp = dcp.
     dcp: usize = 1,
@@ -1280,6 +1301,7 @@ pub const Forward = struct {
                 }
             }
             try f.route(b, L, 0, R);
+            if (f.route_tap) |tap| try tap.take(f, b, L, R);
             try f.expertsPartWith(b, L, R, sy_ev);
             if (sd_used) |sd| sd.forked = false; // joined inside the routed chain (experts.routed's sy_ready)
             return;
