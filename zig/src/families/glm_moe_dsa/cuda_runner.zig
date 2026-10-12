@@ -75,7 +75,7 @@ pub const Settings = struct {
     /// Phase 4: copy drafts (TF_GLM53_COPY_DRAFTS / _MIN / _MAX)
     copy: copies.Settings = .{ .on = false, .match = 0, .most = 0 },
     /// Phase 4b (--parallel N): the caches hold this many streams' slots (fused.State(slots=N)); `run` uses slot 0,
-    /// cuda_multi.zig drives the rest. DCP 1 only.
+    /// cuda_multi.zig drives the rest (under DCP too: each slot this rank's shard of its stream).
     slots: usize = 1,
 };
 
@@ -265,7 +265,7 @@ pub const Runner = struct {
         const c = w.config;
         var set = set_in;
         if (set.dcp != 1 and set.dcp != w.world) return error.BadDcp;
-        if (set.slots == 0 or (set.slots > 1 and set.dcp != 1)) return error.BadDcp; // concurrent streams: DCP off
+        if (set.slots == 0) return error.BadDcp; // several streams under DCP: cuda_multi (docs/glm53-dcp-streams.md)
         if (set.dcp > 1 and !set.served) return error.BadDcp; // the served prompt path only
         if (set.dcp > 1) { // Runner.__init__ with dcp > 1: prompt chunks of at most 1024 rows, no overlap
             set.prompt_rows = @min(set.prompt_rows, 1024);

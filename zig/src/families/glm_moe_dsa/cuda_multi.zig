@@ -42,7 +42,11 @@
 //! rises to TF_GLM53_DRAFT_CUT_DFLASH (default: TF_GLM53_DRAFT_CUT). Verify windows hold N x max(k + 1, the drafters'
 //! rows) rows. A drafter stream's kept prompt state keeps its slot's ring window, and a stream resumed from it gets the
 //! window in its own slot (prefixes.slot_ring_window / put_slot_ring_window). Not here: auto mode (per-stream MTP /
-//! DFlash2 by rate), copy drafts, DCP (refused at boot).
+//! DFlash2 by rate), copy drafts.
+//!
+//! Decode context parallelism with several streams (this port's own, TF_GLM53_DCP_STREAMS=1; Python refuses it): the
+//! same rounds, each slot holding this rank's shard of its stream (`local` = ceil(capacity / dcp) + 1 rows), the windows'
+//! position-dependent kernels the *RowsDcp ones (cuda_forward). docs/glm53-dcp-streams.md.
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
@@ -628,7 +632,7 @@ pub const Multi = struct {
         const w = r.w;
         const c = w.config;
         const k = r.set.k;
-        if (r.set.slots != n or r.set.dcp != 1 or !r.set.served) return error.Invalid;
+        if (r.set.slots != n or !r.set.served) return error.Invalid;
         if (r.copy_on) return error.CopiesNeedOneStream;
         // Phase 4c: the runner's drafters serve the streams too (MultiDrafter); their rows widen the windows
         const bases = [2]?*draft.Drafter{ r.dflash, r.dspark };
@@ -781,7 +785,7 @@ pub const Multi = struct {
 
     /// The caches' bytes a stream holds (multi.nbytes_per_stream: the State's share, the drafters' rings).
     pub fn bytesPerStream(mu: *const Multi) usize {
-        var b = fw.State.bytesForDcp(mu.w, mu.r.capacity, 1);
+        var b = fw.State.bytesForDcp(mu.w, mu.r.capacity, mu.r.set.dcp);
         for (mu.md) |maybe| {
             if (maybe) |x| b += x.deviceBytes() / mu.N;
         }
@@ -894,11 +898,14 @@ pub const Multi = struct {
         const st = &mu.r.st;
         const lat = c.latentWidth() * 2;
         const idx = c.index_dim * 2;
-        for (st.kc) |p| try o.copy(p + dst * mu.local * lat, p + src * mu.local * lat, n * lat);
-        for (st.ic) |p| if (p != 0) try o.copy(p + dst * mu.local * idx, p + src * mu.local * idx, n * idx);
-        if (st.mkc != 0 and n > 1) {
-            try o.copy(st.mkc + dst * mu.local * lat, st.mkc + src * mu.local * lat, (n - 1) * lat);
-            if (st.mic != 0) try o.copy(st.mic + dst * mu.local * idx, st.mic + src * mu.local * idx, (n - 1) * idx);
+        // DCP: this rank's share of the state's rows (every rank copies the most any rank holds, as rowViews counts)
+        const m = st.localRows(n);
+        const mm = st.localMtpRows(n);
+        for (st.kc) |p| try o.copy(p + dst * mu.local * lat, p + src * mu.local * lat, m * lat);
+        for (st.ic) |p| if (p != 0) try o.copy(p + dst * mu.local * idx, p + src * mu.local * idx, m * idx);
+        if (st.mkc != 0 and mm > 0) {
+            try o.copy(st.mkc + dst * mu.local * lat, st.mkc + src * mu.local * lat, mm * lat);
+            if (st.mic != 0) try o.copy(st.mic + dst * mu.local * idx, st.mic + src * mu.local * idx, mm * idx);
         }
     }
 
