@@ -66,6 +66,16 @@
 //! --mode list-variants (no GPU): every Triton launch shape the engine can make for that configuration (cuda_coverage
 //! .zig: Tri in probe mode over every window size, index range and DCP rank) as JSON for tools/glm53/sweep_aot.py;
 //! with --aot, each marked "have" and `VARIANTS PASS|FAIL n needs, m missing` printed (exit 3 when any is missing).
+//! --mode score (cuda_score.zig): as-served scoring. Every row of the reference file --ref (score.zig's format,
+//! written by tools/glm53/score_reference.py) runs teacher-forced through the served engine's prompt path with no
+//! drafts and the head on every row; this rank's share of every position's sums goes to --out (a partials file).
+//! --score-rows N: prompt chunks of N rows (0: the served prompt path's chunks; up to 16: the decode windows'
+//! kernels); --score-head-rows N: rows a head pass. Takes 3b's engine flags; --k is 0 whatever is given.
+//! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
+//! tools/glm53/score_dump.py prints them beside the reference's).
+//! --mode score-combine (no GPU): --ref FILE --parts F0,F1,.. (every rank's partials, any order) -> KL(reference ||
+//! served) and top-1 agreement per set and in all, as text and (--out FILE) JSON; prints `SCORE OK|FAIL ...`.
+//! --mode score-info (no GPU): --ref FILE -> what a rows / reference file holds.
 //! Prints `RESULT glm53-generate OK|FAIL ...`; exit 0 only on OK.
 
 const std = @import("std");
@@ -96,6 +106,11 @@ const usage =
     \\       tf-glm53-generate --sampler-check FILE
     \\       tf-glm53-generate --mode list-variants --model DIR --world 4 --context N --tiles F0,F1,.. [--aot DIR]
     \\                         [--prompt-rows 8192] [--dcp 0|1|4] [--out FILE] [--parallel N]
+    \\       tf-glm53-generate --mode score --ref FILE --out PARTIALS --rank R --world W --master IP:PORT --model DIR
+    \\                         --aot DIR [3b's engine flags] [--score-rows 0] [--score-head-rows 64]
+    \\                         [--score-dump FILE --score-dump-rows 0,5]
+    \\       tf-glm53-generate --mode score-combine --ref FILE --parts F0,F1,F2,F3 [--out FILE.json]
+    \\       tf-glm53-generate --mode score-info --ref FILE
     \\
 ;
 
@@ -174,6 +189,13 @@ const Args = struct {
     single: bool = true,
     // Phase 4c (--mode 4b): the drafts of every stream (mtp | dflash | dspark; null: the engine's default mode)
     draft_mode: ?[]const u8 = null,
+    // --mode score | score-combine | score-info
+    ref: []const u8 = "",
+    parts: []const u8 = "",
+    score_rows: usize = 0,
+    score_head_rows: usize = 64,
+    score_dump: []const u8 = "",
+    score_dump_rows: []const u8 = "",
 };
 
 fn flag(v: []const u8) !bool {
@@ -345,6 +367,18 @@ pub fn main(init: std.process.Init) !u8 {
             a.single = try flag(v);
         } else if (std.mem.eql(u8, k, "--draft-mode")) {
             a.draft_mode = v;
+        } else if (std.mem.eql(u8, k, "--ref")) {
+            a.ref = v;
+        } else if (std.mem.eql(u8, k, "--parts")) {
+            a.parts = v;
+        } else if (std.mem.eql(u8, k, "--score-rows")) {
+            a.score_rows = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--score-head-rows")) {
+            a.score_head_rows = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--score-dump")) {
+            a.score_dump = v;
+        } else if (std.mem.eql(u8, k, "--score-dump-rows")) {
+            a.score_dump_rows = v;
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -369,6 +403,24 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         return if (okb) 0 else 1;
+    }
+    if (std.mem.eql(u8, a.mode, "score-combine") or std.mem.eql(u8, a.mode, "score-info")) {
+        const oks = scoreHost(init.gpa, init.io, a) catch |e| {
+            std.debug.print("SCORE FAIL error {t}\n", .{e});
+            return 1;
+        };
+        return if (oks) 0 else 1;
+    }
+    if (std.mem.eql(u8, a.mode, "score")) {
+        if (a.model.len == 0 or a.aot.len == 0 or a.ref.len == 0 or a.out.len == 0 or a.rank >= a.world) {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        const oks = runScore(init.gpa, init.io, a) catch |e| {
+            std.debug.print("RESULT glm53-generate FAIL rank {d}: error {t}\n", .{ a.rank, e });
+            return 1;
+        };
+        return if (oks) 0 else 1;
     }
     if (a.model.len == 0 or a.aot.len == 0 or a.prompts.len == 0 or a.out.len == 0 or a.rank >= a.world or a.tokens == 0 or a.window == 0 or a.window > glm.forward.max_rows) {
         std.debug.print("{s}", .{usage});
@@ -1813,4 +1865,96 @@ fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks' token streams differ ({t})\n", .{ a.rank, e });
         return false;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------- scoring ---
+
+/// A rows / reference file whole in memory (up to 16 GiB: the vocabulary kept for 2 x 65K positions).
+fn readRef(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 << 30));
+}
+
+fn scoreProgress(row: usize, of: usize, s: *const glm.score_cuda.Scorer) void {
+    if ((row + 1) % 8 != 0 and row + 1 != of) return;
+    std.debug.print("rank {d}: scored row {d} of {d} ({d} positions; engine {d:.1} s, host sums {d:.1} s)\n", .{ s.r.w.rank, row + 1, of, s.positions, s.engine_s, s.host_s });
+}
+
+/// --mode score: every row of --ref through the served engine (cuda_engine.Boot as the server boots it, with no
+/// drafts and nothing captured), this rank's partials to --out. The ranks agree on the rows they scored.
+fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
+    const bytes = try readRef(gpa, io, a.ref);
+    defer gpa.free(bytes);
+    const ref = try glm.score.Ref.open(bytes, true);
+    if (!ref.hasPositions()) return error.NoReference;
+    var longest: usize = 0;
+    for (0..ref.head.n_rows) |i| longest = @max(longest, ref.row(i).len);
+    if (longest > a.context) return error.ContextTooLong;
+    std.debug.print("rank {d} of {d}: scoring {d} rows ({d} positions, {d} sets, the reference keeps {d} tokens a position), prompt chunks of {d} rows (0: the served chunks), head passes of {d} rows\n", .{ a.rank, a.world, ref.head.n_rows, ref.head.n_pos, ref.head.n_sets, ref.head.topk, a.score_rows, a.score_head_rows });
+    var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = 0, .draft_vocab = 0, .mtp_reuse = a.mtp_reuse, .graphs = false, .prewarm = false, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = false, .dcp = 1, .timeout_s = a.timeout_s };
+    o.reuse.on = false;
+    const boot = try glm.engine.Boot.init(gpa, io, o);
+    defer boot.deinit();
+    // every rank scores the same rows against the same reference, in the same chunks
+    var same = std.hash.Wyhash.init(0x5c0e);
+    const shape = [_]u64{ ref.head.tokens_digest, ref.head.body_digest, ref.head.n_pos, a.score_rows };
+    same.update(std.mem.asBytes(&shape));
+    try boot.rdv.sync("score", same.final(), a.timeout_s);
+    var dump_rows: std.ArrayList(u32) = .empty;
+    defer dump_rows.deinit(gpa);
+    var dit = std.mem.tokenizeScalar(u8, a.score_dump_rows, ',');
+    while (dit.next()) |x| try dump_rows.append(gpa, try std.fmt.parseInt(u32, x, 10));
+    var sc = try glm.score_cuda.Scorer.init(gpa, &boot.driver, &boot.r, .{ .head_rows = a.score_head_rows, .chunk_rows = a.score_rows, .dump_rows = if (a.score_dump.len > 0) dump_rows.items else &.{} });
+    defer sc.deinit();
+    const t0 = now(io);
+    const parts = try sc.run(&ref, scoreProgress);
+    defer gpa.free(parts);
+    const wall = since(io, t0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = parts });
+    if (a.score_dump.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.score_dump, .data = sc.dump.items });
+    const agree = boot.rdv.sync("done", sc.positions, a.timeout_s);
+    if (agree) {
+        std.debug.print("RESULT glm53-generate OK rank {d}: scored {d} positions in {d:.0} s ({d:.0} tokens/s; engine {d:.0} s, host sums {d:.0} s), load {d:.0} s; wrote {s}\n", .{ a.rank, sc.positions, wall, @as(f64, @floatFromInt(sc.positions)) / @max(wall, 1e-9), sc.engine_s, sc.host_s, boot.load_s, a.out });
+        return true;
+    } else |e| {
+        std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks scored different rows ({t})\n", .{ a.rank, e });
+        return false;
+    }
+}
+
+/// --mode score-combine / score-info (no GPU).
+fn scoreHost(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
+    if (a.ref.len == 0) return error.Usage;
+    const bytes = try readRef(gpa, io, a.ref);
+    defer gpa.free(bytes);
+    const ref = try glm.score.Ref.open(bytes, true);
+    const h = ref.head;
+    if (std.mem.eql(u8, a.mode, "score-info")) {
+        std.debug.print("{s}: vocabulary {d}, {d} rows, {d} positions, {s} (tokens kept a position: {d}); tokens digest {x}\n", .{ a.ref, h.vocab, h.n_rows, h.n_pos, if (ref.hasPositions()) "reference" else "rows only", h.topk, h.tokens_digest });
+        for (0..h.n_sets) |i| {
+            const s = ref.set(i);
+            var toks: usize = 0;
+            for (s.first_row..s.first_row + s.n_rows) |ri| toks += ref.row(ri).len;
+            std.debug.print("  {s}: {d} rows, {d} tokens\n", .{ glm.score.Ref.setName(&s), s.n_rows, toks });
+        }
+        std.debug.print("SCORE OK\n", .{});
+        return true;
+    }
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    var it = std.mem.tokenizeScalar(u8, a.parts, ',');
+    while (it.next()) |path| try files.append(gpa, try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 30)));
+    var sum = try glm.score.combine(gpa, &ref, files.items);
+    defer sum.deinit(gpa);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    try glm.score.report(gpa, &ref, &sum, &text, &json);
+    std.debug.print("KL(reference || served) at temperature 1, {d} ranks, the reference keeps {d} of {d} tokens a position (KL is the lower bound, exact when all are kept)\n{s}", .{ files.items.len, h.topk, h.vocab, text.items });
+    if (a.out.len > 0) try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = a.out, .data = json.items });
+    std.debug.print("SCORE OK {d} positions, KL {d:.6} (upper bound {d:.6}), top-1 agreement {d:.4}\n", .{ sum.all.n, sum.all.mean(sum.all.kl_lo), sum.all.mean(sum.all.kl_hi), sum.all.mean(@floatFromInt(sum.all.agree)) });
+    return true;
 }

@@ -25,6 +25,8 @@
 //! slots).
 //! Phase 4c: the drafters for concurrent streams (cuda_mdraft.zig: DFlash2 as dflash.MultiDrafter, DSpark with the
 //! drafter's KV keyed by the stream slot and one ragged batched block pass) in cuda_multi.zig's rounds.
+//! Scoring (score.zig, cuda_score.zig; tf-glm53-generate --mode score): KL(reference || served) and top-1 agreement
+//! over fixed token rows through the served prompt path, the head on every row. Not reached by the server.
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -53,6 +55,8 @@ pub const draft_host = @import("draft_host.zig");
 pub const copies = @import("copies.zig");
 pub const multi = @import("cuda_multi.zig");
 pub const mdraft = @import("cuda_mdraft.zig");
+pub const score = @import("score.zig");
+pub const score_cuda = @import("cuda_score.zig");
 
 test {
     _ = @import("config.zig");
@@ -78,4 +82,6 @@ test {
     _ = copies;
     _ = multi;
     _ = mdraft;
+    _ = score;
+    _ = score_cuda;
 }
