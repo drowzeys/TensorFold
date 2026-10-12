@@ -49,3 +49,31 @@ def test_condition_rows_must_match_the_keyframes():
         run(mx.zeros((3, 96)), ("first",))
     with pytest.raises(ValueError):
         run(None, ("first",))
+
+
+def test_references_hold_their_video_and_audio_rows():
+    from tensorfold.families.h3.packing import Reference
+
+    references = (Reference("image", 4, 2), Reference("video", 2, 2, latent_frames=2, audio_latents=5),
+                  Reference("audio", audio_latents=3))
+    dit = FakeDiT()
+    text = mx.zeros((1, 3, dit.config.text_dim))
+    condition, clean = mx.random.normal((2 + 2, 96)), mx.random.normal((16, 32)) + 7.0
+    out = denoise(dit, text, [1, 1, 1], 64, 64, 22, points=3, seed=1, condition=condition, references=references,
+                  audio_condition=clean)
+    assert dit.calls == [(4 + 28, 16 + 74, 3 + 4 + 16 + 74 + 28)] * 2
+    assert out.video_rows.shape == (28, 96) and out.audio_rows.shape == (74, 32)
+    assert (out.packed.condition_video_rows, out.packed.condition_audio_rows) == (4, 16)
+    assert abs(float(mx.mean(out.audio_rows).item())) < 1.0  # the clean reference rows are not returned
+
+
+def test_reference_rows_must_match_the_references():
+    from tensorfold.families.h3.packing import Reference
+
+    dit = FakeDiT()
+    text = mx.zeros((1, 3, dit.config.text_dim))
+    with pytest.raises(ValueError):
+        denoise(dit, text, [1, 1, 1], 64, 64, 22, points=3, references=(Reference("audio", audio_latents=3),))
+    with pytest.raises(ValueError):
+        denoise(dit, text, [1, 1, 1], 64, 64, 22, points=3, references=(Reference("image", 2, 2),),
+                condition=mx.zeros((1, 96)), keyframes=("first",))

@@ -22,15 +22,45 @@ _SPATIAL_SCALE = 32
 
 @dataclass
 class Layout:
-    """Rows of one packed sequence, in the order [text | keyframe conditions | audio | video]."""
+    """Rows of one packed sequence, in the order [text | keyframe conditions | audio | video], or with
+    references [text | reference blocks | audio | video]."""
 
     rows: int
     position_ids: mx.array  # (rows, 3) float32 over (t, h, w)
     tags: mx.array  # (rows,) modality per row
     video_rows: mx.array  # conditioning rows first, then generated rows
-    audio_rows: mx.array
+    audio_rows: mx.array  # reference soundtrack rows first, then generated rows
     text_rows: mx.array
     condition_video_rows: int
+    condition_audio_rows: int = 0
+
+
+AUDIO_CONDITION_TIMESTEP = 1.0  # reference audio rows are clean and held at this timestep for every step
+
+
+@dataclass(frozen=True)
+class Reference:
+    """Latent geometry of one Ref2VA reference, in request order.
+
+    ``kind`` is ``image`` (one latent frame), ``video`` (``latent_frames`` of them, with ``audio_latents`` of its
+    own soundtrack or 0) or ``audio`` (``audio_latents`` alone). Height and width are the reference's own latent
+    size, never the clip's.
+    """
+
+    kind: str
+    latent_height: int = 0
+    latent_width: int = 0
+    latent_frames: int = 1
+    audio_latents: int = 0
+
+    def video_rows(self, patch: tuple[int, int, int]) -> int:
+        if self.kind == "audio":
+            return 0
+        return self.latent_frames * (self.latent_height // patch[1]) * (self.latent_width // patch[2])
+
+    @property
+    def audio_rows(self) -> int:
+        return self.audio_latents * AUDIO_CHANNELS
 
 
 def patchify(latents: mx.array, patch: tuple[int, int, int]) -> mx.array:
@@ -131,11 +161,107 @@ def layout(text_tags, latent_frames: int, latent_height: int, latent_width: int,
                   mx.array(np.arange(text, dtype=np.int32)), condition)
 
 
+def _frame_grid(latent_height: int, latent_width: int, patch: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """(height, width) coordinates of one latent frame's rows, and the width axis they were built from."""
+
+    _, ph, pw = patch
+    sqrt_area = np.sqrt(latent_height * latent_width)
+    width_grid = _spatial_grid(latent_width, pw, sqrt_area)
+    hh, ww = np.meshgrid(_spatial_grid(latent_height, ph, sqrt_area), width_grid, indexing="ij")
+    return np.stack([hh.reshape(-1), ww.reshape(-1)], axis=-1), width_grid
+
+
+def _place_audio(positions: np.ndarray, lo: int, latents: int, origin: float, width_grid: np.ndarray) -> None:
+    """One channel-major audio block: no height, the two ends of a width grid, one clock unit per latent."""
+
+    positions[lo:lo + latents * AUDIO_CHANNELS, 0] = np.tile(origin + np.arange(latents), AUDIO_CHANNELS)
+    positions[lo:lo + latents * AUDIO_CHANNELS, 2] = np.concatenate([np.full(latents, width_grid[0]),
+                                                                     np.full(latents, width_grid[-1])])
+
+
+def reference_layout(text_tags, references, latent_frames: int, latent_height: int, latent_width: int,
+                     audio_latents: int, patch: tuple[int, int, int]) -> Layout:
+    """The Ref2VA layout: [text | one block per reference, in request order | audio | video].
+
+    After MiniMax's ``build_ref2va_packed_sequence``. The references share one clock that starts where the text
+    ends: a picture is one latent frame on its own height/width grid and takes one unit; an audio clip takes one
+    unit per latent and sits at the two ends of the clip's width grid; a video packs its soundtrack rows (at the
+    ends of its own width grid) immediately before its frames, both from the same origin, and takes the longer of
+    the two. The clip's audio and video start where the references leave the clock. Reference rows are counted
+    in ``condition_video_rows`` and ``condition_audio_rows`` and are never stepped.
+    """
+
+    references = tuple(references)
+    text_tags = np.asarray(text_tags, dtype=np.int64)
+    text = int(text_tags.shape[0])
+    per_frame = (latent_height // patch[1]) * (latent_width // patch[2])
+    audio = audio_latents * AUDIO_CHANNELS
+    held_video = sum(reference.video_rows(patch) for reference in references)
+    held_audio = sum(reference.audio_rows for reference in references)
+    audio_start = text + held_video + held_audio
+    video_start = audio_start + audio
+    rows = video_start + latent_frames * per_frame
+
+    positions = np.zeros((rows, 3), dtype=np.float64)
+    positions[:text, 0] = np.arange(text)
+    frame, width_grid = _frame_grid(latent_height, latent_width, patch)
+    video_index, audio_index = [], []
+    cursor, clock = text, float(text)
+    for reference in references:
+        if reference.kind not in ("image", "video", "audio"):
+            raise ValueError(f"a reference is an image, a video or an audio clip, got {reference.kind!r}")
+        if reference.kind == "audio":
+            if reference.audio_latents < 1:
+                raise ValueError("an audio reference needs at least one audio latent")
+            _place_audio(positions, cursor, reference.audio_latents, clock, width_grid)
+            audio_index.append(np.arange(cursor, cursor + reference.audio_rows))
+            cursor += reference.audio_rows
+            clock += float(reference.audio_latents)
+            continue
+        own, own_width = _frame_grid(reference.latent_height, reference.latent_width, patch)
+        if reference.kind == "image":
+            if reference.latent_frames != 1 or reference.audio_latents:
+                raise ValueError("a picture reference is one latent frame without sound")
+            positions[cursor:cursor + own.shape[0], 0] = clock
+            positions[cursor:cursor + own.shape[0], 1:] = own
+            video_index.append(np.arange(cursor, cursor + own.shape[0]))
+            cursor += own.shape[0]
+            clock += 1.0  # a picture takes one whole unit, not a latent frame's 5/3
+            continue
+        if reference.audio_latents:
+            _place_audio(positions, cursor, reference.audio_latents, clock, own_width)
+            audio_index.append(np.arange(cursor, cursor + reference.audio_rows))
+            cursor += reference.audio_rows
+        count = reference.latent_frames * own.shape[0]
+        positions[cursor:cursor + count, 0] = np.repeat(_frame_times(reference.latent_frames, clock), own.shape[0])
+        positions[cursor:cursor + count, 1:] = np.tile(own, (reference.latent_frames, 1))
+        video_index.append(np.arange(cursor, cursor + count))
+        cursor += count
+        # summed in sequence here, unlike the keyframe anchor's pairwise sum: the reference keeps both
+        span = sum(_FRAME_RESCALE * _FRAMES_PER_LATENT[i % 5] for i in range(reference.latent_frames))
+        clock += max(float(reference.audio_latents), span)
+
+    _place_audio(positions, audio_start, audio_latents, clock, width_grid)
+    positions[video_start:, 0] = np.repeat(_frame_times(latent_frames, clock), per_frame)
+    positions[video_start:, 1:] = np.tile(frame, (latent_frames, 1))
+
+    video_rows = np.concatenate([*video_index, np.arange(video_start, rows)]).astype(np.int64)
+    audio_rows = np.concatenate([*audio_index, np.arange(audio_start, video_start)]).astype(np.int64)
+    tags = np.empty(rows, dtype=np.int64)
+    tags[:text] = text_tags
+    tags[audio_rows] = TAG_AUDIO
+    tags[video_rows] = TAG_VIDEO
+    return Layout(rows, mx.array(positions.astype(np.float32)), mx.array(tags.astype(np.int32)),
+                  mx.array(video_rows.astype(np.int32)), mx.array(audio_rows.astype(np.int32)),
+                  mx.array(np.arange(text, dtype=np.int32)), held_video, held_audio)
+
+
 def timestep_plan(packed: Layout, video_timesteps, audio_timesteps) -> tuple[mx.array, list[mx.array]]:
     """One table of the distinct timesteps of a run and, for every step, each row's index into it.
 
     Generated video and audio rows follow their own schedules inside one forward; conditioning video rows stay
-    at ``max(t, KEYFRAME_NOISE)``; text rows never reach an output and take the video timestep.
+    at ``max(t, KEYFRAME_NOISE)`` and reference audio rows at ``AUDIO_CONDITION_TIMESTEP``; text rows never reach
+    an output and take the video timestep.
     """
 
     video_index = np.asarray(packed.video_rows.tolist(), dtype=np.int64)
@@ -145,6 +271,7 @@ def timestep_plan(packed: Layout, video_timesteps, audio_timesteps) -> tuple[mx.
         per_row = np.full(packed.rows, np.float32(video_t), dtype=np.float32)
         per_row[video_index[:packed.condition_video_rows]] = np.float32(max(float(video_t), KEYFRAME_NOISE))
         per_row[audio_index] = np.float32(audio_t)
+        per_row[audio_index[:packed.condition_audio_rows]] = np.float32(AUDIO_CONDITION_TIMESTEP)
         steps.append(per_row)
     table = np.unique(np.concatenate(steps))
     return mx.array(table), [mx.array(np.searchsorted(table, per_row).astype(np.int32)) for per_row in steps]

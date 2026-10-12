@@ -95,3 +95,27 @@ def test_kept_revoice_runs_with_a_first_frame_and_is_deterministic():
     assert np.isfinite(np.asarray(first)).all()
     with pytest.raises(ValueError):
         revoice(model, text, latents, points=4)  # the clip was made with a first frame
+
+
+def test_revoice_holds_reference_audio_rows_and_the_kept_pass_matches_a_whole_one():
+    from tensorfold.families.h3.packing import AUDIO_CONDITION_TIMESTEP, Reference
+
+    model = small_model()
+    text = mx.random.normal((1, 3, SMALL.text_dim))
+    references = (Reference("image", 2, 2), Reference("audio", audio_latents=4))
+    condition, clean = mx.random.normal((1, 16)), mx.random.normal((8, 32))
+    latents = denoise(model, text, [1, 1, 1], 64, 64, 22, points=3, seed=1, condition=condition,
+                      references=references, audio_condition=clean)
+    assert latents.audio_rows.shape == (74, 32)
+    recorder = Recorder(model)
+    exact = revoice(recorder, text, latents, 3, seed=2, condition=condition, audio_condition=clean, exact=True)
+    assert exact.shape == (74, 32) and np.isfinite(np.asarray(exact)).all()
+    audio_index = np.asarray(latents.packed.audio_rows)
+    for _, audio, per_row in recorder.calls:
+        assert np.allclose(audio[0, :8], np.asarray(clean))  # the reference rows go in clean on every step
+        assert np.allclose(per_row[audio_index[:8]], AUDIO_CONDITION_TIMESTEP)
+        assert np.allclose(np.delete(per_row, audio_index), KEYFRAME_NOISE)
+    kept = revoice(model, text, latents, 3, seed=2, condition=condition, audio_condition=clean)
+    assert kept.shape == (74, 32) and np.isfinite(np.asarray(kept)).all()
+    with pytest.raises(ValueError):
+        revoice(model, text, latents, 3, seed=2, condition=condition)

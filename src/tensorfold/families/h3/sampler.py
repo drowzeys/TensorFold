@@ -10,7 +10,8 @@ import numpy as np
 
 from . import config as h3
 from .dit import MODALITIES
-from .packing import AUDIO_CHANNELS, KEYFRAME_NOISE, TAG_AUDIO, Layout, layout, patchify, timestep_plan
+from .packing import (AUDIO_CHANNELS, AUDIO_CONDITION_TIMESTEP, KEYFRAME_NOISE, TAG_AUDIO, Layout, layout, patchify,
+                      reference_layout, timestep_plan)
 from .schedule import AUDIO_SHIFT, VIDEO_SHIFT, Schedule
 
 
@@ -91,12 +92,17 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
             condition: mx.array | None = None, keyframes: tuple[str, ...] = (),
             audio_shift: float | None = None, step_cache: float = 0.0, attention_every: int = 0,
             nodes: tuple[float, ...] | None = None, video_shift: float | None = None, prepare=None,
-            gates: tuple[int, int, int] | None = None) -> Latents:
+            gates: tuple[int, int, int] | None = None, references=None,
+            audio_condition: mx.array | None = None) -> Latents:
     """Denoise one clip. ``points`` is the number of sigma points, so ``points - 1`` forwards (fewer with
     ``subset``). ``forward`` replaces the plain DiT call. The AdaLN tables for the whole run are projected once
     up front; ``release`` then frees the projection weights. ``condition`` holds the encoded keyframe rows for
     ``keyframes`` (``first`` or ``last`` each); they condition every step and are not denoised. ``audio_shift``
     replaces the audio schedule's sigma shift (3 in the released model).
+
+    ``references`` (Ref2VA) are the :class:`~.packing.Reference` geometries of the request's pictures, videos and
+    audio clips in order; ``condition`` then holds their video rows in that order and ``audio_condition`` their
+    clean audio rows (soundtracks and audio clips, channel-major). Neither is denoised; not with ``keyframes``.
 
     Two savings for many-step runs, after mlx-serve's fast recipe (ddalcu), which combines a TeaCache-style
     velocity cache with PAB-style attention reuse. ``step_cache`` (0.05 there) skips a forward and reuses the last
@@ -114,15 +120,28 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
     latent_frames = h3.latent_frames(frames)
     latent_height, latent_width = height // h3.VAE_SPATIAL_RATIO, width // h3.VAE_SPATIAL_RATIO
     audio_latents = h3.audio_latents(frames)
-    packed = layout(text_tags, latent_frames, latent_height, latent_width, audio_latents, config.patch_size,
-                    keyframes)
-    held = packed.condition_video_rows
+    if references is not None:
+        if keyframes:
+            raise ValueError("references cannot be combined with a first or last frame")
+        packed = reference_layout(text_tags, references, latent_frames, latent_height, latent_width, audio_latents,
+                                  config.patch_size)
+    else:
+        packed = layout(text_tags, latent_frames, latent_height, latent_width, audio_latents, config.patch_size,
+                        keyframes)
+    held, held_audio = packed.condition_video_rows, packed.condition_audio_rows
     if (condition is None) != (held == 0) or (condition is not None and condition.shape[0] != held):
-        raise ValueError(f"{len(keyframes)} keyframes need {held} condition rows")
+        raise ValueError(f"the layout holds {held} condition video rows, got "
+                         f"{0 if condition is None else condition.shape[0]}")
+    if (audio_condition is None) != (held_audio == 0) or (audio_condition is not None
+                                                          and audio_condition.shape[0] != held_audio):
+        raise ValueError(f"the layout holds {held_audio} reference audio rows, got "
+                         f"{0 if audio_condition is None else audio_condition.shape[0]}")
     video_rows, audio_rows = start_noise(config, latent_frames, latent_height, latent_width, audio_latents, seed,
                                          condition)
     check_noise("video", video_rows[held:])
     check_noise("audio", audio_rows)
+    if held_audio:  # clean, ahead of the generated rows, and never stepped
+        audio_rows = mx.concatenate([audio_condition.astype(mx.float32), audio_rows])
 
     if prepare is not None:
         prepare(packed, latent_frames, latent_height, latent_width)
@@ -158,20 +177,21 @@ def denoise(dit, text, text_tags, width: int, height: int, frames: int, points: 
             out_video, out_audio = run(video_rows[None], audio_rows[None], text, table, plan[index], packed.tags,
                                        packed.position_ids, packed.video_rows, packed.audio_rows, packed.text_rows,
                                        **extra)
-            video_velocity, audio_velocity = out_video[0, held:], out_audio[0]
+            video_velocity, audio_velocity = out_video[0, held:], out_audio[0, held_audio:]
             if step_cache > 0:
                 last_video, last_audio = video_velocity, audio_velocity
             moved, running = 0.0, 0
             reused += int(kept is not None and not refresh)
         stepped = video_schedule.step(index, video_velocity, video_rows[held:])
         video_rows = mx.concatenate([video_rows[:held], stepped]) if held else stepped
-        audio_rows = audio_schedule.step(index, audio_velocity, audio_rows)
+        stepped = audio_schedule.step(index, audio_velocity, audio_rows[held_audio:])
+        audio_rows = mx.concatenate([audio_rows[:held_audio], stepped]) if held_audio else stepped
         mx.eval(video_rows, audio_rows)
         seconds.append(time.perf_counter() - started)
         if on_step is not None:
             on_step(index + 1, steps, seconds[-1])
-    return Latents(video_rows[held:], audio_rows, packed, latent_frames, latent_height, latent_width, audio_latents,
-                   seconds, reused, skipped)
+    return Latents(video_rows[held:], audio_rows[held_audio:], packed, latent_frames, latent_height, latent_width,
+                   audio_latents, seconds, reused, skipped)
 
 
 def _block_inputs(block, x, table, adaln):
@@ -198,12 +218,14 @@ class HeldContext:
 
 
 def held_context(dit, video_rows, audio_rows, text, table, plan_rows, packed: Layout) -> HeldContext:
-    """One whole-sequence pass that keeps each block's keys and values over the non-audio rows."""
+    """One whole-sequence pass that keeps each block's keys and values over every row but the generated audio.
 
-    audio_index = np.asarray(packed.audio_rows.tolist(), dtype=np.int64)
+    ``audio_rows`` are all the audio rows of the layout: reference audio first, which is kept with the rest."""
+
+    audio_index = np.asarray(packed.audio_rows.tolist(), dtype=np.int64)[packed.condition_audio_rows:]
     first, last = int(audio_index[0]), int(audio_index[-1]) + 1
     if not np.array_equal(audio_index, np.arange(first, last)):
-        raise ValueError("audio rows are expected to be one run of the sequence")
+        raise ValueError("generated audio rows are expected to be one run of the sequence")
     x, adaln, rotary = dit.pack(video_rows[None], audio_rows[None], text, table, plan_rows, packed.tags,
                                 packed.position_ids, packed.video_rows, packed.audio_rows, packed.text_rows)
     tables, final = dit.modulation(table)
@@ -235,7 +257,8 @@ def audio_velocity(dit, audio_rows, plan_rows, context: HeldContext) -> mx.array
 
 
 def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: mx.array | None = None,
-            exact: bool = False, on_step=None, release: bool = False) -> mx.array:
+            exact: bool = False, on_step=None, release: bool = False,
+            audio_condition: mx.array | None = None) -> mx.array:
     """Denoise the audio rows again, from noise, against the finished video of ``latents``; returns audio rows.
 
     The video, keyframe and text rows are held at the keyframe timestep for every step and only the audio rows
@@ -243,13 +266,16 @@ def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: 
     run made. ``exact`` runs the whole sequence each step. Otherwise the held rows go through the stack once,
     beside the audio that came with the clip, and each block's keys and values over them are kept; a step then
     runs the audio rows alone against those. That is the same computation except that the held rows do not see
-    the audio changing between steps.
+    the audio changing between steps. ``audio_condition`` are the clean reference audio rows the clip was made
+    with (Ref2VA); they are held too, at their own timestep.
     """
 
     packed = latents.packed
-    held = packed.condition_video_rows
+    held, held_audio = packed.condition_video_rows, packed.condition_audio_rows
     if (condition is None) != (held == 0):
         raise ValueError("pass the keyframe rows the clip was made with")
+    if (audio_condition is None) != (held_audio == 0):
+        raise ValueError("pass the reference audio rows the clip was made with")
     level = float(np.float32(KEYFRAME_NOISE))
     rest = float(np.float32(1.0) - np.float32(KEYFRAME_NOISE))
     mx.random.seed(seed)
@@ -266,14 +292,19 @@ def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: 
 
     schedule = Schedule(AUDIO_SHIFT, points)
     audio_index = np.asarray(packed.audio_rows.tolist(), dtype=np.int64)
+    pinned = np.full(packed.rows, np.float32(KEYFRAME_NOISE), dtype=np.float32)
+    pinned[audio_index[:held_audio]] = np.float32(AUDIO_CONDITION_TIMESTEP)
     steps = []
     for audio_t in schedule.timesteps:
-        per_row = np.full(packed.rows, np.float32(KEYFRAME_NOISE), dtype=np.float32)
-        per_row[audio_index] = np.float32(audio_t)
+        per_row = pinned.copy()
+        per_row[audio_index[held_audio:]] = np.float32(audio_t)
         steps.append(per_row)
-    values = np.unique(np.concatenate([*steps, np.array([KEYFRAME_NOISE], dtype=np.float32)]))
+    values = np.unique(np.concatenate([*steps, pinned]))
     plan = [mx.array(np.searchsorted(values, per_row).astype(np.int32)) for per_row in steps]
-    held_plan = mx.array(np.full(packed.rows, np.searchsorted(values, np.float32(KEYFRAME_NOISE)), dtype=np.int32))
+    held_plan = mx.array(np.searchsorted(values, pinned).astype(np.int32))
+    if held_audio:
+        clean = audio_condition.astype(mx.float32)
+        reference = mx.concatenate([clean, reference])
     table = mx.array(values)
     text = text.astype(mx.bfloat16)
     dit.cache_modulation(table, release=release)
@@ -282,9 +313,10 @@ def revoice(dit, text, latents: Latents, points: int, seed: int = 0, condition: 
     for index in range(len(schedule)):
         started = time.perf_counter()
         if exact:
-            _, velocity = dit(video_rows[None], audio_rows[None], text, table, plan[index], packed.tags,
+            every = mx.concatenate([clean, audio_rows]) if held_audio else audio_rows
+            _, velocity = dit(video_rows[None], every[None], text, table, plan[index], packed.tags,
                               packed.position_ids, packed.video_rows, packed.audio_rows, packed.text_rows)
-            velocity = velocity[0]
+            velocity = velocity[0, held_audio:]
         else:
             velocity = audio_velocity(dit, audio_rows, plan[index], context)
         audio_rows = schedule.step(index, velocity, audio_rows)
