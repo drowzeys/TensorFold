@@ -29,6 +29,7 @@ const multi = @import("cuda_multi.zig");
 const mdraft = @import("cuda_mdraft.zig");
 const dcpm = @import("cuda_dcp.zig");
 const prune = @import("prune.zig");
+const headq = @import("headq.zig");
 
 pub const world_default: usize = 4;
 /// engine.DCP_AUTO: contexts past this interleave the KV cache over the ranks (bf16 latent)
@@ -132,6 +133,11 @@ pub const Options = struct {
     l2pf_after: bool = false,
     /// routed-expert pruning (lossy; TF_GLM53_EXPERT_TOPP / _MIN_K / _RENORM / _PRUNE_PROMPT, prune.zig), off by default
     prune: prune.Rule = .{},
+    /// TF_GLM53_HEAD_Q (headq.zig): lm_head as an EXL3 linear from a safetensors file of its own (the value: its
+    /// path) or from the checkpoint ("pack"); off by default (the bf16 rows)
+    head_q: headq.Setting = .off,
+    /// TF_GLM53_KVB_Q: a checkpoint whose kv_b_proj is an EXL3 linear is decoded to the bf16 blocks at load
+    kvb_q: bool = false,
     /// TF_GLM53_DCP: 0 auto (the world past dcp_auto tokens of context, else 1), 1, or the world
     dcp: usize = 0,
     timeout_s: f64 = 5400,
@@ -197,6 +203,8 @@ pub const Options = struct {
             std.log.err("TF_GLM53_EXPERT_TOPP (0 <= p < 1), _MIN_K (1 or more), _RENORM (orig | kept), _PRUNE_PROMPT (0 / 1)", .{});
             return error.BadSetting;
         };
+        o.head_q = headq.Setting.parse(env("TF_GLM53_HEAD_Q"));
+        o.kvb_q = try envFlag("TF_GLM53_KVB_Q", false);
         o.dcp = try envInt(usize, "TF_GLM53_DCP", 0);
         o.timeout_s = try envFloat("TF_GLM53_TIMEOUT", o.timeout_s);
         o.reuse = try reuse.Settings.fromEnv();
@@ -418,10 +426,14 @@ pub const Boot = struct {
         try checkParallelDrafters(o.parallel, if (b.dflash_cfg) |c| c.block else null, if (b.dspark_cfg) |c| c.block else null);
         const mode_word: u64 = @intFromEnum(b.mode);
         dh.update(std.mem.asBytes(&mode_word));
+        // a quantized head's bytes and the kv_b setting join the record only when on: off, the digest is unchanged
+        const head_id = try headq.identityOf(gpa, io, o.head_q, o.model, b.cfg.vocab, b.cfg.hidden);
+        if (head_id != 0) dh.update(std.mem.asBytes(&head_id));
+        if (o.kvb_q) dh.update("kvb_q");
         try b.rdv.sync("settings", settingsDigest(o, b.dcp, dh.final()), o.timeout_s);
 
         const t_load = now(io);
-        b.w = try W.load(gpa, io, &b.driver, o.model, b.cfg, .{ .layers = b.cfg.layers, .rank = o.rank, .world = o.world, .head = true, .log_every = 10, .fast = o.fast_load, .mtp = o.k > 0, .draft_vocab = if (o.k > 0) o.draft_vocab else 0 });
+        b.w = try W.load(gpa, io, &b.driver, o.model, b.cfg, .{ .layers = b.cfg.layers, .rank = o.rank, .world = o.world, .head = true, .log_every = 10, .fast = o.fast_load, .mtp = o.k > 0, .draft_vocab = if (o.k > 0) o.draft_vocab else 0, .head_q = o.head_q, .head_host = o.head_q.on() and b.plan.n > 0, .kvb_q = o.kvb_q });
         b.stage = 6;
         if (o.tiles) |path| {
             const t = try tiles.load(gpa, io, &b.w, path);
@@ -435,6 +447,10 @@ pub const Boot = struct {
 
         b.k = try kern.Kernels.load(gpa, io, &b.ctx, o.aot);
         b.stage = 7;
+        if (b.w.head_q) |hq| if (!b.k.haveWidth(hq.lin.k2)) {
+            std.log.err("glm53 rank {d}: this build's glm53_exl3_linear fatbin has no {d}-bit linear kernel for the quantized head (rebuild the fatbins: buildspeed.sh fatbins)", .{ o.rank, hq.lin.k2 / 2 });
+            return error.UnsupportedExl3Width;
+        };
         b.stream = try cuda.Stream.init(&b.driver, true);
         b.stage = 8;
         const half = b.cfg.rope / 2;

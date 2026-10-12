@@ -5,7 +5,7 @@
 //! Options.chunk_rows rows: up to fused.FAST_ROWS = 16 rows a chunk takes the decode windows' kernels, so the rows
 //! are computed as generated tokens are). After a chunk its final hidden rows are in the prompt buffers
 //! (pb.hidden[:R]); the scorer runs fused.head's own two launches on them - the final RMSNorm and glue.router over
-//! this rank's lm_head share - in its own scratch, `head_rows` rows a pass, copies the logits to the host and reduces
+//! this rank's lm_head share, or the quantized head's launch (TF_GLM53_HEAD_Q, fw.headLogits) - in its own scratch, `head_rows` rows a pass, copies the logits to the host and reduces
 //! each row to score.Part. Both kernels compute each row alone, so a row's logits are the bits the served head gives
 //! that row. Nothing is exchanged between the ranks: every rank writes its own partials file and score.combine adds
 //! them up.
@@ -19,6 +19,7 @@ const tri = @import("cuda_triton.zig");
 const fw = @import("cuda_forward.zig");
 const rn = @import("cuda_runner.zig");
 const sc = @import("score.zig");
+const headq = @import("headq.zig");
 
 pub const Options = struct {
     /// rows a head pass (their logits are copied to the host together: head_rows * vocab_part * 4 bytes)
@@ -37,7 +38,8 @@ pub const Scorer = struct {
     o: Options,
     fnormed: cuda.DeviceBuffer, // bf16 [head_rows, D]
     lg: cuda.DeviceBuffer, // fp32 [head_rows, vocab_part]
-    hpart: cuda.DeviceBuffer, // fp32 [ROUTER_KS, head_rows, vocab_part]
+    hpart: cuda.DeviceBuffer, // fp32 [ROUTER_KS, head_rows, vocab_part]; a quantized head: [head_rows, blocks * 128]
+    hxh: cuda.DeviceBuffer, // fp16 [head_rows, D]: a quantized head's rotated input (16 bytes without one)
     host: cuda.HostBuffer, // fp32 [head_rows, vocab_part], page-locked
     /// seconds in the engine (chunks and head passes) and in the host sums, positions scored
     engine_s: f64 = 0,
@@ -47,7 +49,7 @@ pub const Scorer = struct {
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, r: *rn.Runner, o: Options) !Scorer {
         const w = r.w;
-        if (w.lm_head == 0) return error.NoHead;
+        if (!w.hasHead()) return error.NoHead;
         if (r.set.k != 0 or r.dspark != null or r.dflash != null or r.f.taps.n != 0) return error.ScoreWithDrafts;
         if (!r.set.served or r.set.slots != 1) return error.Invalid;
         if (o.head_rows == 0 or o.head_rows > fw.max_rows) return error.WindowTooWide; // the router's widest block
@@ -60,16 +62,19 @@ pub const Scorer = struct {
         errdefer fnormed.free();
         var lg = try cuda.DeviceBuffer.alloc(d, o.head_rows * V * 4);
         errdefer lg.free();
-        var hpart = try cuda.DeviceBuffer.alloc(d, tri.router_ks * o.head_rows * V * 4);
+        var hpart = try cuda.DeviceBuffer.alloc(d, o.head_rows * 4 * if (w.head_q) |hq| @max(hq.lin.n, V) else tri.router_ks * V);
         errdefer hpart.free();
+        var hxh = try cuda.DeviceBuffer.alloc(d, if (w.head_q != null) o.head_rows * D * 2 else 16);
+        errdefer hxh.free();
         var host = try cuda.HostBuffer.alloc(d, o.head_rows * V * 4);
         errdefer host.free();
-        return .{ .gpa = gpa, .r = r, .o = o, .fnormed = fnormed, .lg = lg, .hpart = hpart, .host = host };
+        return .{ .gpa = gpa, .r = r, .o = o, .fnormed = fnormed, .lg = lg, .hpart = hpart, .hxh = hxh, .host = host };
     }
 
     pub fn deinit(s: *Scorer) void {
         s.dump.deinit(s.gpa);
         s.host.free();
+        s.hxh.free();
         s.hpart.free();
         s.lg.free();
         s.fnormed.free();
@@ -95,12 +100,17 @@ pub const Scorer = struct {
         try o.fill32(s.fnormed.ptr, 0x3c003c00, s.o.head_rows * D / 2); // bf16 ~0.0078 everywhere
         try o.fill32(r.pb.normed, 0x3c003c00, 4 * D / 2);
         for (1..4) |n| {
-            for (0..10) |_| try t_.router(s.fnormed.ptr, D, w.lm_head, s.lg.ptr, s.hpart.ptr, n, D, V);
+            for (0..10) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
             try r.f.s.synchronize();
             const t0 = s.now();
-            for (0..reps) |_| try t_.router(s.fnormed.ptr, D, w.lm_head, s.lg.ptr, s.hpart.ptr, n, D, V);
+            for (0..reps) |_| try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
             try r.f.s.synchronize();
-            std.debug.print("TIME rank {d} head bf16 [{d} x {d}] ({d} MB) rows {d}: {d:.3} ms\n", .{ w.rank, V, D, V * D * 2 >> 20, n, s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps)) });
+            const ms = s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps));
+            if (w.head_q) |hq| {
+                std.debug.print("TIME rank {d} head exl3 [{d} x {d}] {d} half-bits ({d} MB, its share copied out) rows {d}: {d:.3} ms\n", .{ w.rank, hq.lin.n, D, hq.lin.k2, hq.lin.wordBytes() >> 20, n, ms });
+            } else {
+                std.debug.print("TIME rank {d} head bf16 [{d} x {d}] ({d} MB) rows {d}: {d:.3} ms\n", .{ w.rank, V, D, V * D * 2 >> 20, n, ms });
+            }
         }
         const L0 = &w.layers[0];
         const names = [_][]const u8{ "layer0 mlp.gate", "layer0 q_a", "layer0 kv_a" };
@@ -116,6 +126,46 @@ pub const Scorer = struct {
                 std.debug.print("TIME rank {d} exl3 {s} [{d} x {d}] {d} half-bits ({d} MB) rows {d}: {d:.3} ms\n", .{ w.rank, name, l.n, l.k, l.k2, l.n * l.k * l.k2 / 16 >> 20, n, s.since(t0) * 1e3 / @as(f64, @floatFromInt(reps)) });
             }
         }
+    }
+
+    /// --score-head-check N (a gate, not a score; TF_GLM53_HEAD_Q): `n` fixed pseudo-random bf16 rows through the
+    /// quantized head's launch on the device against headq.replay of this rank's part `h` on the CPU. The launch's
+    /// tile steps are mma sums whose inner order the replay cannot know, so the bound is 1e-4 of the largest logit
+    /// (the replay agrees with the numpy reference to 2e-5 on the host); each row's first maximum must be the same.
+    pub fn checkHead(s: *Scorer, h: *const headq.Host, n: usize) !void {
+        const r = s.r;
+        const w = r.w;
+        const D = w.config.hidden;
+        const V = w.vocab_part;
+        const hq = w.head_q orelse return error.NoHead;
+        if (n == 0 or n > s.o.head_rows or h.k != D or h.cut.part != V or h.cut.n() != hq.lin.n or h.cut.off != hq.off or h.k2 != hq.lin.k2) return error.Invalid;
+        const t_: tri.Tri = .{ .set = &r.f.k.triton, .s = r.f.s };
+        const o = kern.Ops{ .k = r.f.k, .s = r.f.s };
+        const x = try s.gpa.alloc(u16, n * D);
+        defer s.gpa.free(x);
+        var prng = std.Random.DefaultPrng.init(0x53 + w.rank);
+        for (x) |*v| v.* = @import("cuda_weights.zig").bf16Bits(prng.random().floatNorm(f32)); // unit rows, as the final norm leaves them
+        try o.upload(s.fnormed.ptr, std.mem.sliceAsBytes(x));
+        try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
+        try o.download(s.host.bytes[0 .. n * V * 4], s.lg.ptr);
+        try r.f.s.synchronize();
+        const got = std.mem.bytesAsSlice(f32, s.host.bytes)[0 .. n * V];
+        const want = try s.gpa.alloc(f32, n * V);
+        defer s.gpa.free(want);
+        try headq.replay(s.gpa, h, x, n, want);
+        var top: f32 = 0;
+        var worst: f32 = 0;
+        var same_bits: usize = 0;
+        for (got, want) |g, e| {
+            top = @max(top, @abs(e));
+            worst = @max(worst, @abs(g - e));
+            same_bits += @intFromBool(@as(u32, @bitCast(g)) == @as(u32, @bitCast(e)));
+        }
+        var picks: usize = 0;
+        for (0..n) |i| picks += @intFromBool(fw.argmaxFirst(got[i * V ..][0..V]) == fw.argmaxFirst(want[i * V ..][0..V]));
+        const ok = worst <= 1e-4 * top and picks == n;
+        std.debug.print("HEADQ rank {d}: {d} rows x {d} logits, {d} half-bits: largest difference {e:.2} of {e:.2} (bound 1e-4), {d} of {d} values the replay's bits, {d} of {d} rows the same first maximum: {s}\n", .{ w.rank, n, V, hq.lin.k2, worst, top, same_bits, got.len, picks, n, if (ok) "OK" else "FAIL" });
+        if (!ok) return error.HeadCheckFailed;
     }
 
     /// One row (`ri` in the file): `ids` its tokens, `ref` and `first_pos` where its positions' reference records
@@ -152,7 +202,7 @@ pub const Scorer = struct {
                 const n = @min(s.o.head_rows, R - i);
                 // fused.head "local": the final norm, then this rank's logits over its vocabulary share
                 try t_.rmsnorm(r.pb.hidden + i * D * 2, D, w.final_norm, s.fnormed.ptr, D, n, D, c.eps);
-                try t_.router(s.fnormed.ptr, D, w.lm_head, s.lg.ptr, s.hpart.ptr, n, D, V);
+                try fw.headLogits(w, t_, o, s.fnormed.ptr, s.lg.ptr, s.hpart.ptr, s.hxh.ptr, n);
                 try o.download(s.host.bytes[0 .. n * V * 4], s.lg.ptr);
                 try r.f.s.synchronize();
                 s.engine_s += s.since(t0);

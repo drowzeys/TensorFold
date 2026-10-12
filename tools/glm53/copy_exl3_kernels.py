@@ -29,7 +29,7 @@ OUT = REPO / "zig" / "kernels" / "cuda"
 
 # linear_kernel<K2, CB, WK, G, V>: GLM-5.3's dense linears are 5-bit mul1 (K2 10, CB 2); the 2.75 bpw mixed-K pack
 # also has 3/4-bit (K2 6/8) dense parts in other packs. WK from x3linear.plan (4 or 8), G 1 (<= 8 rows) or 2, V = vec_ok.
-LINEAR_K2 = (6, 8, 10, 16)   # 16: the MTP layer's 8-bit dense projections (layer 78)
+LINEAR_K2 = (6, 8, 10, 12, 16)   # 12: a 6-bit output head (TF_GLM53_HEAD_Q); 16: the MTP layer's 8-bit dense projections (layer 78)
 LINEAR_CB = (2,)
 # warps a block: x3linear.plan picks 4 or 8; Phase 3a's served tiles (fused.tune_linears / tune_groups, saved with
 # TF_GLM53_TILES=save:) may also pick 2

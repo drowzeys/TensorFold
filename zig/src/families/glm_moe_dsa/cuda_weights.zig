@@ -21,6 +21,7 @@ const exl3 = @import("exl3.zig");
 const split = @import("split.zig");
 const kern = @import("cuda_kernels.zig");
 const source = @import("cuda_source.zig");
+const headq = @import("headq.zig");
 
 const Tensor = core.checkpoint.Tensor;
 const config_max_layers = @import("config.zig").max_layers;
@@ -76,6 +77,10 @@ pub const DraftHead = struct {
     sk: usize, // glm5_next qmm.split_k(n, k)
 };
 
+/// TF_GLM53_HEAD_Q (headq.zig): the head as an EXL3 linear over the Hadamard blocks that cover this rank's
+/// vocabulary share; the share starts `off` outputs into the launch's result.
+pub const HeadQ = struct { lin: exl3.Linear, off: usize };
+
 pub const Weights = struct {
     gpa: std.mem.Allocator,
     config: Config,
@@ -84,7 +89,11 @@ pub const Weights = struct {
     heads: usize, // this rank's attention heads
     embed: u64 = 0, // bf16 [V, D]
     final_norm: u64 = 0, // bf16 [D] (model.norm)
-    lm_head: u64 = 0, // bf16 [V / world, D]: this rank's vocabulary share (rows vocab_off ..)
+    lm_head: u64 = 0, // bf16 [V / world, D]: this rank's vocabulary share (rows vocab_off ..); 0 with head_q
+    head_q: ?HeadQ = null, // TF_GLM53_HEAD_Q: the quantized head instead (the same share, the same vocab_off)
+    /// with head_q and Options.head_host: this rank's bf16 lm_head rows [vocab_part, D] on the host, for the
+    /// drafters' 4-bit head (cuda_draft.buildDraftHead takes and frees them)
+    head_host: []u16 = &.{},
     vocab_part: usize = 0,
     vocab_off: usize = 0,
     layers: []Layer = &.{},
@@ -130,7 +139,13 @@ pub const Weights = struct {
         return ptr;
     }
 
+    pub fn hasHead(w: *const Weights) bool {
+        return w.lm_head != 0 or w.head_q != null;
+    }
+
     pub fn deinit(w: *Weights) void {
+        if (w.head_host.len > 0) w.gpa.free(w.head_host);
+        w.head_host = &.{};
         for (w.buffers.items) |*b| b.free();
         w.buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
@@ -183,6 +198,12 @@ pub const Options = struct {
     mtp: bool = false,
     /// fused.DRAFT_VOCAB: the 4-bit draft head over this many lowest ids (+ the last 128); 0: none
     draft_vocab: usize = 0,
+    /// TF_GLM53_HEAD_Q: lm_head as an EXL3 linear (headq.zig) from a file of its own or the checkpoint; off: bf16 rows
+    head_q: headq.Setting = .off,
+    /// with head_q: keep this rank's bf16 lm_head rows on the host (Weights.head_host) for the drafters' 4-bit head
+    head_host: bool = false,
+    /// TF_GLM53_KVB_Q: a checkpoint whose kv_b_proj is an EXL3 linear is decoded to the bf16 blocks at load
+    kvb_q: bool = false,
 };
 
 /// libc calls std does not wrap on every target: dropping a mapped file's pages from this process and the page cache.
@@ -208,6 +229,7 @@ const Loader = struct {
     ck: *core.Checkpoint,
     w: *Weights,
     o: Options,
+    io: std.Io,
     host: std.ArrayList(u8) = .empty,
     host2: std.ArrayList(u8) = .empty,
     touched: []bool = &.{}, // per checkpoint file: read since the last release
@@ -446,6 +468,52 @@ const Loader = struct {
         return .{ a, b };
     }
 
+    /// TF_GLM53_KVB_Q: kv_b as an EXL3 linear (kv_lora inputs, H (nope + v) outputs, cut by outputs: this rank's
+    /// heads) decoded on the host to the dense matrix (headq.dense) and rounded to bf16 into the same wk / wv
+    /// blocks kvB makes from a bf16 `.weight`. The attention reads bf16 as before: the pack is smaller, a token
+    /// reads the same bytes.
+    fn kvBq(L: *Loader, prefix: []const u8, key: []const u8, c: Config, heads: usize) ![2]u64 {
+        var nb: [256]u8 = undefined;
+        const tname = try std.fmt.bufPrint(&nb, "{s}.trellis", .{prefix});
+        const t = try L.get(tname);
+        if (t.dtype != .i16 or t.rank != 3 or t.shape[2] % 8 != 0) return error.UnexpectedTensor;
+        var shape: [core.safetensors.max_rank]usize = undefined;
+        const raw = try L.part(tname, &shape);
+        const k2 = shape[2] / 8;
+        const K = 16 * shape[0];
+        const N = 16 * shape[1];
+        const per = c.nope + c.v_dim;
+        if (K != c.kv_lora or N != heads * per) return error.UnexpectedTensor;
+        if (try L.codebook(prefix) != .mul1) return error.UnsupportedExl3Codebook;
+        const trellis = try L.gpa.alloc(i16, raw.len / 2);
+        defer L.gpa.free(trellis);
+        @memcpy(std.mem.sliceAsBytes(trellis), raw);
+        const suh = try L.gpa.alloc(f16, K);
+        defer L.gpa.free(suh);
+        const svh = try L.gpa.alloc(f16, N);
+        defer L.gpa.free(svh);
+        for ([_][]const u8{ "suh", "svh" }, [_][]f16{ suh, svh }) |name, dst| {
+            const full = try std.fmt.bufPrint(&nb, "{s}.{s}", .{ prefix, name });
+            const sc = try L.get(full);
+            if (sc.dtype != .f16) return error.UnsupportedScales;
+            const bytes = try L.part(full, &shape);
+            if (bytes.len != dst.len * 2) return error.UnexpectedTensor;
+            @memcpy(std.mem.sliceAsBytes(dst), bytes);
+        }
+        const rows = try L.gpa.alloc(f32, N * K);
+        defer L.gpa.free(rows);
+        try headq.dense(L.gpa, k2, trellis, K, N, suh, svh, rows);
+        const wk = try L.gpa.alloc(u16, heads * c.nope * K);
+        defer L.gpa.free(wk);
+        const wv = try L.gpa.alloc(u16, heads * c.v_dim * K);
+        defer L.gpa.free(wv);
+        kvSplit(rows, heads, c.nope, c.v_dim, K, wk, wv);
+        var kb: [128]u8 = undefined;
+        const a = try L.put(try std.fmt.bufPrint(&kb, "{s}.wk", .{key}), std.mem.sliceAsBytes(wk));
+        const b = try L.put(try std.fmt.bufPrint(&kb, "{s}.wv", .{key}), std.mem.sliceAsBytes(wv));
+        return .{ a, b };
+    }
+
     /// weights.load_experts + experts.prepare: per-expert trellises (gate, up: output tiles; down: input tiles),
     /// int64 pointer tables, int32 widths, stacked fp16 scales; digests in prepare's order (gate, up, down).
     fn experts(L: *Loader, li: usize, key: []const u8, c: Config) !Experts {
@@ -593,6 +661,7 @@ const Loader = struct {
         if (L.o.head) {
             w.final_norm = try L.bf16("model.norm.weight", "final_norm");
             if (c.vocab % L.o.world != 0) return error.UnevenVocab;
+            if (L.o.head_q.on()) return L.headQ(c);
             const t = try L.get("lm_head.weight");
             if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != c.vocab or t.shape[1] != c.hidden) return error.UnexpectedTensor;
             var shape: [core.safetensors.max_rank]usize = undefined;
@@ -600,6 +669,66 @@ const Loader = struct {
             w.vocab_part = shape[0];
             w.vocab_off = L.o.rank * shape[0];
             w.lm_head = try L.put("lm_head", raw);
+        }
+    }
+
+    /// TF_GLM53_HEAD_Q: the EXL3 head's blocks covering this rank's vocabulary share (headq.Host), in the strips
+    /// layout with x3linear.plan's tiles (no tile table holds the head); lm_head stays 0. With o.head_host the
+    /// checkpoint's bf16 rows of the share are kept on the host for the drafters' 4-bit head.
+    fn headQ(L: *Loader, c: Config) !void {
+        const w = L.w;
+        var file: ?core.safetensors.File = null;
+        defer if (file) |*f| {
+            dropFile(f);
+            f.close(L.io);
+        };
+        const src: headq.Source = switch (L.o.head_q) {
+            .file => |path| blk: {
+                file = try headq.openFile(L.gpa, L.io, path);
+                break :blk .{ .file = &file.? };
+            },
+            .pack => .{ .ck = L.ck },
+            .off => return error.Invalid,
+        };
+        var h = try headq.Host.load(L.gpa, src, c.vocab, c.hidden, L.o.world, L.o.rank);
+        defer h.deinit();
+        if (L.o.head_q == .pack) for ([_][]const u8{ "lm_head.trellis", "lm_head.suh", "lm_head.svh", "lm_head.mul1" }) |name| {
+            _ = try L.get(name);
+        };
+        const n = h.cut.n();
+        const sk_wk = exl3.plan(h.k, n);
+        // a split-K head would need the launch's partials scratch; GLM-5.3's (303 blocks a rank) takes one split
+        if (sk_wk[0] != 1) return error.BadSplit;
+        const words = try staging(&L.host, L.gpa, h.trellis.len);
+        h.strips(words);
+        w.vocab_part = h.cut.part;
+        w.vocab_off = L.o.rank * h.cut.part;
+        w.head_q = .{ .off = h.cut.off, .lin = .{
+            .words = try L.put("lm_head.words", words),
+            .suh = try L.put("lm_head.suh", h.suh),
+            .svh = try L.put("lm_head.svh", h.svh),
+            .counters = try L.zeros(8 * (n / 128) * 4),
+            .k = h.k,
+            .n = n,
+            .k2 = h.k2,
+            .cb = .mul1,
+            .sk = sk_wk[0],
+            .wk = sk_wk[1],
+        } };
+        std.log.info("glm53 rank {d}: quantized head ({s}): {d}.{d} bits, blocks {d}..{d} of {d} for tokens {d}..{d}, {d} MB", .{ L.o.rank, if (L.o.head_q == .pack) "the checkpoint's" else L.o.head_q.file, h.k2 / 2, (h.k2 % 2) * 5, h.cut.b0, h.cut.b0 + h.cut.nb, c.vocab / 128, w.vocab_off, w.vocab_off + w.vocab_part, words.len >> 20 });
+        if (L.o.head_host) {
+            if (!L.has("lm_head.weight")) {
+                std.log.err("glm53: the drafters' 4-bit head is made from lm_head.weight (bf16), which this checkpoint does not hold: keep it in the pack beside the quantized head, or serve the head from a file of its own (TF_GLM53_HEAD_Q=<file>)", .{});
+                return error.NoDraftHeadRows;
+            }
+            const t = try L.get("lm_head.weight");
+            if (t.dtype != .bf16 or t.rank != 2 or t.shape[0] != c.vocab or t.shape[1] != c.hidden) return error.UnexpectedTensor;
+            var shape: [core.safetensors.max_rank]usize = undefined;
+            const raw = try L.part("lm_head.weight", &shape);
+            if (shape[0] != w.vocab_part) return error.UnexpectedTensor;
+            const rows = try L.gpa.alloc(u16, raw.len / 2);
+            @memcpy(std.mem.sliceAsBytes(rows), raw);
+            w.head_host = rows;
         }
     }
 
@@ -727,7 +856,15 @@ const Loader = struct {
         out.kv_a = try L.linear(try at.n(&nb, p, "self_attn.kv_a_proj_with_mqa"), try at.n(&kb, key, "kv_a"));
         out.kv_a_norm = try L.bf16(try at.n(&nb, p, "self_attn.kv_a_layernorm.weight"), try at.n(&kb, key, "kv_a_norm"));
         out.q_b = try L.linear(try at.n(&nb, p, "self_attn.q_b_proj"), try at.n(&kb, key, "q_b"));
-        const kvb = try L.kvB(try at.n(&nb, p, "self_attn.kv_b_proj.weight"), key, c, L.w.heads);
+        const kvb = if (L.o.kvb_q and L.has(try at.n(&nb, p, "self_attn.kv_b_proj.trellis")))
+            try L.kvBq(try at.n(&nb, p, "self_attn.kv_b_proj"), key, c, L.w.heads)
+        else blk: {
+            if (!L.o.kvb_q and L.has(try at.n(&nb, p, "self_attn.kv_b_proj.trellis"))) {
+                std.log.err("glm53: this checkpoint's kv_b_proj is an EXL3 linear: set TF_GLM53_KVB_Q=1 on every rank to decode it at load", .{});
+                return error.UnexpectedTensor;
+            }
+            break :blk try L.kvB(try at.n(&nb, p, "self_attn.kv_b_proj.weight"), key, c, L.w.heads);
+        };
         out.wk = kvb[0];
         out.wv = kvb[1];
         out.o_proj = try L.linear(try at.n(&nb, p, "self_attn.o_proj"), try at.n(&kb, key, "o_proj"));
@@ -768,7 +905,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
     defer ck.close();
     var w: Weights = .{ .gpa = gpa, .config = c, .rank = o.rank, .world = o.world, .heads = c.heads / o.world };
     errdefer w.deinit();
-    var L: Loader = .{ .gpa = gpa, .d = d, .ck = &ck, .w = &w, .o = o };
+    var L: Loader = .{ .gpa = gpa, .d = d, .ck = &ck, .w = &w, .o = o, .io = io };
     defer L.deinit();
     L.touched = try gpa.alloc(bool, ck.files.items.len);
     @memset(L.touched, false);
@@ -837,6 +974,17 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
     }
     w.layers = layers;
     return w;
+}
+
+/// kv_b's dense rows [H (nope + v), K] fp32 (a head's nope key rows, then its v value rows) rounded to bf16 into
+/// wk [H, nope, K] and wv [H, v, K]: Loader.kvB's split of a bf16 `.weight`.
+pub fn kvSplit(rows: []const f32, heads: usize, nope: usize, v_dim: usize, K: usize, wk: []u16, wv: []u16) void {
+    const per = nope + v_dim;
+    std.debug.assert(rows.len == heads * per * K and wk.len == heads * nope * K and wv.len == heads * v_dim * K);
+    for (0..heads) |h| {
+        for (0..nope * K) |i| wk[h * nope * K + i] = bf16Bits(rows[h * per * K + i]);
+        for (0..v_dim * K) |i| wv[h * v_dim * K + i] = bf16Bits(rows[(h * per + nope) * K + i]);
+    }
 }
 
 // --------------------------------------------------------------------------------------- the draft head (host) ---
@@ -976,4 +1124,24 @@ test "quantize4 + pack4: shapes, a constant group, round halves to even" {
     try std.testing.expectEqual(@as(u32, 0x91918080), out[0]);
     try std.testing.expectEqual(sc[1], so[128 + 0]);
     try std.testing.expectEqual(@as(u16, 0), so[5]);
+}
+
+test "an EXL3 kv_b's dense rows land in the blocks a bf16 kv_b gives" {
+    // 2 heads, 3 key rows + 2 value rows a head, 4 inputs: row r holds r + i / 8 (exact in bf16)
+    const heads = 2;
+    const nope = 3;
+    const v_dim = 2;
+    const K = 4;
+    var rows: [heads * (nope + v_dim) * K]f32 = undefined;
+    for (&rows, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i / K)) + @as(f32, @floatFromInt(i % K)) / 8;
+    var wk: [heads * nope * K]u16 = undefined;
+    var wv: [heads * v_dim * K]u16 = undefined;
+    kvSplit(&rows, heads, nope, v_dim, K, &wk, &wv);
+    // Loader.kvB's copies of the same rows as bf16 bytes
+    for (0..heads) |h| {
+        for (0..nope * K) |i| try std.testing.expectEqual(bf16Bits(rows[h * (nope + v_dim) * K + i]), wk[h * nope * K + i]);
+        for (0..v_dim * K) |i| try std.testing.expectEqual(bf16Bits(rows[(h * (nope + v_dim) + nope) * K + i]), wv[h * v_dim * K + i]);
+    }
+    try std.testing.expectEqual(bf16Bits(5.0), wk[nope * K]); // head 1's first key row is row 5
+    try std.testing.expectEqual(bf16Bits(3.125), wv[1]); // head 0's first value row is row 3
 }

@@ -1184,14 +1184,20 @@ pub fn quantizePack(gpa: std.mem.Allocator, rows: []const u16, n: usize, k: usiz
 
 /// headq.prepare's draft_lm_head (TF_GLM53_DRAFT_HEAD=q4): this rank's lm_head share [vocab_part, D] quantized to
 /// 4 bits (qmm.quantize4 on the host, torch's float32 steps) for the drafters' block passes; the verify windows keep
-/// the bf16 share. Appended to the weights' own buffers.
+/// the bf16 share (or, with TF_GLM53_HEAD_Q, the EXL3 head: the 4-bit copy is still made from the bf16 rows, which
+/// the loader kept on the host). Appended to the weights' own buffers.
 pub fn buildDraftHead(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *W.Weights) !Q4 {
     const n = w.vocab_part;
     const k = w.config.hidden;
-    if (w.lm_head == 0) return error.NoHead;
-    const rows = try gpa.alloc(u16, n * k);
-    defer gpa.free(rows);
-    try d.check(d.api.cuMemcpyDtoH_v2(std.mem.sliceAsBytes(rows).ptr, w.lm_head, n * k * 2), "cuMemcpyDtoH");
+    // TF_GLM53_HEAD_Q: the device holds the EXL3 head; the loader kept the checkpoint's bf16 rows of the share
+    const kept = w.lm_head == 0 and w.head_host.len == n * k;
+    if (w.lm_head == 0 and !kept) return error.NoHead;
+    const rows = if (kept) w.head_host else try gpa.alloc(u16, n * k);
+    defer {
+        if (kept) w.head_host = &.{};
+        (if (kept) w.gpa else gpa).free(rows);
+    }
+    if (!kept) try d.check(d.api.cuMemcpyDtoH_v2(std.mem.sliceAsBytes(rows).ptr, w.lm_head, n * k * 2), "cuMemcpyDtoH");
     const hq = try quantizePack(gpa, rows, n, k);
     defer hq.free(gpa);
     return .{ .w = try keep(d, w, std.mem.sliceAsBytes(hq.w)), .scales = try keep(d, w, std.mem.sliceAsBytes(hq.s)), .biases = try keep(d, w, std.mem.sliceAsBytes(hq.b)), .n = n, .npad = hq.npad, .k = k, .sk = W.q4SplitK(n, k) };

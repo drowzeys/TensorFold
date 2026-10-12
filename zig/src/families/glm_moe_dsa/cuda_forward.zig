@@ -155,7 +155,8 @@ pub const Buffers = struct {
     head_rows: usize = 0, // min(rows, small)
     fnormed: u64 = 0, // bf16 [head_rows, D]
     lg: u64 = 0, // fp32 [head_rows, vocab_part]
-    hpart: u64 = 0, // fp32 [ROUTER_KS, head_rows, vocab_part] (glue.router's partials)
+    hpart: u64 = 0, // fp32 [ROUTER_KS, head_rows, vocab_part] (glue.router's partials); a quantized head: its launch's result, fp32 [head_rows, blocks * 128]
+    hxh: u64 = 0, // a quantized head (TF_GLM53_HEAD_Q): fp16 [head_rows, D], the launch's rotated input
     amax: u64 = 0, // fp32 [head_rows, 4]: [max logit, global id, 0, 0] a row
     amax_all: u64 = 0, // fp32 [world, head_rows, 4]
     // Phase 2b: device ids, the hidden rows the MTP layer reads and writes, its scratch, the device head
@@ -284,14 +285,15 @@ pub const Buffers = struct {
         b.sy = try b.alloc(rows * D * 4);
         b.part = try b.alloc(rows * D * 4);
         b.gath = try b.alloc(w.world * rows * D * 4);
-        if (w.lm_head != 0) {
+        if (w.hasHead()) {
             const hr = @min(rows, b.small);
             const V = @max(w.vocab_part, if (w.draft) |dh| dh.n else 0);
             b.head_rows = hr;
             b.head_v = V;
             b.fnormed = try b.alloc(hr * D * 2);
             b.lg = try b.alloc(hr * V * 4);
-            b.hpart = try b.alloc(tri.router_ks * hr * V * 4);
+            b.hpart = try b.alloc(hr * 4 * if (w.head_q) |hq| @max(hq.lin.n, V) else tri.router_ks * V);
+            if (w.head_q != null) b.hxh = try b.alloc(hr * D * 2);
             b.amax = try b.alloc(hr * 4 * 4);
             b.amax_all = try b.alloc(w.world * hr * 4 * 4);
             b.argmax = try b.alloc(hr * 8);
@@ -991,15 +993,15 @@ pub const Forward = struct {
         const o = f.ops();
         const t_ = f.t();
         const world = f.w.world;
-        if (f.w.lm_head == 0 or b.lg == 0) return error.NoHead;
+        if (!f.w.hasHead() or b.lg == 0) return error.NoHead;
         if (n > b.head_rows) return error.WindowTooWide;
         try t_.rmsnorm(x, D, norm, b.fnormed, D, n, D, c.eps);
         const V = f.w.vocab_part;
         switch (mode) {
             .none => return,
-            .local => return t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, n, D, V),
+            .local => return headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n),
             .argmax => {
-                try t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, n, D, V);
+                try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, n);
                 try o.argmaxRec(b.lg, V, V, 0, f.w.vocab_off, b.amax, n);
             },
             .draft => {
@@ -1263,12 +1265,12 @@ pub const Forward = struct {
         const D = c.hidden;
         const V = f.w.vocab_part;
         const world = f.w.world;
-        if (f.w.lm_head == 0 or b.lg == 0) return error.NoHead;
+        if (!f.w.hasHead() or b.lg == 0) return error.NoHead;
         if (host.len < V or world > max_world) return error.Invalid;
         const t_ = f.t();
         const o = f.ops();
         try t_.rmsnorm(b.x + (R - 1) * D * 2, D, f.w.final_norm, b.fnormed, D, 1, D, c.eps);
-        try t_.router(b.fnormed, D, f.w.lm_head, b.lg, b.hpart, 1, D, V);
+        try headLogits(f.w, t_, o, b.fnormed, b.lg, b.hpart, b.hxh, 1);
         try o.download(std.mem.sliceAsBytes(host[0..V]), b.lg);
         try f.s.synchronize();
         const i = argmaxFirst(host[0..V]);
@@ -1404,6 +1406,23 @@ pub const Forward = struct {
         try f.lin(b, &L.mlp.down, b.act, R, out, .f32);
     }
 };
+
+/// This rank's logits [n, vocab_part] fp32 at `lg` of n normed bf16 rows `x` (row stride D): glue.router over the bf16
+/// lm_head share, or (TF_GLM53_HEAD_Q, headq.zig) the EXL3 head's launch over the blocks that cover the share - rot_in
+/// and linear_kernel, as every dense EXL3 linear - and the share copied out of its result. `scratch`: the router's
+/// partials, or the launch's result fp32 [n, blocks * 128]; `xh`: fp16 [n, D] (a quantized head alone). Each row is
+/// computed alone on both paths.
+pub fn headLogits(w: *const W.Weights, t_: tri.Tri, o: kern.Ops, x: u64, lg: u64, scratch: u64, xh: u64, n: usize) !void {
+    const D = w.config.hidden;
+    const V = w.vocab_part;
+    if (w.head_q) |*hq| {
+        if (xh == 0) return error.NoHead;
+        const sc: kern.LinearScratch = .{ .xh = .{ xh, 0, 0 }, .z = .{ 0, 0, 0 }, .xh_bytes = n * D * 2, .z_bytes = 0 };
+        try o.linear(&hq.lin, x, .bf16, scratch, .f32, n, sc);
+        return o.copyRows(lg, V * 4, scratch + hq.off * 4, hq.lin.n * 4, V * 4, n);
+    }
+    return t_.router(x, D, w.lm_head, lg, scratch, n, D, V);
+}
 
 /// fused.inv_freq on the host: a diagnostic only. torch's bytes come from libdevice's powf on the GPU, which this
 /// does not reproduce exactly; Kernels.invFreq runs the same powf (glm53_rope.cu) and is what the engine uses.

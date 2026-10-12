@@ -76,12 +76,21 @@
 //! all prompt rows, so it turns --expert-prune-prompt on): --score-rows 0 through the prompt kernels, 1..16 through
 //! the decode kernels.
 //! --score-route FILE (with --score-rows 1..16): every MoE layer's routed weights and picks of every window (RouteTap).
-//! --score-time N: before scoring, N timed launches of the bf16 head and of some EXL3 linears at 1..3 rows (TIME lines).
+//! --score-time N: before scoring, N timed launches of the head (bf16, or the quantized one) and of some EXL3 linears
+//! at 1..3 rows (TIME lines).
+//! --head-q FILE|pack (modes 3b, 4 and score): lm_head as an EXL3 linear, as TF_GLM53_HEAD_Q sets it for the server
+//! (headq.zig); --kvb-q 1: an EXL3 kv_b decoded at load (TF_GLM53_KVB_Q). --score-head-check N (mode score, with
+//! --head-q): before scoring, N fixed rows through the quantized head on the device against its CPU replay (a HEADQ
+//! line; the rank fails when they differ by more than 1e-4 of the largest logit or pick another token).
 //! --score-dump FILE --score-dump-rows 0,5: these rows' 16 largest local logits a position too (score.DumpRec;
 //! tools/glm53/score_dump.py prints them beside the reference's).
 //! --mode score-combine (no GPU): --ref FILE --parts F0,F1,.. (every rank's partials, any order) -> KL(reference ||
 //! served) and top-1 agreement per set and in all, as text and (--out FILE) JSON; prints `SCORE OK|FAIL ...`.
 //! --mode score-info (no GPU): --ref FILE -> what a rows / reference file holds.
+//! --mode head-q-info (no GPU): --head-q FILE|pack --model DIR -> the quantized head's width, every rank's blocks and
+//! the identity the ranks compare; with --rank R --score-head-check N, N fixed rows through R's launch on the CPU
+//! (and, with --head-bf16 FILE holding the unquantized lm_head.weight, against those bf16 rows: random inputs, a
+//! weight-space comparison).
 //! Prints `RESULT glm53-generate OK|FAIL ...`; exit 0 only on OK.
 
 const std = @import("std");
@@ -117,6 +126,8 @@ const usage =
     \\                         [--score-dump FILE --score-dump-rows 0,5]
     \\       tf-glm53-generate --mode score-combine --ref FILE --parts F0,F1,F2,F3 [--out FILE.json]
     \\       tf-glm53-generate --mode score-info --ref FILE
+    \\       tf-glm53-generate --mode head-q-info --head-q FILE|pack --model DIR [--world 4] [--rank R --score-head-check N
+    \\                         [--head-bf16 FILE]]
     \\
 ;
 
@@ -214,6 +225,11 @@ const Args = struct {
     expert_renorm: ?[]const u8 = null,
     expert_prune_prompt: ?[]const u8 = null,
     score_time: usize = 0,
+    // a quantized head / an EXL3 kv_b (families/glm_moe_dsa/headq.zig), the engine-booted modes; unset: off
+    head_q: ?[]const u8 = null,
+    kvb_q: bool = false,
+    score_head_check: usize = 0,
+    head_bf16: []const u8 = "",
 };
 
 fn flag(v: []const u8) !bool {
@@ -417,6 +433,14 @@ pub fn main(init: std.process.Init) !u8 {
             a.expert_prune_prompt = v;
         } else if (std.mem.eql(u8, k, "--score-time")) {
             a.score_time = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, k, "--head-q")) {
+            a.head_q = v;
+        } else if (std.mem.eql(u8, k, "--kvb-q")) {
+            a.kvb_q = try flag(v);
+        } else if (std.mem.eql(u8, k, "--head-bf16")) {
+            a.head_bf16 = v;
+        } else if (std.mem.eql(u8, k, "--score-head-check")) {
+            a.score_head_check = try std.fmt.parseInt(usize, v, 10);
         } else {
             std.debug.print("unknown argument {s}\n{s}", .{ k, usage });
             return 2;
@@ -448,6 +472,13 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         };
         return if (oks) 0 else 1;
+    }
+    if (std.mem.eql(u8, a.mode, "head-q-info")) {
+        const okh = headInfo(init.gpa, init.io, a) catch |e| {
+            std.debug.print("HEADQ FAIL error {t}\n", .{e});
+            return 1;
+        };
+        return if (okh) 0 else 1;
     }
     if (std.mem.eql(u8, a.mode, "score")) {
         if (a.model.len == 0 or a.aot.len == 0 or a.ref.len == 0 or a.out.len == 0 or a.rank >= a.world) {
@@ -1632,6 +1663,8 @@ fn run3b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     }
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s };
     o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
+    o.head_q = glm.headq.Setting.parse(a.head_q);
+    o.kvb_q = a.kvb_q;
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     // Phase 4: the drafters, their settings, copy drafts (on when --copy 1 or a run asks for them)
@@ -1816,6 +1849,8 @@ fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     }
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = a.k, .draft_vocab = a.draft_vocab, .mtp_reuse = a.mtp_reuse, .graphs = a.graphs, .prewarm = a.prewarm, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = a.mtp_dense, .dcp = a.dcp, .timeout_s = a.timeout_s, .parallel = a.parallel };
     o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
+    o.head_q = glm.headq.Setting.parse(a.head_q);
+    o.kvb_q = a.kvb_q;
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     o.multi_set = try glm.multi.Settings.fromEnv();
@@ -1947,6 +1982,8 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     std.debug.print("rank {d} of {d}: scoring {d} rows ({d} positions, {d} sets, the reference keeps {d} tokens a position), prompt chunks of {d} rows (0: the served chunks), head passes of {d} rows\n", .{ a.rank, a.world, ref.head.n_rows, ref.head.n_pos, ref.head.n_sets, ref.head.topk, a.score_rows, a.score_head_rows });
     var o: glm.engine.Options = .{ .rank = a.rank, .world = a.world, .master = a.master, .model = a.model, .aot = a.aot, .nccl_lib = a.nccl_lib, .cublas_lib = a.cublas_lib, .cublas_ws = a.cublas_ws, .cublas_math = a.cublas_math, .context = a.context, .k = 0, .draft_vocab = 0, .mtp_reuse = a.mtp_reuse, .graphs = false, .prewarm = false, .fast_load = a.fast_load orelse true, .roce = a.roce, .hcas = a.hcas, .gid = a.gid, .roce_health = a.roce_health, .spin_limit = a.spin_limit, .tiles = a.tiles, .inv_ref = a.inv_ref, .bmm_probe = a.bmm_probe, .prompt_rows = a.prompt_rows, .prompt_rows_short = a.prompt_rows_short, .prompt_sp = a.prompt_sp, .experts = a.experts, .pe_det = a.pe_det, .unpack_mb = a.unpack_mb, .side = a.side, .l2pf = a.l2pf, .l2pf_mb = a.l2pf_mb, .multi_select = a.multi_select, .device_cands = a.device_cands, .mtp_dense = false, .dcp = 1, .timeout_s = a.timeout_s };
     o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
+    o.head_q = glm.headq.Setting.parse(a.head_q);
+    o.kvb_q = a.kvb_q;
     o.reuse.on = false;
     if (o.prune.on()) o.prune.prompt = true; // every scored row is a prompt row: --expert-topp alone scores the rule
     const boot = try glm.engine.Boot.init(gpa, io, o);
@@ -1966,6 +2003,27 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     defer sc.deinit();
     const t0 = now(io);
     if (a.score_time > 0) try sc.timeHead(a.score_time);
+    if (a.score_head_check > 0) {
+        // the quantized head's launch against its CPU replay, this rank's part read again from where the head came from
+        var file: ?glm.headq.core_st.File = null;
+        defer if (file) |*f| f.close(io);
+        var ck: ?glm.headq.core_ck = null;
+        defer if (ck) |*c| c.close();
+        const src: glm.headq.Source = switch (o.head_q) {
+            .off => return error.NoQuantizedHead,
+            .file => |path| blk: {
+                file = try glm.headq.openFile(gpa, io, path);
+                break :blk .{ .file = &file.? };
+            },
+            .pack => blk: {
+                ck = try glm.headq.core_ck.openModel(gpa, io, a.model);
+                break :blk .{ .ck = &ck.? };
+            },
+        };
+        var host = try glm.headq.Host.load(gpa, src, boot.cfg.vocab, boot.cfg.hidden, a.world, a.rank);
+        defer host.deinit();
+        try sc.checkHead(&host, a.score_head_check);
+    }
     const parts = try sc.run(&ref, scoreProgress);
     defer gpa.free(parts);
     const wall = since(io, t0);
@@ -1980,6 +2038,105 @@ fn runScore(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
         std.debug.print("RESULT glm53-generate FAIL rank {d}: the ranks scored different rows ({t})\n", .{ a.rank, e });
         return false;
     }
+}
+
+/// --mode head-q-info (no GPU): the quantized head --head-q names against --model's config: its width, every rank's
+/// blocks, the identity the ranks compare; with --score-head-check N also N fixed rows through --rank's launch on
+/// the CPU (headq.replay), to see the file decode to finite logits before a cluster window.
+fn headInfo(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
+    const set = glm.headq.Setting.parse(a.head_q);
+    if (!set.on() or a.model.len == 0) return error.Usage;
+    const cfg = try glm.Config.load(gpa, io, a.model);
+    var file: ?glm.headq.core_st.File = null;
+    defer if (file) |*f| f.close(io);
+    var ck: ?glm.headq.core_ck = null;
+    defer if (ck) |*c| c.close();
+    const src: glm.headq.Source = switch (set) {
+        .off => unreachable,
+        .file => |path| blk: {
+            file = try glm.headq.openFile(gpa, io, path);
+            break :blk .{ .file = &file.? };
+        },
+        .pack => blk: {
+            ck = try glm.headq.core_ck.openModel(gpa, io, a.model);
+            break :blk .{ .ck = &ck.? };
+        },
+    };
+    const p = try glm.headq.Parts.of(src, cfg.vocab, cfg.hidden);
+    std.debug.print("quantized head: {d}.{d} bits (mul1), {d} inputs, {d} outputs in {d} blocks, {d} MB of tiles; identity {x}\n", .{ p.k2 / 2, (p.k2 % 2) * 5, cfg.hidden, cfg.vocab, cfg.vocab / 128, p.trellis.bytes.len >> 20, p.identity() | 1 });
+    for (0..a.world) |r| {
+        const c = try glm.headq.Cut.of(cfg.vocab, a.world, r);
+        const plan = glm.exl3.plan(cfg.hidden, c.n());
+        std.debug.print("  rank {d} of {d}: tokens {d}..{d} from blocks {d}..{d} (share starts {d} outputs in), {d} MB on the device, launch {d} x {d} threads, {d} K split(s){s}\n", .{ r, a.world, r * c.part, (r + 1) * c.part, c.b0, c.b0 + c.nb, c.off, cfg.hidden * c.n() * p.k2 / 16 >> 20, c.nb * plan[0], plan[1] * 32, plan[0], if (plan[0] != 1) " - REFUSED at load (no partials scratch)" else "" });
+    }
+    if (a.score_head_check > 0) {
+        var h = try glm.headq.Host.load(gpa, src, cfg.vocab, cfg.hidden, a.world, a.rank);
+        defer h.deinit();
+        const n = a.score_head_check;
+        const x = try gpa.alloc(u16, n * cfg.hidden);
+        defer gpa.free(x);
+        var prng = std.Random.DefaultPrng.init(0x53 + a.rank);
+        for (x) |*v| v.* = glm.weights.bf16Bits(prng.random().floatNorm(f32));
+        const lg = try gpa.alloc(f32, n * h.cut.part);
+        defer gpa.free(lg);
+        try glm.headq.replay(gpa, &h, x, n, lg);
+        // --head-bf16 FILE (a safetensors file holding the unquantized lm_head.weight): the same rows through the bf16
+        // rows of the share, in float64. Random rows, not hidden states: a weight-space comparison, not a KL.
+        if (a.head_bf16.len > 0) {
+            var bf = try glm.headq.core_st.File.open(gpa, io, a.head_bf16);
+            defer bf.close(io);
+            const t = bf.get("lm_head.weight") orelse return error.MissingTensor;
+            if (!t.is(.bf16, &.{ cfg.vocab, cfg.hidden })) return error.UnexpectedTensor;
+            const K = cfg.hidden;
+            const rows = t.bytes[a.rank * h.cut.part * K * 2 ..][0 .. h.cut.part * K * 2];
+            const xf = try gpa.alloc(f64, K);
+            defer gpa.free(xf);
+            for (0..n) |i| {
+                for (xf, x[i * K ..][0..K]) |*d, b| d.* = @as(f32, @bitCast(@as(u32, b) << 16));
+                var err: f64 = 0;
+                var ref_sq: f64 = 0;
+                var dot: f64 = 0;
+                var q_sq: f64 = 0;
+                var best: f64 = -std.math.inf(f64);
+                var best_at: usize = 0;
+                var second: f64 = -std.math.inf(f64);
+                for (0..h.cut.part) |v| {
+                    var d: f64 = 0;
+                    const wrow = rows[v * K * 2 ..][0 .. K * 2];
+                    for (0..K) |kk| d += xf[kk] * @as(f64, @as(f32, @bitCast(@as(u32, std.mem.readInt(u16, wrow[2 * kk ..][0..2], .little)) << 16)));
+                    const q: f64 = lg[i * h.cut.part + v];
+                    err += (q - d) * (q - d);
+                    ref_sq += d * d;
+                    q_sq += q * q;
+                    dot += q * d;
+                    if (d > best) {
+                        second = best;
+                        best = d;
+                        best_at = v;
+                    } else if (d > second) second = d;
+                }
+                const qa = glm.forward.argmaxFirst(lg[i * h.cut.part ..][0..h.cut.part]);
+                std.debug.print("  rank {d} row {d} against the bf16 head: relative error {d:.4} (rms of the difference over rms of the bf16 logits), cosine {d:.5}, first maximum {s} (bf16 token {d}, lead over the runner-up {d:.3})\n", .{ a.rank, i, @sqrt(err / ref_sq), dot / @sqrt(q_sq * ref_sq), if (qa == best_at) "the same" else "MOVED", a.rank * h.cut.part + best_at, best - second });
+            }
+        }
+        for (0..n) |i| {
+            const row = lg[i * h.cut.part ..][0..h.cut.part];
+            var lo: f32 = std.math.inf(f32);
+            var hi: f32 = -std.math.inf(f32);
+            var sq: f64 = 0;
+            var bad: usize = 0;
+            for (row) |v| {
+                if (!std.math.isFinite(v)) bad += 1;
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+                sq += @as(f64, v) * v;
+            }
+            std.debug.print("  rank {d} row {d} (unit-normal input): logits {d:.3} .. {d:.3}, rms {d:.3}, first maximum token {d}, {d} not finite\n", .{ a.rank, i, lo, hi, @sqrt(sq / @as(f64, @floatFromInt(row.len))), a.rank * h.cut.part + glm.forward.argmaxFirst(row), bad });
+            if (bad != 0) return false;
+        }
+    }
+    std.debug.print("HEADQ OK\n", .{});
+    return true;
 }
 
 /// --mode score-combine / score-info (no GPU).

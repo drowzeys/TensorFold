@@ -27,6 +27,8 @@
 //! drafter's KV keyed by the stream slot and one ragged batched block pass) in cuda_multi.zig's rounds.
 //! Scoring (score.zig, cuda_score.zig; tf-glm53-generate --mode score): KL(reference || served) and top-1 agreement
 //! over fixed token rows through the served prompt path, the head on every row. Not reached by the server.
+//! Quantized head (headq.zig, TF_GLM53_HEAD_Q, off by default): lm_head as an EXL3 linear over the blocks covering a
+//! rank's vocabulary share; an EXL3 kv_b decoded to the bf16 blocks at load (TF_GLM53_KVB_Q). Not yet run on a GPU.
 
 pub const Config = @import("config.zig").Config;
 pub const exl3 = @import("exl3.zig");
@@ -57,6 +59,7 @@ pub const copies = @import("copies.zig");
 pub const multi = @import("cuda_multi.zig");
 pub const mdraft = @import("cuda_mdraft.zig");
 pub const prune = @import("prune.zig");
+pub const headq = @import("headq.zig");
 pub const score = @import("score.zig");
 pub const score_cuda = @import("cuda_score.zig");
 
@@ -85,6 +88,7 @@ test {
     _ = multi;
     _ = mdraft;
     _ = prune;
+    _ = headq;
     _ = score;
     _ = score_cuda;
 }

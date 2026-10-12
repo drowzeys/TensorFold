@@ -29,7 +29,8 @@ fn exl3Proj(name: []const u8) ?struct { proj: []const u8, part: []const u8 } {
         return .{ .proj = proj[0 .. proj.len - "_proj".len], .part = part };
     }
     if (std.mem.endsWith(u8, owner, ".self_attn")) {
-        for ([_][]const u8{ "q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj" }) |p| if (std.mem.eql(u8, proj, p)) return .{ .proj = proj, .part = part };
+        // kv_b_proj: bf16 `.weight` in today's packs; as an EXL3 linear it is cut by outputs (its heads' rows), TF_GLM53_KVB_Q
+        for ([_][]const u8{ "q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "kv_b_proj", "o_proj" }) |p| if (std.mem.eql(u8, proj, p)) return .{ .proj = proj, .part = part };
         return null;
     }
     if (std.mem.endsWith(u8, owner, ".self_attn.indexer") and std.mem.eql(u8, proj, "wq_b")) return .{ .proj = proj, .part = part };
@@ -67,7 +68,7 @@ pub fn rule(name: []const u8) !Kind {
 pub fn known(name: []const u8) ?Kind {
     if (exl3Proj(name)) |x| {
         if (std.mem.eql(u8, x.proj, "q_a_proj") or std.mem.eql(u8, x.proj, "kv_a_proj_with_mqa") or std.mem.eql(u8, x.proj, "wq_b")) return .rep;
-        const out_split = std.mem.eql(u8, x.proj, "gate") or std.mem.eql(u8, x.proj, "up") or std.mem.eql(u8, x.proj, "q_b_proj");
+        const out_split = std.mem.eql(u8, x.proj, "gate") or std.mem.eql(u8, x.proj, "up") or std.mem.eql(u8, x.proj, "q_b_proj") or std.mem.eql(u8, x.proj, "kv_b_proj");
         return partRule(x.part, out_split);
     }
     const row = std.mem.endsWith(u8, name, ".self_attn.kv_b_proj.weight") or std.mem.eql(u8, name, "lm_head.weight");
@@ -132,6 +133,10 @@ test "split rules of GLM-5.3's tensors" {
         .{ .n = "model.layers.0.self_attn.o_proj.suh", .k = .row },
         .{ .n = "model.layers.0.self_attn.indexer.wq_b.trellis", .k = .rep },
         .{ .n = "model.layers.0.self_attn.kv_b_proj.weight", .k = .row },
+        .{ .n = "model.layers.0.self_attn.kv_b_proj.trellis", .k = .dim1 },
+        .{ .n = "model.layers.0.self_attn.kv_b_proj.svh", .k = .row },
+        .{ .n = "model.layers.0.self_attn.kv_b_proj.suh", .k = .rep },
+        .{ .n = "model.layers.0.self_attn.kv_b_proj.mul1", .k = .rep },
         .{ .n = "lm_head.weight", .k = .row },
         .{ .n = "model.embed_tokens.weight", .k = .rep },
         .{ .n = "model.layers.0.input_layernorm.weight", .k = .rep },
@@ -159,4 +164,7 @@ test "cuts: rows and second-axis columns" {
     try std.testing.expectEqualSlices(u8, raw[8..16], &out);
     try checkCut("x.trellis", .dim1, &.{ 384, 1024, 80 }, 4);
     try std.testing.expectError(error.CutStraddlesHadamard, checkCut("x.trellis", .dim1, &.{ 384, 40, 80 }, 4));
+    // an EXL3 kv_b of GLM-5.3: 64 heads x (192 + 256) outputs, 512 inputs; a rank's 16 heads are 56 whole blocks
+    try checkCut("model.layers.0.self_attn.kv_b_proj.trellis", .dim1, &.{ 32, 1792, 80 }, 4);
+    try checkCut("model.layers.0.self_attn.kv_b_proj.svh", .row, &.{28672}, 4);
 }

@@ -17,6 +17,9 @@ pub const Kernels = struct {
     linear: [n_k2][3][2]cuda.Function,
     /// Phase 3a: unpack_kernel<K2, 2> by K2 index (x3prefill.matmul's W_q decode)
     unpack: [n_k2]cuda.Function,
+    /// widths the linear fatbin holds: all of exl3.linear_k2s, except that a fatbin built before the 6-bit head
+    /// (K2 12, TF_GLM53_HEAD_Q) may lack that one - the engine then serves everything but a 6-bit head
+    have_k2: [n_k2]bool,
     prompt_mod: cuda.Module, // glm53_prompt.cu: transposed copies, bf16 -> fp32, add_, the Hadamard matrix
     bhx_to_hbx: cuda.Function,
     bf16_f32: cuda.Function,
@@ -92,10 +95,17 @@ pub const Kernels = struct {
         errdefer k.experts_mod.unload();
         k.rot_in = try k.linear_mod.function(exl3.rot_in_symbol);
         var buf: [256]u8 = undefined;
-        for (exl3.linear_k2s, 0..) |k2, i| for ([_]usize{ 2, 4, 8 }, 0..) |wk, j| for ([_]usize{ 1, 2 }, 0..) |g, h| {
-            k.linear[i][j][h] = try k.linear_mod.function(try exl3.linearSymbol(&buf, k2, .mul1, wk, g, exl3.vecOk(k2)));
-        };
-        for (exl3.linear_k2s, 0..) |k2, i| k.unpack[i] = try k.linear_mod.function(try exl3.unpackSymbol(&buf, k2, .mul1));
+        for (exl3.linear_k2s, 0..) |k2, i| {
+            k.have_k2[i] = true;
+            k.unpack[i] = k.linear_mod.function(try exl3.unpackSymbol(&buf, k2, .mul1)) catch |e| {
+                if (k2 != 12) return e;
+                k.have_k2[i] = false;
+                continue;
+            };
+            for ([_]usize{ 2, 4, 8 }, 0..) |wk, j| for ([_]usize{ 1, 2 }, 0..) |g, h| {
+                k.linear[i][j][h] = try k.linear_mod.function(try exl3.linearSymbol(&buf, k2, .mul1, wk, g, exl3.vecOk(k2)));
+            };
+        }
         k.group = try k.experts_mod.function(exl3.group_symbol);
         k.expert_rot_in = try k.experts_mod.function(exl3.expert_rot_in_symbol);
         k.gateup_epilogue = try k.experts_mod.function(exl3.gateup_epilogue_symbol);
@@ -199,8 +209,15 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.inv_freq, .{ .grid = .{ .x = u((half + 127) / 128) }, .block = .{ .x = 128 } }, s, &a);
     }
 
+    /// Whether the loaded fatbin has linear_kernel / unpack_kernel for `k2` half-bits.
+    pub fn haveWidth(k: *const Kernels, k2: usize) bool {
+        const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, k2) orelse return false;
+        return k.have_k2[i];
+    }
+
     fn linearFn(k: *const Kernels, k2: usize, wk: usize, g: usize) !cuda.Function {
         const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, k2) orelse return error.UnsupportedExl3Width;
+        if (!k.have_k2[i]) return error.UnsupportedExl3Width;
         const j: usize = switch (wk) {
             2 => 0,
             4 => 1,
@@ -792,6 +809,7 @@ pub const Ops = struct {
     /// Exl3Linear.unpack (ext.unpack): W_q [K, N] fp16 decoded from the strips words, one warp a 16 x 16 tile.
     pub fn unpack(o: Ops, l: *const exl3.Linear, w: u64) !void {
         const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, l.k2) orelse return error.UnsupportedExl3Width;
+        if (!o.k.have_k2[i]) return error.UnsupportedExl3Width;
         if (l.cb != .mul1) return error.UnsupportedExl3Codebook;
         const st = l.strides();
         var a: cuda.Args = .{};
@@ -807,6 +825,7 @@ pub const Ops = struct {
     /// mul1): W_q [K, N] fp16 at `w` (the rotated domain, as Exl3Linear.unpack).
     pub fn unpackRaw(o: Ops, words: u64, k2: usize, K: usize, N: usize, w: u64) !void {
         const i = std.mem.indexOfScalar(usize, &exl3.linear_k2s, k2) orelse return error.UnsupportedExl3Width;
+        if (!o.k.have_k2[i]) return error.UnsupportedExl3Width;
         if (N % 128 != 0 or K % 16 != 0) return error.BadSplit;
         const tw: i64 = @intCast(4 * k2);
         var a: cuda.Args = .{};
