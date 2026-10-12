@@ -87,7 +87,7 @@ pub fn exchange(small: bool, G: usize, rank: usize, R: usize, H: usize, lw: usiz
 pub const streams_tokens: usize = 1 << 20;
 /// GiB that must stay free on a rank after the slots' caches (TF_GLM53_DCP_STREAMS_RESERVE_GB): what the runner's
 /// buffers, the drafters' rings, the decode graphs and the host still take after the check, with room to spare.
-pub const streams_reserve_gb: f64 = 8.0;
+pub const streams_reserve_gb: f64 = 20.0; // measured 2026-10-12 at 250K x 2: 14 to 21 GiB go after this check (graphs, windows, drafter); 8 let 250K x 4 start and the memory guard stopped it
 
 pub fn streamsTokensOk(context: usize, streams: usize) bool {
     return streams >= 1 and context <= streams_tokens / streams;

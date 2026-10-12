@@ -686,10 +686,10 @@ pub const Multi = struct {
         mu.lay = Layout.make(rows, n, k, w.world);
         const cols = tri.bucket(r.capacity, r.topk) orelse 1;
         const shared = r.f.shared_experts;
-        mu.vb = try fw.Buffers.initWith(gpa, r.d, w, rows, cols, .{ .decode = true, .shared_experts = shared, .taps = r.f.taps.n });
+        mu.vb = try fw.Buffers.initWith(gpa, r.d, w, rows, cols, .{ .decode = true, .shared_experts = shared, .dcp = r.set.dcp, .taps = r.f.taps.n });
         errdefer mu.vb.deinit();
         mu.mb = null;
-        if (k > 0) mu.mb = try fw.Buffers.initWith(gpa, r.d, w, @max(mu.MR, rows), cols, .{ .decode = true, .mtp = true, .shared_experts = shared });
+        if (k > 0) mu.mb = try fw.Buffers.initWith(gpa, r.d, w, @max(mu.MR, rows), cols, .{ .decode = true, .mtp = true, .shared_experts = shared, .dcp = r.set.dcp });
         errdefer if (mu.mb) |*b| b.deinit();
         mu.bh = try zeroed(r.d, @max(mu.MR, 1) * mu.D * 2);
         errdefer mu.bh.free();
