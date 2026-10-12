@@ -58,6 +58,9 @@ MODULES = {
     "_block_attn_kernel": "tensorfold.families.glm_moe_dsa.cuda.dspark",
 }
 FUSED = "tensorfold.families.glm_moe_dsa.cuda.fused"
+# a function no reference run ever launched takes its floats' fp64 values and unnamed constexprs from the captured
+# variants of the function it was derived from (patch_fused_dcp_rows.py: _attn_dcp_rows is _attn_dcp per row)
+TEMPLATE_OF = {"_attn_dcp_rows": "_attn_dcp"}
 DTYPES = {"*bf16": "bfloat16", "*fp16": "float16", "*fp32": "float32", "*i32": "int32", "*i64": "int64",
           "*u8": "uint8", "*i8": "int8", "*u32": "uint32", "*i16": "int16"}
 
@@ -181,7 +184,7 @@ def main() -> int:
         name = n["fn"]
         mod_name = where.get(name) or MODULES.get(name) or FUSED
         fn = getattr(importlib.import_module(mod_name), name)
-        cands = by_name.get(name, [])
+        cands = by_name.get(name) or by_name.get(TEMPLATE_OF.get(name, ""), [])
         tmpl = best_template(cands, n) if cands else None
         if tmpl is None:
             fallback.add(name)

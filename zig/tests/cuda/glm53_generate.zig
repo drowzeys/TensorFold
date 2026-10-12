@@ -39,7 +39,9 @@
 //! (--single 1) each one through the one-stream path (Runner.run in slot 0, copy drafts off). Greedy or keyed
 //! sampled; every stream's tokens must equal its alone run's and its one-stream run's. Prints aggregate and per-stream
 //! tok/s and TTFT; `RESULT glm53-generate OK|FAIL` (FAIL: some stream differs). list-variants --parallel N adds the
-//! concurrent windows' launches (ROWS kernels, N x (k + 1) rows).
+//! concurrent windows' launches (ROWS kernels, N x (k + 1) rows). With TF_GLM53_DCP_STREAMS=1 and --dcp 4 (or a
+//! context past the auto point) the streams run with the cache split over the ranks (the *RowsDcp kernels): the same
+//! three runs must agree, and list-variants --dcp 4 --parallel N names the launches a pack needs for it.
 //! Phase 4c: --mode 4b with --dspark DIR / --dflash DIR (and their settings as --mode 4) and --draft-mode
 //! dflash|dspark|mtp (default: TF_GLM53_MTP's rule - a drafter alone with --mtp-drafts 0, else the MTP head): every
 //! stream drafts with that drafter (cuda_mdraft.zig) - concurrently, alone through the concurrent decoder, and through
@@ -1851,6 +1853,9 @@ fn run4b(gpa: std.mem.Allocator, io: std.Io, a: Args) !bool {
     o.prune = try glm.prune.Rule.parse(a.expert_topp, a.expert_min_k, a.expert_renorm, a.expert_prune_prompt);
     o.head_q = glm.headq.Setting.parse(a.head_q);
     o.kvb_q = a.kvb_q;
+    // several streams with the cache split over the ranks (--dcp 4, or a context past the auto point): the served
+    // engine's own opt-in, TF_GLM53_DCP_STREAMS=1 (docs/glm53-dcp-streams.md)
+    if (std.c.getenv("TF_GLM53_DCP_STREAMS")) |v| o.dcp_streams = std.mem.eql(u8, std.mem.span(v), "1");
     o.reuse = try glm.reuse.Settings.fromEnv();
     o.reuse.on = a.reuse;
     o.multi_set = try glm.multi.Settings.fromEnv();

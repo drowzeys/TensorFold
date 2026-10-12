@@ -14,7 +14,8 @@
 //!   * DCP 1 and DCP = world with every rank's RANK constexpr;
 //!   * Phase 4b (`rows_windows` > 0, --parallel N): the concurrent decode windows of 1 .. N x (k + 1) rows with per-row
 //!     positions and cache bases (fused.Rows: _kv_write / _ik_write / _iq_rope / _absorb / _attn_chunks /
-//!     _index_scores with ROWS and a BASE table), their selections over the decode key buckets;
+//!     _index_scores with ROWS and a BASE table), their selections over the decode key buckets; with DCP = world in
+//!     `dcps` too (several streams with the caches sharded): those launches with DCP / RANK and _attn_dcp_rows;
 //!   * Phase 4c (`streams` > 1 with drafters): the concurrent drafters' passes (cuda_mdraft.enumerate: context updates
 //!     of every row bucket, block passes of 1 .. N blocks - DFlash2's _dconv_seg / _dattn_seg, DSpark's per-block
 //!     _prep_kernel / _block_attn_kernel and the row-wise launches over every block).
@@ -153,16 +154,31 @@ fn window(t: tri.Tri, sp: Space, R: usize) !void {
 fn rowsWindow(t: tri.Tri, sp: Space, R: usize) !void {
     const c = sp.cfg;
     const m = mla(sp);
-    try t.kvWriteRows(A, sp.kva_n, A, A, A, A, A, c.eps, R, m);
-    try t.ikWriteRows(A, A, A, A, A, A, A, R, c.index_dim, c.rope);
     try t.iqRopeRows(A, A, A, R, c.index_heads, c.index_dim, c.rope);
     try t.absorbRows(A, A, A, A, A, A, R, m);
-    try t.attentionRows(A, A, A, A, A, A, A, A, A, A, A, R, m, tri.attn_decode);
     // decode key buckets: powers of two from 2 index_topk up to the capacity's (one class: multiples of 16)
     const K = c.index_topk;
     const top = std.math.ceilPowerOfTwo(usize, @max(sp.capacity, 2 * K)) catch return error.Overflow;
-    var T: usize = 2 * K;
-    while (T <= top) : (T *= 2) try t.indexScoresRows(A, A, A, A, A, A, T, 0, R, c.index_heads, c.index_dim);
+    for (sp.dcps) |dcp| {
+        if (dcp <= 1) {
+            try t.kvWriteRows(A, sp.kva_n, A, A, A, A, A, c.eps, R, m);
+            try t.ikWriteRows(A, A, A, A, A, A, A, R, c.index_dim, c.rope);
+            try t.attentionRows(A, A, A, A, A, A, A, A, A, A, A, R, m, tri.attn_decode);
+            var T: usize = 2 * K;
+            while (T <= top) : (T *= 2) try t.indexScoresRows(A, A, A, A, A, A, T, 0, R, c.index_heads, c.index_dim);
+            continue;
+        }
+        // several streams with the caches sharded (TF_GLM53_DCP_STREAMS): the ROWS launches with DCP / RANK and
+        // _attn_dcp_rows; _merge_lse, _dcp_combine and the candidates' top keys are a one-stream window's (`window`,
+        // `selects`: nothing in them knows a position)
+        for (0..dcp) |rank| {
+            try t.kvWriteRowsDcp(A, sp.kva_n, A, A, A, A, A, c.eps, R, m, dcp, rank);
+            try t.ikWriteRowsDcp(A, A, A, A, A, A, A, R, c.index_dim, c.rope, dcp, rank);
+            try t.attnDcpRows(A, A, A, A, A, A, A, A, A, R, m, dcp, rank, tri.attn_decode);
+            var T: usize = 2 * K;
+            while (T <= top) : (T *= 2) try t.indexScoresRowsDcp(A, A, A, A, A, A, dcpm.localCols(T, dcp), 0, R, c.index_heads, c.index_dim, dcp, rank);
+        }
+    }
 }
 
 /// Index ranges reaching every class of T and of ceil(T / dcp) for dcp in sp.dcps: decode buckets (powers of two
@@ -277,6 +293,24 @@ test "every Triton function cuda_triton.zig launches is reached, a 41-row window
     sp4.rows_windows = 32;
     sp4.streams = 4;
     try enumerate(&p, sp4);
+    // several streams with the cache split over the ranks: the ROWS launches with DCP / RANK, _attn_dcp_rows
+    var sp4d = sp4;
+    sp4d.dcps = &.{4};
+    sp4d.capacity = 250_003;
+    try enumerate(&p, sp4d);
+    var rows_dcp: usize = 0;
+    for (p.needs.values()) |n| {
+        if (std.mem.eql(u8, n.function, "_attn_dcp_rows")) rows_dcp += 1;
+        if (!std.mem.eql(u8, n.function, "_kv_write")) continue;
+        var rows = false;
+        var dcp4 = false;
+        for (n.consts) |k| {
+            if (std.mem.eql(u8, k.name, "ROWS") and (k.int orelse 0) == 1) rows = true;
+            if (std.mem.eql(u8, k.name, "DCP") and (k.int orelse 0) == 4) dcp4 = true;
+        }
+        if (rows and dcp4) rows_dcp += 1;
+    }
+    try std.testing.expect(rows_dcp >= 8); // a variant a rank of each, at least
     // the function names in cuda_triton.zig's launches: t.run("_name", ...)
     const src = @embedFile("cuda_triton.zig");
     var seen: usize = 0;
