@@ -339,3 +339,16 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
 // The instantiations Nemotron's windows launch on sm_121 (tile 2: rows <= 16, bf16 out).
 template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, false, false, false, false>(
     const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+// GLM-5.3's 4-bit draft head (headq q4: glm5_next qmm.matmul, f32=True; one row, tile 2 on GB10).
+template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, true, false, false, false>(
+    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+// Phase 4: the drafters' 4-bit matmuls (DSpark / DFlash2 weights, the full-share draft head: glm5_next qmm.matmul ->
+// shared qmm.matmul, qmm_group with group_tile 0 on GB10: tile 2 up to 16 rows, 3 up to 32, 4 up to 64), both outputs.
+template __global__ void tf_qmm_group::group_kernel<64, 32, 64, 1, 4, 4, false, false, false, false>(
+    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 32, 64, 1, 4, 4, true, false, false, false>(
+    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 64, 64, 1, 4, 4, false, false, false, false>(
+    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 64, 64, 1, 4, 4, true, false, false, false>(
+    const __nv_bfloat16*, const float*, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);

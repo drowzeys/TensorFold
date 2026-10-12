@@ -1,0 +1,68 @@
+#!/bin/bash
+# Full GLM-5.3 at TP4 with the Zig engine (tensorfold-native), one rank a container, started the way the Python
+# server of this image is:
+#   /opt/tensorfold-zig/serve MODEL --tp 4 --rank R --master HOST [--master-port P] --port 8890 --host 0.0.0.0 \
+#       --name glm-5.3-tf --context N --parallel N [--mtp-drafts K] [tensorfold-native serve flags ...]
+# The rank flags become the engine's TF_GLM53_* settings; everything else goes to `tensorfold-native serve`.
+# What the engine needs beside the checkpoint is in this directory: bin/ (tensorfold-native, tf-glm53-generate),
+# aot/ (the Triton kernel pack: aot.json + cubins), ref/ (the prompt GEMM's tile tables a rank, torch's inv_freq
+# bytes, the cuBLAS bmm probe - recorded from the Python engine the Zig engine is gated against, token for token).
+# Settings read from the environment, as the Python server's: TF_GLM53_DSPARK / TF_GLM53_DFLASH (+ _POLICY,
+# _CONFIDENCE, _DEPTH), TF_GLM53_PROMPT_REUSE, TF_GLM53_COPY_DRAFTS, TF_GLM53_ROCE_HCA / TF_GLM53_ROCE_GIDS (the
+# recipe's rail detection), TF_GLM53_STALL_S (the stall limit: 900 s up to 166K of context; 0 off).
+#   TF_GLM53_ZIG_TILES=0     the engine's own tile plan instead of ref/tiles-rR.json
+#   TF_GLM53_ZIG_COVER=0     skip rank 0's check that aot/ holds every kernel variant this context / --parallel /
+#                            drafter can launch (a missing one would fail a request later, not the start)
+set -eu
+Z=$(cd "$(dirname "$0")" && pwd)
+[ $# -ge 1 ] || { sed -n 2,7p "$0"; exit 2; }
+MODEL=$1; shift
+rank=${TF_GLM53_RANK:-0}; world=${TF_GLM53_WORLD:-4}; master=127.0.0.1; mport=29681; ctx=32768; par=${TF_GLM53_PARALLEL:-1}
+k=${TF_GLM53_K:-2}
+pass=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tp) world=$2; shift 2 ;;
+    --rank) rank=$2; shift 2 ;;
+    --master) master=$2; shift 2 ;;
+    --master-port) mport=$2; shift 2 ;;
+    --mtp-drafts) k=$2; shift 2 ;;
+    --no-drafts) k=0; pass+=("$1"); shift ;;
+    --context) ctx=$2; pass+=("$1" "$2"); shift 2 ;;
+    --parallel) par=$2; pass+=("$1" "$2"); shift 2 ;;
+    *) pass+=("$1"); shift ;;
+  esac
+done
+case "$master" in *:*) ;; *) master=$master:$mport ;; esac
+py=/usr/local/lib/python3.12/dist-packages/nvidia
+lib() { local f; for f in "$@"; do [ -e "$f" ] && { echo "$f"; return; }; done; echo "${@: -1}"; }
+export TF_GLM53_RANK=$rank TF_GLM53_WORLD=$world TF_GLM53_MASTER=$master TF_GLM53_K=$k
+export TF_GLM53_AOT=${TF_GLM53_AOT:-$Z/aot} TENSORFOLD_CUDA_KERNELS=${TF_GLM53_AOT:-$Z/aot}
+export TF_GLM53_NCCL_LIB=${TF_GLM53_NCCL_LIB:-$(lib $py/nccl/lib/libnccl.so.2 libnccl.so.2)}
+export TF_GLM53_CUBLAS_LIB=${TF_GLM53_CUBLAS_LIB:-$(lib $py/cu13/lib/libcublas.so.13 libcublas.so.13)}
+if [ "${TF_GLM53_ZIG_TILES:-1}" != 0 ] && [ -z "${TF_GLM53_TILES:-}" ] && [ -f "$Z/ref/tiles-r$rank.json" ] && [ "$world" = 4 ]; then
+  export TF_GLM53_TILES=$Z/ref/tiles-r$rank.json
+fi
+[ -n "${TF_GLM53_INV_REF:-}" ] || { [ -f "$Z/ref/inv_freq.bin" ] && export TF_GLM53_INV_REF=$Z/ref/inv_freq.bin; }
+[ -n "${TF_GLM53_BMM_PROBE:-}" ] || { [ -f "$Z/ref/bmm_probe.json" ] && export TF_GLM53_BMM_PROBE=$Z/ref/bmm_probe.json; }
+# rails: the recipe passes every rail's device and GID index; the RoCE one-shot takes one GID index, so with
+# differing indices it runs on the first rail alone (as the gates did)
+if [ -z "${TF_GLM53_HCAS:-}" ] && [ -n "${TF_GLM53_ROCE_HCA:-}" ]; then
+  gids=${TF_GLM53_ROCE_GIDS:-3}
+  if [ "$(tr ',' '\n' <<<"$gids" | sort -u | wc -l)" = 1 ]; then export TF_GLM53_HCAS=$TF_GLM53_ROCE_HCA TF_GLM53_GID=${gids%%,*}
+  else export TF_GLM53_HCAS=${TF_GLM53_ROCE_HCA%%,*} TF_GLM53_GID=${gids%%,*}; fi
+fi
+if [ "$rank" = 0 ] && [ "${TF_GLM53_ZIG_COVER:-1}" != 0 ] && [ "$world" = 4 ] && [ -f "$Z/ref/tiles-r3.json" ]; then
+  d=""; [ -n "${TF_GLM53_DSPARK:-}" ] && d="$d --dspark $TF_GLM53_DSPARK"; [ -n "${TF_GLM53_DFLASH:-}" ] && d="$d --dflash $TF_GLM53_DFLASH"
+  p=""; [ "$par" -gt 1 ] && p="--parallel $par"
+  dcp=1; [ "$ctx" -gt 200000 ] && dcp=0
+  if ! "$Z/bin/tf-glm53-generate" --mode list-variants --model "$MODEL" --world 4 --context "$ctx" --prompt-rows 8192 \
+       --window 128 --k "$k" --dcp $dcp $p $d --aot "$TF_GLM53_AOT" --out /tmp/zig-cover.json \
+       --tiles "$Z/ref/tiles-r0.json,$Z/ref/tiles-r1.json,$Z/ref/tiles-r2.json,$Z/ref/tiles-r3.json" > /tmp/zig-cover.log 2>&1; then
+    grep -E '^(VARIANTS|variants|  missing)|error' /tmp/zig-cover.log | head -12 >&2
+    echo "serve: the kernel pack $TF_GLM53_AOT does not cover --context $ctx --parallel $par with these drafters (TF_GLM53_ZIG_COVER=0 starts anyway)" >&2
+    exit 5
+  fi
+  grep -E '^VARIANTS' /tmp/zig-cover.log >&2 || true
+fi
+exec "$Z/bin/tensorfold-native" serve "$MODEL" --no-update-check "${pass[@]}"

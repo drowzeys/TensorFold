@@ -1,0 +1,293 @@
+// GLM-5.3's RoCE one-shot all-reduce and all-gather for decode windows: b12x RoCEnante's two CuTe DSL kernels
+// (b12x/comm/roce/_oneshot_cute.py and _allgather_cute.py, Apache-2.0, the b12x contributors) rewritten in plain CUDA
+// with the same protocol, the same PTX for every access to the pinned region and the same rank-order fp32 sum, so a
+// reduction stores exactly the bits of the NCCL all-gather + rank-order sum on every rank.
+//
+// One launch is one collective:
+//   1. stage: the local input -> send[seq & 1] in pinned host memory (the NIC reads it there);
+//   2. doorbell: the last block to finish staging writes nbytes (ctrl + 4, and the per-slot word ctrl + 16 + 4 slot,
+//      which the proxy reads when it catches up on two doorbells) and then seq (ctrl + 0), system scope;
+//   3. wait: one thread a (peer, HCA) spins on flag[peer][slot][hca] == seq (ld.acquire.sys); a wait past spin_limit
+//      polls records peer (ctrl + 12), HCA (ctrl + 24), seq (ctrl + 8) and poisons the runtime (device word);
+//   4. data: mode 0 sums the local input and every peer slot in rank order (fp32, rank 0's value first, one add a
+//      source: torch's ref = parts[0]; ref += parts[r]); mode 1 copies shard s to column block s of every output row;
+//   5. epoch: the last block to finish advances the device-resident epoch, so seq is a runtime value and a CUDA graph
+//      replays correctly. A failed sequence keeps the epoch: every later launch does nothing until the host raises.
+// Staging and tail arrivals have separate counters for each power-of-two grid size (counters[1 + c], counters[1 +
+// classes + c]); the poison word follows them. Compiled without fast math: the adds are add.rn.f32, no FTZ.
+//
+// Why plain CUDA and not the CuTe cubins: the CuTe DSL needs the Python compiler at run time (or a cubin export per
+// rank, dtype, world and HCA count - b12x specializes on all four), while these two kernels are ~150 lines whose
+// every memory access is inline PTX anyway; written here they build with the rest of the fatbins, take world / rank /
+// HCA count as launch arguments, and their SASS can be read next to the rest of the engine's.
+#include <cstdint>
+
+namespace {
+
+constexpr int kSlots = 2;          // _roce_proxy.c ROCE_SLOTS
+constexpr int kFlagStride = 128;   // ROCE_FLAG_STRIDE
+constexpr int kPack = 16;          // bytes a pack
+
+__device__ __forceinline__ unsigned ld_relaxed_gpu(unsigned long long a) {
+    unsigned v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(a) : "memory");
+    return v;
+}
+__device__ __forceinline__ unsigned ld_relaxed_sys(unsigned long long a) {
+    unsigned v;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(a) : "memory");
+    return v;
+}
+__device__ __forceinline__ unsigned atom_add_relaxed_gpu(unsigned long long a, unsigned x) {
+    unsigned v;
+    asm volatile("atom.relaxed.gpu.global.add.u32 %0, [%1], %2;" : "=r"(v) : "l"(a), "r"(x) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_gpu(unsigned long long a, unsigned x) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(a), "r"(x) : "memory");
+}
+__device__ __forceinline__ void st_relaxed_sys(unsigned long long a, unsigned x) {
+    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::"l"(a), "r"(x) : "memory");
+}
+__device__ __forceinline__ void fence_sc_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
+__device__ __forceinline__ void fence_sc_gpu() { asm volatile("fence.sc.gpu;" ::: "memory"); }
+
+// 0 once the word equals `expected`, 1 after `limit` polls without it (b12x spin_until_eq_acquire_sys)
+__device__ __forceinline__ unsigned spin_until_eq(unsigned long long a, unsigned expected, unsigned limit) {
+    unsigned polls = 0;
+    while (true) {
+        unsigned seen;
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(a) : "memory");
+        if (seen == expected) return 0;
+        if (++polls >= limit) return 1;
+    }
+}
+
+__device__ __forceinline__ uint4 ld_v4(unsigned long long a) {
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(a)
+                 : "memory");
+    return v;
+}
+__device__ __forceinline__ uint4 ld_relaxed_sys_v4(unsigned long long a) {
+    uint4 v;
+    asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(a)
+                 : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_v4(unsigned long long a, uint4 v) {
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(a), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+}
+
+// 8 fp32 at a (two 16-byte packs) -> 8 bf16, round to nearest even (NaN kept quiet), lower address in the low half
+__device__ __forceinline__ unsigned bf16_bits(float f) {
+    const unsigned u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ uint4 pack_bf16(unsigned long long a) {
+    const uint4 x = ld_v4(a), y = ld_v4(a + kPack);
+    return make_uint4(bf16_bits(__uint_as_float(x.x)) | (bf16_bits(__uint_as_float(x.y)) << 16),
+                      bf16_bits(__uint_as_float(x.z)) | (bf16_bits(__uint_as_float(x.w)) << 16),
+                      bf16_bits(__uint_as_float(y.x)) | (bf16_bits(__uint_as_float(y.y)) << 16),
+                      bf16_bits(__uint_as_float(y.z)) | (bf16_bits(__uint_as_float(y.w)) << 16));
+}
+
+// The exchange trace (TF_GLM53_ROCE_TRACE): the GPU's nanosecond timer and one 64-bit store into this exchange's
+// entry (16 words at trace + (seq & mask) * 128: seq | nbytes << 32, start, doorbell, end, then the time each
+// (peer, HCA) flag was seen - the first 8 - and the mode). Only block 0 stamps; trace == 0 stamps nothing.
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void trace_put(unsigned long long trace, unsigned mask, unsigned seq, int word,
+                                          unsigned long long v) {
+    *reinterpret_cast<unsigned long long*>(trace + ((unsigned long long)(seq & mask) * 16 + word) * 8) = v;
+}
+
+}  // namespace
+
+// mode 2 (glm53-comm-probe, TF_GLM53_ROCE_BF16): as mode 0 with fp32 in / out but bf16 on the wire - size_packs and
+// nbytes count the wire's bf16 packs (8 values each), every rank's partial rounded to bf16 before the rank-order sum.
+// mode 0: out [packs] fp32 = rank-order sum of every rank's in [packs]; mode 1: all-gather, shard s -> column block s
+// of each of the shard's rows (row_packs packs a row; dim-0 concat: row_packs = size_packs). Grid: a power of two
+// <= 8 blocks of `threads` threads (threads >= world * hcas: one thread a stripe flag).
+extern "C" __global__ void __launch_bounds__(512) glm53_roce_oneshot(
+    unsigned long long in, unsigned long long out, int size_packs, int nbytes, int row_packs, int mode,
+    unsigned long long recv_base, unsigned long long flag_base, unsigned long long send_base,
+    unsigned long long ctrl_base, unsigned long long slot_bytes, unsigned long long epoch_ptr,
+    unsigned long long stage_ctr, unsigned long long tail_ctr, unsigned long long poison_ptr, unsigned spin_limit,
+    int world, int rank, int hcas, unsigned long long trace, unsigned trace_mask) {
+    const int tid = threadIdx.x;
+    const unsigned gdim = gridDim.x;
+    // every block reads the epoch before any can advance it (the advance waits for all blocks at the tail)
+    const unsigned epoch = ld_relaxed_gpu(epoch_ptr);
+    const unsigned seq = epoch + 1u;
+    const unsigned long long slot = seq & 1u;
+    const unsigned long long send_slot = send_base + slot * slot_bytes;
+    const int index = (int)blockIdx.x * (int)blockDim.x + tid;
+    const int stride = (int)gdim * (int)blockDim.x;
+
+    if (ld_relaxed_gpu(poison_ptr) != 0u) return;   // a recorded timeout: later launches do nothing
+    const bool tracing = trace != 0ull && blockIdx.x == 0;
+    if (tracing && tid == 0) {
+        trace_put(trace, trace_mask, seq, 1, global_ns());
+        trace_put(trace, trace_mask, seq, 0, (unsigned long long)seq | ((unsigned long long)(unsigned)nbytes << 32));
+        trace_put(trace, trace_mask, seq, 12, (unsigned long long)mode);
+    }
+
+    // 1. stage the local input into the pinned send slot (mode 2: fp32 in -> bf16 on the wire, 8 values a pack)
+    if (mode == 2) {
+        for (int i = index; i < size_packs; i += stride)
+            st_v4(send_slot + (unsigned long long)i * kPack, pack_bf16(in + (unsigned long long)i * 2 * kPack));
+    } else {
+        for (int i = index; i < size_packs; i += stride)
+            st_v4(send_slot + (unsigned long long)i * kPack, ld_v4(in + (unsigned long long)i * kPack));
+    }
+    __syncthreads();
+
+    // 2. the last block to finish staging rings the proxy's doorbell
+    if (tid == 0) {
+        fence_sc_sys();
+        const unsigned prior = atom_add_relaxed_gpu(stage_ctr, 1u);
+        if ((prior + 1u) % gdim == 0u) {
+            st_relaxed_sys(ctrl_base + 4, (unsigned)nbytes);
+            st_relaxed_sys(ctrl_base + 16 + slot * 4, (unsigned)nbytes);
+            fence_sc_sys();
+            st_relaxed_sys(ctrl_base, seq);
+            if (trace != 0ull) trace_put(trace, trace_mask, seq, 2, global_ns());
+        }
+    }
+
+    // 3. wait for every peer's payload-stripe flags (one thread a peer and HCA)
+    if (tid < world * hcas) {
+        const int peer = tid / hcas;
+        const int hca = tid - peer * hcas;
+        if (peer != rank) {
+            const unsigned long long flag =
+                flag_base + (((unsigned long long)peer * kSlots + slot) * (unsigned long long)hcas + (unsigned long long)hca) *
+                                kFlagStride;
+            if (spin_until_eq(flag, seq, spin_limit) != 0u) {
+                st_relaxed_sys(ctrl_base + 12, (unsigned)peer);
+                st_relaxed_sys(ctrl_base + 24, (unsigned)hca);
+                st_relaxed_sys(ctrl_base + 8, seq);
+                st_release_gpu(poison_ptr, seq);
+            }
+            if (tracing && tid < 8) trace_put(trace, trace_mask, seq, 4 + tid, global_ns());
+        }
+    }
+    __syncthreads();
+
+    // 4. data, unless a wait of this block timed out (a peer slot is then unreliable)
+    if (ld_relaxed_gpu(poison_ptr) == 0u) {
+        if (mode == 2) {
+            // every rank sums the same bf16-rounded partials (its own re-rounded from `in`) in rank order in fp32
+            for (int i = index; i < size_packs; i += stride) {
+                const unsigned long long off = (unsigned long long)i * kPack;
+                float acc[8];
+                for (int s = 0; s < world; ++s) {
+                    const uint4 w = s == rank ? pack_bf16(in + off * 2)
+                                              : ld_relaxed_sys_v4(recv_base + ((unsigned long long)s * kSlots + slot) *
+                                                                                  slot_bytes + off);
+                    const unsigned u[4] = {w.x, w.y, w.z, w.w};
+                    for (int q = 0; q < 4; ++q) {
+                        const float lo = __uint_as_float(u[q] << 16), hi = __uint_as_float(u[q] & 0xffff0000u);
+                        if (s == 0) {
+                            acc[2 * q] = lo;
+                            acc[2 * q + 1] = hi;
+                        } else {
+                            acc[2 * q] = __fadd_rn(acc[2 * q], lo);
+                            acc[2 * q + 1] = __fadd_rn(acc[2 * q + 1], hi);
+                        }
+                    }
+                }
+                st_v4(out + off * 2, make_uint4(__float_as_uint(acc[0]), __float_as_uint(acc[1]), __float_as_uint(acc[2]),
+                                                __float_as_uint(acc[3])));
+                st_v4(out + off * 2 + kPack, make_uint4(__float_as_uint(acc[4]), __float_as_uint(acc[5]),
+                                                        __float_as_uint(acc[6]), __float_as_uint(acc[7])));
+            }
+        } else if (mode == 0) {
+            for (int i = index; i < size_packs; i += stride) {
+                const unsigned long long off = (unsigned long long)i * kPack;
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                for (int s = 0; s < world; ++s) {
+                    const uint4 w = s == rank ? ld_v4(in + off)
+                                              : ld_relaxed_sys_v4(recv_base + ((unsigned long long)s * kSlots + slot) *
+                                                                                  slot_bytes + off);
+                    if (s == 0) {
+                        a0 = __uint_as_float(w.x);
+                        a1 = __uint_as_float(w.y);
+                        a2 = __uint_as_float(w.z);
+                        a3 = __uint_as_float(w.w);
+                    } else {
+                        a0 = __fadd_rn(a0, __uint_as_float(w.x));
+                        a1 = __fadd_rn(a1, __uint_as_float(w.y));
+                        a2 = __fadd_rn(a2, __uint_as_float(w.z));
+                        a3 = __fadd_rn(a3, __uint_as_float(w.w));
+                    }
+                }
+                st_v4(out + off, make_uint4(__float_as_uint(a0), __float_as_uint(a1), __float_as_uint(a2),
+                                            __float_as_uint(a3)));
+            }
+        } else {
+            const int out_row = world * row_packs;
+            for (int s = 0; s < world; ++s) {
+                for (int i = index; i < size_packs; i += stride) {
+                    const int row = i / row_packs;
+                    const int col = i - row * row_packs;
+                    const unsigned long long dst =
+                        out + ((unsigned long long)row * out_row + (unsigned long long)s * row_packs + col) * kPack;
+                    const unsigned long long off = (unsigned long long)i * kPack;
+                    const uint4 w = s == rank ? ld_v4(in + off)
+                                              : ld_relaxed_sys_v4(recv_base + ((unsigned long long)s * kSlots + slot) *
+                                                                                  slot_bytes + off);
+                    st_v4(dst, w);
+                }
+            }
+        }
+    }
+
+    // 5. the last block to finish publishes the next epoch (not after a failed sequence)
+    fence_sc_gpu();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned prior = atom_add_relaxed_gpu(tail_ctr, 1u);
+        if ((prior + 1u) % gdim == 0u) {
+            fence_sc_gpu();
+            if (trace != 0ull) trace_put(trace, trace_mask, seq, 3, global_ns());
+            if (ld_relaxed_sys(ctrl_base + 8) == 0u) st_release_gpu(epoch_ptr, seq);
+        }
+    }
+}
+
+// ---- glm53-comm-probe bench kernels (roce-bench --bench-layer-mb): not used by the engine --------------------------
+// A memory-bound stand-in for a decode layer's weight reads: n_packs 16-byte loads, folded so the loads stay live.
+extern "C" __global__ void __launch_bounds__(512) glm53_bench_read(unsigned long long p, unsigned long long n_packs,
+                                                                   unsigned long long sink, unsigned magic) {
+    unsigned acc = 0;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
+        const uint4 v = ld_v4(p + i * kPack);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == magic) st_v4(sink, make_uint4(acc, 0u, 0u, 0u));
+}
+
+// Spin `base_ns + (hash(iter, rank) % jitter_ns)` ns on %globaltimer (one thread): per-rank launch skew / jitter.
+extern "C" __global__ void glm53_bench_spin(unsigned base_ns, unsigned jitter_ns, unsigned iter, unsigned rank) {
+    if (threadIdx.x != 0) return;
+    unsigned h = (iter + 1u) * 2654435761u ^ (rank + 7u) * 40503u;
+    h ^= h >> 13;
+    h *= 2246822519u;
+    h ^= h >> 16;
+    const unsigned long long want = (unsigned long long)base_ns + (jitter_ns ? (h % jitter_ns) : 0u);
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < want);
+}

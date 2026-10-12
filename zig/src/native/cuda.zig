@@ -6,6 +6,8 @@ const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
+/// Full GLM-5.3 at TP4 (its own host: one stream, ranks 1..3 following rank 0), not a lane-core family.
+const glm53 = @import("glm53_cuda.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
 const Pool = budget.Pool;
 
@@ -22,8 +24,9 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
-    var out: [registry.len]api.Family = undefined;
+    var out: [registry.len + 1]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+    out[registry.len] = .{ .model_type = glm53.model_type, .formats = glm53.formats };
     const final = out;
     break :blk &final;
 };
@@ -341,6 +344,7 @@ const Host = struct {
 
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    if (std.mem.eql(u8, o.model_type, glm53.model_type)) return glm53.open(a, gpa, io, o, problem);
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     }
@@ -491,6 +495,10 @@ test "this host's /proc/meminfo reads whole and parses (Linux)" {
     try std.testing.expect(budget.meminfo(text) != null);
 }
 
+test {
+    _ = glm53;
+}
+
 test "chip classes name the compute capability as gate entries do" {
     const a = std.testing.allocator;
     const name = chipClass(a, 121).?;
@@ -499,7 +507,7 @@ test "chip classes name the compute capability as gate entries do" {
 }
 
 test "every registered family is listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len), families.len);
+    try std.testing.expectEqual(@as(usize, registry.len + 1), families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
 }
 

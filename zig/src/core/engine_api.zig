@@ -146,6 +146,8 @@ pub const Info = struct {
     warm_turns: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
+    /// The widest top_k a sampled request may ask (0: no limit); the server refuses a wider one with 400.
+    top_k_most: u32 = 0,
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
     prompt_cache_plan: ?PromptCachePlan = null,
     /// The engine decodes greedily only: the server refuses a request with a temperature before admitting it.
@@ -215,8 +217,9 @@ pub const Open = struct {
     policy: []const u8 = "",
 };
 
-/// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+/// An opened engine; ``close`` stops its thread and frees its backend. ``follow``: a rank of a tensor-parallel world
+/// other than rank 0 (GLM-5.3 TP4): it serves no HTTP, it mirrors rank 0's requests until rank 0 stops.
+pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
 
