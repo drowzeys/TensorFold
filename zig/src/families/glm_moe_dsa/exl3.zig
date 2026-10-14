@@ -208,6 +208,8 @@ pub const pe_route_symbol = "_ZN8tf_exl3p12route_kernelEPKiiiPiS2_S2_ii";
 pub const pe_gateup_symbol = "_ZN8tf_exl3p20prompt_gateup_kernelILi2EEEvPK13__nv_bfloat16iPKiS5_S5_PKlS7_S5_PK6__halfSA_SA_SA_SA_PS8_iiiifiP6float4x";
 pub const pe_down_symbol = "_ZN8tf_exl3p18prompt_down_kernelILi2EEEvPK6__halfPKiS5_S5_PKlS5_S3_PKfPfiiiii";
 pub const pe_slot_sum16_symbol = "_Z17slot_sum16_kernelPK5uint2PKiP6float4xiii";
+/// slot_sum16 + the bf16 round trip of promptRouted's result in one pass (the same bits)
+pub const pe_slot_sum16_bf16_symbol = "glm53_slot_sum16_bf16";
 /// prompt_experts.py PROMPT_K2: the widths its kernels take (2, 3 and 4 bits a value)
 pub const prompt_k2s = [_]usize{ 4, 6, 8 };
 /// prompt_experts.py CHUNK_ROWS / SLAB_BYTES

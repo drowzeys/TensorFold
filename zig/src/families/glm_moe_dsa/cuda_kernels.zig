@@ -30,6 +30,7 @@ pub const Kernels = struct {
     pe_gateup: cuda.Function,
     pe_down: cuda.Function,
     pe_slot_sum16: cuda.Function,
+    pe_slot_sum16_bf16: cuda.Function,
     pe: PeConsts,
     group: cuda.Function,
     expert_rot_in: cuda.Function,
@@ -157,6 +158,7 @@ pub const Kernels = struct {
         k.pe_gateup = try k.pe_mod.function(exl3.pe_gateup_symbol);
         k.pe_down = try k.pe_mod.function(exl3.pe_down_symbol);
         k.pe_slot_sum16 = try k.pe_mod.function(exl3.pe_slot_sum16_symbol);
+        k.pe_slot_sum16_bf16 = try k.pe_mod.function(exl3.pe_slot_sum16_bf16_symbol);
         k.pe = try PeConsts.read(d, k.pe_mod);
         k.decode_mod = try cuda.Module.load(d, cuda.kernels.glm53_decode);
         errdefer k.decode_mod.unload();
@@ -997,21 +999,23 @@ pub const Ops = struct {
             da.add(mode);
             try cuda.launch.launch(o.k.pe_down, .{ .grid = .{ .x = u(items), .y = u(D / 256 / ncb) }, .block = .{ .x = pe.dn_threads }, .shared = pe.dn_smem }, o.s, &da);
             if (det16) {
-                // slot_sum16: a row's fp16 pair rows added in fp32 in slot order (picks outside [0, E) skipped)
+                // a row's fp16 pair rows added in fp32 in slot order (picks outside [0, E) skipped), then through bf16
+                // and back into out: slot_sum16, out.copy_(bf16) and b.part.copy_(fp32) in one pass, the same bits
                 const n4 = n * D / 4;
                 var sa: cuda.Args = .{};
                 sa.add(sc.pairs);
                 sa.add(pk);
-                sa.add(sc.acc);
+                sa.add(out + r0 * D * 4);
                 sa.add(@as(i64, @intCast(n4)));
                 sa.add(int(S));
                 sa.add(int(D / 4));
                 sa.add(int(E));
-                try cuda.launch.launch(o.k.pe_slot_sum16, .{ .grid = .{ .x = u((n4 + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &sa);
+                try cuda.launch.launch(o.k.pe_slot_sum16_bf16, .{ .grid = .{ .x = u((n4 + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &sa);
+            } else {
+                // out.copy_(fp32 sums) into the bf16 result, then b.part.copy_(bf16) into fp32
+                try o.f32ToBf16(sc.acc, sc.out16, n * D);
+                try o.bf16ToF32(sc.out16, out + r0 * D * 4, n * D);
             }
-            // out.copy_(fp32 sums) into the bf16 result, then b.part.copy_(bf16) into fp32
-            try o.f32ToBf16(sc.acc, sc.out16, n * D);
-            try o.bf16ToF32(sc.out16, out + r0 * D * 4, n * D);
         }
     }
 
