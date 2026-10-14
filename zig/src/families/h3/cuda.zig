@@ -347,6 +347,37 @@ pub const Model = struct {
         try self.stream.synchronize();
     }
 
+    /// The projections a block's int8 weights are made from, in checkpoint names: attn.qkv_proj,
+    /// attn.to_gate_compress, attn.out_proj, mlp.fc1, mlp.fc2.
+    pub const Projection = enum(c_int) { qkv, gate_compress, out, fc1, fc2 };
+
+    /// Replaces one projection of `block` with `w`: bf16 (N, K) on the device in the checkpoint's layout, such as the
+    /// checkpoint's weight with a LoRA merged in. Quantized as at load; the saved int8 copy is left as it was.
+    pub fn setWeight(self: *Model, block: usize, which: Projection, w: u64, rows: usize, cols: usize) !void {
+        if (block >= self.blocks.len) return error.NoSuchBlock;
+        try self.ctx.makeCurrent();
+        const b = &self.blocks[block];
+        const inner = self.inner;
+        const hidden = self.hidden;
+        const want: [2]usize, const q: Quant, const row0: usize, const half: usize = switch (which) {
+            .qkv => .{ .{ 3 * inner, hidden }, b.qkvc, 0, 0 },
+            .gate_compress => .{ .{ inner, hidden }, b.qkvc, 3 * inner, 0 },
+            .out => .{ .{ hidden, inner }, b.out, 0, 0 },
+            .fc1 => .{ .{ 2 * self.mlp, hidden }, b.fc1, 0, self.mlp },
+            .fc2 => .{ .{ hidden, self.mlp }, b.fc2, 0, 0 },
+        };
+        if (rows != want[0] or cols != want[1]) return error.WrongShape;
+        var args: cuda.Args = .{};
+        args.add(w);
+        args.add(q.w.ptr);
+        args.add(q.s.ptr);
+        args.add(@as(c_int, @intCast(cols)));
+        args.add(@as(c_int, @intCast(row0)));
+        args.add(@as(c_int, @intCast(half)));
+        try self.launch("h3_quant_weight", .{ .x = @intCast(rows) }, 128, 0, &args);
+        try self.stream.synchronize();
+    }
+
     pub fn deinit(self: *Model) void {
         self.release();
         for (self.blocks) |*b| {

@@ -30,6 +30,17 @@ export fn tf_h3_forward(model: *h3.Model, in: *const h3.Model.Inputs) f64 {
     };
 }
 
+/// One projection of one block from bf16 (rows, cols) on the device: 0 attn.qkv_proj, 1 attn.to_gate_compress,
+/// 2 attn.out_proj, 3 mlp.fc1, 4 mlp.fc2. Returns 0, or -1 on failure (a wrong block, projection or shape).
+export fn tf_h3_set_weight(model: *h3.Model, block: u32, which: c_int, w: u64, rows: u32, cols: u32) c_int {
+    const projection = std.enums.fromInt(h3.Model.Projection, which) orelse return -1;
+    model.setWeight(block, projection, w, rows, cols) catch |e| {
+        std.debug.print("tf_h3_set_weight: {t}\n", .{e});
+        return -1;
+    };
+    return 0;
+}
+
 /// With `on`, a forward waits for the GPU after every stage and adds up where the time went.
 export fn tf_h3_profile(model: *h3.Model, on: c_int) void {
     model.profile = on != 0;
