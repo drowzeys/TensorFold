@@ -140,9 +140,18 @@ pub const Kernels = struct {
     }
 
     pub fn gemmTyped(k: *const Kernels, s: cuda.Stream, ta: cuda.cublas.Op, tb: cuda.cublas.Op, m: usize, n: usize, kk: usize, alpha: f32, a_: u64, lda: usize, sa: usize, b_: u64, ldb: usize, sb: usize, c: u64, ldc: usize, sc: usize, batch: usize, in_t: cuda.cublas.DataType, out_t: cuda.cublas.DataType) !void {
+        return k.gemmBeta(s, ta, tb, m, n, kk, alpha, a_, lda, sa, b_, ldb, sb, c, ldc, sc, batch, in_t, out_t, 0.0);
+    }
+
+    /// fp32 Y [t, o] (rows ldy apart) = X [t, cin] (rows ldx apart) W [o, cin]^T + beta Y: CUBLAS_COMPUTE_32F, default
+    /// math (no TF32) - the codec's convolutions and projections.
+    pub fn sgemm(k: *const Kernels, s: cuda.Stream, w: u64, o: usize, cin: usize, x: u64, ldx: usize, y: u64, ldy: usize, t: usize, beta: f32) !void {
+        return k.gemmBeta(s, .t, .n, o, t, cin, 1.0, w, cin, 0, x, ldx, 0, y, ldy, 0, 1, .f32, .f32, beta);
+    }
+
+    pub fn gemmBeta(k: *const Kernels, s: cuda.Stream, ta: cuda.cublas.Op, tb: cuda.cublas.Op, m: usize, n: usize, kk: usize, alpha: f32, a_: u64, lda: usize, sa: usize, b_: u64, ldb: usize, sb: usize, c: u64, ldc: usize, sc: usize, batch: usize, in_t: cuda.cublas.DataType, out_t: cuda.cublas.DataType, beta: f32) !void {
         const lib = &k.blas_lib;
         try lib.check(lib.api.cublasSetStream_v2(k.blas.h, s.handle), "cublasSetStream");
-        const beta: f32 = 0.0;
         try lib.check(lib.api.cublasGemmStridedBatchedEx(k.blas.h, ta, tb, @intCast(m), @intCast(n), @intCast(kk), &alpha, a_, in_t, @intCast(lda), @intCast(sa), b_, in_t, @intCast(ldb), @intCast(sb), &beta, c, out_t, @intCast(ldc), @intCast(sc), @intCast(batch), cuda.cublas.compute_32f, cuda.cublas.gemm_default_tensor_op), "cublasGemmStridedBatchedEx");
     }
 

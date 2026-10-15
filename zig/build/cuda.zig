@@ -69,6 +69,8 @@ const kernels = [_]Kernel{
     .{ .name = "drama3", .flags = &.{"-O3"} },
     // ours: fp8_experts.cu with per-row FP8 activation scales (SGLang's block-FP8 w8a8 MoE) for Drama 3
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+    // ours: Drama 3's codec (fp32, no fast math) between its cuBLAS SGEMMs
+    .{ .name = "drama3_codec", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
