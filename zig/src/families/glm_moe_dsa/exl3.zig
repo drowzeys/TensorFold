@@ -214,7 +214,10 @@ pub const pe_slot_sum16_bf16_symbol = "glm53_slot_sum16_bf16";
 pub const prompt_k2s = [_]usize{ 4, 6, 8 };
 /// prompt_experts.py CHUNK_ROWS / SLAB_BYTES
 pub const pe_chunk_rows: usize = 4096;
-pub const pe_slab_bytes: usize = 9 << 20;
+/// (glm53-prefill: 36 MB, not prompt_experts.py's 9: the down kernel's K is only the 512-wide expert share, so a block
+/// staging its rows once for 8 column blocks instead of 2 ran 15-24% faster on a GB10 - 5.2 -> 4.4 ms a 4096-row
+/// sub-chunk in tests/pe-harness - with the same bits: column grouping changes no output's sum)
+pub const pe_slab_bytes: usize = 36 << 20;
 
 /// prompt_experts.auto_ncb: column blocks (of 256) a down pass - the widest slab of out within SLAB_BYTES.
 pub fn autoNcb(R: usize, D: usize, elem: usize) usize {
@@ -249,8 +252,8 @@ pub fn prefillTiles(k: usize, n: usize) PrefillTiles {
 pub const had_scale: f32 = @floatCast(@as(f64, 0.08838834764831845));
 
 test "prompt experts' column slabs (prompt_experts.auto_ncb)" {
-    try std.testing.expectEqual(@as(usize, 2), autoNcb(4096, 6144, 4)); // 4096 x 256 x 4 = 4 MiB a block, 9 MiB a slab
-    try std.testing.expectEqual(@as(usize, 4), autoNcb(2048, 6144, 4));
+    try std.testing.expectEqual(@as(usize, 8), autoNcb(4096, 6144, 4)); // 4096 x 256 x 4 = 4 MiB a block, 36 MiB a slab
+    try std.testing.expectEqual(@as(usize, 12), autoNcb(2048, 6144, 4));
     try std.testing.expectEqual(@as(usize, 24), autoNcb(16, 6144, 4));
 }
 
