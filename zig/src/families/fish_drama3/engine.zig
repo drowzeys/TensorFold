@@ -20,6 +20,7 @@ pub const Options = struct {
     attn_chunk: usize = 512, // query rows a prompt attention GEMM
     max_frames: usize = 2048,
     threads: usize = 16,
+    fast_sampler: bool = true, // the radix-select samplers (identical draws) for top_k <= 64
     pdl: bool = true, // GEMVs launched with programmatic dependent launch
     warmup: bool = true, // a short prompt and frame at open: cuBLAS heuristics and the frame graph ready
     split: bool = true, // tower codes 2..9 on a second stream beside the next backbone row
@@ -152,6 +153,7 @@ pub const Engine = struct {
         e.k = try kern.Kernels.load(&e.driver, &e.ctx);
         e.k.rebind();
         e.k.pdl = o.pdl;
+        e.k.fast_sampler = o.fast_sampler;
         e.w = try wts.load(gpa, io, &e.driver, model_dir, e.c, .{ .threads = o.threads });
         try e.allocState();
         if (o.warmup) {

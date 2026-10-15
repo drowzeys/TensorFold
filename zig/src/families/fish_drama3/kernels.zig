@@ -17,7 +17,7 @@ const names = .{
     "d3_gdn",         "d3_gated_norm", "d3_qk_rope",     "d3_attn_decode",    "d3_q_group",
     "d3_causal_softmax", "d3_attn_gate", "d3_router",   "d3_swiglu",         "d3_moe_combine",
     "d3_tower_mix",   "d3_sample_main", "d3_sample_code", "d3_argmax_main",   "d3_finish_frame",
-    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",  "d3_next_input", "d3_attn_partial", "d3_attn_merge",
+    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",  "d3_next_input", "d3_attn_partial", "d3_attn_merge", "d3_sample_main_fast", "d3_sample_code_fast",
 };
 
 pub const F = enum(u8) {
@@ -47,6 +47,8 @@ pub const F = enum(u8) {
     next_input,
     attn_partial,
     attn_merge,
+    sample_main_fast,
+    sample_code_fast,
 };
 
 /// drama3_fp8.cu's instances: [decode, prompt][gate-up (SwiGLU epilogue 4), down fp32].
@@ -72,6 +74,7 @@ pub const Kernels = struct {
     ws: cuda.DeviceBuffer,
     sms: usize,
     pdl: bool = false, // GEMVs with programmatic dependent launch
+    fast_sampler: bool = true, // radix-select samplers for top_k <= 64
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -381,6 +384,7 @@ pub const Kernels = struct {
         a.add(frame);
         a.add(sem_begin);
         a.add(cb);
+        if (sp.top_k >= 1 and sp.top_k <= 64 and k.fast_sampler) return k.go(.sample_main_fast, s, 1, 1, 1024, 0, &a);
         try k.go(.sample_main, s, 1, 1, 1024, 8192 * 8, &a);
     }
 
@@ -392,6 +396,7 @@ pub const Kernels = struct {
         a.add(step);
         a.add(stream_id);
         a.add(out);
+        if (sp.top_k >= 1 and sp.top_k <= 64 and k.fast_sampler) return k.go(.sample_code_fast, s, 1, 1, 1024, 0, &a);
         try k.go(.sample_code, s, 1, 1, 1024, 4096 * 8, &a);
     }
 
