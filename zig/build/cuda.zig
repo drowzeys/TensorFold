@@ -64,6 +64,9 @@ const kernels = [_]Kernel{
     // Phase 4: the drafters' torch steps (rotary, the ring, the rank-order sums, small dots) and strided row copies
     // (the target's tap rows): torch's default nvcc flags (cosf / sinf as torch's, no fast math)
     .{ .name = "glm53_draft", .flags = &.{"-O3"} },
+    // ours: Fish Audio Drama 3 (families/fish_drama3): backbone glue, the GDN recurrence, the codebook tower, the
+    // samplers (torch's default nvcc flags)
+    .{ .name = "drama3", .flags = &.{"-O3"} },
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -176,6 +179,24 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const capi_host = b.createModule(.{ .root_source_file = b.path("zig/src/native/glm53_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = capi_api }, .{ .name = "glm53", .module = mods.glm53 } } });
     const capi = b.addLibrary(.{ .name = "tensorfold_glm53", .linkage = .dynamic, .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/native/glm53_capi.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "engine_api", .module = capi_api }, .{ .name = "glm53_host", .module = capi_host } } }) });
     b.step("glm53-lib", "libtensorfold_glm53.so: the served GLM-5.3 engine behind a C ABI").dependOn(&b.addInstallArtifact(capi, .{}).step);
+    // Fish Audio Drama 3 TTS on one GPU: drama3-generate (text / reference codes -> frames) and libtensorfold_drama3.so
+    const d3 = drama3Module(b, target, optimize, cuda, mods.core);
+    const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/drama3_generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+    d3_tool.addImport("cuda", cuda);
+    d3_tool.addImport("core", mods.core);
+    d3_tool.addImport("drama3", d3);
+    const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
+    b.step("drama3-generate", "Fish Audio Drama 3 TTS on one GPU: text in, frames out (CUDA)").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
+    const d3_capi = b.addLibrary(.{ .name = "tensorfold_drama3", .linkage = .dynamic, .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/native/drama3_capi.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = d3 } } }) });
+    b.step("drama3-lib", "libtensorfold_drama3.so: Drama 3 TTS behind a C ABI").dependOn(&b.addInstallArtifact(d3_capi, .{}).step);
+}
+
+/// The fish_drama3 family over the given runtime and core.
+fn drama3Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/fish_drama3/drama3.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", core);
+    return m;
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
@@ -246,6 +267,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     // only (kept out of `test` while the family is a Phase 1 port)
     const glm_step = b.step("test-glm53", "Host-side tests of the CUDA runtime (Triton AOT keys) and the GLM-5.3 CUDA family (no GPU)");
     for ([_]*std.Build.Module{ cuda, mods.glm53 }) |m| glm_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const d3_step = b.step("test-drama3", "Host-side tests of the Drama 3 family (config, prompt rows; no GPU)");
+    d3_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = drama3Module(b, host, .debug, cuda, mods.core) })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
