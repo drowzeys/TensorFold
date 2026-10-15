@@ -17,7 +17,7 @@ const names = .{
     "d3_gdn",         "d3_gated_norm", "d3_qk_rope",     "d3_attn_decode",    "d3_q_group",
     "d3_causal_softmax", "d3_attn_gate", "d3_router",   "d3_swiglu",         "d3_moe_combine",
     "d3_tower_mix",   "d3_sample_main", "d3_sample_code", "d3_argmax_main",   "d3_finish_frame",
-    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",  "d3_next_input", "d3_attn_partial", "d3_attn_merge", "d3_sample_main_fast", "d3_sample_code_fast",
+    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",  "d3_next_input", "d3_attn_partial", "d3_attn_merge", "d3_sample_main_fast", "d3_sample_code_fast", "d3_quant_fp8", "d3_gemv_fp8",
 };
 
 pub const F = enum(u8) {
@@ -49,6 +49,8 @@ pub const F = enum(u8) {
     attn_merge,
     sample_main_fast,
     sample_code_fast,
+    quant_fp8,
+    gemv_fp8,
 };
 
 /// drama3_fp8.cu's instances: [decode, prompt][gate-up (SwiGLU epilogue 4), down fp32].
@@ -85,6 +87,7 @@ pub const Kernels = struct {
         inline for (names, 0..) |name, j| k.fns[j] = try k.mod.function(name);
         try k.fns[@intFromEnum(F.sample_main)].allowDynamicShared(8192 * 8);
         try k.fns[@intFromEnum(F.gemv)].allowDynamicShared(6144 * 2);
+        try k.fns[@intFromEnum(F.gemv_fp8)].allowDynamicShared(6144 * 2);
         k.experts_mod = try cuda.Module.load(d, cuda.kernels.experts);
         k.plan = try cuda.grouped.Router.resolve(k.experts_mod);
         k.fp8 = try cuda.experts.Fp8Experts.load(d, k.sms);
@@ -131,6 +134,29 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.f(.gemv), .{ .grid = .{ .x = @intCast((n + 7) / 8) }, .block = .{ .x = 256 }, .shared = @intCast(kdim * 2), .pdl = k.pdl }, s, &a);
     }
 
+    /// Experiment: bf16 W [n, kdim] -> e4m3 q [n, kdim] + fp32 scales [ceil(n / 128), kdim / 128].
+    pub fn quantFp8(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kdim: usize, q: u64, sc: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(w);
+        a.add(i(n));
+        a.add(i(kdim));
+        a.add(q);
+        a.add(sc);
+        try k.go(.quant_fp8, s, (n + 127) / 128, kdim / 128, 256, 0, &a);
+    }
+
+    pub fn gemvFp8(k: *const Kernels, s: cuda.Stream, q: u64, sc: u64, x: u64, kdim: usize, n: usize, y: u64, yf: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(q);
+        a.add(sc);
+        a.add(x);
+        a.add(i(kdim));
+        a.add(i(n));
+        a.add(y);
+        a.add(yf);
+        try cuda.launch.launch(k.f(.gemv_fp8), .{ .grid = .{ .x = @intCast((n + 15) / 16) }, .block = .{ .x = 256 }, .shared = @intCast(kdim * 2), .pdl = k.pdl }, s, &a);
+    }
+
     /// Rows: x rows xs elements apart, y rows ys apart (bf16 out, fp32 accumulate).
     pub fn linear(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, xs: usize, kdim: usize, n: usize, y: u64, ys: usize, t: usize) !void {
         if (t == 1 and xs >= kdim) return k.gemv(s, w, x, kdim, n, y, 0);
@@ -150,6 +176,14 @@ pub const Kernels = struct {
     /// math (no TF32) - the codec's convolutions and projections.
     pub fn sgemm(k: *const Kernels, s: cuda.Stream, w: u64, o: usize, cin: usize, x: u64, ldx: usize, y: u64, ldy: usize, t: usize, beta: f32) !void {
         return k.gemmBeta(s, .t, .n, o, t, cin, 1.0, w, cin, 0, x, ldx, 0, y, ldy, 0, 1, .f32, .f32, beta);
+    }
+
+    /// sgemm on TF32 tensor cores (CUBLAS_COMPUTE_32F_FAST_TF32): the codec decoder's optional fast path.
+    pub fn sgemmTf32(k: *const Kernels, s: cuda.Stream, w: u64, o: usize, cin: usize, x: u64, ldx: usize, y: u64, ldy: usize, t: usize, beta: f32) !void {
+        const lib = &k.blas_lib;
+        try lib.check(lib.api.cublasSetStream_v2(k.blas.h, s.handle), "cublasSetStream");
+        const alpha: f32 = 1.0;
+        try lib.check(lib.api.cublasGemmStridedBatchedEx(k.blas.h, .t, .n, @intCast(o), @intCast(t), @intCast(cin), &alpha, w, .f32, @intCast(cin), 0, x, .f32, @intCast(ldx), 0, &beta, y, .f32, @intCast(ldy), 0, 1, 77, cuda.cublas.gemm_default_tensor_op), "cublasGemmStridedBatchedEx(tf32)");
     }
 
     pub fn gemmBeta(k: *const Kernels, s: cuda.Stream, ta: cuda.cublas.Op, tb: cuda.cublas.Op, m: usize, n: usize, kk: usize, alpha: f32, a_: u64, lda: usize, sa: usize, b_: u64, ldb: usize, sb: usize, c: u64, ldc: usize, sc: usize, batch: usize, in_t: cuda.cublas.DataType, out_t: cuda.cublas.DataType, beta: f32) !void {

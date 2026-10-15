@@ -20,6 +20,8 @@ pub const Options = struct {
     attn_chunk: usize = 512, // query rows a prompt attention GEMM
     max_frames: usize = 2048,
     threads: usize = 16,
+    fp8_tower: bool = false, // experiment: the tower's projections weight-only FP8 in decode GEMVs
+    fp8_dense: bool = false, // experiment: the backbone's attention / GDN projections likewise
     fast_sampler: bool = true, // the radix-select samplers (identical draws) for top_k <= 64
     pdl: bool = true, // GEMVs launched with programmatic dependent launch
     warmup: bool = true, // a short prompt and frame at open: cuBLAS heuristics and the frame graph ready
@@ -126,7 +128,8 @@ pub const Engine = struct {
     graph: ?cuda.graph.Exec = null,
     graph_sampling: Sampling = .{},
     sampling: Sampling = .{},
-    probe_router: ?Probe = null, // diagnostics: every MoE layer's [shared gate | up | router | gate] rows
+    probe_router: ?Probe = null,
+    fp8: std.AutoHashMapUnmanaged(u64, [2]u64) = .empty, // experiment: bf16 weight -> (e4m3 codes, scales) // diagnostics: every MoE layer's [shared gate | up | router | gate] rows
     rows_done: usize = 0, // positions in the cache (prompt rows; the frame step advances on the device)
     prompt_rows: usize = 0,
 
@@ -142,6 +145,7 @@ pub const Engine = struct {
         e.rows_done = 0;
         e.prompt_rows = 0;
         e.probe_router = null;
+        e.fp8 = .empty;
         e.bufs = .empty;
         e.c = try cfg.Config.load(gpa, io, model_dir);
         e.driver = try cuda.Driver.open();
@@ -156,6 +160,7 @@ pub const Engine = struct {
         e.k.fast_sampler = o.fast_sampler;
         e.w = try wts.load(gpa, io, &e.driver, model_dir, e.c, .{ .threads = o.threads });
         try e.allocState();
+        if (o.fp8_tower or o.fp8_dense) try e.quantizeFp8();
         if (o.warmup) {
             var rows: [4][W]i32 = @splat(@splat(0));
             for (&rows, 0..) |*r, i| r[0] = @intCast(198 + i);
@@ -170,6 +175,7 @@ pub const Engine = struct {
         if (e.graph) |*g| g.deinit();
         for (e.bufs.items) |*b| b.free();
         e.bufs.deinit(e.gpa);
+        e.fp8.deinit(e.gpa);
         e.w.deinit();
         e.gpa.destroy(e.w);
         e.k.blas.deinit();
@@ -278,6 +284,40 @@ pub const Engine = struct {
         e.code_logits = try e.alloc(cfg.codebook_size * 4);
     }
 
+    fn quantizeOne(e: *Engine, w: u64, n: usize, kdim: usize) !void {
+        const q = try e.alloc(n * kdim);
+        const sc = try e.alloc(((n + 127) / 128) * (kdim / 128) * 4);
+        try e.k.quantFp8(e.stream, w, n, kdim, q, sc);
+        try e.fp8.put(e.gpa, w, .{ q, sc });
+    }
+
+    fn quantizeFp8(e: *Engine) !void {
+        if (e.o.fp8_tower) for (e.w.tower) |T| {
+            try e.quantizeOne(T.eh, H, 2 * H);
+            try e.quantizeOne(T.qkv, cfg.attn_proj, H);
+            try e.quantizeOne(T.wo, H, 4096);
+            try e.quantizeOne(T.w13, 2 * cfg.tower_ffn, H);
+            try e.quantizeOne(T.w2, H, cfg.tower_ffn);
+        };
+        if (e.o.fp8_dense) for (e.w.layers) |L| {
+            if (L.full) {
+                try e.quantizeOne(L.attn.qkv, cfg.attn_proj, H);
+                try e.quantizeOne(L.attn.o, H, 4096);
+            } else {
+                try e.quantizeOne(L.gdn.proj, cfg.gdn_proj, H);
+                try e.quantizeOne(L.gdn.out, H, 4096);
+            }
+        };
+        try e.stream.synchronize();
+        std.log.info("drama3: experiment: {d} projections FP8 in decode (tower {}, dense {})", .{ e.fp8.count(), e.o.fp8_tower, e.o.fp8_dense });
+    }
+
+    /// The dense linear: one row through the FP8 copy when the experiment made one, else k.linear.
+    fn lin(e: *Engine, s: cuda.Stream, w: u64, x: u64, xs: usize, kdim: usize, n: usize, y: u64, ys: usize, t: usize) !void {
+        if (t == 1) if (e.fp8.get(w)) |q| return e.k.gemvFp8(s, q[0], q[1], x, kdim, n, y, 0);
+        return e.k.linear(s, w, x, xs, kdim, n, y, ys, t);
+    }
+
     fn buf(ptr: u64) Buf {
         return .{ .d = undefined, .ptr = ptr, .len = std.math.maxInt(usize) / 2, .borrowed = true };
     }
@@ -353,16 +393,16 @@ pub const Engine = struct {
         const L = &e.w.layers[li];
         try k.rmsnorm(s, e.x, H, L.in_norm, e.xn, H, t, H, cfg.eps, true);
         if (L.full) {
-            try k.linear(s, L.attn.qkv, e.xn, H, H, cfg.attn_proj, e.proj, cfg.attn_proj, t);
+            try e.lin(s, L.attn.qkv, e.xn, H, H, cfg.attn_proj, e.proj, cfg.attn_proj, t);
             try e.attention(ln, t, start, lay_bb, L.attn.q_norm, L.attn.k_norm, e.kv_bb[li][0], e.kv_bb[li][1], false);
-            try k.linear(s, L.attn.o, e.y, 4096, 4096, H, e.tmp, H, t);
+            try e.lin(s, L.attn.o, e.y, 4096, 4096, H, e.tmp, H, t);
         } else {
             const ps = cfg.gdn_proj;
-            try k.linear(s, L.gdn.proj, e.xn, H, H, ps, e.proj, ps, t);
+            try e.lin(s, L.gdn.proj, e.xn, H, H, ps, e.proj, ps, t);
             try k.convSilu(s, e.proj, ps, t, L.gdn.conv, e.conv[li], e.conv_out, cfg.conv_channels);
             try k.gdn(s, e.conv_out, e.proj, ps, t, L.gdn.a_log, L.gdn.dt_bias, e.gstate[li], e.o32);
             try k.gatedNorm(s, e.o32, e.proj, ps, L.gdn.norm, e.y, t, cfg.eps);
-            try k.linear(s, L.gdn.out, e.y, 4096, 4096, H, e.tmp, H, t);
+            try e.lin(s, L.gdn.out, e.y, 4096, 4096, H, e.tmp, H, t);
         }
         try k.addRmsnorm(s, e.x, e.tmp, H, L.post_norm, e.xn, t, H, cfg.eps);
         try e.moe(s, L, t);
@@ -375,10 +415,10 @@ pub const Engine = struct {
     fn moe(e: *Engine, s: cuda.Stream, L: *const wts.Layer, t: usize) !void {
         const k = &e.k;
         const mp = cfg.moe_proj;
-        try k.linear(s, L.moe_in, e.xn, H, H, mp, e.sp, mp, t);
+        try e.lin(s, L.moe_in, e.xn, H, H, mp, e.sp, mp, t);
         try k.router(s, e.sp, mp, 2 * cfg.shared_width, e.picks, e.rw, t);
         try k.swiglu(s, e.sp, mp, 0, cfg.shared_width, cfg.shared_width, e.sact, t);
-        try k.linear(s, L.shared_down, e.sact, cfg.shared_width, cfg.shared_width, H, e.shout, H, t);
+        try e.lin(s, L.shared_down, e.sact, cfg.shared_width, cfg.shared_width, H, e.shout, H, t);
         const pairs = t * cfg.top_k;
         const prompt = t > 2;
         const tile: usize = if (prompt) cuda.experts.promptTile(.fp8g) else 16;
@@ -403,15 +443,15 @@ pub const Engine = struct {
         const T = &e.w.tower[ti];
         const code_col: usize = if (ti < cfg.shared_layers) 1 else 1 + (ti - cfg.shared_layers);
         try k.towerMix(s, lf, lfs, code_col, inf, ti == 0, T.table, e.w.cb_emb, hin, T.enorm, T.hnorm, e.mix, H, e.c.ids.sem_begin, e.c.ids.sem_end, cfg.codebook_size, cfg.eps, t);
-        try k.linear(s, T.eh, e.mix, 2 * H, 2 * H, H, e.mixed, H, t);
+        try e.lin(s, T.eh, e.mix, 2 * H, 2 * H, H, e.mixed, H, t);
         try k.rmsnorm(s, e.mixed, H, T.attn_norm, ln.xn, H, t, H, cfg.eps, true);
-        try k.linear(s, T.qkv, ln.xn, H, H, cfg.attn_proj, ln.proj, cfg.attn_proj, t);
+        try e.lin(s, T.qkv, ln.xn, H, H, cfg.attn_proj, ln.proj, cfg.attn_proj, t);
         try e.attention(ln, t, start, lay_tw, T.q_norm, T.k_norm, e.kv_tw[ti][0], e.kv_tw[ti][1], true);
-        try k.linear(s, T.wo, ln.y, 4096, 4096, H, ln.tmp, H, t);
+        try e.lin(s, T.wo, ln.y, 4096, 4096, H, ln.tmp, H, t);
         try k.addRmsnorm(s, e.mixed, ln.tmp, H, T.ffn_norm, ln.xn, t, H, cfg.eps); // resid = o + mixed
-        try k.linear(s, T.w13, ln.xn, H, H, 2 * cfg.tower_ffn, ln.proj, 2 * cfg.tower_ffn, t);
+        try e.lin(s, T.w13, ln.xn, H, H, 2 * cfg.tower_ffn, ln.proj, 2 * cfg.tower_ffn, t);
         try k.swiglu(s, ln.proj, 2 * cfg.tower_ffn, 0, cfg.tower_ffn, cfg.tower_ffn, e.act, t);
-        try k.linear(s, T.w2, e.act, cfg.tower_ffn, cfg.tower_ffn, H, ln.tmp, H, t);
+        try e.lin(s, T.w2, e.act, cfg.tower_ffn, cfg.tower_ffn, H, ln.tmp, H, t);
         try k.addRmsnorm(s, e.mixed, ln.tmp, H, T.final_norm, hout, t, H, cfg.eps);
     }
 

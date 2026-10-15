@@ -8,6 +8,7 @@
 // CUDA graph. Plain extern "C" symbols; built with -O3 and torch's default flags.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 #include <math.h>
 
@@ -136,6 +137,97 @@ extern "C" __global__ void __launch_bounds__(256) d3_gemv(const bf16* __restrict
   if (lane == 0 && n < N) {
     if (y) y[n] = f2b(acc);
     if (yf) yf[n] = rb(acc);  // logits: rounded to bf16 as the bf16 heads return them
+  }
+}
+
+// Experiment (--fp8-tower / --fp8-dense): weight-only FP8 for decode GEMVs. d3_quant_fp8: bf16 W [N, K] -> e4m3
+// q [N, K] with fp32 scales [ceil(N / 128), K / 128] (amax / 448 a 128 x 128 block, round to nearest even); grid
+// (ceil(N / 128), K / 128), 256 threads. (A scale a row and 128 inputs measured no better.)
+extern "C" __global__ void d3_quant_fp8(const bf16* __restrict__ W, int N, int K, uint8_t* __restrict__ q,
+                                        float* __restrict__ s) {
+  const int nb = blockIdx.x, kb = blockIdx.y;
+  float amax = 0.f;
+  for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
+    const int n = nb * 128 + i / 128, k = kb * 128 + i % 128;
+    if (n < N) amax = fmaxf(amax, fabsf(b2f(W[(size_t)n * K + k])));
+  }
+  amax = block_max(amax);
+  const float sc = fmaxf(amax, 1e-12f) / 448.f;
+  for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
+    const int n = nb * 128 + i / 128, k = kb * 128 + i % 128;
+    if (n < N) {
+      const __nv_fp8_e4m3 e(b2f(W[(size_t)n * K + k]) / sc);
+      q[(size_t)n * K + k] = e.__x;
+    }
+  }
+  if (threadIdx.x == 0) s[(size_t)nb * (K / 128) + kb] = sc;
+}
+
+// y[n] = sum_k dequant(q[n, k]) x[k]: two rows a warp, 8 warps a block (16 rows), 16 e4m3 a 16-byte load; x staged
+// in shared memory (bf16, K * 2 bytes); same outputs as d3_gemv (y bf16 and / or yf, logits rounded).
+extern "C" __global__ void __launch_bounds__(256) d3_gemv_fp8(const uint8_t* __restrict__ q, const float* __restrict__ sc,
+                                                              const bf16* __restrict__ x, int K, int N,
+                                                              bf16* __restrict__ y, float* __restrict__ yf) {
+  extern __shared__ uint4 xs[];
+  const int lane = threadIdx.x & 31;
+  const int n0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * 2;
+  const int chunks = K >> 4;  // 16-byte chunks a row
+  const uint4* r0 = reinterpret_cast<const uint4*>(q + (size_t)min(n0, N - 1) * K);
+  const uint4* r1 = reinterpret_cast<const uint4*>(q + (size_t)min(n0 + 1, N - 1) * K);
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  for (int i = threadIdx.x; i < (K >> 3); i += blockDim.x) xs[i] = reinterpret_cast<const uint4*>(x)[i];
+  __syncthreads();
+  const int kb = K >> 7;
+  const float* s0 = sc + (size_t)(min(n0, N - 1) >> 7) * kb;
+  const float* s1 = sc + (size_t)(min(n0 + 1, N - 1) >> 7) * kb;
+  float a0 = 0.f, a1 = 0.f;
+  for (int c0 = lane; c0 < chunks; c0 += 4 * 32) {
+    uint4 w0[4], w1[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int c = c0 + u * 32;
+      w0[u] = c < chunks ? ld_stream(r0 + c) : make_uint4(0, 0, 0, 0);
+      w1[u] = c < chunks ? ld_stream(r1 + c) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int c = c0 + u * 32;
+      if (c >= chunks) break;
+      const uint4 xa = xs[2 * c], xb = xs[2 * c + 1];
+      const uint32_t xw[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+      const uint32_t ww0[4] = {w0[u].x, w0[u].y, w0[u].z, w0[u].w};
+      const uint32_t ww1[4] = {w1[u].x, w1[u].y, w1[u].z, w1[u].w};
+      float d0 = 0.f, d1 = 0.f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const __half2_raw p0 = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww0[j] >> (16 * h)), __NV_E4M3);
+          const __half2_raw p1 = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(ww1[j] >> (16 * h)), __NV_E4M3);
+          const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&p0));
+          const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&p1));
+          const uint32_t xv = xw[2 * j + h];
+          d0 = fmaf(f0.x, lo(xv), d0);
+          d0 = fmaf(f0.y, hi(xv), d0);
+          d1 = fmaf(f1.x, lo(xv), d1);
+          d1 = fmaf(f1.y, hi(xv), d1);
+        }
+      }
+      a0 = fmaf(d0, s0[c >> 3], a0);
+      a1 = fmaf(d1, s1[c >> 3], a1);
+    }
+  }
+  a0 = warp_sum(a0);
+  a1 = warp_sum(a1);
+  if (lane == 0) {
+    if (n0 < N) {
+      if (y) y[n0] = f2b(a0);
+      if (yf) yf[n0] = rb(a0);
+    }
+    if (n0 + 1 < N) {
+      if (y) y[n0 + 1] = f2b(a1);
+      if (yf) yf[n0 + 1] = rb(a1);
+    }
   }
 }
 

@@ -8,7 +8,7 @@ exec 9>"$HOME/drama3/gpu.lock"
 echo "[guard] waiting for gpu.lock ..." >&2
 flock 9
 echo "[guard] got gpu.lock; MemAvailable $(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo) GB" >&2
-"$@" 9>&- &
+"$@" 9>&- 0<&0 &  # explicit: a background job would otherwise read /dev/null
 PID=$!
 MIN=999999999
 while kill -0 $PID 2>/dev/null; do

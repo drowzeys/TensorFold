@@ -31,7 +31,7 @@ const EncBlock = struct { ru: [3]Ru, alpha: u64, wa: u64, wb: u64, b: u64, cin: 
 /// Diagnostics: a device fp32 tensor [rows, cols] by name (the codec_convert.py --ref names).
 pub const Probe = struct { ctx: *anyopaque, f: *const fn (ctx: *anyopaque, name: []const u8, ptr: u64, rows: usize, cols: usize) anyerror!void };
 
-pub const Options = struct { max_chunk: usize = 32, ring: usize = 512 };
+pub const Options = struct { max_chunk: usize = 32, ring: usize = 512, tf32_decode: bool = false };
 
 pub const Codec = struct {
     gpa: std.mem.Allocator,
@@ -79,6 +79,7 @@ pub const Codec = struct {
     scratch_floats: usize,
     carry_tmp: u64,
     probe: ?Probe = null,
+    tf32: bool = false, // the decoder's GEMMs on TF32 tensor cores (encode stays fp32)
 
     fn f(c: *const Codec, which: F) cuda.Function {
         return c.fns[@intFromEnum(which)];
@@ -106,6 +107,7 @@ pub const Codec = struct {
         c.weight_bytes = 0;
         c.pos = 0;
         c.probe = null;
+        c.tf32 = false;
         c.mod = try cuda.Module.load(d, cuda.kernels.drama3_codec);
         inline for (names, 0..) |name, j| c.fns[j] = try c.mod.function(name);
         var file = try core.safetensors.File.open(gpa, io, path);
@@ -281,6 +283,7 @@ pub const Codec = struct {
     // ---------------------------------------------------------------------------------------------- primitives
 
     fn sgemm(c: *Codec, s: cuda.Stream, w: u64, o: usize, cin: usize, x: u64, ldx: usize, y: u64, ldy: usize, t: usize, beta: f32) !void {
+        if (c.tf32) return c.k.sgemmTf32(s, w, o, cin, x, ldx, y, ldy, t, beta);
         try c.k.sgemm(s, w, o, cin, x, ldx, y, ldy, t, beta);
     }
 
@@ -451,6 +454,8 @@ pub const Codec = struct {
     }
 
     fn decodeChunk(c: *Codec, s: cuda.Stream, frames: u64, n: usize, audio: u64) !void {
+        c.tf32 = c.o.tf32_decode;
+        defer c.tf32 = false;
         const sc = c.scratch;
         const x = sc[3];
         // codes -> z [n, 1024]
