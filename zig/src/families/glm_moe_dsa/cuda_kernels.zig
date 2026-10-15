@@ -24,6 +24,8 @@ pub const Kernels = struct {
     bhx_to_hbx: cuda.Function,
     bf16_f32: cuda.Function,
     add_f32: cuda.Function,
+    fold_w: cuda.Function, // glm53_fold_w: W_q -> W_eff^T (fp16) for the cuBLASLt prompt GEMM (TF_GLM53_PROMPT_GEMM)
+    rows_mx8: cuda.Function, // glm53_rows_mx8: fp16 rows -> e4m3 + UE8M0 scales a 32 values (MXFP8)
     hadamard: cuda.Function,
     pe_mod: cuda.Module, // glm53_prompt_experts.cu (prompt_experts.cu's device part)
     pe_route: cuda.Function,
@@ -151,6 +153,8 @@ pub const Kernels = struct {
         k.bhx_to_hbx = try k.prompt_mod.function("glm53_bhx_to_hbx");
         k.bf16_f32 = try k.prompt_mod.function("glm53_bf16_f32");
         k.add_f32 = try k.prompt_mod.function("glm53_add_f32");
+        k.fold_w = try k.prompt_mod.function("glm53_fold_w");
+        k.rows_mx8 = try k.prompt_mod.function("glm53_rows_mx8");
         k.hadamard = try k.prompt_mod.function("glm53_hadamard");
         k.pe_mod = try cuda.Module.load(d, cuda.kernels.glm53_prompt_experts);
         errdefer k.pe_mod.unload();
@@ -571,6 +575,36 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(c_int, @intFromBool(zero_first)));
         try cuda.launch.launch(o.k.embed_rows, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// glm53_fold_w: out [N, K] (fp16, k contiguous) = (W_q [K, N] @ H_blk * scale * svh)^T, the prompt GEMM's
+    /// epilogue folded into its weight (K % 32, N % 128).
+    pub fn foldW(o: Ops, wq: u64, svh: u64, scale: f32, out: u64, K: usize, N: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(wq);
+        a.add(svh);
+        a.add(scale);
+        a.add(out);
+        a.add(int(K));
+        a.add(int(N));
+        try cuda.launch.launch(o.k.fold_w, .{ .grid = .{ .x = u(N / 128), .y = u(K / 32) }, .block = .{ .x = 128 } }, o.s, &a);
+    }
+
+    /// Bytes of the UE8M0 scale factors of `rows` x `C` MXFP8 values (128 x 4 tiles of 512 bytes, padded).
+    pub fn mx8ScaleBytes(rows: usize, C: usize) usize {
+        return (rows + 127) / 128 * ((C / 32 + 3) / 4) * 512;
+    }
+
+    /// glm53_rows_mx8: in [rows, C] fp16 -> out [rows, C] e4m3 and sf (mx8ScaleBytes) for cuBLASLt's VEC32_UE8M0.
+    pub fn rowsMx8(o: Ops, in: u64, out: u64, sf: u64, rows: usize, C: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(in);
+        a.add(out);
+        a.add(sf);
+        a.add(int(rows));
+        a.add(int(C));
+        const n = rows * C / 32;
+        try cuda.launch.launch(o.k.rows_mx8, .{ .grid = .{ .x = u((n + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 
     /// glm53_f32_bf16: y[:n] = bfloat16(x[:n]) (Tensor.copy_).

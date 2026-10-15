@@ -19,7 +19,7 @@ pub const Heuristic = extern struct {
     reserved: [4]c_int,
 };
 
-pub const DataType = enum(c_int) { f32 = 0, f16 = 2, bf16 = 14 };
+pub const DataType = enum(c_int) { f32 = 0, f16 = 2, bf16 = 14, e4m3 = 28 };
 pub const compute_32f: c_int = 68;
 pub const Op = enum(c_int) { n = 0, t = 1 };
 pub const Order = enum(c_int) { col = 0, row = 1 };
@@ -28,6 +28,14 @@ pub const desc_transa: c_int = 3;
 pub const desc_transb: c_int = 4;
 pub const layout_order: c_int = 1;
 pub const pref_max_workspace_bytes: c_int = 1;
+pub const desc_a_scale_pointer: c_int = 17;
+pub const desc_b_scale_pointer: c_int = 18;
+pub const desc_a_scale_mode: c_int = 31;
+pub const desc_b_scale_mode: c_int = 32;
+/// CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 (MXFP8): one power-of-two scale a 32 values along K, in the 128 x 4 tiles
+/// glm53_rows_mx8 writes. On a GB10 with cuBLASLt 13.1 the e4m3 modes with heuristics are this and one scalar a
+/// tensor (per-row "outer vector" and the 128-block modes report NOT_SUPPORTED).
+pub const scale_vec32_ue8m0: c_int = 2;
 
 pub const Error = error{ LibraryUnavailable, MissingSymbol, CublasFailed, NoAlgorithm, Invalid };
 
@@ -155,6 +163,89 @@ pub const Linear = struct {
         const one: f32 = 1;
         const zero: f32 = 0;
         try self.lt.check(self.lt.api.cublasLtMatmul(self.handle, self.desc, &one, w, self.a, x, self.b, &zero, d, self.c, d, self.c, &self.algo, workspace, workspace_len, stream), "cublasLtMatmul");
+    }
+};
+
+/// D[m,n] = X[m,k] . W[n,k]^T as `Linear`, for any input type cuBLASLt takes on this GPU: fp16 (W and X fp16, D fp32
+/// or fp16) or e4m3 with MXFP8 scales (D bf16 or fp32). Keeps up to `max_algos` of the heuristic's algorithms; `pick`
+/// chooses which one `run` uses (the caller times them: the heuristic's first is not always the fastest).
+pub const Gemm = struct {
+    pub const max_algos = 8;
+    lt: *const Library,
+    handle: Handle,
+    desc: MatmulDesc,
+    a: Layout,
+    b: Layout,
+    c: Layout,
+    algos: [max_algos]Heuristic,
+    count: usize,
+    pick: usize = 0,
+    mx: bool,
+
+    /// `placeholder`: any device address, set as the scale pointers while the heuristic runs (it refuses e4m3 with
+    /// block scales and no scale pointers: CUBLAS_STATUS_INVALID_VALUE); `run` sets the real ones.
+    pub fn init(lt: *const Library, handle: Handle, m: u64, n: u64, k: u64, in: DataType, out: DataType, workspace_limit: usize, placeholder: abi.DevicePtr) Error!Gemm {
+        var self: Gemm = undefined;
+        self.lt = lt;
+        self.handle = handle;
+        self.pick = 0;
+        self.mx = in == .e4m3;
+        try lt.check(lt.api.cublasLtMatmulDescCreate(&self.desc, compute_32f, .f32), "cublasLtMatmulDescCreate");
+        errdefer _ = lt.api.cublasLtMatmulDescDestroy(self.desc);
+        const ta: c_int = @backingInt(Op.t);
+        const tb: c_int = @backingInt(Op.n);
+        try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transa, &ta, @sizeOf(c_int)), "set transa");
+        try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transb, &tb, @sizeOf(c_int)), "set transb");
+        if (self.mx) {
+            const mode: c_int = scale_vec32_ue8m0;
+            try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_a_scale_mode, &mode, @sizeOf(c_int)), "set A scale mode");
+            try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_b_scale_mode, &mode, @sizeOf(c_int)), "set B scale mode");
+            try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_a_scale_pointer, &placeholder, @sizeOf(u64)), "set A scale");
+            try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_b_scale_pointer, &placeholder, @sizeOf(u64)), "set B scale");
+        }
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.a, in, k, n, @intCast(k)), "layout W");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.a);
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.b, in, k, m, @intCast(k)), "layout X");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.b);
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.c, out, n, m, @intCast(n)), "layout D");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.c);
+        var pref: Preference = null;
+        try lt.check(lt.api.cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate");
+        defer _ = lt.api.cublasLtMatmulPreferenceDestroy(pref);
+        const limit: u64 = workspace_limit;
+        try lt.check(lt.api.cublasLtMatmulPreferenceSetAttribute(pref, pref_max_workspace_bytes, &limit, @sizeOf(u64)), "set workspace");
+        var got: c_int = 0;
+        try lt.check(lt.api.cublasLtMatmulAlgoGetHeuristic(handle, self.desc, self.a, self.b, self.c, self.c, pref, max_algos, &self.algos, &got), "cublasLtMatmulAlgoGetHeuristic");
+        self.count = 0;
+        for (self.algos[0..@intCast(got)]) |h| {
+            if (h.state != 0) continue;
+            self.algos[self.count] = h;
+            self.count += 1;
+        }
+        if (self.count == 0) return error.NoAlgorithm;
+        return self;
+    }
+
+    pub fn deinit(self: *Gemm) void {
+        const api = self.lt.api;
+        _ = api.cublasLtMatrixLayoutDestroy(self.c);
+        _ = api.cublasLtMatrixLayoutDestroy(self.b);
+        _ = api.cublasLtMatrixLayoutDestroy(self.a);
+        _ = api.cublasLtMatmulDescDestroy(self.desc);
+        self.* = undefined;
+    }
+
+    /// D = X . W^T with algorithm `algo` (null: the picked one); `sw` / `sx` the MXFP8 scale factors (e4m3 only).
+    pub fn run(self: *Gemm, x: abi.DevicePtr, w: abi.DevicePtr, sx: abi.DevicePtr, sw: abi.DevicePtr, d: abi.DevicePtr, workspace: abi.DevicePtr, workspace_len: usize, stream: abi.Stream, algo: ?usize) Error!void {
+        const h = self.algos[algo orelse self.pick];
+        if (workspace_len < h.workspace_size) return error.Invalid;
+        if (self.mx) {
+            try self.lt.check(self.lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_a_scale_pointer, &sw, @sizeOf(u64)), "set A scale");
+            try self.lt.check(self.lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_b_scale_pointer, &sx, @sizeOf(u64)), "set B scale");
+        }
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        try self.lt.check(self.lt.api.cublasLtMatmul(self.handle, self.desc, &one, w, self.a, x, self.b, &zero, d, self.c, d, self.c, &h.algo, workspace, workspace_len, stream), "cublasLtMatmul");
     }
 };
 

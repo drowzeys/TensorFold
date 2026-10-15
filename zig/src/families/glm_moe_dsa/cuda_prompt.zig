@@ -56,11 +56,21 @@ pub const UnpackCache = struct {
 
     /// The decoded W_q of `l` (decoded now on a miss); null when it is larger than the arena.
     pub fn get(c: *UnpackCache, o: kern.Ops, l: *const exl3.Linear) !?u64 {
-        const len = std.mem.alignForward(usize, l.k * l.n * 2, 256);
+        const sl = (try c.slot(l.words, l.k * l.n * 2)) orelse return null;
+        if (sl.fresh) try o.unpack(l, sl.ptr);
+        return sl.ptr;
+    }
+
+    pub const Slot = struct { ptr: u64, fresh: bool };
+
+    /// The entry of `key` (`bytes` long): kept (fresh false) or newly placed, its contents for the caller to write
+    /// (fresh true); null when it is larger than the arena.
+    pub fn slot(c: *UnpackCache, key: u64, bytes: usize) !?Slot {
+        const len = std.mem.alignForward(usize, bytes, 256);
         for (c.entries.items) |e| {
-            if (e.key == l.words) {
+            if (e.key == key) {
                 c.hits += 1;
-                return c.arena.ptr + e.off;
+                return .{ .ptr = c.arena.ptr + e.off, .fresh = false };
             }
         }
         if (len > c.arena.len) return null;
@@ -74,11 +84,162 @@ pub const UnpackCache = struct {
                 _ = c.entries.swapRemove(i);
             } else i += 1;
         }
-        try c.entries.append(c.gpa, .{ .key = l.words, .off = lo, .len = len });
+        try c.entries.append(c.gpa, .{ .key = key, .off = lo, .len = len });
         c.head = hi;
         c.misses += 1;
-        try o.unpack(l, c.arena.ptr + lo);
-        return c.arena.ptr + lo;
+        return .{ .ptr = c.arena.ptr + lo, .fresh = true };
+    }
+};
+
+/// The cuBLASLt prompt GEMM of `Wide` (TF_GLM53_PROMPT_GEMM lt16 / mx8): folded weights kept in their own arena
+/// (TF_GLM53_FOLD_MB; a weight that does not fit is folded into scratch at each call), one cuBLASLt product a shape,
+/// its algorithm chosen by timing the heuristic's candidates on the first call.
+pub const LtGemm = struct {
+    pub const Mode = enum { lt16, mx8 };
+    const Key = struct { m: usize, n: usize, k: usize, out: cuda.cublaslt.DataType };
+    const Entry = struct { key: Key, g: cuda.cublaslt.Gemm, tuned: bool = false };
+
+    gpa: std.mem.Allocator,
+    d: *const cuda.Driver,
+    mode: Mode,
+    lib: cuda.cublaslt.Library,
+    handle: cuda.cublaslt.Handle,
+    fold: UnpackCache,
+    wf: cuda.DeviceBuffer, // a folded weight that the arena does not take: fp16 [N, K], then (mx8) e4m3 + scales
+    xq: cuda.DeviceBuffer, // mx8: the rows in e4m3 [rows, K] then their scale factors
+    y32: cuda.DeviceBuffer, // fp32 [rows, N] when the product cannot write the asked dtype
+    ws: cuda.DeviceBuffer,
+    gemms: std.ArrayList(Entry) = .empty,
+    tuned: usize = 0,
+
+    const ws_bytes: usize = 32 << 20;
+
+    /// null when TF_GLM53_PROMPT_GEMM is unset or `triton`.
+    pub fn fromEnv(gpa: std.mem.Allocator, d: *const cuda.Driver, rows: usize, kmax: usize, knmax: usize, lins: []const *exl3.Linear) !?*LtGemm {
+        const v = std.mem.span(std.c.getenv("TF_GLM53_PROMPT_GEMM") orelse return null);
+        const mode: Mode = if (std.mem.eql(u8, v, "lt16")) .lt16 else if (std.mem.eql(u8, v, "mx8")) .mx8 else if (v.len == 0 or std.mem.eql(u8, v, "triton")) return null else {
+            std.log.err("TF_GLM53_PROMPT_GEMM is triton, lt16 or mx8, not {s}", .{v});
+            return error.BadSetting;
+        };
+        var nmax: usize = 0;
+        for (lins) |l| nmax = @max(nmax, l.n);
+        const fold_mb: usize = if (std.c.getenv("TF_GLM53_FOLD_MB")) |m| std.fmt.parseInt(usize, std.mem.span(m), 10) catch 0 else 0;
+        const lib_path = if (std.c.getenv("TF_GLM53_CUBLASLT_LIB")) |p| std.mem.span(p) else "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcublasLt.so.13";
+        const g = try gpa.create(LtGemm);
+        errdefer gpa.destroy(g);
+        g.* = .{ .gpa = gpa, .d = d, .mode = mode, .lib = undefined, .handle = null, .fold = undefined, .wf = undefined, .xq = undefined, .y32 = undefined, .ws = undefined };
+        g.lib = cuda.cublaslt.Library.openPath(lib_path) catch try cuda.cublaslt.Library.open();
+        errdefer g.lib.close();
+        try g.lib.check(g.lib.api.cublasLtCreate(&g.handle), "cublasLtCreate");
+        errdefer _ = g.lib.api.cublasLtDestroy(g.handle);
+        g.fold = try UnpackCache.init(gpa, d, @max(fold_mb, 1) << 20);
+        errdefer g.fold.deinit();
+        g.wf = try cuda.DeviceBuffer.alloc(d, knmax * 3 + kern.Ops.mx8ScaleBytes(nmax, kmax) + 256);
+        errdefer g.wf.free();
+        g.xq = try cuda.DeviceBuffer.alloc(d, rows * kmax + kern.Ops.mx8ScaleBytes(rows, kmax) + 256);
+        errdefer g.xq.free();
+        g.y32 = try cuda.DeviceBuffer.alloc(d, rows * nmax * 4);
+        errdefer g.y32.free();
+        g.ws = try cuda.DeviceBuffer.alloc(d, ws_bytes);
+        std.log.info("glm53 prompt GEMM: cuBLASLt {t}, folded weights {d} MB", .{ mode, fold_mb });
+        return g;
+    }
+
+    pub fn destroy(g: *LtGemm) void {
+        for (g.gemms.items) |*e| e.g.deinit();
+        g.gemms.deinit(g.gpa);
+        g.ws.free();
+        g.y32.free();
+        g.xq.free();
+        g.wf.free();
+        g.fold.deinit();
+        _ = g.lib.api.cublasLtDestroy(g.handle);
+        g.lib.close();
+        g.gpa.destroy(g);
+    }
+
+    /// The folded weight of `l`: [N, K] fp16 (lt16), or e4m3 [N, K] then its scale factors at `sf` (mx8).
+    fn weight(g: *LtGemm, o: kern.Ops, wd: *const Wide, l: *const exl3.Linear) !struct { w: u64, sf: u64 } {
+        const kn = l.k * l.n;
+        const sfo = std.mem.alignForward(usize, kn, 256);
+        const bytes = if (g.mode == .lt16) kn * 2 else sfo + kern.Ops.mx8ScaleBytes(l.n, l.k);
+        const sl = try g.fold.slot(l.words, bytes);
+        const dst = if (sl) |s_| s_.ptr else g.wf.ptr + kn * 2;
+        if (sl == null or sl.?.fresh) {
+            // W_q [K, N] (decoded once, or the unpack cache's copy), folded to W_eff^T fp16
+            var wq: u64 = 0;
+            if (wd.cache) |c| wq = (try c.get(o, l)) orelse 0;
+            if (wq == 0) {
+                if (kn * 2 > wd.w.len) return error.ScratchTooSmall;
+                try o.unpack(l, wd.w.ptr);
+                wq = wd.w.ptr;
+            }
+            const half = if (g.mode == .lt16) dst else g.wf.ptr;
+            if (g.mode == .lt16 and sl == null) return error.ScratchTooSmall; // lt16 folds into its arena only
+            try o.foldW(wq, l.svh, exl3.had_scale, half, l.k, l.n);
+            if (g.mode == .mx8) try o.rowsMx8(half, dst, dst + sfo, l.n, l.k);
+        }
+        return .{ .w = dst, .sf = dst + sfo };
+    }
+
+    fn gemm(g: *LtGemm, key: Key) !*Entry {
+        for (g.gemms.items) |*e| if (std.meta.eql(e.key, key)) return e;
+        const in: cuda.cublaslt.DataType = if (g.mode == .lt16) .f16 else .e4m3;
+        const gm = try cuda.cublaslt.Gemm.init(&g.lib, g.handle, key.m, key.n, key.k, in, key.out, ws_bytes, g.ws.ptr);
+        try g.gemms.append(g.gpa, .{ .key = key, .g = gm });
+        return &g.gemms.items[g.gemms.items.len - 1];
+    }
+
+    /// out [M, N] (dtype y) = the prompt GEMM of the rotated rows wd.xh [M, K].
+    pub fn matmul(g: *LtGemm, o: kern.Ops, wd: *const Wide, l: *const exl3.Linear, M: usize, out: u64, y: exl3.DType) !void {
+        const wt = try g.weight(o, wd, l);
+        var x = wd.xh.ptr;
+        var sx: u64 = 0;
+        if (g.mode == .mx8) {
+            if (M * l.k + kern.Ops.mx8ScaleBytes(M, l.k) + 256 > g.xq.len) return error.ScratchTooSmall;
+            sx = g.xq.ptr + std.mem.alignForward(usize, M * l.k, 256);
+            try o.rowsMx8(wd.xh.ptr, g.xq.ptr, sx, M, l.k);
+            x = g.xq.ptr;
+        }
+        // the product writes y itself where cuBLASLt takes it (mx8: bf16 or fp32; lt16: fp32), else fp32 then a copy
+        const direct = y == .f32 or (g.mode == .mx8 and y == .bf16);
+        const dt: cuda.cublaslt.DataType = if (!direct or y == .f32) .f32 else .bf16;
+        if (!direct and M * l.n * 4 > g.y32.len) return error.ScratchTooSmall;
+        const dst = if (direct) out else g.y32.ptr;
+        const e = try g.gemm(.{ .m = M, .n = l.n, .k = l.k, .out = dt });
+        if (!e.tuned) {
+            e.tuned = true;
+            if (e.g.count > 1) g.tune(o, &e.g, x, wt.w, sx, wt.sf, dst);
+        }
+        try e.g.run(x, wt.w, sx, wt.sf, dst, g.ws.ptr, g.ws.len, o.s.handle, null);
+        if (!direct) switch (y) {
+            .bf16 => try o.f32ToBf16(g.y32.ptr, out, M * l.n),
+            else => return error.Unsupported,
+        };
+    }
+
+    /// The first call of a shape: each candidate algorithm timed (3 runs, after one warm-up), the fastest kept.
+    fn tune(g: *LtGemm, o: kern.Ops, gm: *cuda.cublaslt.Gemm, x: u64, w: u64, sx: u64, sw: u64, dst: u64) void {
+        var a = cuda.Event.init(g.d, true) catch return;
+        defer a.deinit();
+        var b = cuda.Event.init(g.d, true) catch return;
+        defer b.deinit();
+        var best: f32 = std.math.inf(f32);
+        var pick: usize = 0;
+        for (0..gm.count) |i| {
+            gm.run(x, w, sx, sw, dst, g.ws.ptr, g.ws.len, o.s.handle, i) catch continue;
+            a.record(o.s) catch return;
+            for (0..3) |_| gm.run(x, w, sx, sw, dst, g.ws.ptr, g.ws.len, o.s.handle, i) catch break;
+            b.record(o.s) catch return;
+            b.synchronize() catch return;
+            const ms = cuda.Event.elapsedMs(a, b) catch continue;
+            if (ms < best) {
+                best = ms;
+                pick = i;
+            }
+        }
+        gm.pick = pick;
+        g.tuned += 1;
     }
 };
 
@@ -90,6 +251,11 @@ pub const Wide = struct {
     had: cuda.DeviceBuffer, // bf16 [128, 128]
     cache: ?*UnpackCache = null,
     blas: ?*const cuda.cublas.Blas = null,
+    /// TF_GLM53_PROMPT_GEMM (main stream only: the Wide with a cache): `triton` (default) the captured _gemm;
+    /// `lt16` the epilogue folded into the weight (fp16 W_eff, glm53_fold_w) and one cuBLASLt fp16 product (fp32
+    /// accumulate); `mx8` the same weight and the rotated rows in MXFP8 (e4m3, a UE8M0 scale a 32 values) through
+    /// cuBLASLt's e4m3 product. Not the captured kernel's bits: lt16 rounds W_eff to fp16 once, mx8 to e4m3.
+    lt: ?*LtGemm = null,
 
     /// `rows`: the widest window; `cache` (main stream) / `blas` (main stream: attention_core runs there).
     pub fn init(d: *const cuda.Driver, k: *const kern.Kernels, s: cuda.Stream, w: *const W.Weights, rows: usize, cache: ?*UnpackCache, blas: ?*const cuda.cublas.Blas) !Wide {
@@ -103,6 +269,7 @@ pub const Wide = struct {
             knmax = @max(knmax, l.k * l.n);
         }
         var wd: Wide = .{ .xh = try cuda.DeviceBuffer.alloc(d, rows * kmax * 2), .w = undefined, .had = undefined, .cache = cache, .blas = blas };
+        if (cache != null) wd.lt = try LtGemm.fromEnv(w.gpa, d, rows, kmax, knmax, all.items);
         errdefer wd.xh.free();
         wd.w = try cuda.DeviceBuffer.alloc(d, knmax * 2);
         errdefer wd.w.free();
@@ -114,6 +281,7 @@ pub const Wide = struct {
     }
 
     pub fn deinit(wd: *Wide) void {
+        if (wd.lt) |g| g.destroy();
         wd.had.free();
         wd.w.free();
         wd.xh.free();
@@ -124,6 +292,7 @@ pub const Wide = struct {
         const o: kern.Ops = .{ .k = f.k, .s = f.s };
         if (M * l.k * 2 > wd.xh.len) return error.ScratchTooSmall;
         try o.rotIn(x, .bf16, l.suh, wd.xh.ptr, M, l.k);
+        if (wd.lt) |g| return g.matmul(o, wd, l, M, out, y);
         var wq: u64 = 0;
         if (wd.cache) |c| wq = (try c.get(o, l)) orelse 0;
         if (wq == 0) {
