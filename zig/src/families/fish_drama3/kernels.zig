@@ -17,7 +17,7 @@ const names = .{
     "d3_gdn",         "d3_gated_norm", "d3_qk_rope",     "d3_attn_decode",    "d3_q_group",
     "d3_causal_softmax", "d3_attn_gate", "d3_router",   "d3_swiglu",         "d3_moe_combine",
     "d3_tower_mix",   "d3_sample_main", "d3_sample_code", "d3_argmax_main",   "d3_finish_frame",
-    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",
+    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",  "d3_next_input", "d3_attn_partial", "d3_attn_merge",
 };
 
 pub const F = enum(u8) {
@@ -44,6 +44,9 @@ pub const F = enum(u8) {
     copy_i32,
     act_quant,
     bf16_f32,
+    next_input,
+    attn_partial,
+    attn_merge,
 };
 
 /// drama3_fp8.cu's instances: [decode, prompt][gate-up (SwiGLU epilogue 4), down fp32].
@@ -68,6 +71,7 @@ pub const Kernels = struct {
     blas: cuda.cublas.Blas,
     ws: cuda.DeviceBuffer,
     sms: usize,
+    pdl: bool = false, // GEMVs with programmatic dependent launch
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -121,7 +125,7 @@ pub const Kernels = struct {
         a.add(i(n));
         a.add(y);
         a.add(yf);
-        try k.go(.gemv, s, (n + 7) / 8, 1, 256, kdim * 2, &a);
+        try cuda.launch.launch(k.f(.gemv), .{ .grid = .{ .x = @intCast((n + 7) / 8) }, .block = .{ .x = 256 }, .shared = @intCast(kdim * 2), .pdl = k.pdl }, s, &a);
     }
 
     /// Rows: x rows xs elements apart, y rows ys apart (bf16 out, fp32 accumulate).
@@ -252,6 +256,25 @@ pub const Kernels = struct {
         a.add(i(lay.gate_head_stride));
         a.add(out);
         try k.go(.attn_decode, s, t, 16, 256, 0, &a);
+    }
+
+    pub const attn_splits = 16;
+
+    /// Split-key decode attention: t rows (keys 0..pos0 + i each), partials in pml [t, 16, S, 2] / pacc [t, 16, S, 256].
+    pub fn attnSplit(k: *const Kernels, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos0: u64, pml: u64, pacc: u64, proj: u64, ps: usize, lay: QkLayout, out: u64, t: usize) !void {
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, kc, vc, pos0, pml, pacc }) |v| a.add(v);
+        try cuda.launch.launch(k.f(.attn_partial), .{ .grid = .{ .x = @intCast(t), .y = 16, .z = attn_splits }, .block = .{ .x = 256 } }, s, &a);
+        var b: cuda.Args = .{};
+        b.add(pml);
+        b.add(pacc);
+        b.add(@as(i32, attn_splits));
+        b.add(proj);
+        b.add(i(ps));
+        b.add(i(lay.gate_off));
+        b.add(i(lay.gate_head_stride));
+        b.add(out);
+        try k.go(.attn_merge, s, t, 16, 256, 0, &b);
     }
 
     pub fn qGroup(k: *const Kernels, s: cuda.Stream, q: u64, qg: u64, t: usize) !void {
@@ -425,6 +448,12 @@ pub const Kernels = struct {
         a.add(y);
         a.add(i(n));
         try k.go(.bf16_f32, s, @min((n + 255) / 256, 4096), 1, 256, 0, &a);
+    }
+
+    pub fn nextInput(k: *const Kernels, s: cuda.Stream, frame: u64, bb_input: u64, pos: u64, pos_bb: u64) !void {
+        var a: cuda.Args = .{};
+        for ([_]u64{ frame, bb_input, pos, pos_bb }) |v| a.add(v);
+        try k.go(.next_input, s, 1, 1, 32, 0, &a);
     }
 
     pub fn copyI32(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, n: usize) !void {

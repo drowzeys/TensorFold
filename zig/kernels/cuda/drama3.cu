@@ -110,24 +110,30 @@ extern "C" __global__ void __launch_bounds__(256) d3_gemv(const bf16* __restrict
                                                           int K, int N, bf16* __restrict__ y, float* __restrict__ yf) {
   extern __shared__ uint4 xs[];
   const int chunks = K >> 3;
-  for (int i = threadIdx.x; i < chunks; i += blockDim.x) xs[i] = reinterpret_cast<const uint4*>(x)[i];
-  __syncthreads();
   const int lane = threadIdx.x & 31;
   const int n = blockIdx.x * 8 + (threadIdx.x >> 5);
-  if (n >= N) return;
-  const uint4* row = reinterpret_cast<const uint4*>(W + (size_t)n * K);
-  float acc = 0.f;
+  const uint4* row = reinterpret_cast<const uint4*>(W + (size_t)min(n, N - 1) * K);
+  // the row's first 8 chunks a lane are in flight before x is staged (they do not depend on it)
+  uint4 w[8];
   int c = lane;
-  for (; c + 7 * 32 < chunks; c += 8 * 32) {
-    uint4 w[8];
 #pragma unroll
-    for (int u = 0; u < 8; ++u) w[u] = ld_stream(row + c + u * 32);
+  for (int u = 0; u < 8; ++u) w[u] = c + u * 32 < chunks ? ld_stream(row + c + u * 32) : make_uint4(0, 0, 0, 0);
+  // launched with programmatic dependent launch, the weights stream while the kernel before finishes; x is its output
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  for (int i = threadIdx.x; i < chunks; i += blockDim.x) xs[i] = reinterpret_cast<const uint4*>(x)[i];
+  __syncthreads();
+  float acc = 0.f;
+  while (true) {
 #pragma unroll
-    for (int u = 0; u < 8; ++u) acc += dot8(w[u], xs[c + u * 32]);
+    for (int u = 0; u < 8; ++u)
+      if (c + u * 32 < chunks) acc += dot8(w[u], xs[c + u * 32]);
+    c += 8 * 32;
+    if (c >= chunks) break;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) w[u] = c + u * 32 < chunks ? ld_stream(row + c + u * 32) : make_uint4(0, 0, 0, 0);
   }
-  for (; c < chunks; c += 32) acc += dot8(ld_stream(row + c), xs[c]);
   acc = warp_sum(acc);
-  if (lane == 0) {
+  if (lane == 0 && n < N) {
     if (y) y[n] = f2b(acc);
     if (yf) yf[n] = rb(acc);  // logits: rounded to bf16 as the bf16 heads return them
   }
@@ -413,6 +419,85 @@ extern "C" __global__ void __launch_bounds__(256) d3_attn_decode(const bf16* __r
 // bf16 -> fp32 (the V cache rows for the prompt PV GEMM).
 extern "C" __global__ void d3_bf16_f32(const bf16* __restrict__ x, float* __restrict__ y, int n) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] = b2f(x[i]);
+}
+
+// Split-key decode attention (flash-decoding): block (row, head, split) covers keys [split * chunk, ...) of the row's
+// 0..pos, chunk = ceil(L / splits); partial max / sum / unnormalized output per split, merged by d3_attn_merge.
+extern "C" __global__ void __launch_bounds__(256) d3_attn_partial(const bf16* __restrict__ q, const bf16* __restrict__ kc,
+                                                                  const bf16* __restrict__ vc, const int* __restrict__ pos0,
+                                                                  float* __restrict__ pml, float* __restrict__ pacc) {
+  const int t = blockIdx.x, h = blockIdx.y, sp = blockIdx.z, S = gridDim.z, g = h >> 3;
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  const int L = pos0[0] + t + 1;
+  const int chunk = (L + S - 1) / S;
+  const int k0 = sp * chunk, k1 = min(L, k0 + chunk);
+  const uint4 qv = reinterpret_cast<const uint4*>(q + ((size_t)t * 16 + h) * 256)[lane];
+  float m = -INFINITY, l = 0.f, acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+  for (int p = k0 + w; p < k1; p += 8) {
+    const uint4 kv = reinterpret_cast<const uint4*>(kc + ((size_t)p * 2 + g) * 256)[lane];
+    const uint4 vv = reinterpret_cast<const uint4*>(vc + ((size_t)p * 2 + g) * 256)[lane];
+    const float sc = warp_sum(dot8(qv, kv)) * 0.0625f;
+    const float nm = fmaxf(m, sc);
+    const float corr = expf(m - nm), e = expf(sc - nm);
+    l = l * corr + e;
+    acc[0] = acc[0] * corr + e * lo(vv.x);
+    acc[1] = acc[1] * corr + e * hi(vv.x);
+    acc[2] = acc[2] * corr + e * lo(vv.y);
+    acc[3] = acc[3] * corr + e * hi(vv.y);
+    acc[4] = acc[4] * corr + e * lo(vv.z);
+    acc[5] = acc[5] * corr + e * hi(vv.z);
+    acc[6] = acc[6] * corr + e * lo(vv.w);
+    acc[7] = acc[7] * corr + e * hi(vv.w);
+    m = nm;
+  }
+  __shared__ float sm[8], sl[8], sacc[8][256];
+  if (lane == 0) {
+    sm[w] = m;
+    sl[w] = l;
+  }
+#pragma unroll
+  for (int j = 0; j < 8; ++j) sacc[w][lane * 8 + j] = acc[j];
+  __syncthreads();
+  const int i = threadIdx.x;
+  float M = -INFINITY;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) M = fmaxf(M, sm[k]);
+  float Ls = 0.f, A = 0.f;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    if (sm[k] == -INFINITY) continue;
+    const float c = expf(sm[k] - M);
+    Ls += sl[k] * c;
+    A += sacc[k][i] * c;
+  }
+  const size_t slot = ((size_t)t * 16 + h) * S + sp;
+  pacc[slot * 256 + i] = A;
+  if (i == 0) {
+    pml[slot * 2] = M;
+    pml[slot * 2 + 1] = Ls;
+  }
+}
+
+extern "C" __global__ void d3_attn_merge(const float* __restrict__ pml, const float* __restrict__ pacc, int S,
+                                         const bf16* __restrict__ proj, int ps, int gate_off, int gate_head_stride,
+                                         bf16* __restrict__ out) {
+  const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+  const size_t base = ((size_t)t * 16 + h) * S;
+  float M = -INFINITY;
+  for (int k = 0; k < S; ++k) M = fmaxf(M, pml[(base + k) * 2]);
+  float Ls = 0.f, A = 0.f;
+  for (int k = 0; k < S; ++k) {
+    const float mk = pml[(base + k) * 2];
+    if (mk == -INFINITY) continue;
+    const float c = expf(mk - M);
+    Ls += pml[(base + k) * 2 + 1] * c;
+    A += pacc[(base + k) * 256 + i] * c;
+  }
+  const float a = rb(A / Ls);
+  const float gt = b2f(proj[(size_t)t * ps + gate_off + h * gate_head_stride + i]);
+  out[((size_t)t * 16 + h) * 256 + i] = f2b(a * rb(sigmoidf_(gt)));
 }
 
 // Prompt attention through cuBLAS: q regrouped per KV head for the score GEMM: qg [2][T][8][256] from q [T, 16, 256].
@@ -863,6 +948,14 @@ extern "C" __global__ void d3_finish_frame(const int* __restrict__ frame, int* _
   *pos += 1;
   *step += 1;
   *count = n + 1;
+}
+
+// The next backbone row's input as soon as the main token, code 0 and code 1 are drawn (all the embedding reads):
+// bb_input = frame, *pos_bb = *pos + 1, while the tower's last layers draw codes 2..9 on another stream.
+extern "C" __global__ void d3_next_input(const int* __restrict__ frame, int* __restrict__ bb_input,
+                                         const int* __restrict__ pos, int* __restrict__ pos_bb) {
+  if (threadIdx.x < 11) bb_input[threadIdx.x] = threadIdx.x < 3 ? frame[threadIdx.x] : 0;
+  if (threadIdx.x == 0) *pos_bb = *pos + 1;
 }
 
 // Copy n ints (small device-side moves inside a graph).

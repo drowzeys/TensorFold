@@ -18,6 +18,8 @@ MODEL = os.environ.get("DRAMA3_MODEL", "/w")
 
 def main() -> None:
     dev = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = False  # GOTCHAS 9: TF32 changes ~3% of reference codes
+    torch.backends.cudnn.allow_tf32 = False
     codec = build_codec(MODEL, dev)
     if sys.argv[1] == "decode":
         for src, dst in zip(sys.argv[2::2], sys.argv[3::2]):

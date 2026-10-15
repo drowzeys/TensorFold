@@ -20,6 +20,8 @@ pub const Options = struct {
     attn_chunk: usize = 512, // query rows a prompt attention GEMM
     max_frames: usize = 2048,
     threads: usize = 16,
+    pdl: bool = true, // GEMVs launched with programmatic dependent launch
+    split: bool = true, // tower codes 2..9 on a second stream beside the next backbone row
     exact_attn_rows: usize = 0, // prompt chunks up to this many rows attend with the fp32 decode kernel
     fp8_act: bool = true, // the routed experts' activations FP8 per token and 128 inputs, as SGLang serves them
 };
@@ -42,6 +44,10 @@ pub const Probe = struct {
 };
 
 const Buf = cuda.DeviceBuffer;
+const max_split_rows = 8; // decode rows the split-key attention takes
+
+/// The scratch and stream one chain of launches uses (the backbone and the tower run concurrently in a frame).
+const Lane = struct { s: cuda.Stream, xn: u64, tmp: u64, proj: u64, y: u64, q: u64, pos: u64, pml: u64, pacc: u64 };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -50,6 +56,9 @@ pub const Engine = struct {
     driver: cuda.Driver,
     ctx: cuda.Context,
     stream: cuda.Stream,
+    stream2: cuda.Stream, // the tower's codes 2..9 in a frame, beside the next backbone row
+    ev_fork: cuda.Event,
+    ev_join: cuda.Event,
     k: kern.Kernels,
     w: *wts.Weights,
     bufs: std.ArrayList(Buf),
@@ -62,6 +71,15 @@ pub const Engine = struct {
     state_bytes: [2]usize,
     // device scalars
     pos: u64, // i32: the newest row's position
+    pos_bb: u64, // i32: the next backbone row's position (pos + 1 inside a frame)
+    bb_input: u64, // i32 [11]: the next backbone row's frame (main, code 0, code 1)
+    t_xn: u64, // the tower lane's scratch
+    t_tmp: u64,
+    t_proj: u64,
+    t_y: u64,
+    t_q: u64,
+    pml: [2]u64, // split-key attention partials, a lane each
+    pacc: [2]u64,
     step: u64, // u64: the sampler's step
     count: u64, // i32: frames made
     window: u64, // i32 [16]
@@ -127,8 +145,12 @@ pub const Engine = struct {
         e.driver = try cuda.Driver.open();
         e.ctx = try cuda.Context.init(&e.driver, 0);
         e.stream = try cuda.Stream.init(&e.driver, true);
+        e.stream2 = try cuda.Stream.init(&e.driver, true);
+        e.ev_fork = try cuda.Event.init(&e.driver, false);
+        e.ev_join = try cuda.Event.init(&e.driver, false);
         e.k = try kern.Kernels.load(&e.driver, &e.ctx);
         e.k.rebind();
+        e.k.pdl = o.pdl;
         e.w = try wts.load(gpa, io, &e.driver, model_dir, e.c, .{ .threads = o.threads });
         try e.allocState();
         return e;
@@ -147,6 +169,9 @@ pub const Engine = struct {
         e.k.fp8a_mod.unload();
         e.k.experts_mod.unload();
         e.k.mod.unload();
+        e.ev_fork.deinit();
+        e.ev_join.deinit();
+        e.stream2.deinit();
         e.stream.deinit();
         e.ctx.deinit();
         e.driver.close();
@@ -187,6 +212,17 @@ pub const Engine = struct {
             }
         }
         e.pos = try e.alloc(8);
+        e.pos_bb = try e.alloc(8);
+        e.bb_input = try e.alloc(W * 4);
+        e.t_xn = try e.alloc(R * H * 2);
+        e.t_tmp = try e.alloc(R * H * 2);
+        e.t_proj = try e.alloc(R * cfg.gdn_proj * 2);
+        e.t_y = try e.alloc(R * 4096 * 2);
+        e.t_q = try e.alloc(R * 4096 * 2);
+        for (0..2) |li| {
+            e.pml[li] = try e.alloc(max_split_rows * 16 * kern.Kernels.attn_splits * 2 * 4);
+            e.pacc[li] = try e.alloc(max_split_rows * 16 * kern.Kernels.attn_splits * 256 * 4);
+        }
         e.step = try e.alloc(8);
         e.count = try e.alloc(8);
         e.window = try e.alloc(16 * 4);
@@ -262,12 +298,16 @@ pub const Engine = struct {
 
     /// Gated attention of t rows at positions pos0 + i whose q / k / v are in e.proj (layout `lay`), K / V caches kc
     /// / vc; the gated output into e.y [t, 4096]. `start` is the first row's position (host side, for the GEMMs).
-    fn attention(e: *Engine, t: usize, start: usize, lay: kern.Kernels.QkLayout, qn: u64, kn: u64, kc: u64, vc: u64, interleaved: bool) !void {
+    fn attention(e: *Engine, ln: Lane, t: usize, start: usize, lay: kern.Kernels.QkLayout, qn: u64, kn: u64, kc: u64, vc: u64, interleaved: bool) !void {
         const k = &e.k;
-        const s = e.stream;
+        const s = ln.s;
         const ps = cfg.attn_proj;
-        try k.qkRope(s, e.proj, ps, lay, qn, kn, e.pos, e.q, kc, vc, t, interleaved, cfg.rope_theta, cfg.eps);
-        if (t == 1 or t <= e.o.exact_attn_rows) return k.attnDecode(s, e.q, kc, vc, e.pos, e.proj, ps, lay, e.y, t);
+        try k.qkRope(s, ln.proj, ps, lay, qn, kn, ln.pos, ln.q, kc, vc, t, interleaved, cfg.rope_theta, cfg.eps);
+        if (t == 1 or t <= e.o.exact_attn_rows) {
+            if (t <= max_split_rows) return k.attnSplit(s, ln.q, kc, vc, ln.pos, ln.pml, ln.pacc, ln.proj, ps, lay, ln.y, t);
+            return k.attnDecode(s, ln.q, kc, vc, ln.pos, ln.proj, ps, lay, ln.y, t);
+        }
+        std.debug.assert(ln.pos == e.pos and ln.s.handle == e.stream.handle); // prompt rows: the main stream
         // prompt rows: per chunk of query rows, scores = q K^T / 16 (fp32), causal softmax (bf16), P V
         const ac = @min(e.o.attn_chunk, e.o.max_rows);
         var c0: usize = 0;
@@ -276,27 +316,35 @@ pub const Engine = struct {
             const L = start + c0 + tc;
             const ld = (L + 7) / 8 * 8;
             if (c0 > 0) try e.setPos(start + c0);
-            const qrow = e.q + c0 * 4096 * 2;
+            const qrow = ln.q + c0 * 4096 * 2;
             try k.qGroup(s, qrow, e.qg, tc);
             const m8 = 8 * tc;
             try k.gemmEx(s, .t, .n, L, m8, 256, 0.0625, kc, 512, 256, e.qg, 256, m8 * 256, e.scores, ld, m8 * ld, 2, true);
             try k.causalSoftmax(s, e.scores, tc, ld, e.pos);
             try k.bf16F32(s, vc, e.vf, L * 512);
             try k.gemmTyped(s, .n, .n, 256, m8, L, 1.0, e.vf, 512, 256, e.scores, ld, m8 * ld, e.og, 256, m8 * 256, 2, .f32, .f32);
-            try k.attnGate(s, e.og, e.proj + c0 * ps * 2, ps, lay, e.y + c0 * 4096 * 2, tc);
+            try k.attnGate(s, e.og, ln.proj + c0 * ps * 2, ps, lay, ln.y + c0 * 4096 * 2, tc);
         }
         if (t > ac) try e.setPos(start);
     }
 
     /// One backbone layer over t rows: e.x (residual stream) in and out.
-    fn backboneLayer(e: *Engine, li: usize, t: usize, start: usize) !void {
+    fn laneBB(e: *Engine, pos: u64) Lane {
+        return .{ .s = e.stream, .xn = e.xn, .tmp = e.tmp, .proj = e.proj, .y = e.y, .q = e.q, .pos = pos, .pml = e.pml[0], .pacc = e.pacc[0] };
+    }
+
+    fn laneTW(e: *Engine, s: cuda.Stream) Lane {
+        return .{ .s = s, .xn = e.t_xn, .tmp = e.t_tmp, .proj = e.t_proj, .y = e.t_y, .q = e.t_q, .pos = e.pos, .pml = e.pml[1], .pacc = e.pacc[1] };
+    }
+
+    fn backboneLayer(e: *Engine, ln: Lane, li: usize, t: usize, start: usize) !void {
         const k = &e.k;
-        const s = e.stream;
+        const s = ln.s;
         const L = &e.w.layers[li];
         try k.rmsnorm(s, e.x, H, L.in_norm, e.xn, H, t, H, cfg.eps, true);
         if (L.full) {
             try k.linear(s, L.attn.qkv, e.xn, H, H, cfg.attn_proj, e.proj, cfg.attn_proj, t);
-            try e.attention(t, start, lay_bb, L.attn.q_norm, L.attn.k_norm, e.kv_bb[li][0], e.kv_bb[li][1], false);
+            try e.attention(ln, t, start, lay_bb, L.attn.q_norm, L.attn.k_norm, e.kv_bb[li][0], e.kv_bb[li][1], false);
             try k.linear(s, L.attn.o, e.y, 4096, 4096, H, e.tmp, H, t);
         } else {
             const ps = cfg.gdn_proj;
@@ -307,16 +355,15 @@ pub const Engine = struct {
             try k.linear(s, L.gdn.out, e.y, 4096, 4096, H, e.tmp, H, t);
         }
         try k.addRmsnorm(s, e.x, e.tmp, H, L.post_norm, e.xn, t, H, cfg.eps);
-        try e.moe(L, t);
+        try e.moe(s, L, t);
         if (e.probe_router) |p| {
             var nb: [32]u8 = undefined;
             try p.f(p.ctx, try std.fmt.bufPrint(&nb, "router.layer{d:0>2}", .{li}), e.sp, t, cfg.moe_proj, false);
         }
     }
 
-    fn moe(e: *Engine, L: *const wts.Layer, t: usize) !void {
+    fn moe(e: *Engine, s: cuda.Stream, L: *const wts.Layer, t: usize) !void {
         const k = &e.k;
-        const s = e.stream;
         const mp = cfg.moe_proj;
         try k.linear(s, L.moe_in, e.xn, H, H, mp, e.sp, mp, t);
         try k.router(s, e.sp, mp, 2 * cfg.shared_width, e.picks, e.rw, t);
@@ -340,22 +387,22 @@ pub const Engine = struct {
     }
 
     /// Tower layer ti over t rows: hidden hin -> hout; label frames lf (rows lfs ints apart), input frames inf.
-    fn towerLayer(e: *Engine, ti: usize, t: usize, start: usize, hin: u64, hout: u64, lf: u64, lfs: usize, inf: u64) !void {
+    fn towerLayer(e: *Engine, ln: Lane, ti: usize, t: usize, start: usize, hin: u64, hout: u64, lf: u64, lfs: usize, inf: u64) !void {
         const k = &e.k;
-        const s = e.stream;
+        const s = ln.s;
         const T = &e.w.tower[ti];
         const code_col: usize = if (ti < cfg.shared_layers) 1 else 1 + (ti - cfg.shared_layers);
         try k.towerMix(s, lf, lfs, code_col, inf, ti == 0, T.table, e.w.cb_emb, hin, T.enorm, T.hnorm, e.mix, H, e.c.ids.sem_begin, e.c.ids.sem_end, cfg.codebook_size, cfg.eps, t);
         try k.linear(s, T.eh, e.mix, 2 * H, 2 * H, H, e.mixed, H, t);
-        try k.rmsnorm(s, e.mixed, H, T.attn_norm, e.xn, H, t, H, cfg.eps, true);
-        try k.linear(s, T.qkv, e.xn, H, H, cfg.attn_proj, e.proj, cfg.attn_proj, t);
-        try e.attention(t, start, lay_tw, T.q_norm, T.k_norm, e.kv_tw[ti][0], e.kv_tw[ti][1], true);
-        try k.linear(s, T.wo, e.y, 4096, 4096, H, e.tmp, H, t);
-        try k.addRmsnorm(s, e.mixed, e.tmp, H, T.ffn_norm, e.xn, t, H, cfg.eps); // resid = o + mixed
-        try k.linear(s, T.w13, e.xn, H, H, 2 * cfg.tower_ffn, e.proj, 2 * cfg.tower_ffn, t);
-        try k.swiglu(s, e.proj, 2 * cfg.tower_ffn, 0, cfg.tower_ffn, cfg.tower_ffn, e.act, t);
-        try k.linear(s, T.w2, e.act, cfg.tower_ffn, cfg.tower_ffn, H, e.tmp, H, t);
-        try k.addRmsnorm(s, e.mixed, e.tmp, H, T.final_norm, hout, t, H, cfg.eps);
+        try k.rmsnorm(s, e.mixed, H, T.attn_norm, ln.xn, H, t, H, cfg.eps, true);
+        try k.linear(s, T.qkv, ln.xn, H, H, cfg.attn_proj, ln.proj, cfg.attn_proj, t);
+        try e.attention(ln, t, start, lay_tw, T.q_norm, T.k_norm, e.kv_tw[ti][0], e.kv_tw[ti][1], true);
+        try k.linear(s, T.wo, ln.y, 4096, 4096, H, ln.tmp, H, t);
+        try k.addRmsnorm(s, e.mixed, ln.tmp, H, T.ffn_norm, ln.xn, t, H, cfg.eps); // resid = o + mixed
+        try k.linear(s, T.w13, ln.xn, H, H, 2 * cfg.tower_ffn, ln.proj, 2 * cfg.tower_ffn, t);
+        try k.swiglu(s, ln.proj, 2 * cfg.tower_ffn, 0, cfg.tower_ffn, cfg.tower_ffn, e.act, t);
+        try k.linear(s, T.w2, e.act, cfg.tower_ffn, cfg.tower_ffn, H, ln.tmp, H, t);
+        try k.addRmsnorm(s, e.mixed, ln.tmp, H, T.final_norm, hout, t, H, cfg.eps);
     }
 
     // ------------------------------------------------------------------------------------------------ requests
@@ -394,7 +441,7 @@ pub const Engine = struct {
             try k.embedBackbone(s, e.pframes + c0 * W * 4, e.w.embed, e.w.cb_emb, e.x, t, H, e.c.ids.sem_begin, e.c.ids.sem_end, cfg.codebook_size);
             if (probe) |p| try p.f(p.ctx, "backbone_input_embeds", e.x, t, H, false);
             for (0..cfg.layers) |li| {
-                try e.backboneLayer(li, t, c0);
+                try e.backboneLayer(e.laneBB(e.pos), li, t, c0);
                 if (probe) |p| {
                     var nb: [64]u8 = undefined;
                     try p.f(p.ctx, try std.fmt.bufPrint(&nb, "backbone_hidden.layer{d:0>2}", .{li}), e.x, t, H, false);
@@ -408,7 +455,7 @@ pub const Engine = struct {
                 var hin = e.hfin;
                 for (0..cfg.tower_layers) |ti| {
                     const hout = e.th[ti % 2];
-                    try e.towerLayer(ti, tt, c0, hin, hout, e.pframes + (c0 + 1) * W * 4, W, e.pframes + c0 * W * 4);
+                    try e.towerLayer(e.laneTW(e.stream), ti, tt, c0, hin, hout, e.pframes + (c0 + 1) * W * 4, W, e.pframes + c0 * W * 4);
                     if (probe) |p| {
                         var nb: [64]u8 = undefined;
                         try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_prefill.layer{d:0>2}", .{ti}), hout, tt, H, false);
@@ -441,7 +488,7 @@ pub const Engine = struct {
         var hin = e.hfin;
         for (0..cfg.tower_layers) |ti| {
             const hout = e.th[ti % 2];
-            try e.towerLayer(ti, n - 1, 0, hin, hout, e.pframes + W * 4, W, e.pframes);
+            try e.towerLayer(e.laneTW(e.stream), ti, n - 1, 0, hin, hout, e.pframes + W * 4, W, e.pframes);
             if (probe) |p| {
                 var nb: [64]u8 = undefined;
                 try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_prefill.layer{d:0>2}", .{ti}), hout, n - 1, H, false);
@@ -475,6 +522,8 @@ pub const Engine = struct {
         const sem_begin = e.c.ids.sem_begin;
         const greedy = smp.greedy();
         const sp = spOf(smp);
+        // the tail of the tower on the second stream (not under a probe: its reads would race)
+        const split = e.o.split and probe == null;
         try k.gemv(s, e.w.cand_head, e.hlast, H, e.w.n_cand, 0, e.cand_logits);
         if (probe) |p| try p.f(p.ctx, "tower_decode0.candidate_logits", e.cand_logits, 1, e.w.n_cand, true);
         if (force) |fc| {
@@ -486,9 +535,10 @@ pub const Engine = struct {
             try k.sampleMain(s, e.cand_logits, e.w.n_cand, e.w.cand_ids, e.window, sp, e.step, e.frame, sem_begin, cfg.codebook_size);
         }
         var hin = e.hlast;
+        var ts = s;
         for (0..cfg.tower_layers) |ti| {
             const hout = e.th[ti % 2];
-            try e.towerLayer(ti, 1, 0, hin, hout, e.frame, W, e.cur_input);
+            try e.towerLayer(e.laneTW(ts), ti, 1, 0, hin, hout, e.frame, W, e.cur_input);
             if (probe) |p| {
                 var nb: [64]u8 = undefined;
                 try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_decode0.layer{d:0>2}", .{ti}), hout, 1, H, false);
@@ -496,27 +546,39 @@ pub const Engine = struct {
             hin = hout;
             if (ti >= cfg.shared_layers) {
                 const hi = ti - cfg.shared_layers;
-                try k.gemv(s, e.w.heads[hi], hout, H, cfg.codebook_size, 0, e.code_logits);
+                try k.gemv(ts, e.w.heads[hi], hout, H, cfg.codebook_size, 0, e.code_logits);
                 if (probe) |p| {
                     var nb: [64]u8 = undefined;
                     try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_decode0.head{d}_logits", .{hi}), e.code_logits, 1, cfg.codebook_size, true);
                 }
                 const out = e.frame + (2 + hi) * 4;
                 if (force) |fc| {
-                    try k.argmax(s, e.code_logits, cfg.codebook_size, 0, fc.picks + (2 + hi) * 4, 0, 0);
-                    try k.copyI32(s, fc.frame + (2 + hi) * 4, out, 1);
+                    try k.argmax(ts, e.code_logits, cfg.codebook_size, 0, fc.picks + (2 + hi) * 4, 0, 0);
+                    try k.copyI32(ts, fc.frame + (2 + hi) * 4, out, 1);
                 } else if (greedy) {
-                    try k.argmax(s, e.code_logits, cfg.codebook_size, 0, out, 0, 0);
+                    try k.argmax(ts, e.code_logits, cfg.codebook_size, 0, out, 0, 0);
                 } else {
-                    try k.sampleCode(s, e.code_logits, cfg.codebook_size, sp, e.step, @intCast(2 + hi), out);
+                    try k.sampleCode(ts, e.code_logits, cfg.codebook_size, sp, e.step, @intCast(2 + hi), out);
+                }
+                if (hi == 0) {
+                    // main token, code 0 and code 1 drawn: the next backbone row can start
+                    try k.nextInput(s, e.frame, e.bb_input, e.pos, e.pos_bb);
+                    if (split) {
+                        try e.ev_fork.record(s);
+                        try e.stream2.wait(e.ev_fork);
+                        ts = e.stream2;
+                    }
                 }
             }
         }
-        try k.finishFrame(s, e.frame, e.frames_out, e.cur_input, e.window, e.pos, e.step, e.count);
-        // the backbone row of the new frame at pos (already advanced)
-        try k.embedBackbone(s, e.cur_input, e.w.embed, e.w.cb_emb, e.x, 1, H, sem_begin, e.c.ids.sem_end, cfg.codebook_size);
-        for (0..cfg.layers) |li| try e.backboneLayer(li, 1, 0);
+        if (split) try e.ev_join.record(e.stream2);
+        // the backbone row of the new frame at pos + 1
+        const bb = e.laneBB(e.pos_bb);
+        try k.embedBackbone(s, e.bb_input, e.w.embed, e.w.cb_emb, e.x, 1, H, sem_begin, e.c.ids.sem_end, cfg.codebook_size);
+        for (0..cfg.layers) |li| try e.backboneLayer(bb, li, 1, 0);
         try k.rmsnorm(s, e.x, H, e.w.final_norm, e.hlast, H, 1, H, cfg.eps, true);
+        if (split) try s.wait(e.ev_join);
+        try k.finishFrame(s, e.frame, e.frames_out, e.cur_input, e.window, e.pos, e.step, e.count);
     }
 
     /// One teacher-forced greedy frame, eager.
