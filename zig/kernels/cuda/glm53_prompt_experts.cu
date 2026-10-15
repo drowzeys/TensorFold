@@ -876,8 +876,11 @@ __global__ void slot_sum16_kernel(const uint2* __restrict__ pairs, const int* __
 // mode 4's sum written as the prompt path takes it: the same adds in the same order as slot_sum16, then each value
 // through bf16 and back (promptRouted's out.copy_(bf16) then b.part.copy_(fp32), which were two more passes over the
 // rows) - the same bits as slot_sum16 + f32ToBf16 + bf16ToF32, one pass instead of three
+// `add` (may be null): the shared expert's rows, added after the round trip (experts_part's b.part += b.sy, the same
+// single fp32 add, so the same bits as a separate glm53_add_f32 pass).
 extern "C" __global__ void glm53_slot_sum16_bf16(const uint2* __restrict__ pairs, const int* __restrict__ pick,
-                                                 float4* __restrict__ out, long long n4, int S, int D4, int E) {
+                                                 float4* __restrict__ out, long long n4, int S, int D4, int E,
+                                                 const float4* __restrict__ add) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n4) return;
     const long long r = i / D4, c = i % D4;
@@ -889,7 +892,12 @@ extern "C" __global__ void glm53_slot_sum16_bf16(const uint2* __restrict__ pairs
         const float2 a = __half22float2(*reinterpret_cast<const half2*>(&v.x)), b = __half22float2(*reinterpret_cast<const half2*>(&v.y));
         acc.x += a.x; acc.y += a.y; acc.z += b.x; acc.w += b.y;
     }
-    out[i] = make_float4(bf16r(acc.x), bf16r(acc.y), bf16r(acc.z), bf16r(acc.w));
+    float4 y = make_float4(bf16r(acc.x), bf16r(acc.y), bf16r(acc.z), bf16r(acc.w));
+    if (add) {
+        const float4 a = add[i];
+        y.x += a.x; y.y += a.y; y.z += a.z; y.w += a.w;
+    }
+    out[i] = y;
 }
 
 // the codebook-2 (mul1) kernels GLM-5.3's prompt chunks launch (SharedExperts.prefill -> prompt_routed)

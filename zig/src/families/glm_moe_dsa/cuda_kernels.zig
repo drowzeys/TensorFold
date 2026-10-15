@@ -983,7 +983,8 @@ pub const Ops = struct {
     /// codebook 2): the routed experts of rows x [R, D] (bf16, row stride x_stride) with picks [R, S] int32 and
     /// weights [R, S] fp32 -> out [R, D] fp32 = float(bf16(the slots' outputs summed in slot order)) (b.part.copy_ of
     /// the bf16 result). Chunks of up to CHUNK_ROWS rows; each row's bits never depend on its chunk.
-    pub fn promptRouted(o: Ops, x: u64, x_stride: usize, pick: u64, wts: u64, ex: *const Experts, sc: PromptExpertScratch, out: u64, R: usize, det16: bool) !void {
+    /// `add` (det16 only; 0: none): fp32 rows [R, D] added to the result (the shared expert, b.part += b.sy fused).
+    pub fn promptRouted(o: Ops, x: u64, x_stride: usize, pick: u64, wts: u64, ex: *const Experts, sc: PromptExpertScratch, out: u64, R: usize, det16: bool, add: u64) !void {
         const D = ex.dims;
         const I = ex.width;
         const S = sc.slots;
@@ -1044,6 +1045,7 @@ pub const Ops = struct {
                 sa.add(int(S));
                 sa.add(int(D / 4));
                 sa.add(int(E));
+                sa.add(if (add != 0) add + r0 * D * 4 else @as(u64, 0));
                 try cuda.launch.launch(o.k.pe_slot_sum16_bf16, .{ .grid = .{ .x = u((n4 + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &sa);
             } else {
                 // out.copy_(fp32 sums) into the bf16 result, then b.part.copy_(bf16) into fp32

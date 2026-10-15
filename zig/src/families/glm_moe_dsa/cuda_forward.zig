@@ -1378,13 +1378,15 @@ pub const Forward = struct {
         }
         if (b.pe != null and kern.Ops.promptSupported(ex)) {
             if (f.k.pe.ipm != 112) return error.PromptExpertsUnsupported; // Buffers sized PromptScratch for IPM 112
-            const p0 = try f.pbegin();
-            try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16);
-            try f.pend(p0, .routed);
+            // the shared expert first, so the routed experts' slot sum adds it on its way out (b.part += b.sy fused:
+            // the same fp32 add); without the slot-order sum it is still a separate add
             const p1 = try f.pbegin();
             try f.mlp(b, L, R, b.sy);
-            try f.ops().addF32(b.part, b.sy, R * D);
             try f.pend(p1, .shared);
+            const p0 = try f.pbegin();
+            try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16, if (f.pe_det16) b.sy else 0);
+            if (!f.pe_det16) try f.ops().addF32(b.part, b.sy, R * D);
+            try f.pend(p0, .routed);
             return;
         }
         // widths prompt_experts does not take (the MTP layer's 8-bit experts): the Python engine runs cuda-exl3's
