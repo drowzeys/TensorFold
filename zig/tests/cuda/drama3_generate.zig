@@ -1,17 +1,21 @@
-//! drama3-generate: Fish Audio Drama 3 on one CUDA GPU (fish_drama3), text (and voice-reference codes) in, frames out.
+//! drama3-generate: Fish Audio Drama 3 on one CUDA GPU (fish_drama3), text (and a voice reference) in, audio out.
 //!
-//!   drama3-generate --model DIR --text "..." [--ref-text "..." --ref-codes FILE] [--rows FILE]
-//!                   [--temperature 1.0] [--top-k 30] [--top-p 0.9] [--seed 1] [--greedy]
-//!                   [--max-frames 1500] [--graphs 1] [--sync-every 8] [--out FILE] [--rows-out FILE]
-//!                   [--max-ctx 4096] [--max-rows 1024] [--threads 16] [--repeat N] [--fp8-act 1]
-//!   drama3-generate --model DIR --check DUMPDIR [--check-frames 40]
+//!   text -> WAV (no Python; the codec from tools/drama3/codec_convert.py):
+//!   drama3-generate --model DIR --codec CODEC.safetensors --text "..." --wav OUT.wav
+//!                   [--ref-audio REF.wav --ref-text "..."] [--ref-codes FILE] [--pcm-out PATH|-]
+//!                   [--temperature 1.0] [--top-k 30] [--top-p 0.9] [--seed 1] [--greedy] [--max-frames 1500]
+//!                   [--first-chunk 4] [--chunk 16] [--chunks-log 1] [--out FRAMES] [--rows-out FILE]
+//!   one process, many requests (JSON lines on stdin, one JSON result a line):
+//!   drama3-generate --model DIR --codec CODEC --serve 1
+//!   audio -> codes:  drama3-generate --codec CODEC --encode OUT.codes --ref-audio REF.wav
+//!   checks: --check DUMPDIR [--check-frames 40]  /  --codec-check REF --codec CODEC --frames F [--ref-audio WAV]
+//!   engine knobs: [--max-ctx 4096] [--max-rows 1024] [--threads 16] [--repeat N] [--graphs 1] [--split 1] [--pdl 1]
+//!                 [--fp8-act 1] [--fast-sampler 1] [--fp8-dense 0] [--fp8-tower 0] [--codec-tf32 0]
 //!
-//! --ref-codes: int32 little-endian [frames, 10] (or .npy int32/int64 [10, frames] / [frames, 10]); --rows: prompt
-//! rows int32 [n, 11] that override --text. --out: the frames, int32 [n, 11] (main token, codes 0..9), for the codec
-//! (tools/drama3/frames_to_wav.py). --check: the oracle's test vectors (DUMPDIR/vectors.safetensors, written by
-//! drama3_ref.py --dump --greedy): its prompt rows run with a probe on every layer (cosine and max |diff| against
-//! the oracle's tensors), then greedy frames against its frames (first divergence with the oracle's logit margin).
-//! Prints `RESULT drama3 ...`.
+//! Audio: 16-bit PCM mono 44.1 kHz WAV (--wav, header patched at the end); --pcm-out streams raw s16le 44.1 kHz mono
+//! as chunks decode ("-" = stdout). The last stderr line is `RESULT drama3 OK frames=.. audio_s=.. first_audio_ms=..`.
+//! Reference WAVs: PCM 8/16/24/32-bit or float32, any rate and channel count (mixed to mono, resampled to 44.1 kHz as
+//! torchaudio does). --rows: prompt rows int32 [n, 11]; --ref-codes: int32 [frames, 10]; --out: frames int32 [n, 11].
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -51,7 +55,10 @@ const Args = struct {
 };
 
 const usage =
-    \\usage: drama3-generate --model DIR --text "..." [--ref-text "..." --ref-codes FILE] [--rows FILE]
+    \\usage: drama3-generate --model DIR --codec CODEC --text "..." --wav OUT.wav [--ref-audio REF.wav --ref-text "..."]
+    \\       drama3-generate --model DIR --codec CODEC --serve 1        (JSON lines on stdin)
+    \\       drama3-generate --codec CODEC --encode OUT.codes --ref-audio REF.wav
+    \\       drama3-generate --model DIR --text "..." [--ref-text "..." --ref-codes FILE] [--rows FILE]
     \\                       [--temperature 1.0] [--top-k 30] [--top-p 0.9] [--seed 1] [--greedy]
     \\                       [--max-frames 1500] [--graphs 1] [--sync-every 8] [--out FILE] [--rows-out FILE]
     \\                       [--max-ctx 4096] [--max-rows 1024] [--threads 16] [--repeat N] [--fp8-act 1]
