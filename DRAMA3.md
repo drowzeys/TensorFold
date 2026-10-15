@@ -115,7 +115,7 @@ windows, and serves until its stdin closes. The other command-line options (`--m
 
 - stdin: one JSON request a line. Stdout is used only for audio when a request asks for `"pcm": "-"`.
 - stderr: the protocol and the logs. Every protocol line is one JSON object starting with `{`; log lines never
-  do. First `{"ready":true,"engine":"tensorfold-drama3-mlx","load_s":..,"verify":true,"stream":true}` (or
+  do. First `{"ready":true,"engine":"tensorfold-drama3-mlx","load_s":..,"verify":true,"stream":true,"ref_text_optional":true}` (or
   `{"ok":false,"error":"load failed: ..."}`), then exactly one answer line a request, in order.
 
 Request fields (only `text` is required):
@@ -126,7 +126,7 @@ Request fields (only `text` is required):
 | `wav` | write the take there (16-bit WAV; while streaming it grows and gets its sizes at the end) | none |
 | `pcm` | raw s16le 44.1 kHz mono, written as it is made (`"-"`: stdout) | none |
 | `stream` | stream while generating (the stop rule holds back a suspect tail; no redraws) | true when `pcm` is given |
-| `ref_audio` + `ref_text` | a voice to clone (encoded once and cached by path and mtime) | |
+| `ref_audio` + `ref_text` | a voice to clone (encoded once and cached by path and mtime); `ref_text` may be left out or empty: the server's Whisper hears the clip (cached the same way) and the answer gives what it heard as `ref_texts` (and `ref_asr_ms`) | |
 | `ref_codes` + `ref_text` | a reference as saved codes (.npy, [10, frames] or [frames, 10]) | |
 | `refs` | several references: `[{"audio" or "codes", "text"}]` | |
 | `temperature`, `top_k`, `top_p`, `seed`, `greedy` | sampling | 1.0, 30, 0.9, 0, false |

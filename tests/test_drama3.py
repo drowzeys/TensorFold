@@ -165,3 +165,38 @@ def test_serve_arguments():
     assert parse(["--serve", "1"]).serve and parse(["--serve"]).serve and not parse(["--text", "x", "--out", "o"]).serve
     with pytest.raises(SystemExit):
         parse(["--text", "x"])
+
+
+def test_serve_hears_a_reference_left_without_its_transcript(tmp_path):
+    """--serve: a reference without ref_text is heard by the server's Whisper, once per file (no weights here)."""
+    import argparse
+
+    import numpy as np
+    import soundfile
+
+    from tensorfold import drama3
+    from tensorfold.families.drama3.verify import Word
+
+    clip = tmp_path / "ref.wav"
+    soundfile.write(str(clip), np.zeros(22050, dtype=np.float32), 22050)
+    calls = []
+
+    class Heard:
+        def words(self, audio, sample_rate=44100, language=None):
+            calls.append(len(audio))
+            return [Word(" Hello", 0.0, 0.4), Word(" there.", 0.4, 0.8)]
+
+    cache, logged = {}, []
+    text, spent = drama3.reference_transcript(clip, Heard(), argparse.Namespace(asr="auto"), cache, logged.append)
+    assert text == "Hello there." and spent >= 0 and calls == [44100]
+    assert drama3.reference_transcript(clip, Heard(), argparse.Namespace(asr="auto"), cache, logged.append) == ("Hello there.", 0.0)
+    assert calls == [44100]  # cached by path and mtime
+
+    class Silent:
+        def words(self, audio, sample_rate=44100, language=None):
+            return []
+
+    import pytest
+
+    with pytest.raises(ValueError, match="no speech"):
+        drama3.reference_transcript(clip, Silent(), argparse.Namespace(asr="auto"), {}, logged.append)

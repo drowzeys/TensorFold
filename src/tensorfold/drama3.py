@@ -283,7 +283,7 @@ def serve(args: argparse.Namespace) -> int:
     log(f"[drama3] serving {gen.model_dir}: loaded and warm in {time.perf_counter() - started:.1f}s; "
         f"memory {mx.get_active_memory() / 1e9:.1f} GB")
     answer({"ready": True, "engine": "tensorfold-drama3-mlx", "load_s": round(time.perf_counter() - started, 2),
-            "verify": bool(asr), "stream": True})
+            "verify": bool(asr), "stream": True, "ref_text_optional": True})
     encoded: dict = {}
     for line in sys.stdin:
         line = line.strip()
@@ -305,6 +305,36 @@ def serve(args: argparse.Namespace) -> int:
     return 0
 
 
+_REF_ASR: list = []  # a recogniser loaded for reference transcripts when the server runs without --verify
+
+
+def reference_transcript(path: Path, asr, args, cache: dict, log) -> tuple[str, float]:
+    """What a reference clip says, heard by Whisper (the server's own when it has one, else one loaded on first use
+    and kept), cached by path and mtime: (transcript, milliseconds spent). A request may leave ``ref_text`` out."""
+
+    from tensorfold.families.drama3.codec import load_audio
+
+    key = ("transcript", str(path), path.stat().st_mtime_ns)
+    if key in cache:
+        return cache[key], 0.0
+    listener = asr
+    if not listener:
+        if not _REF_ASR:
+            _REF_ASR.append(make_transcriber(args.asr, log))
+        listener = _REF_ASR[0]
+    if not listener:
+        raise ValueError("a reference without its transcript (\"ref_text\") needs mlx-whisper or faster-whisper")
+    started = time.perf_counter()
+    words = listener.words(load_audio(path), language=None)
+    text = " ".join(" ".join(w.text.strip() for w in words).split())
+    if not text:
+        raise ValueError(f"no speech heard in the reference {path.name}: give its transcript (\"ref_text\")")
+    spent = (time.perf_counter() - started) * 1000
+    log(f"[drama3] heard {path.name} in {spent / 1000:.2f}s: {text}")
+    cache[key] = text
+    return text, spent
+
+
 def serve_one(gen, q: dict, args, asr, encoded: dict, log) -> dict:
     import numpy as np
 
@@ -316,12 +346,17 @@ def serve_one(gen, q: dict, args, asr, encoded: dict, log) -> dict:
     text = q.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("a request needs \"text\"")
-    references, encode_ms, ref_frames = [], 0.0, 0
+    references, encode_ms, ref_frames, heard, heard_ms = [], 0.0, 0, [], 0.0
     refs = q.get("refs") or ([{"audio": q.get("ref_audio"), "codes": q.get("ref_codes"), "text": q.get("ref_text")}]
                              if (q.get("ref_audio") or q.get("ref_codes")) else [])
     for ref in refs:
-        if not ref.get("text"):
-            raise ValueError("a reference needs its transcript (\"ref_text\")")
+        if not (ref.get("text") or "").strip():
+            if not ref.get("audio"):
+                raise ValueError("a reference given as codes needs its transcript (\"ref_text\")")
+            text_heard, spent = reference_transcript(Path(ref["audio"]).expanduser(), asr, args, encoded, log)
+            ref = {**ref, "text": text_heard}
+            heard.append(text_heard)
+            heard_ms += spent
         if ref.get("codes"):
             codes = np.load(Path(ref["codes"]).expanduser())
             if codes.ndim == 2 and codes.shape[0] != 10 and codes.shape[1] == 10:
@@ -362,12 +397,14 @@ def serve_one(gen, q: dict, args, asr, encoded: dict, log) -> dict:
              "eos": all(f != "length" for f in stats["finish"]), "audio_s": stats["audio_s"],
              "prompt_rows": sum(r.prompt_rows for r in results), "ref_frames": ref_frames,
              "encode_ms": round(encode_ms, 1), "prefill_ms": round(stats["prefill_s"] * 1000, 1),
-             "first_audio_ms": round(stats["first_audio_s"] * 1000 + encode_ms, 1), "total_ms": round(total_ms, 1),
+             "first_audio_ms": round(stats["first_audio_s"] * 1000 + encode_ms + heard_ms, 1), "total_ms": round(total_ms, 1),
              "fps": round(stats["frames"] / decode_s, 2) if decode_s else None,
              "rtf": round(total_ms / 1000 / stats["audio_s"], 3) if stats["audio_s"] else None,
              "wav": q.get("wav") or "", "pcm": pcm or "", "stream": stats["stream"], "chunks": stats["chunks"],
              "finish": stats["finish"], "stop_rule": stats["stop_rule"], "verify": stats["verify"],
              "peak_memory_gb": stats["peak_memory_gb"]}
+    if heard:                                               # references left without their transcript: what was heard
+        reply.update(ref_texts=heard, ref_asr_ms=round(heard_ms, 1))
     if q.get("stats"):
         Path(q["stats"]).expanduser().write_text(json.dumps({**stats, **reply}, indent=1) + "\n")
     return reply
