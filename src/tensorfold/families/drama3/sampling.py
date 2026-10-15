@@ -25,6 +25,7 @@ class Sampling:
     top_k: int = 30
     top_p: float = 0.9
     greedy: bool = False
+    eos_bias: float = 0.0          # added to the EOS logit before drawing (< 0 provokes runaways, for tests)
 
 
 def draw(logits: mx.array, temperature: float, top_k: int, top_p: float, key: mx.array | None,
@@ -48,9 +49,11 @@ def draw(logits: mx.array, temperature: float, top_k: int, top_p: float, key: mx
 
 
 def draw_main(logits: mx.array, candidate_ids: mx.array, window: mx.array, s: Sampling, keys: mx.array | None,
-              semantic_begin: int, codebook_size: int) -> tuple[mx.array, mx.array]:
+              semantic_begin: int, codebook_size: int, eos_id: int = -1) -> tuple[mx.array, mx.array]:
     """The main token [B] (vocabulary ids) and code 0 [B] from candidate logits [B, C] and the RAS window [B, 16]."""
 
+    if s.eos_bias:
+        logits = mx.where(candidate_ids == eos_id, logits + s.eos_bias, logits)
     first = candidate_ids[draw(logits, s.temperature, s.top_k, s.top_p, None if keys is None else keys[0], s.greedy)]
     if s.greedy or keys is None:
         main = first

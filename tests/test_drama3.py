@@ -78,3 +78,53 @@ def test_fused_projections_match_separate():
     before = ff(x)
     ff.fuse()
     assert "w1" not in ff and mx.allclose(ff(x), before, atol=1e-5).item()
+
+
+def test_end_of_text_check():
+    from tensorfold.families.drama3.verify import Word, check_words, ends_with_direction, words_of
+
+    assert words_of("<|speaker:1|> [sighs] It's 41 days, 2nd!") == ["it's", "forty", "one", "days", "second"]
+    assert ends_with_direction("Fine. [laughs]") and not ends_with_direction("[laughs] Fine.")
+    heard = [Word(t, s, s + 0.3) for t, s in ((" Hello", 0.0), (" there.", 0.4), (" This", 1.0), (" is", 1.3),
+                                                (" Tensor", 1.6), (" Fold.", 1.9), (" And", 2.6), (" then.", 2.9))]
+    text = "Hello there. This is TensorFold."
+    clean = check_words(text, heard[:6], 2.5)
+    assert clean.action == "ok" and clean.coverage == 1.0
+    runaway = check_words(text, heard, 3.5)
+    assert runaway.action == "trim" and runaway.tail_words == ["and", "then"] and 2.2 <= runaway.cut_s <= 2.5
+    dropped = check_words(text + " Goodbye now, my friend.", heard[:6], 2.5)
+    assert dropped.action == "redraw" and dropped.ending_missing
+    long_tail = check_words(text, heard[:6], 6.0)
+    assert long_tail.action == "trim" and abs(long_tail.cut_s - 2.5) < 1e-6
+    assert check_words(text + " [laughs]", heard[:6], 4.0).action == "ok"
+
+
+def test_stop_rule_missed_stop():
+    pytest.importorskip("mlx.core")
+    from tensorfold.families.drama3.generate import StopRule
+
+    rule = StopRule(min_frames=10, max_overrun=5, pad_frames=2)
+    assert not any(rule(n, [0.5 if n == 4 else 0.01]) for n in range(1, 10))   # before min_frames: ignored
+    assert rule.hold_from is None
+    assert not rule(12, [0.3]) and rule.hold_from == 11 and rule.cut_frames == 13
+    assert not any(rule(n, [0.0]) for n in range(13, 17))
+    assert rule(17, [0.0])                                                     # 6 frames past the candidate
+
+
+def test_streamed_wav_bytes(tmp_path):
+    pytest.importorskip("mlx.core")
+    import soundfile
+
+    from tensorfold.families.drama3.stream import GrowingWav, pcm16, wav_header, wav_stream
+
+    chunks = [np.linspace(-1, 1, 300, dtype=np.float32), np.zeros(100, dtype=np.float32)]
+    data = b"".join(wav_stream(chunks))
+    assert data[:4] == b"RIFF" and len(data) == 44 + 2 * 400 and data[44:] == pcm16(np.concatenate(chunks))
+    assert wav_header(800)[40:44] == (800).to_bytes(4, "little")
+    path = tmp_path / "grow.wav"
+    wav = GrowingWav(path)
+    for c in chunks:
+        wav.write(c)
+    wav.close()
+    audio, rate = soundfile.read(str(path), dtype="float32")
+    assert rate == 44100 and len(audio) == 400 and abs(audio[0] + 1) < 1e-3

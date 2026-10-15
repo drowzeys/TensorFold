@@ -90,6 +90,107 @@ class Codec:
         return codes[0, :, :frames].astype(mx.int32)
 
 
+QUANTIZER_RECEPTIVE_FRAMES = 1024     # the quantizer's 8 causal transformer layers see 8 x 127 frames back
+
+
+class StreamDecoder:
+    """Codec decoding of frames as they are drawn, in growing windows (Fish's streaming schedule), equal to the
+    one-pass decode.
+
+    The first window is ``first`` frames (small, for a short time to first audio), the next ones follow ``ramp``,
+    then every ``stride`` frames. The codec is causal, but its quantizer stacks 8 transformer layers that each look
+    128 frames back, so a window decoded from a short overlap alone drifts (Fish's 32-frame overlap gives ~11 dB
+    against the one-pass decode here). Instead each window recomputes the quantizer's latent over up to the last
+    1024 frames (cheap: ~6 ms for 250 frames) and runs the convolutional decoder (the costly part) only on the new
+    frames plus ``context`` frames before them; the stream then matches the one-pass decode to float noise (~87-90
+    dB). ``crossfade`` samples at each seam may be held back and blended with the next window's decode of them.
+    """
+
+    def __init__(self, codec: "Codec", *, first: int = 10, ramp: tuple[int, ...] = (10, 12, 32), stride: int = 64,
+                 context: int = 16, crossfade: int = 0) -> None:
+        import numpy as np
+
+        self.codec, self.first, self.ramp, self.stride = codec, first, tuple(ramp), stride
+        self.context, self.crossfade = context, crossfade
+        self.codes = np.zeros((CODEBOOKS, 0), dtype=np.int64)
+        self.base = 0                      # frames dropped from the front of ``codes``
+        self.emitted = 0                   # frames whose samples have been emitted (absolute)
+        self.windows = 0
+        self.pending_tail = None           # crossfade samples held back
+        self.decode_s = 0.0
+
+    @property
+    def frames(self) -> int:
+        return self.base + self.codes.shape[1]
+
+    def next_boundary(self) -> int:
+        k = self.windows
+        stride = self.first if k == 0 else (self.ramp[k - 1] if k - 1 < len(self.ramp) else self.stride)
+        return self.emitted + stride
+
+    def push(self, codes) -> list:
+        """Add frames' codes [10, n] (or one frame [10]); return the audio of every window they complete."""
+
+        import numpy as np
+
+        codes = np.asarray(codes, dtype=np.int64)
+        if codes.ndim == 1:
+            codes = codes[:, None]
+        self.codes = np.concatenate([self.codes, codes], axis=1)
+        out = []
+        while self.frames >= self.next_boundary():
+            out.append(self._decode(self.next_boundary(), final=False))
+            self.windows += 1
+        return [a for a in out if len(a)]
+
+    def flush(self):
+        """The audio of the frames no window has emitted yet (and any held-back crossfade)."""
+
+        import numpy as np
+
+        if self.frames > self.emitted:
+            return self._decode(self.frames, final=True)
+        tail, self.pending_tail = self.pending_tail, None
+        return tail if tail is not None else np.zeros(0, dtype=np.float32)
+
+    def _decode(self, end: int, final: bool):
+        import time
+
+        import mlx.core as mx
+        import numpy as np
+
+        started = time.perf_counter()
+        model = self.codec.model
+        first = max(self.base, end - QUANTIZER_RECEPTIVE_FRAMES)
+        codes = mx.array(self.codes[:, first - self.base:end - self.base]).astype(mx.int32)
+        codes = mx.concatenate([mx.clip(codes[:1], 0, 4095), mx.clip(codes[1:], 0, 1023)], axis=0)
+        latent = model.quantizer.decode(codes[None])                      # [1, C, 4 * frames]
+        steps = int(latent.shape[-1]) // (end - first)                     # latent steps a frame
+        start = max(first, self.emitted - self.context)
+        audio = model.decoder(latent[:, :, (start - first) * steps:]).reshape(-1)
+        audio = np.array(audio.astype(mx.float32))
+        mx.clear_cache()
+        hop = self.codec.frame_length
+        offset = (self.emitted - start) * hop
+        delta = audio[offset:]
+        if self.pending_tail is not None and len(self.pending_tail):
+            n = len(self.pending_tail)
+            fade = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            blended = self.pending_tail * (1.0 - fade) + audio[offset - n:offset] * fade
+            delta = np.concatenate([blended, delta])
+            self.pending_tail = None
+        if not final and self.crossfade > 0 and len(delta) > self.crossfade:
+            self.pending_tail = delta[-self.crossfade:].copy()
+            delta = delta[:-self.crossfade]
+        self.emitted = end
+        keep_from = max(self.base, end - QUANTIZER_RECEPTIVE_FRAMES)       # older frames are never needed again
+        if keep_from > self.base:
+            self.codes = self.codes[:, keep_from - self.base:]
+            self.base = keep_from
+        self.decode_s += time.perf_counter() - started
+        return delta.astype(np.float32)
+
+
 def load_audio(path: str | Path, sample_rate: int = SAMPLE_RATE):
     """A mono float32 numpy waveform at ``sample_rate`` (soundfile reads it; numpy polyphase-free resampling)."""
 

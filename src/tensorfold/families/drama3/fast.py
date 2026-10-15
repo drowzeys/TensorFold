@@ -350,7 +350,7 @@ class FastStep:
         """Layer i's compiled post-attention part; with ``sampling``, followed by its head and code draw."""
 
         spec = self.tower[i]
-        key = None if sampling is None else (sampling.temperature, sampling.top_k, sampling.top_p, sampling.greedy)
+        key = sampling            # a frozen dataclass: every setting is part of the key
         if key not in spec["draws"]:
             post = spec["post"]
             if sampling is None:
@@ -374,33 +374,53 @@ class FastStep:
     def tower_step(self, hidden, frame, main, code0, caches, sampling: Sampling, keys) -> list[mx.array]:
         """Codes 0..9 [B] of one row: as ``Drama3.tower_step`` with draws by ``sampling`` and ``keys`` [9]."""
 
+        h, codes = self.tower_head(hidden, frame, main, code0, caches, sampling, keys)
+        return self.tower_tail(h, main, codes, caches, sampling, keys)
+
+    def tower_head(self, hidden, frame, main, code0, caches, sampling: Sampling, keys):
+        """The shared layers and the first residual layer: (hidden after it, [code 0, code 1]). Code 1 is all the
+        next backbone step needs of this row besides the main token, so the rest of the tower can run alongside it."""
+
         c, model = self.c, self.model
         semantic = model.is_semantic(main)[:, None]
         extra = model.shared_extra(frame)
         offset = mx.array(caches[0].offset, dtype=mx.int32)
         h = hidden
         codes = [code0]
-        for i, spec in enumerate(self.tower):
-            given = (code0 if i < c.shared_layers else codes[-1])[:, None]
-            if spec["first"]:
-                q, k, v, gate, mixed = spec["pre"](h, given, semantic, extra, offset)
-            else:
-                q, k, v, gate, mixed = spec["pre"](h, given, semantic, offset)
-            out = self._attend(spec, q, k, v, caches[i])
-            if i < c.shared_layers:
-                h = self._tower_post(i, None)(out, gate, mixed)
-            else:
-                r = i - c.shared_layers
-                h, code = self._tower_post(i, sampling)(out, gate, mixed, None if keys is None else keys[r])
-                codes.append(code)
+        for i in range(c.shared_layers + 1):
+            h = self._tower_layer_step(i, h, codes, semantic, extra, offset, caches, sampling, keys)
+        return h, codes
+
+    def tower_tail(self, h, main, codes, caches, sampling: Sampling, keys) -> list[mx.array]:
+        """The residual layers after the first: codes 2..9 appended to ``codes``."""
+
+        semantic = self.model.is_semantic(main)[:, None]
+        offset = mx.array(caches[-1].offset, dtype=mx.int32)
+        for i in range(self.c.shared_layers + 1, len(self.tower)):
+            h = self._tower_layer_step(i, h, codes, semantic, None, offset, caches, sampling, keys)
         return codes
+
+    def _tower_layer_step(self, i, h, codes, semantic, extra, offset, caches, sampling, keys):
+        c = self.c
+        spec = self.tower[i]
+        given = (codes[0] if i < c.shared_layers else codes[-1])[:, None]
+        if spec["first"]:
+            q, k, v, gate, mixed = spec["pre"](h, given, semantic, extra, offset)
+        else:
+            q, k, v, gate, mixed = spec["pre"](h, given, semantic, offset)
+        out = self._attend(spec, q, k, v, caches[i])
+        if i < c.shared_layers:
+            return self._tower_post(i, None)(out, gate, mixed)
+        h, code = self._tower_post(i, sampling)(out, gate, mixed, keys[i - c.shared_layers])
+        codes.append(code)
+        return h
 
     # main token ----------------------------------------------------------------------------------------------------
     def head(self, sampling: Sampling):
         """compiled (hidden [1, 1, D], RAS window [1, 16], key) -> (candidate logits, main, code 0, new window,
         code keys [9], next key, p(EOS)); greedy draws ignore the keys."""
 
-        key = (sampling.temperature, sampling.top_k, sampling.top_p, sampling.greedy)
+        key = sampling
         if key not in self._heads:
             model, c = self.model, self.c
 
@@ -408,7 +428,8 @@ class FastStep:
                 keys = mx.random.split(rng, 12)
                 logits = model.candidate_logits(h[:, -1])
                 main, code0 = draw_main(logits, model._candidate_ids, window, sampling,
-                                        None if sampling.greedy else keys[:2], c.semantic_begin, c.codebook_size)
+                                        None if sampling.greedy else keys[:2], c.semantic_begin, c.codebook_size,
+                                        c.eos_token_id)
                 new_window = mx.concatenate([window[:, 1:], main[:, None]], axis=1)
                 temp = max(float(sampling.temperature), 1e-5)
                 p_eos = mx.softmax(logits / temp, axis=-1)[:, model.eos_index]
