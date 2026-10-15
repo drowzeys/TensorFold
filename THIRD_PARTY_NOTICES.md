@@ -146,3 +146,16 @@ FastH3 weights are derivatives of MiniMax H3 under the MiniMax H3 Community Lice
 The velocity cache and attention reuse in `src/tensorfold/families/h3/sampler.py` follow the fast recipe of
 mlx-serve, https://github.com/ddalcu/mlx-serve (its thresholds and step gates); no source is included.
 
+
+## Fish Audio Drama 3
+
+`src/tensorfold/families/drama3/codec_dac.py` is adapted from mlx-audio, https://github.com/Blaizzy/mlx-audio,
+version 0.5.7, `mlx_audio/codec/models/fish_s1_dac/fish_s1_dac.py`, MIT License, Copyright (c) 2024 Prince
+Canuma (hub download removed, weight-norm folding added). See [the license text](LICENSES/MIT.txt). It ports
+Fish Audio's codec (fish-speech `modded_dac`).
+
+The Drama 3 backbone uses mlx-lm's `qwen3_5` model (MIT, installed as a dependency). The tower, frame
+embeddings, sampler and prompt layout in `src/tensorfold/families/drama3/` follow SGLang-Omni's
+`sglang_omni/models/fishaudio_drama3` (revision 416a70c0, Apache-2.0) in MLX; no SGLang-Omni source is included.
+
+Drama 3 weights are under the Fish Audio Community License v1.0; TensorFold ships no model weights.
