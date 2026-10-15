@@ -7,6 +7,7 @@
 // Every kernel that a decode frame runs reads its position and step from device memory, so a frame replays as one
 // CUDA graph. Plain extern "C" symbols; built with -O3 and torch's default flags.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 #include <math.h>
 
@@ -406,7 +407,12 @@ extern "C" __global__ void __launch_bounds__(256) d3_attn_decode(const bf16* __r
   }
   const float a = rb(A / Lsum);
   const float gt = b2f(proj[(size_t)t * ps + gate_off + h * gate_head_stride + i]);
-  out[((size_t)t * 16 + h) * 256 + i] = f2b(a * sigmoidf_(gt));
+  out[((size_t)t * 16 + h) * 256 + i] = f2b(a * rb(sigmoidf_(gt)));
+}
+
+// bf16 -> fp32 (the V cache rows for the prompt PV GEMM).
+extern "C" __global__ void d3_bf16_f32(const bf16* __restrict__ x, float* __restrict__ y, int n) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] = b2f(x[i]);
 }
 
 // Prompt attention through cuBLAS: q regrouped per KV head for the score GEMM: qg [2][T][8][256] from q [T, 16, 256].
@@ -415,31 +421,30 @@ extern "C" __global__ void d3_q_group(const bf16* __restrict__ q, bf16* __restri
   qg[(((size_t)(h >> 3) * T + t) * 8 + (h & 7)) * 256 + i] = q[((size_t)t * 16 + h) * 256 + i];
 }
 
-// Scores [2][T * 8][ld] fp32 (already scaled) -> causal softmax probabilities bf16 in place layout P [2][T*8][ld]:
+// Scores [2][T * 8][ld] fp32 (already scaled) -> causal softmax probabilities, fp32 in place (as the reference):
 // row (g, t, hh) sees keys 0..pos0 + t. One block a row.
-extern "C" __global__ void d3_causal_softmax(const float* __restrict__ s, bf16* __restrict__ p, int T, int ld,
-                                             const int* __restrict__ pos0) {
+extern "C" __global__ void d3_causal_softmax(float* __restrict__ s, int T, int ld, const int* __restrict__ pos0) {
   const size_t r = blockIdx.x;
   const int t = (int)((r / 8) % T);
   const int L = pos0[0] + t + 1;
-  const float* sr = s + r * ld;
-  bf16* pr = p + r * ld;
+  float* sr = s + r * ld;
   float m = -INFINITY;
   for (int j = threadIdx.x; j < L; j += blockDim.x) m = fmaxf(m, sr[j]);
   m = block_max(m);
   float sum = 0.f;
   for (int j = threadIdx.x; j < L; j += blockDim.x) sum += expf(sr[j] - m);
   const float inv = 1.f / block_sum(sum);
-  for (int j = threadIdx.x; j < ld; j += blockDim.x) pr[j] = j < L ? f2b(expf(sr[j] - m) * inv) : f2b(0.f);
+  __syncthreads();
+  for (int j = threadIdx.x; j < ld; j += blockDim.x) sr[j] = j < L ? expf(sr[j] - m) * inv : 0.f;
 }
 
-// O [2][T][8][256] bf16 (the PV GEMM's output) -> out [T, 16, 256] = O * sigmoid(gate).
-extern "C" __global__ void d3_attn_gate(const bf16* __restrict__ og, const bf16* __restrict__ proj, int ps,
+// O [2][T][8][256] fp32 (the PV GEMM's output) -> out [T, 16, 256] = bf16(O) * bf16(sigmoid(gate)).
+extern "C" __global__ void d3_attn_gate(const float* __restrict__ og, const bf16* __restrict__ proj, int ps,
                                         int gate_off, int gate_head_stride, bf16* __restrict__ out, int T) {
   const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
-  const float a = b2f(og[(((size_t)(h >> 3) * T + t) * 8 + (h & 7)) * 256 + i]);
+  const float a = rb(og[(((size_t)(h >> 3) * T + t) * 8 + (h & 7)) * 256 + i]);
   const float gt = b2f(proj[(size_t)t * ps + gate_off + h * gate_head_stride + i]);
-  out[((size_t)t * 16 + h) * 256 + i] = f2b(a * sigmoidf_(gt));
+  out[((size_t)t * 16 + h) * 256 + i] = f2b(a * rb(sigmoidf_(gt)));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -527,6 +532,21 @@ extern "C" __global__ void d3_moe_combine(bf16* __restrict__ r, const float* __r
     const float moe = rb(rb(acc) + sh);
     r[(size_t)t * D + i] = f2b(b2f(r[(size_t)t * D + i]) + moe);
   }
+}
+
+// SGLang's per_token_group_quant_fp8 (the routed experts' dynamic activations): per row and 128 inputs,
+// scale = max(amax, 1e-10) / 448, q = e4m3(clamp(x / scale)) written back as bf16 (exact); s [rows, K / 128].
+// grid (rows, K / 128), 128 threads.
+extern "C" __global__ void d3_act_quant(const bf16* __restrict__ x, int xs, bf16* __restrict__ q, int qs,
+                                        float* __restrict__ s) {
+  const int r = blockIdx.x, g = blockIdx.y, i = threadIdx.x;
+  const float v = b2f(x[(size_t)r * xs + g * 128 + i]);
+  const float amax = block_max(fabsf(v));
+  const float sc = fmaxf(amax, 1e-10f) / 448.f;
+  const float y = fminf(fmaxf(__fdiv_rn(v, sc), -448.f), 448.f);
+  const __nv_fp8_e4m3 e(y);
+  q[(size_t)r * qs + g * 128 + i] = f2b(float(e));
+  if (i == 0) s[(size_t)r * gridDim.y + g] = sc;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

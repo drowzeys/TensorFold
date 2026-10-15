@@ -17,7 +17,7 @@ const names = .{
     "d3_gdn",         "d3_gated_norm", "d3_qk_rope",     "d3_attn_decode",    "d3_q_group",
     "d3_causal_softmax", "d3_attn_gate", "d3_router",   "d3_swiglu",         "d3_moe_combine",
     "d3_tower_mix",   "d3_sample_main", "d3_sample_code", "d3_argmax_main",   "d3_finish_frame",
-    "d3_copy_i32",
+    "d3_copy_i32",    "d3_act_quant",  "d3_bf16_f32",
 };
 
 pub const F = enum(u8) {
@@ -42,6 +42,14 @@ pub const F = enum(u8) {
     argmax_main,
     finish_frame,
     copy_i32,
+    act_quant,
+    bf16_f32,
+};
+
+/// drama3_fp8.cu's instances: [decode, prompt][gate-up (SwiGLU epilogue 4), down fp32].
+const fp8_symbols = [2][2][:0]const u8{
+    .{ "_ZN9tf_d3_fp817fp8_expert_kernelILi2ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_PvifiS8_", "_ZN9tf_d3_fp817fp8_expert_kernelILi1ELi0ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_PvifiS8_" },
+    .{ "_ZN9tf_d3_fp824fp8_expert_prompt_kernelILi2ELi4ELi2ELi2EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_PvifiS8_", "_ZN9tf_d3_fp824fp8_expert_prompt_kernelILi1ELi0ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_PvifiS8_" },
 };
 
 const n_fns = @typeInfo(F).@"enum".field_names.len;
@@ -53,6 +61,9 @@ pub const Kernels = struct {
     experts_mod: cuda.Module,
     plan: cuda.grouped.Router,
     fp8: cuda.experts.Fp8Experts,
+    fp8a_mod: cuda.Module,
+    fp8a: [2][2]cuda.Function,
+    fp8a_resident: [2][2]usize,
     blas_lib: cuda.cublas.Library,
     blas: cuda.cublas.Blas,
     ws: cuda.DeviceBuffer,
@@ -70,6 +81,11 @@ pub const Kernels = struct {
         k.experts_mod = try cuda.Module.load(d, cuda.kernels.experts);
         k.plan = try cuda.grouped.Router.resolve(k.experts_mod);
         k.fp8 = try cuda.experts.Fp8Experts.load(d, k.sms);
+        k.fp8a_mod = try cuda.Module.load(d, cuda.kernels.drama3_fp8);
+        for (fp8_symbols, 0..) |set, pi| for (set, 0..) |name, ei| {
+            k.fp8a[pi][ei] = try k.fp8a_mod.function(name);
+            k.fp8a_resident[pi][ei] = @max(1, try k.fp8a[pi][ei].occupancy(128, 0)) * k.sms;
+        };
         k.blas_lib = try cuda.cublas.Library.open();
         const ws_bytes: usize = 32 << 20;
         k.ws = try cuda.DeviceBuffer.alloc(d, ws_bytes);
@@ -116,10 +132,14 @@ pub const Kernels = struct {
 
     /// Column-major C = alpha op(A) op(B), batched, bf16 in, fp32 or bf16 out (the attention score / value GEMMs).
     pub fn gemmEx(k: *const Kernels, s: cuda.Stream, ta: cuda.cublas.Op, tb: cuda.cublas.Op, m: usize, n: usize, kk: usize, alpha: f32, a_: u64, lda: usize, sa: usize, b_: u64, ldb: usize, sb: usize, c: u64, ldc: usize, sc: usize, batch: usize, out_f32: bool) !void {
+        return k.gemmTyped(s, ta, tb, m, n, kk, alpha, a_, lda, sa, b_, ldb, sb, c, ldc, sc, batch, .bf16, if (out_f32) .f32 else .bf16);
+    }
+
+    pub fn gemmTyped(k: *const Kernels, s: cuda.Stream, ta: cuda.cublas.Op, tb: cuda.cublas.Op, m: usize, n: usize, kk: usize, alpha: f32, a_: u64, lda: usize, sa: usize, b_: u64, ldb: usize, sb: usize, c: u64, ldc: usize, sc: usize, batch: usize, in_t: cuda.cublas.DataType, out_t: cuda.cublas.DataType) !void {
         const lib = &k.blas_lib;
         try lib.check(lib.api.cublasSetStream_v2(k.blas.h, s.handle), "cublasSetStream");
         const beta: f32 = 0.0;
-        try lib.check(lib.api.cublasGemmStridedBatchedEx(k.blas.h, ta, tb, @intCast(m), @intCast(n), @intCast(kk), &alpha, a_, .bf16, @intCast(lda), @intCast(sa), b_, .bf16, @intCast(ldb), @intCast(sb), &beta, c, if (out_f32) .f32 else .bf16, @intCast(ldc), @intCast(sc), @intCast(batch), cuda.cublas.compute_32f, cuda.cublas.gemm_default_tensor_op), "cublasGemmStridedBatchedEx");
+        try lib.check(lib.api.cublasGemmStridedBatchedEx(k.blas.h, ta, tb, @intCast(m), @intCast(n), @intCast(kk), &alpha, a_, in_t, @intCast(lda), @intCast(sa), b_, in_t, @intCast(ldb), @intCast(sb), &beta, c, out_t, @intCast(ldc), @intCast(sc), @intCast(batch), cuda.cublas.compute_32f, cuda.cublas.gemm_default_tensor_op), "cublasGemmStridedBatchedEx");
     }
 
     // ---- norms and elementwise
@@ -242,10 +262,9 @@ pub const Kernels = struct {
         try k.go(.q_group, s, t, 16, 256, 0, &a);
     }
 
-    pub fn causalSoftmax(k: *const Kernels, s: cuda.Stream, sc: u64, p: u64, t: usize, ld: usize, pos0: u64) !void {
+    pub fn causalSoftmax(k: *const Kernels, s: cuda.Stream, sc: u64, t: usize, ld: usize, pos0: u64) !void {
         var a: cuda.Args = .{};
         a.add(sc);
-        a.add(p);
         a.add(i(t));
         a.add(i(ld));
         a.add(pos0);
@@ -360,6 +379,52 @@ pub const Kernels = struct {
         var a: cuda.Args = .{};
         for ([_]u64{ frame, frames_out, next_input, window, pos, step, count }) |v| a.add(v);
         try k.go(.finish_frame, s, 1, 1, 32, 0, &a);
+    }
+
+    /// SGLang's per_token_group_quant_fp8: rows of x (k wide, xs apart) -> q (bf16 holding e4m3, qs apart) and
+    /// scales s [rows, k / 128].
+    pub fn actQuant(k: *const Kernels, s: cuda.Stream, x: u64, xs: usize, q: u64, qs: usize, sc: u64, rows: usize, kdim: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(i(xs));
+        a.add(q);
+        a.add(i(qs));
+        a.add(sc);
+        try k.go(.act_quant, s, rows, kdim / 128, 128, 0, &a);
+    }
+
+    /// The routed experts with FP8 activations (drama3_fp8.cu): `up` takes token rows (slots pairs a row) to the
+    /// SwiGLU pair rows, else pair rows to fp32 down rows; xsc the rows' activation scales (0: bf16 rows).
+    pub fn experts(k: *const Kernels, s: cuda.Stream, up: bool, prompt: bool, x: u64, stride: usize, slots: usize, xsc: u64, l: cuda.experts.Layer, p: cuda.grouped.Plan, out: u64, items: usize) !void {
+        const kg = (if (up) l.dims else l.width) / 32;
+        const nb = (if (up) l.width else l.dims) / 32;
+        const n = if (up) l.width else l.dims;
+        const pi: usize = @intFromBool(prompt);
+        const ei: usize = if (up) 0 else 1;
+        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (up) 2 else 4)), k.fp8a_resident[pi][ei]) else @min((items * nb + 3) / 4, k.fp8a_resident[pi][ei]);
+        if (grid < 1) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(i(stride));
+        a.add(i(if (up) slots else 0));
+        a.add(if (up) l.up else l.down);
+        a.add(if (up) l.up_scale else l.down_scale);
+        a.add(i(kg));
+        a.add(i(nb));
+        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
+        a.add(i(n));
+        a.add(@as(f32, 0.0));
+        a.add(@as(i32, -1));
+        a.add(xsc);
+        try cuda.launch.launch(k.fp8a[pi][ei], .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    pub fn bf16F32(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(i(n));
+        try k.go(.bf16_f32, s, @min((n + 255) / 256, 4096), 1, 256, 0, &a);
     }
 
     pub fn copyI32(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, n: usize) !void {

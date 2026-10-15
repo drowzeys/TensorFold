@@ -20,6 +20,8 @@ pub const Options = struct {
     attn_chunk: usize = 512, // query rows a prompt attention GEMM
     max_frames: usize = 2048,
     threads: usize = 16,
+    exact_attn_rows: usize = 0, // prompt chunks up to this many rows attend with the fp32 decode kernel
+    fp8_act: bool = true, // the routed experts' activations FP8 per token and 128 inputs, as SGLang serves them
 };
 
 pub const Sampling = struct {
@@ -79,7 +81,7 @@ pub const Engine = struct {
     qg: u64,
     og: u64,
     scores: u64, // [2, 8 * attn_chunk, max_ctx] fp32
-    probs: u64, // bf16
+    vf: u64, // V cache rows in fp32 [max_ctx, 512] for the prompt PV GEMM
     sp: u64, // [R, 1288]
     sact: u64, // [R, 512]
     shout: u64, // [R, H]
@@ -87,6 +89,10 @@ pub const Engine = struct {
     rw: u64, // f32 [R * 8]
     gu: u64, // [R * 8, 512] bf16
     down: u64, // [R * 8, H] fp32
+    xq: u64, // [R, H] bf16 (e4m3 values)
+    xsc: u64, // [R, H / 128] fp32
+    gq: u64, // [R * 8, 512]
+    gsc: u64, // [R * 8, 4]
     plan: cuda.grouped.Plan,
     hfin: u64, // [R, H] final-norm hidden
     th: [2]u64, // tower hidden ping-pong [R, H]
@@ -100,6 +106,7 @@ pub const Engine = struct {
     graph: ?cuda.graph.Exec = null,
     graph_sampling: Sampling = .{},
     sampling: Sampling = .{},
+    probe_router: ?Probe = null, // diagnostics: every MoE layer's [shared gate | up | router | gate] rows
     rows_done: usize = 0, // positions in the cache (prompt rows; the frame step advances on the device)
     prompt_rows: usize = 0,
 
@@ -114,6 +121,7 @@ pub const Engine = struct {
         e.graph_sampling = .{};
         e.rows_done = 0;
         e.prompt_rows = 0;
+        e.probe_router = null;
         e.bufs = .empty;
         e.c = try cfg.Config.load(gpa, io, model_dir);
         e.driver = try cuda.Driver.open();
@@ -136,6 +144,7 @@ pub const Engine = struct {
         e.k.ws.free();
         e.k.blas_lib.close();
         e.k.fp8.unload();
+        e.k.fp8a_mod.unload();
         e.k.experts_mod.unload();
         e.k.mod.unload();
         e.stream.deinit();
@@ -194,10 +203,10 @@ pub const Engine = struct {
         e.y = try e.alloc(R * 4096 * 2);
         e.q = try e.alloc(R * 4096 * 2);
         e.qg = try e.alloc(R * 4096 * 2);
-        e.og = try e.alloc(R * 4096 * 2);
+        e.og = try e.alloc(R * 4096 * 4);
         const ac = @min(e.o.attn_chunk, R);
         e.scores = try e.alloc(2 * 8 * ac * (ctxn + 8) * 4);
-        e.probs = try e.alloc(2 * 8 * ac * (ctxn + 8) * 2);
+        e.vf = try e.alloc((ctxn + 8) * 512 * 4);
         e.sp = try e.alloc(R * cfg.moe_proj * 2);
         e.sact = try e.alloc(R * cfg.shared_width * 2);
         e.shout = try e.alloc(R * H * 2);
@@ -205,6 +214,10 @@ pub const Engine = struct {
         e.rw = try e.alloc(R * 8 * 4);
         e.gu = try e.alloc(R * 8 * cfg.expert_width * 2);
         e.down = try e.alloc(R * 8 * H * 4);
+        e.xq = try e.alloc(R * H * 2);
+        e.xsc = try e.alloc(R * (H / 128) * 4);
+        e.gq = try e.alloc(R * 8 * cfg.expert_width * 2);
+        e.gsc = try e.alloc(R * 8 * (cfg.expert_width / 128) * 4);
         const pairs = R * 8;
         const items = cuda.grouped.maxItems(pairs, cfg.experts, 16);
         const nblk = (pairs + 1023) / 1024;
@@ -254,7 +267,7 @@ pub const Engine = struct {
         const s = e.stream;
         const ps = cfg.attn_proj;
         try k.qkRope(s, e.proj, ps, lay, qn, kn, e.pos, e.q, kc, vc, t, interleaved, cfg.rope_theta, cfg.eps);
-        if (t == 1) return k.attnDecode(s, e.q, kc, vc, e.pos, e.proj, ps, lay, e.y, 1);
+        if (t == 1 or t <= e.o.exact_attn_rows) return k.attnDecode(s, e.q, kc, vc, e.pos, e.proj, ps, lay, e.y, t);
         // prompt rows: per chunk of query rows, scores = q K^T / 16 (fp32), causal softmax (bf16), P V
         const ac = @min(e.o.attn_chunk, e.o.max_rows);
         var c0: usize = 0;
@@ -267,8 +280,9 @@ pub const Engine = struct {
             try k.qGroup(s, qrow, e.qg, tc);
             const m8 = 8 * tc;
             try k.gemmEx(s, .t, .n, L, m8, 256, 0.0625, kc, 512, 256, e.qg, 256, m8 * 256, e.scores, ld, m8 * ld, 2, true);
-            try k.causalSoftmax(s, e.scores, e.probs, tc, ld, e.pos);
-            try k.gemmEx(s, .n, .n, 256, m8, L, 1.0, vc, 512, 256, e.probs, ld, m8 * ld, e.og, 256, m8 * 256, 2, false);
+            try k.causalSoftmax(s, e.scores, tc, ld, e.pos);
+            try k.bf16F32(s, vc, e.vf, L * 512);
+            try k.gemmTyped(s, .n, .n, 256, m8, L, 1.0, e.vf, 512, 256, e.scores, ld, m8 * ld, e.og, 256, m8 * 256, 2, .f32, .f32);
             try k.attnGate(s, e.og, e.proj + c0 * ps * 2, ps, lay, e.y + c0 * 4096 * 2, tc);
         }
         if (t > ac) try e.setPos(start);
@@ -294,6 +308,10 @@ pub const Engine = struct {
         }
         try k.addRmsnorm(s, e.x, e.tmp, H, L.post_norm, e.xn, t, H, cfg.eps);
         try e.moe(L, t);
+        if (e.probe_router) |p| {
+            var nb: [32]u8 = undefined;
+            try p.f(p.ctx, try std.fmt.bufPrint(&nb, "router.layer{d:0>2}", .{li}), e.sp, t, cfg.moe_proj, false);
+        }
     }
 
     fn moe(e: *Engine, L: *const wts.Layer, t: usize) !void {
@@ -309,8 +327,15 @@ pub const Engine = struct {
         const tile: usize = if (prompt) cuda.experts.promptTile(.fp8g) else 16;
         try k.plan.route(s, e.picks, pairs, cfg.experts, tile, e.plan);
         const items = cuda.grouped.maxItems(pairs, cfg.experts, tile);
-        try k.fp8.run(s, .up, .{ .x = e.xn, .stride = H, .slots = cfg.top_k }, L.experts, e.plan, prompt, e.gu, items, -1);
-        try k.fp8.run(s, .down_f32, .{ .x = e.gu, .stride = cfg.expert_width }, L.experts, e.plan, prompt, e.down, items, -1);
+        if (e.o.fp8_act) {
+            try k.actQuant(s, e.xn, H, e.xq, H, e.xsc, t, H);
+            try k.experts(s, true, prompt, e.xq, H, cfg.top_k, e.xsc, L.experts, e.plan, e.gu, items);
+            try k.actQuant(s, e.gu, cfg.expert_width, e.gq, cfg.expert_width, e.gsc, pairs, cfg.expert_width);
+            try k.experts(s, false, prompt, e.gq, cfg.expert_width, 0, e.gsc, L.experts, e.plan, e.down, items);
+        } else {
+            try k.experts(s, true, prompt, e.xn, H, cfg.top_k, 0, L.experts, e.plan, e.gu, items);
+            try k.experts(s, false, prompt, e.gu, cfg.expert_width, 0, 0, L.experts, e.plan, e.down, items);
+        }
         try k.moeCombine(s, e.x, e.down, e.rw, e.shout, e.sp, mp, 2 * cfg.shared_width + cfg.experts, H, t);
     }
 
@@ -407,6 +432,24 @@ pub const Engine = struct {
         e.rows_done = n;
     }
 
+    /// Parity: the tower prefill alone over prompt rows 0..n-2 from final-norm hidden rows hfin (host bf16 [n, H]),
+    /// with the prompt rows prefill() left on the device (one chunk).
+    pub fn towerOnly(e: *Engine, n: usize, hfin: []const u8, probe: ?Probe) !void {
+        if (n > e.o.max_rows) return error.ProbeNeedsOneChunk;
+        try e.put(e.hfin, hfin);
+        try e.setPos(0);
+        var hin = e.hfin;
+        for (0..cfg.tower_layers) |ti| {
+            const hout = e.th[ti % 2];
+            try e.towerLayer(ti, n - 1, 0, hin, hout, e.pframes + W * 4, W, e.pframes);
+            if (probe) |p| {
+                var nb: [64]u8 = undefined;
+                try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_prefill.layer{d:0>2}", .{ti}), hout, n - 1, H, false);
+            }
+            hin = hout;
+        }
+    }
+
     fn copyRow(e: *Engine, src: u64, dst: u64, bytes: usize) !void {
         var b = buf(dst);
         b.d = &e.driver;
@@ -419,6 +462,14 @@ pub const Engine = struct {
 
     /// The frame step's launches (one graph): sample, tower, record, backbone row at the next position.
     fn enqueueFrame(e: *Engine, smp: Sampling, probe: ?Probe) !void {
+        return e.enqueueFrameForced(smp, probe, null);
+    }
+
+    /// Teacher forcing (parity checks): each pick goes to force.picks and is then replaced by force.frame's value
+    /// (device int32 [11] each), so the tower and the next backbone row take the forced frame.
+    pub const Force = struct { frame: u64, picks: u64 };
+
+    fn enqueueFrameForced(e: *Engine, smp: Sampling, probe: ?Probe, force: ?Force) !void {
         const k = &e.k;
         const s = e.stream;
         const sem_begin = e.c.ids.sem_begin;
@@ -426,7 +477,10 @@ pub const Engine = struct {
         const sp = spOf(smp);
         try k.gemv(s, e.w.cand_head, e.hlast, H, e.w.n_cand, 0, e.cand_logits);
         if (probe) |p| try p.f(p.ctx, "tower_decode0.candidate_logits", e.cand_logits, 1, e.w.n_cand, true);
-        if (greedy) {
+        if (force) |fc| {
+            try k.argmax(s, e.cand_logits, e.w.n_cand, e.w.cand_ids, fc.picks, sem_begin, cfg.codebook_size);
+            try k.copyI32(s, fc.frame, e.frame, 2);
+        } else if (greedy) {
             try k.argmax(s, e.cand_logits, e.w.n_cand, e.w.cand_ids, e.frame, sem_begin, cfg.codebook_size);
         } else {
             try k.sampleMain(s, e.cand_logits, e.w.n_cand, e.w.cand_ids, e.window, sp, e.step, e.frame, sem_begin, cfg.codebook_size);
@@ -448,7 +502,10 @@ pub const Engine = struct {
                     try p.f(p.ctx, try std.fmt.bufPrint(&nb, "tower_decode0.head{d}_logits", .{hi}), e.code_logits, 1, cfg.codebook_size, true);
                 }
                 const out = e.frame + (2 + hi) * 4;
-                if (greedy) {
+                if (force) |fc| {
+                    try k.argmax(s, e.code_logits, cfg.codebook_size, 0, fc.picks + (2 + hi) * 4, 0, 0);
+                    try k.copyI32(s, fc.frame + (2 + hi) * 4, out, 1);
+                } else if (greedy) {
                     try k.argmax(s, e.code_logits, cfg.codebook_size, 0, out, 0, 0);
                 } else {
                     try k.sampleCode(s, e.code_logits, cfg.codebook_size, sp, e.step, @intCast(2 + hi), out);
@@ -460,6 +517,11 @@ pub const Engine = struct {
         try k.embedBackbone(s, e.cur_input, e.w.embed, e.w.cb_emb, e.x, 1, H, sem_begin, e.c.ids.sem_end, cfg.codebook_size);
         for (0..cfg.layers) |li| try e.backboneLayer(li, 1, 0);
         try k.rmsnorm(s, e.x, H, e.w.final_norm, e.hlast, H, 1, H, cfg.eps, true);
+    }
+
+    /// One teacher-forced greedy frame, eager.
+    pub fn frameForced(e: *Engine, force: Force) !void {
+        try e.enqueueFrameForced(.{ .temperature = 0, .top_k = 1 }, null, force);
     }
 
     /// One frame (eager, or replaying the captured graph when `graphs`).
