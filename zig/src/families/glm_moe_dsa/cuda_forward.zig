@@ -889,6 +889,12 @@ pub const Forward = struct {
     /// max_rows rows (prompt chunks): q_b / o_proj through the prompt GEMM, absorb and expand as torch.bmm (cuBLAS,
     /// tensor cores: not row-exact, as the Python engine's) with _qrope beside.
     pub fn attentionCore(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, pos: u64, R: usize, q_done: bool) !void {
+        return f.attentionCoreTo(b, L, kc, pos, R, q_done, false);
+    }
+
+    /// attentionCore; `to16`: o_proj writes its rows as bf16 into b.bpart (the reduce-scatter's input) instead of
+    /// fp32 into b.part - the prompt GEMM's bf16 store rounds as glm53_f32_bf16 does, so the same bits.
+    pub fn attentionCoreTo(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, pos: u64, R: usize, q_done: bool, to16: bool) !void {
         const t_ = f.t();
         const m = f.mla();
         if (!q_done) {
@@ -926,7 +932,7 @@ pub const Forward = struct {
         }
         try f.pend(p1, .attn_core);
         const p2 = try f.pbegin();
-        try f.lin(b, &L.o_proj, b.o, R, b.part, .f32);
+        if (to16) try f.lin(b, &L.o_proj, b.o, R, b.bpart, .bf16) else try f.lin(b, &L.o_proj, b.o, R, b.part, .f32);
         try f.pend(p2, .attn_proj);
     }
 
@@ -1369,12 +1375,19 @@ pub const Forward = struct {
     /// expertsPart; `sy_ev` (TF_GLM53_SIDE "f"): the shared expert is already queued on the side stream into b.sy,
     /// this event marks its end (the routed chain waits on it right before its down + combine launch).
     pub fn expertsPartWith(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, sy_ev: ?cuda.Event) !void {
+        _ = try f.expertsPartTo(b, L, R, sy_ev, false);
+    }
+
+    /// expertsPartWith; `to16`: where the prompt experts' slot-order sum runs, the result goes as bf16 into b.bpart
+    /// (true returned) instead of fp32 into b.part (false: the caller converts).
+    pub fn expertsPartTo(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, sy_ev: ?cuda.Event, to16: bool) !bool {
         const D = f.w.config.hidden;
         const ex = if (L.experts) |*e| e else return error.Invalid;
         if (!f.shared_experts or R <= b.xs_rows) {
             if (sy_ev == null) try f.mlp(b, L, R, b.sy); // first: its weights may still be in L2 (TF_GLM53_L2PF)
             const xs = b.xs orelse return error.NoExpertScratch;
-            return f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R, sy_ev);
+            try f.ops().routed(b.normed, D, b.pick, b.wts, ex, xs, b.part, b.sy, R, sy_ev);
+            return false;
         }
         if (b.pe != null and kern.Ops.promptSupported(ex)) {
             if (f.k.pe.ipm != 112) return error.PromptExpertsUnsupported; // Buffers sized PromptScratch for IPM 112
@@ -1384,10 +1397,11 @@ pub const Forward = struct {
             try f.mlp(b, L, R, b.sy);
             try f.pend(p1, .shared);
             const p0 = try f.pbegin();
-            try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16, if (f.pe_det16) b.sy else 0);
+            const direct16 = to16 and f.pe_det16 and b.bpart != 0;
+            try f.ops().promptRouted(b.normed, D, b.pick, b.wts, ex, b.pe.?, b.part, R, f.pe_det16, if (f.pe_det16) b.sy else 0, if (direct16) b.bpart else 0);
             if (!f.pe_det16) try f.ops().addF32(b.part, b.sy, R * D);
             try f.pend(p0, .routed);
-            return;
+            return direct16;
         }
         // widths prompt_experts does not take (the MTP layer's 8-bit experts): the Python engine runs cuda-exl3's
         // grouped GEMM (not ported; its split-K atomics make it irreproducible run to run anyway). Here: the decode
@@ -1398,7 +1412,8 @@ pub const Forward = struct {
         if (f.mtp_dense) |md| {
             if (L.index == f.w.config.layers) {
                 try f.mlp(b, L, R, b.sy);
-                return md.routed(f, b, R);
+                try md.routed(f, b, R);
+                return false;
             }
         }
         // blocks of xs_big.rows rows when the prompt buffers carved one (Phase 3a speed: each block re-reads every
@@ -1411,14 +1426,20 @@ pub const Forward = struct {
             const n = @min(xs.rows, R - r0);
             try f.ops().routed(b.normed + r0 * D * 2, D, b.pick + r0 * K * 4, b.wts + r0 * K * 4, ex, xs, b.part + r0 * D * 4, b.sy + r0 * D * 4, n, null);
         }
+        return false;
     }
 
     /// fused.mlp: gate and up (one launch up to max_rows rows, else one prompt GEMM each), SwiGLU, down into `out`.
     pub fn mlp(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, out: u64) !void {
+        return f.mlpTo(b, L, R, out, .f32);
+    }
+
+    /// mlp with the down projection's output dtype `y` (.bf16: the reduce-scatter's input, rounded as converted).
+    pub fn mlpTo(f: *const Forward, b: *const Buffers, L: *const W.Layer, R: usize, out: u64, y: exl3.DType) !void {
         const width = L.mlp.gate.n;
         try f.lins(b, &.{ &L.mlp.gate, &L.mlp.up }, b.normed, R, &.{ b.g, b.u }, &.{ .bf16, .bf16 });
         try f.t().swiglu2(b.g, b.u, b.act, R, width);
-        try f.lin(b, &L.mlp.down, b.act, R, out, .f32);
+        try f.lin(b, &L.mlp.down, b.act, R, out, y);
     }
 };
 

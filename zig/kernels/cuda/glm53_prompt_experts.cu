@@ -878,9 +878,11 @@ __global__ void slot_sum16_kernel(const uint2* __restrict__ pairs, const int* __
 // rows) - the same bits as slot_sum16 + f32ToBf16 + bf16ToF32, one pass instead of three
 // `add` (may be null): the shared expert's rows, added after the round trip (experts_part's b.part += b.sy, the same
 // single fp32 add, so the same bits as a separate glm53_add_f32 pass).
+// `out16` (may be null): the result written as bf16 there instead of fp32 in `out` - the reduce-scatter's input,
+// rounded as glm53_f32_bf16 rounds it (to nearest even), so the same bits as writing fp32 and converting after.
 extern "C" __global__ void glm53_slot_sum16_bf16(const uint2* __restrict__ pairs, const int* __restrict__ pick,
                                                  float4* __restrict__ out, long long n4, int S, int D4, int E,
-                                                 const float4* __restrict__ add) {
+                                                 const float4* __restrict__ add, uint2* __restrict__ out16) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n4) return;
     const long long r = i / D4, c = i % D4;
@@ -897,7 +899,12 @@ extern "C" __global__ void glm53_slot_sum16_bf16(const uint2* __restrict__ pairs
         const float4 a = add[i];
         y.x += a.x; y.y += a.y; y.z += a.z; y.w += a.w;
     }
-    out[i] = y;
+    if (out16) {
+        const __nv_bfloat162 lo = __floats2bfloat162_rn(y.x, y.y), hi = __floats2bfloat162_rn(y.z, y.w);
+        out16[i] = make_uint2(*reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
+    } else {
+        out[i] = y;
+    }
 }
 
 // the codebook-2 (mul1) kernels GLM-5.3's prompt chunks launch (SharedExperts.prefill -> prompt_routed)

@@ -315,9 +315,9 @@ pub const Wide = struct {
         const lw = c.kv_lora;
         // baddbmm_out_cuda_impl, result [H, R, lw] contiguous -> transpose_result: m = lw, n = R, k = nope;
         // batch1_ = wk ('n', lda lw, stride nope lw), batch2_ = q's view ('n', ldb H qd, stride qd), ldc lw
-        try blas.bgemmBf16(f.s.handle, .n, .n, lw, R, c.nope, L.wk, lw, c.nope * lw, b.q, H * qd, qd, b.ol, lw, R * lw, H);
-        const o: kern.Ops = .{ .k = f.k, .s = f.s };
-        try o.bhxToHbx(b.ol, b.qlat, H, R, lw);
+        // written straight into the [R, H, lw] rows (ldc H lw, a head lw apart) instead of [H, R, lw] then
+        // bhxToHbx's copy: the same products, laid out where the attention reads them
+        try blas.bgemmBf16(f.s.handle, .n, .n, lw, R, c.nope, L.wk, lw, c.nope * lw, b.q, H * qd, qd, b.qlat, H * lw, lw, H);
         const t_: tri.Tri = .{ .set = &f.k.triton, .s = f.s };
         try t_.qrope(b.q, f.inv, b.qrot, pos, R, .{ .heads = H, .nope = c.nope, .rope = c.rope, .lw = lw, .vd = c.v_dim, .topk = c.index_topk });
     }
@@ -332,9 +332,8 @@ pub const Wide = struct {
         const vd = c.v_dim;
         // m = v, n = R, k = lw; batch1_ = wv^T ('t', lda lw, stride v lw), batch2_ = ol's view ('n', ldb H lw,
         // stride lw), ldc v
-        try blas.bgemmBf16(f.s.handle, .t, .n, vd, R, lw, L.wv, lw, vd * lw, b.ol, H * lw, lw, b.qlat, vd, R * vd, H);
-        const o: kern.Ops = .{ .k = f.k, .s = f.s };
-        try o.bhxToHbx(b.qlat, b.o, H, R, vd);
+        // straight into b.o's [R, H, v] rows (ldc H v, a head v apart): no bhxToHbx copy
+        try blas.bgemmBf16(f.s.handle, .t, .n, vd, R, lw, L.wv, lw, vd * lw, b.ol, H * lw, lw, b.o, H * vd, vd, H);
     }
 };
 
@@ -490,6 +489,9 @@ pub const Sp = struct {
     done: [2]cuda.Event,
     pos1: cuda.DeviceBuffer, // int32 [1]
     spos: cuda.DeviceBuffer, // int32 a half, 256 bytes apart (16-aligned pointers: Triton specializes on it)
+    /// a half's last producer (o_proj, the experts, the dense MLP) wrote its partial as bf16 into b.bpart already:
+    /// rsResidual skips the fp32 -> bf16 pass (read on the host as rsResidual is queued, right after the producer)
+    p16: [2]bool = .{ false, false },
 
     pub fn init(d: *const cuda.Driver, main: *const fw.Forward, side_stream: cuda.Stream, side_wide: *const Wide) !Sp {
         var sp: Sp = .{ .main = main, .side = main.*, .comm = main.comm orelse return error.NoCommunicator, .ready = undefined, .done = undefined, .pos1 = undefined, .spos = undefined };
@@ -543,17 +545,21 @@ pub const Sp = struct {
             const L = &f.w.layers[li];
             for (&hs) |*h| {
                 try f.s.wait(sp.done[h.i]);
-                try f.attentionCore(h.b, L, st.kc[li], h.pos, h.R, false);
+                const a16 = h.b.bpart != 0;
+                try f.attentionCoreTo(h.b, L, st.kc[li], h.pos, h.R, false, a16);
+                sp.p16[h.i] = a16;
                 try sp.chain(h, st, .after_attn, li, T);
             }
             for (&hs) |*h| {
                 try f.s.wait(sp.done[h.i]);
                 if (L.experts != null) {
-                    try f.expertsPart(h.b, L, h.R);
+                    sp.p16[h.i] = try f.expertsPartTo(h.b, L, h.R, null, h.b.bpart != 0);
                 } else {
+                    const d16 = h.b.bpart != 0;
                     const p0 = try f.pbegin();
-                    try f.mlp(h.b, L, h.R, h.b.part);
+                    try f.mlpTo(h.b, L, h.R, if (d16) h.b.bpart else h.b.part, if (d16) .bf16 else .f32);
                     try f.pend(p0, .dense);
+                    sp.p16[h.i] = d16;
                 }
                 try sp.chain(h, st, .after_ffn, li, T);
             }
@@ -718,8 +724,13 @@ pub const Sp = struct {
         const b = h.b;
         const o = sp.ops();
         const p0 = try sp.side.pbegin();
-        if (h.Rp > h.R) try o.fill32(b.part + h.R * D * 4, 0, (h.Rp - h.R) * D);
-        try o.f32ToBf16(b.part, b.bpart, h.Rp * D);
+        if (sp.p16[h.i]) {
+            // the producer wrote b.bpart itself: only the padding rows to zero (bf16 zero is all-zero bits)
+            if (h.Rp > h.R) try o.fill32(b.bpart + h.R * D * 2, 0, (h.Rp - h.R) * D / 2);
+        } else {
+            if (h.Rp > h.R) try o.fill32(b.part + h.R * D * 4, 0, (h.Rp - h.R) * D);
+            try o.f32ToBf16(b.part, b.bpart, h.Rp * D);
+        }
         try sp.comm.reduceScatter(b.bpart, b.bred, h.n * D, .bf16, .sum, sp.side.s.handle);
         try sp.tr().residualAddOf(b.xo, b.bred, "*bf16", h.n, D, 1);
         try sp.side.pend(p0, .rs);
