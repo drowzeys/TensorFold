@@ -119,6 +119,9 @@ pub const Options = struct {
     bmm_probe: ?[]const u8 = null,
     prompt_rows: usize = 8192,
     prompt_rows_short: usize = 4096,
+    dcp_prompt_rows: usize = 1024,
+    /// TF_GLM53_DCP_PROMPT_GATHER: prompt chunks under DCP gather each layer's cache prefix (cuda_forward.PromptGather)
+    dcp_prompt_gather: bool = false,
     prompt_sp: bool = true,
     experts: []const u8 = "shared",
     pe_det: []const u8 = "slots16",
@@ -191,6 +194,8 @@ pub const Options = struct {
         o.bmm_probe = env("TF_GLM53_BMM_PROBE");
         o.prompt_rows = try envInt(usize, "TF_GLM53_PROMPT_ROWS", o.prompt_rows);
         o.prompt_rows_short = try envInt(usize, "TF_GLM53_PROMPT_ROWS_SHORT", o.prompt_rows_short);
+        o.dcp_prompt_rows = try envInt(usize, "TF_GLM53_DCP_PROMPT_ROWS", o.dcp_prompt_rows);
+        o.dcp_prompt_gather = try envFlag("TF_GLM53_DCP_PROMPT_GATHER", false);
         o.prompt_sp = try envFlag("TF_GLM53_PROMPT_SP", true);
         o.experts = env("TF_GLM53_EXPERTS") orelse o.experts;
         o.pe_det = env("TF_GLM53_PE_DET") orelse env("TF_EXL3_PROMPT_DET") orelse o.pe_det;
@@ -279,7 +284,7 @@ fn settingsDigest(o: Options, dcp: usize, drafts: u64) u64 {
     const cw = [_]usize{ @intFromBool(o.copy.on), o.copy.match, o.copy.most, o.verify_rows, o.parallel };
     h.update(std.mem.asBytes(&cw));
     if (o.parallel > 1) o.multi_set.digest(&h);
-    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.stride, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
+    const shape = [_]usize{ o.world, o.context, o.k, o.draft_vocab, o.mtp_reuse, @intFromBool(o.graphs), @intFromBool(o.prewarm), @intFromBool(o.roce), o.prompt_rows, o.prompt_rows_short, o.dcp_prompt_rows, @intFromBool(o.dcp_prompt_gather), @intFromBool(o.prompt_sp), o.unpack_mb, @intFromBool(o.multi_select), @intFromBool(o.device_cands), @intFromBool(o.mtp_dense), dcp, @intFromBool(o.roce_health), @intFromBool(o.reuse.on), o.reuse.gap, o.reuse.stride, o.reuse.entries, @intFromBool(o.reuse.loose), @intFromFloat(o.l2pf_mb * 1024) };
     h.update(std.mem.asBytes(&shape));
     for ([_][]const u8{ o.experts, o.pe_det, o.side, o.l2pf }) |t| {
         h.update(t);
@@ -325,6 +330,7 @@ pub const Boot = struct {
     side: ?dec.Side = null,
     l2pf: ?dec.L2pf = null,
     sp: ?prompt.Sp = null,
+    pg: ?fw.PromptGather = null,
     fwd: fw.Forward, // the sequence-parallel chunk points at it (Sp.main); the Runner holds a copy
     r: rn.Runner,
     // Phase 4: the drafters' configs (read and checked before anything loads), their tap plan, the drafters, the
@@ -516,10 +522,15 @@ pub const Boot = struct {
         if (o.prompt_sp and o.world > 1 and b.dcp == 1) b.sp = try prompt.Sp.init(&b.driver, &b.fwd, b.side_stream, &b.side_wide);
         b.stage = 17;
         const capacity = o.context + o.k + 1; // Glm53Engine: Runner(limit + k + 1)
+        if (o.dcp_prompt_gather and b.dcp > 1) {
+            b.pg = try fw.PromptGather.init(&b.driver, &b.w, capacity, b.dcp);
+            b.fwd.pg = &b.pg.?;
+            std.log.info("glm53 rank {d}: DCP prompt chunks gather the cache prefix ({d:.2} GiB of scratch)", .{ o.rank, @as(f64, @floatFromInt(b.pg.?.bytes())) / (1024.0 * 1024.0 * 1024.0) });
+        }
         try b.checkCacheFits(capacity);
         // --parallel N: N slots of the caches; copy drafts are one stream's (Runner: slots == 1)
         const copy_set: copies.Settings = if (o.parallel > 1) .{ .on = false, .match = 0, .most = 0 } else o.copy;
-        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = copy_set, .slots = o.parallel });
+        b.r = try rn.Runner.init(gpa, io, &b.driver, b.fwd, capacity, .{ .k = o.k, .graphs = o.graphs, .window = 128, .reuse = o.mtp_reuse, .served = true, .prompt_rows = o.prompt_rows, .prompt_rows_short = o.prompt_rows_short, .dcp_prompt_rows = o.dcp_prompt_rows, .prompt_sp = o.prompt_sp, .roce_health = o.roce_health, .sp = if (b.sp) |*x| x else null, .device_cands = o.device_cands, .dcp = b.dcp, .verify_rows = o.verify_rows, .draft_rows = if (b.dspark_cfg) |c| c.block + 1 else 0, .copy = copy_set, .slots = o.parallel });
         b.stage = 18;
         // Phase 4: the drafters on every rank (each its heads / MLP share), attached to the runner before its prewarm
         if (b.dflash_cfg != null) {
@@ -594,6 +605,7 @@ pub const Boot = struct {
         if (b.dflash_dr) |x| x.deinit();
         if (s >= 18) b.r.deinit();
         if (s >= 17) if (b.sp) |*x| x.deinit();
+        if (s >= 17) if (b.pg) |*x| x.deinit();
         if (s >= 16) {
             if (b.l2pf) |*x| x.deinit();
             if (b.side) |*x| x.deinit();

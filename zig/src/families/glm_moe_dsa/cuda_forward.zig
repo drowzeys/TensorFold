@@ -612,6 +612,49 @@ pub const RouteTap = struct {
     }
 };
 
+/// TF_GLM53_DCP_PROMPT_GATHER: a prompt chunk under DCP gathers each target layer's filled cache prefix (latent rows
+/// and index keys, every rank's share, put back in position order) and runs DCP 1's selection and attention over it -
+/// the head-sharded prompt kernels instead of every rank attending all heads over its quarter of the keys plus the
+/// query gather, the candidates' gathers and the partials' all-to-all. The caches themselves stay split (decode and
+/// the MTP layer unchanged); the scratch holds one layer's prefix at a time.
+pub const PromptGather = struct {
+    gk: cuda.DeviceBuffer, // bf16 [G, ceil(cap / G), latent width]: every rank's local rows as gathered
+    fk: cuda.DeviceBuffer, // bf16 [cap, latent width]: position order
+    gi: cuda.DeviceBuffer, // bf16 [G, ceil(cap / G), index_dim]
+    fi: cuda.DeviceBuffer, // bf16 [cap, index_dim]
+    sc: cuda.DeviceBuffer, // int64 [128, cap]: DCP 1's score rows (Buffers.sc holds a rank's share only)
+    cap: usize,
+
+    pub fn init(d: *const cuda.Driver, w: *const W.Weights, capacity: usize, dcp: usize) !PromptGather {
+        const c = w.config;
+        const lr = dcpm.cdiv(capacity, dcp);
+        const lat = c.latentWidth() * 2;
+        const idx = c.index_dim * 2;
+        var gk = try cuda.DeviceBuffer.alloc(d, dcp * lr * lat);
+        errdefer gk.free();
+        var fk = try cuda.DeviceBuffer.alloc(d, dcp * lr * lat);
+        errdefer fk.free();
+        var gi = try cuda.DeviceBuffer.alloc(d, dcp * lr * idx);
+        errdefer gi.free();
+        var fi = try cuda.DeviceBuffer.alloc(d, dcp * lr * idx);
+        errdefer fi.free();
+        const sc = try cuda.DeviceBuffer.alloc(d, 128 * capacity * 8);
+        return .{ .gk = gk, .fk = fk, .gi = gi, .fi = fi, .sc = sc, .cap = capacity };
+    }
+
+    pub fn bytes(pg: *const PromptGather) usize {
+        return pg.gk.len + pg.fk.len + pg.gi.len + pg.fi.len + pg.sc.len;
+    }
+
+    pub fn deinit(pg: *PromptGather) void {
+        pg.sc.free();
+        pg.fi.free();
+        pg.gi.free();
+        pg.fk.free();
+        pg.gk.free();
+    }
+};
+
 pub const Forward = struct {
     w: *const W.Weights,
     k: *const kern.Kernels,
@@ -664,6 +707,10 @@ pub const Forward = struct {
     /// window's first position. Under DCP (dcp > 1) the kernels are the *RowsDcp ones: a row's keys on the owner of its
     /// position at BASE + POS // dcp, its attention over each rank's share of its own stream's rows.
     base: u64 = 0,
+    /// TF_GLM53_DCP_PROMPT_GATHER (PromptGather): the scratch, and the prompt chunk's end position (Runner.prefillChunk
+    /// sets it on its copy; 0 everywhere else: no gather)
+    pg: ?*const PromptGather = null,
+    pg_end: usize = 0,
 
     fn ops(f: *const Forward) kern.Ops {
         return .{ .k = f.k, .s = f.s };
@@ -815,9 +862,7 @@ pub const Forward = struct {
     /// (keys) on the side stream beside the query path, joined before select or the attention kernels.
     fn attentionPart(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, T: ?usize, reuse: u32) !void {
         const c = f.w.config;
-        const o = f.ops();
         const t_ = f.t();
-        const D = c.hidden;
         if (reuse != 0 and (L.indexer == null or R != 1)) return error.Invalid;
         if (f.base != 0 and reuse != 0) return error.Invalid; // several streams: no MTP index reuse
         const sd = f.sideOn();
@@ -839,6 +884,42 @@ pub const Forward = struct {
         }
         try t_.rmsnorm(b.qa, c.q_lora, L.q_a_norm, b.qn, c.q_lora, R, c.q_lora, c.eps);
         if (!side_a and !side_w) try f.keys(b, L, kc, ic, pos, R, reuse);
+        // PromptGather: the chunk's keys are in this rank's share; the layer's prefix gathered, then DCP 1 over it
+        if (f.pg) |pg| if (f.dcp > 1 and f.base == 0 and f.pg_end > 0 and R > b.small and T != null and reuse == 0 and sd == null) {
+            if (f.pg_end > pg.cap) return error.WindowTooWide;
+            try f.gatherPrefix(kc, pg.gk.ptr, pg.fk.ptr, c.latentWidth() * 2, f.pg_end);
+            if (ic != 0) try f.gatherPrefix(ic, pg.gi.ptr, pg.fi.ptr, c.index_dim * 2, f.pg_end);
+            var g = f.*;
+            g.dcp = 1;
+            g.pg = null;
+            var bg = b.*;
+            bg.sc = pg.sc.ptr;
+            bg.dcp = 1;
+            return g.attentionRest(&bg, L, pg.fk.ptr, if (ic != 0) pg.fi.ptr else 0, pos, R, T, reuse, null);
+        };
+        return f.attentionRest(b, L, kc, ic, pos, R, T, reuse, sd);
+    }
+
+    /// PromptGather: rows [0, end) of a split cache (this rank's local rows at `src`, position p on rank p % dcp at
+    /// row p / dcp) into `full` in position order - every rank's ceil(end / dcp) rows gathered into `g`, then each
+    /// rank's rows strided back.
+    fn gatherPrefix(f: *const Forward, src: u64, g: u64, full: u64, row_bytes: usize, end: usize) !void {
+        const G = f.dcp;
+        const lr = dcpm.cdiv(end, G);
+        const cm = f.comm orelse return error.NoCommunicator;
+        try cm.allGather(src, g, lr * row_bytes / 2, .bf16, f.s.handle);
+        for (0..G) |r| {
+            const n = if (end > r) dcpm.cdiv(end - r, G) else 0;
+            try f.ops().copyRows(full + r * row_bytes, G * row_bytes, g + r * lr * row_bytes, row_bytes, row_bytes, n);
+        }
+    }
+
+    /// attention_part past the keys: the index queries, the selection and attention_core.
+    fn attentionRest(f: *const Forward, b: *const Buffers, L: *const W.Layer, kc: u64, ic: u64, pos: u64, R: usize, T: ?usize, reuse: u32, sd: ?*dec.Side) !void {
+        const c = f.w.config;
+        const o = f.ops();
+        const t_ = f.t();
+        const D = c.hidden;
         // b.tok[0, K-1:] = pos (DCP 1 only: under DCP the row's own key is in its owner's share already)
         if (reuse == 1 and T != null and f.dcp == 1) try o.copy(b.tok + (c.index_topk - 1) * 4, pos, 4);
         var q_done = false;

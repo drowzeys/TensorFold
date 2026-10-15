@@ -68,6 +68,8 @@ pub const Settings = struct {
     /// DCP_AUTO tokens of context): the target's and the MTP layer's cache rows interleaved over the ranks
     /// (position p on rank p % dcp at row p / dcp), so no sequence-parallel prompt chunks (compute_prompt_sp needs 1)
     dcp: usize = 1,
+    /// TF_GLM53_DCP_PROMPT_ROWS: the widest prompt chunk under DCP (the Python engine's 1024)
+    dcp_prompt_rows: usize = 1024,
     /// Phase 4: TF_GLM53_VERIFY_ROWS (runner.vrows when a drafter taps the target: 8) and a drafter's own verify rows
     /// (DSpark: block + 1)
     verify_rows: usize = 8,
@@ -267,8 +269,8 @@ pub const Runner = struct {
         if (set.dcp != 1 and set.dcp != w.world) return error.BadDcp;
         if (set.slots == 0) return error.BadDcp; // several streams under DCP: cuda_multi (docs/glm53-dcp-streams.md)
         if (set.dcp > 1 and !set.served) return error.BadDcp; // the served prompt path only
-        if (set.dcp > 1) { // Runner.__init__ with dcp > 1: prompt chunks of at most 1024 rows, no overlap
-            set.prompt_rows = @min(set.prompt_rows, 1024);
+        if (set.dcp > 1) { // Runner.__init__ with dcp > 1: prompt chunks of at most dcp_prompt_rows (1024), no overlap
+            set.prompt_rows = @min(set.prompt_rows, set.dcp_prompt_rows);
             set.prompt_rows_short = @min(set.prompt_rows_short, set.prompt_rows);
         }
         if (set.k > 0 and w.mtp == null) return error.NoMtpLayer;
@@ -876,6 +878,7 @@ pub const Runner = struct {
         } else {
             var pf = r.f; // a prompt chunk: routed-expert pruning only with TF_GLM53_EXPERT_PRUNE_PROMPT=1
             pf.chunk = true;
+            pf.pg_end = e; // PromptGather (DCP): this chunk's prefix [0, e)
             try pf.compute(&r.pb, st, R, T, if (last) head else .none, true);
             if (last) hb = &r.pb;
         }
