@@ -21,6 +21,7 @@ pub const Options = struct {
     max_frames: usize = 2048,
     threads: usize = 16,
     pdl: bool = true, // GEMVs launched with programmatic dependent launch
+    warmup: bool = true, // a short prompt and frame at open: cuBLAS heuristics and the frame graph ready
     split: bool = true, // tower codes 2..9 on a second stream beside the next backbone row
     exact_attn_rows: usize = 0, // prompt chunks up to this many rows attend with the fp32 decode kernel
     fp8_act: bool = true, // the routed experts' activations FP8 per token and 128 inputs, as SGLang serves them
@@ -153,6 +154,13 @@ pub const Engine = struct {
         e.k.pdl = o.pdl;
         e.w = try wts.load(gpa, io, &e.driver, model_dir, e.c, .{ .threads = o.threads });
         try e.allocState();
+        if (o.warmup) {
+            var rows: [4][W]i32 = @splat(@splat(0));
+            for (&rows, 0..) |*r, i| r[0] = @intCast(198 + i);
+            try e.prefill(&rows, null);
+            for (0..2) |_| try e.frameStep(.{}, true, null);
+            try e.stream.synchronize();
+        }
         return e;
     }
 
