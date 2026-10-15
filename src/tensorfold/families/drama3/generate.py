@@ -28,6 +28,7 @@ class Result:
     decode_s: float
     first_frame_s: float
     stats: dict = field(default_factory=dict)
+    eos_probs: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))   # p(EOS) each step
 
     @property
     def codes(self) -> np.ndarray:
@@ -112,25 +113,34 @@ class Drama3Generator:
         window = mx.array(window)
         key = mx.random.key(int(seed))
 
+        fast_step = model.fast_step
+        head = fast_step.head(sampling) if fast_step is not None else None
+
         def step(h: mx.array, frame_in: mx.array, window: mx.array, key: mx.array):
-            keys = None if sampling.greedy else mx.random.split(key, 12)
-            logits = model.candidate_logits(h[:, -1])
-            main, code0 = draw_main(logits, model._candidate_ids, window, sampling,
-                                    None if keys is None else keys[:2], c.semantic_begin, c.codebook_size)
+            if fast_step is not None:
+                logits, main, code0, new_window, code_keys, next_key, p_eos = head(h, window, key)
+                codes = fast_step.tower_step(h, frame_in, main, code0, tcaches, sampling, code_keys)
+            else:
+                keys = None if sampling.greedy else mx.random.split(key, 12)
+                logits = model.candidate_logits(h[:, -1])
+                main, code0 = draw_main(logits, model._candidate_ids, window, sampling,
+                                        None if keys is None else keys[:2], c.semantic_begin, c.codebook_size)
 
-            def draw_code(lg, r):
-                return draw(lg, sampling.temperature, sampling.top_k, sampling.top_p,
-                            None if keys is None else keys[2 + r], sampling.greedy)
+                def draw_code(lg, r):
+                    return draw(lg, sampling.temperature, sampling.top_k, sampling.top_p,
+                                None if keys is None else keys[2 + r], sampling.greedy)
 
-            codes = model.tower_step(h, frame_in, main, code0, tcaches, draw_code)
+                codes = model.tower_step(h, frame_in, main, code0, tcaches, draw_code)
+                new_window = mx.concatenate([window[:, 1:], main[:, None]], axis=1)
+                next_key = keys[11] if keys is not None else key
+                p_eos = mx.softmax(logits / max(float(sampling.temperature), 1e-5), axis=-1)[:, model.eos_index]
             frame = mx.stack([main, *codes], axis=-1)[:, None]           # [1, 1, 11]
-            new_window = mx.concatenate([window[:, 1:], main[:, None]], axis=1)
-            next_key = keys[11] if keys is not None else key
-            return frame, new_window, next_key, logits
+            return frame, new_window, next_key, logits, p_eos
 
-        frame, window, key, logits = step(last, frames[:, -1:], window, key)
-        mx.async_eval(frame, window)
+        frame, window, key, logits, p_eos = step(last, frames[:, -1:], window, key)
+        mx.async_eval(frame, window, p_eos)
         out: list[np.ndarray] = []
+        eos_probs: list[mx.array] = []
         finish = "length"
         first_frame_s = 0.0
         decode_started = time.perf_counter()
@@ -139,10 +149,11 @@ class Drama3Generator:
             if len(out) + 1 < max_frames:
                 h = model.backbone_hidden(frame, bcache)
                 pending = step(h, frame, window, key)
-                mx.async_eval(pending[0], pending[1])
+                mx.async_eval(pending[0], pending[1], pending[4])
             if trace is not None:
                 trace["logits"].append(np.array(logits[0]))
             value = np.array(frame[0, 0])
+            eos_probs.append(p_eos)
             if not out:
                 first_frame_s = time.perf_counter() - started
             if int(value[0]) == c.eos_token_id:
@@ -153,11 +164,12 @@ class Drama3Generator:
                 on_frame(value)
             if pending is None:
                 break
-            frame, window, key, logits = pending
+            frame, window, key, logits, p_eos = pending
         decode_s = time.perf_counter() - decode_started
         result = np.stack(out).astype(np.int64) if out else np.zeros((0, c.codebooks + 1), dtype=np.int64)
+        probs = np.array(mx.concatenate(eos_probs)) if eos_probs else np.zeros(0, dtype=np.float32)
         return Result(frames=result, prompt_rows=n, finish=finish, prefill_s=prefill_s, decode_s=decode_s,
-                      first_frame_s=first_frame_s)
+                      first_frame_s=first_frame_s, eos_probs=probs)
 
     # -- text in, audio out -------------------------------------------------------------------------------------
     def synthesize(self, text: str, *, references: list[Reference] | None = None, sampling: Sampling = Sampling(),

@@ -59,3 +59,22 @@ def test_top_p_keeps_rank0_and_drops_crossing_token():
     seen = {int(draw(logits, 1.0, 30, 0.9, mx.random.key(s))[0]) for s in range(50)}
     assert seen == {0}
     assert int(draw(logits, 1.0, 30, 0.9, None, greedy=True)[0]) == 0
+
+
+def test_fused_projections_match_separate():
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from tensorfold.families.drama3.fast import _fused_linear, _project
+    from tensorfold.families.drama3.model import FeedForward
+
+    parts = [nn.Linear(64, n, bias=False) for n in (48, 16, 8)]
+    fused = _fused_linear(*parts)
+    for rows in (1, 7):
+        x = mx.random.normal((1, rows, 64), key=mx.random.key(rows))
+        for got, part in zip(_project(fused, x, [48, 16, 8]), parts):
+            assert mx.allclose(got, part(x), atol=1e-5).item()
+    ff = FeedForward(64, 96)
+    x = mx.random.normal((1, 3, 64), key=mx.random.key(0))
+    before = ff(x)
+    ff.fuse()
+    assert "w1" not in ff and mx.allclose(ff(x), before, atol=1e-5).item()

@@ -19,6 +19,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from tensorfold.families.drama3 import fast
+
 
 @dataclass(frozen=True)
 class Drama3Config:
@@ -134,7 +136,9 @@ class TowerAttention(nn.Module):
         self.rotary_dim, self.rope_base = c.rotary_dim, c.rope_base
         self.scale = c.head_dim ** -0.5
 
-    def __call__(self, x: mx.array, cache: Any) -> mx.array:
+    def project(self, x: mx.array, offset) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        """Rotated queries and keys, values [B, heads, L, head_dim] and the output gate [B, L, heads * head_dim]."""
+
         B, L, _ = x.shape
         q_width = self.heads * self.head_dim
         kv_width = self.kv_heads * self.head_dim
@@ -146,15 +150,21 @@ class TowerAttention(nn.Module):
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
-        offset = cache.offset
         queries = mx.fast.rope(queries, self.rotary_dim, traditional=True, base=self.rope_base, scale=1.0,
                                offset=offset)
         keys = mx.fast.rope(keys, self.rotary_dim, traditional=True, base=self.rope_base, scale=1.0, offset=offset)
+        return queries, keys, values, gate
+
+    def finish(self, out: mx.array, gate: mx.array) -> mx.array:
+        B, _, L, _ = out.shape
+        return self.wo(out.transpose(0, 2, 1, 3).reshape(B, L, -1) * mx.sigmoid(gate))
+
+    def __call__(self, x: mx.array, cache: Any) -> mx.array:
+        queries, keys, values, gate = self.project(x, cache.offset)
         keys, values = cache.update_and_fetch(keys, values)
-        mask = "causal" if L > 1 else None
+        mask = "causal" if x.shape[1] > 1 else None
         out = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
-        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.wo(out * mx.sigmoid(gate))
+        return self.finish(out, gate)
 
 
 class FeedForward(nn.Module):
@@ -164,7 +174,22 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
+    def fuse(self) -> None:
+        """w1 and w3 as one [2 * hidden, dim] matrix (w1 rows first); the separate matrices are dropped."""
+
+        if "w13" in self:
+            return
+        w13 = nn.Linear(int(self.w1.weight.shape[1]), 2 * int(self.w1.weight.shape[0]), bias=False)
+        w13.weight = mx.concatenate([self.w1.weight, self.w3.weight], axis=0)
+        mx.eval(w13.weight)
+        self.pop("w1")
+        self.pop("w3")
+        self.w13 = w13
+
     def __call__(self, x: mx.array) -> mx.array:
+        if "w13" in self:
+            gate, up = mx.split(self.w13(x), 2, axis=-1)
+            return self.w2(nn.silu(gate) * up)
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
 
 
@@ -220,6 +245,7 @@ class Drama3(nn.Module):
         self.eos_index = candidates.index(c.eos_token_id)
         self._offsets = mx.arange(c.codebooks, dtype=mx.int32) * c.codebook_size
         self._head_rows: mx.array | None = None       # lm_head rows of the candidates, set after loading
+        self.fast_step: Any = None                         # the fused, compiled single-row step (fast.FastStep)
 
     # -- loading ----------------------------------------------------------------------------------------------------
     @classmethod
@@ -250,11 +276,15 @@ class Drama3(nn.Module):
         model.load_weights(list(weights.items()), strict=True)
         model.eval()
         mx.eval(model.parameters())
-        if os.environ.get("TF_DRAMA3_MOE_ACT", "bf16") == "fp8":
+        fp8 = os.environ.get("TF_DRAMA3_MOE_ACT", "bf16") == "fp8"
+        if fp8:
             emulate_fp8_moe(model.backbone)
             print("[drama3] MoE inputs emulate SGLang's FP8 activations (TF_DRAMA3_MOE_ACT=fp8)", flush=True)
         model._head_rows = mx.take(model.backbone.lm_head.weight, model._candidate_ids, axis=0)
         mx.eval(model._head_rows)
+        if fast.enabled() and not fp8:
+            fast.fuse_model(model, experts=not fp8)
+            model.fast_step = fast.FastStep(model)
         return model
 
     # -- caches -----------------------------------------------------------------------------------------------------
@@ -290,6 +320,8 @@ class Drama3(nn.Module):
     def backbone_hidden(self, frames: mx.array, cache: list[Any]) -> mx.array:
         """Final-norm backbone states [B, L, 2048] of frames [B, L, 11]."""
 
+        if self.fast_step is not None and frames.shape[:2] == (1, 1):
+            return self.fast_step.backbone(frames, cache)
         return self.backbone.model(None, cache, input_embeddings=self.embed(frames))
 
     def candidate_logits(self, hidden: mx.array) -> mx.array:

@@ -44,6 +44,7 @@ def run(model_dir: str, dump_dir: Path, gen, frames_to_check: int, free_frames: 
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     from tensorfold.families.drama3.codec import load_audio
+    from tensorfold.families.drama3.fast import router_logits
     from tensorfold.families.drama3.prompt import Reference
 
     model, c = gen.model, gen.model.config
@@ -82,7 +83,7 @@ def run(model_dir: str, dump_dir: Path, gen, frames_to_check: int, free_frames: 
         if i == 0:
             normed = layer.input_layernorm(h)
             r = h + layer.linear_attn(normed, ssm_mask, None)     # a probe: leaves the cache alone
-            gates = mx.softmax(layer.mlp.gate(layer.post_attention_layernorm(r)).astype(mx.float32), axis=-1)
+            gates = mx.softmax(router_logits(layer.mlp, layer.post_attention_layernorm(r)).astype(mx.float32), axis=-1)
             ours = np.argsort(-np.array(gates[0]), axis=-1)[:, :8]
             theirs = np.asarray(d["moe0.topk_ids"])
             report["moe0_topk_set_match"] = round(float(np.mean([len(set(a) & set(b)) / 8
