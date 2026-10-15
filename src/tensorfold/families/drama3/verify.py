@@ -114,9 +114,28 @@ def ends_with_direction(text: str) -> bool:
     return m is not None and not words_of(tail[m.end():])
 
 
+# words whose absence at the very end is more likely the recogniser's than the take's
+FUNCTION_WORDS = frozenset("a an the to of and or but in on at by for with from up it is be am are was so too oh ah "
+                           "uh um hm mm yeah yes no me you we us he him she her they them i my our its".split())
+
+
+def last_is_content(text: str) -> bool:
+    """Whether the text's last spoken word is one whose absence means the take dropped it: not a short function
+    word, and not part of a number (Whisper writes numbers in more ways than one)."""
+
+    spoken = _TAGS.sub(" ", text).split()
+    if not spoken or not words_of(spoken[-1]):
+        return False
+    last = spoken[-1]
+    if re.search(r"\d", last):
+        return False
+    return words_of(last)[-1] not in FUNCTION_WORDS
+
+
 # -- alignment ----------------------------------------------------------------------------------------------------
 
 MATCH_SIMILARITY = 0.6
+MERGE_COST = 0.2                     # a split / merge needs similarity >= 0.8
 
 
 def similarity(a: str, b: str) -> float:
@@ -164,9 +183,11 @@ def align(ref: list[str], hyp: list[str]) -> list[tuple[list[int], list[int]]]:
                 moves.append((i, j + 1, 1.0, ([], [j])))
             if i < n and j < m:
                 moves.append((i + 1, j + 1, sub(ref[i], hyp[j]), ([i], [j])))
-            if i < n and j + 1 < m and (c := sub(ref[i], hyp[j] + hyp[j + 1])) < 1.0:
+            # a split or merge must be near-exact ("tensor fold" for "tensorfold"), or a dropped short word hides
+            # in it ("the" for "the cat")
+            if i < n and j + 1 < m and (c := sub(ref[i], hyp[j] + hyp[j + 1])) <= MERGE_COST:
                 moves.append((i + 1, j + 2, c + 0.25, ([i], [j, j + 1])))
-            if i + 1 < n and j < m and (c := sub(ref[i] + ref[i + 1], hyp[j])) < 1.0:
+            if i + 1 < n and j < m and (c := sub(ref[i] + ref[i + 1], hyp[j])) <= MERGE_COST:
                 moves.append((i + 2, j + 1, c + 0.25, ([i, i + 1], [j])))
             for a, b, c, step in moves:
                 if here + c < cost[a, b]:
@@ -203,7 +224,7 @@ class Check:
     audio_s: float
     tail_s: float                    # audio after the last aligned word
     action: str                      # "ok", "trim" or "redraw"
-    ending_missing: bool = False     # the text's last two words were not heard
+    ending_missing: bool = False     # the text's last content word (or its last two words) was not heard
     reason: str = ""
     cut_s: float | None = None       # where a trim cuts the audio
     heard: str = ""
@@ -282,14 +303,17 @@ def check_words(text: str, heard: list[Word], audio_s: float, policy: Policy = P
                    heard=" ".join(w.text.strip() for w in heard))
     if not ref:
         return result
-    ending_missing = bool(len(ref) >= 2) and (len(ref) - 1) in missing_idx and (len(ref) - 2) in missing_idx
+    last_two = bool(len(ref) >= 2) and (len(ref) - 1) in missing_idx and (len(ref) - 2) in missing_idx
+    last_content = bool(ref) and (len(ref) - 1) in missing_idx and last_is_content(text)
+    ending_missing = last_two or last_content
     result.ending_missing = ending_missing
     if coverage < policy.min_coverage:
         result.action, result.reason = "redraw", f"coverage {coverage:.2f} < {policy.min_coverage}"
     elif longest > policy.max_missing_run:
         result.action, result.reason = "redraw", f"{longest} words in a row missing"
     elif ending_missing:
-        result.action, result.reason = "redraw", "the ending is missing"
+        result.action, result.reason = "redraw", ("the last word is missing" if not last_two
+                                                  else "the ending is missing")
     else:
         allowed = policy.max_tail_after_direction_s if ends_with_direction(text) else policy.max_tail_s
         if last_end is not None and (tail or tail_s > allowed):

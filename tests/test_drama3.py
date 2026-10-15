@@ -128,3 +128,40 @@ def test_streamed_wav_bytes(tmp_path):
     wav.close()
     audio, rate = soundfile.read(str(path), dtype="float32")
     assert rate == 44100 and len(audio) == 400 and abs(audio[0] + 1) < 1e-3
+
+
+def test_dialogue_turns_on_lines_and_chunks():
+    pytest.importorskip("mlx.core")
+    from tensorfold.families.drama3.generate import split_text, turns_on_lines
+
+    one = "<|speaker:0|> [whispering] Hi there. <|speaker:1|> [sighs] Go back to sleep. <|speaker:0|> No."
+    assert turns_on_lines(one) == ("<|speaker:0|> [whispering] Hi there.\n<|speaker:1|> [sighs] Go back to sleep."
+                                   "\n<|speaker:0|> No.")
+    assert turns_on_lines("<|speaker:3|> Just one. Two sentences.") == "<|speaker:3|> Just one. Two sentences."
+    assert split_text(one, 300) == [turns_on_lines(one)]
+    long = " ".join(f"<|speaker:{i % 2}|> Turn number {i} is said here. And a second sentence {i}." for i in range(12))
+    chunks = split_text(long, 150)
+    assert len(chunks) > 2
+    for chunk in chunks:
+        assert all(line.startswith("<|speaker:") for line in chunk.split("\n")), chunk
+
+
+def test_missing_last_content_word_redraws():
+    from tensorfold.families.drama3.verify import Word, check_words
+
+    def heard(text):
+        return [Word(w, 0.3 * i, 0.3 * i + 0.25) for i, w in enumerate(text.split())]
+
+    text = "Did you hear that? It's probably just the cat."
+    got = check_words(text, heard("Did you hear that? It's probably just the"), 2.6)
+    assert got.action == "redraw" and got.ending_missing
+    question = "Did you hear that noise? Where are you going to?"
+    assert check_words(question, heard("Did you hear that noise? Where are you going"), 2.9).action == "ok"
+
+
+def test_serve_arguments():
+    from tensorfold.drama3 import parse
+
+    assert parse(["--serve", "1"]).serve and parse(["--serve"]).serve and not parse(["--text", "x", "--out", "o"]).serve
+    with pytest.raises(SystemExit):
+        parse(["--text", "x"])

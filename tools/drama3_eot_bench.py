@@ -46,6 +46,12 @@ TEXTS.update({
     "numbers": "Call me at 555-0142 before 9:30 on March 3rd, 2027.",
     "question": "Wait, what was that?",
     "clone_short": "Thanks, see you tomorrow.",
+    # dialogue, each written on one line (as typed into a text box)
+    "dlg_vo": "<|speaker:0|> [whispering] Did you hear that noise downstairs? <|speaker:1|> [sighs] It's probably just "
+              "the cat. Go back to sleep. <|speaker:0|> Cats don't knock on doors.",
+    "dlg_four": "<|speaker:0|> [laughs] You really thought that would work? <|speaker:1|> [annoyed] It worked last "
+                "time. <|speaker:0|> Last time was different. We had a map. <|speaker:1|> [sighs] Fine. Next time "
+                "you lead.",
 })
 CLONE_REF_TEXT = "We asked over twenty different people, and they all said it was his."
 
@@ -69,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--first-seed", type=int, default=1)
     p.add_argument("--verify", action="store_true", help="synthesize with the end-of-text check")
     p.add_argument("--stop-rule", action="store_true", help="synthesize with the model-side StopRule")
+    p.add_argument("--stream", action="store_true", help="stream (Drama3Stream) instead of synthesize")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=30)
@@ -105,9 +112,18 @@ def main(argv: list[str] | None = None) -> int:
                 started = time.perf_counter()
                 sampling = Sampling(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
                                     eos_bias=args.eos_bias)
-                audio, results = gen.synthesize(text, references=refs, sampling=sampling, seed=seed,
-                                                verify=guard if args.verify else False, stop=args.stop_rule,
-                                                log=lambda s: None)
+                if args.stream:
+                    from tensorfold.families.drama3.stream import Drama3Stream
+
+                    st = Drama3Stream(gen, text, references=refs, sampling=sampling, seed=seed,
+                                      verify=guard if args.verify else False, stop=args.stop_rule, log=lambda s: None)
+                    pieces = list(st)
+                    audio = np.concatenate(pieces) if pieces else np.zeros(0, np.float32)
+                    results = st.results
+                else:
+                    audio, results = gen.synthesize(text, references=refs, sampling=sampling, seed=seed,
+                                                    verify=guard if args.verify else False, stop=args.stop_rule,
+                                                    log=lambda s: None)
                 total_s = time.perf_counter() - started
                 if args.wav_dir:
                     save_wav(args.wav_dir / f"{name}_s{seed}.wav", audio)
@@ -144,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"runaway={row['runaway']} missing={row['missing']} "
                       + " | ".join(f"c{c['chunk']} {c['frames']}f {c['finish']} cov {c['coverage']} "
                                    f"tail {len(c['tail_words'])}w/{c['tail_s']}s"
-                                   + (f" guard {c['guard']['action']}x{c['guard']['attempts']}" if c["guard"] else "")
+                                   + (f" guard {c['guard']['action']}x{c['guard'].get('attempts', 1)}" if c["guard"] else "")
                                    for c in chunk_rows), flush=True)
     np.savez(args.out.with_suffix(".npz"), **traces)
     n = len(rows)

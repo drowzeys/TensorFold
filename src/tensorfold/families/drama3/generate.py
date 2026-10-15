@@ -13,7 +13,7 @@ import mlx.core as mx
 import numpy as np
 
 from tensorfold.families.drama3.model import Drama3
-from tensorfold.families.drama3.prompt import WHITE_SPACE, Reference, build_rows
+from tensorfold.families.drama3.prompt import SPEAKER_TAG, WHITE_SPACE, Reference, build_rows
 from tensorfold.families.drama3.sampling import EMPTY_SLOT, RAS_WINDOW, Sampling, draw, draw_main
 from tensorfold.families.drama3.verify import trim_take
 
@@ -360,33 +360,52 @@ class Drama3Generator:
 
 SENTENCE_END = re.compile(r"(?<=[.!?。！？…])[" + re.escape(WHITE_SPACE) + r"]+|\n{2,}")
 SPEAKER_START = re.compile(r"(?=<\|speaker:\d+\|>)")
+SPEAKER_SPLIT = re.compile(r"(<\|speaker:\d+\|>)")
+
+
+def turns_on_lines(text: str) -> str:
+    """Dialogue with each speaker turn on a line of its own.
+
+    Drama 3 reads a turn that starts mid-line much worse than one that starts a line: on a three-turn dialogue with
+    directions ("<|speaker:0|> [whispering] Did you hear ... <|speaker:1|> [sighs] It's probably ...") written on
+    one line, 9 of 16 seeds dropped later turns or ran on for 10-30 s; with a line break before each tag, 1 of 16
+    (the CUDA port and the Studio's examples write turns on lines). Text with fewer than two tags is unchanged.
+    """
+
+    if len(SPEAKER_TAG.findall(text)) < 2:
+        return text
+    lined = re.sub(r"[" + re.escape(WHITE_SPACE) + r"]*(<\|speaker:\d+\|>)", r"\n\1", text)
+    return lined.lstrip(WHITE_SPACE)
 
 
 def split_text(text: str, max_chars: int) -> list[str]:
-    """Sentence-aligned chunks of at most ``max_chars`` (a longer sentence stays whole). Speaker tags carry over:
-    a chunk that does not begin with one gets the tag in force where it starts."""
+    """Sentence-aligned chunks of at most ``max_chars`` (a longer sentence stays whole), each speaker turn on a
+    line of its own. Speaker tags carry over: a chunk that begins inside a turn opens with that turn's tag."""
 
-    text = text.strip(WHITE_SPACE)
+    text = turns_on_lines(text.strip(WHITE_SPACE))
     if len(text) <= max_chars:
         return [text]
-    pieces = [p for p in SENTENCE_END.split(text) if p and p.strip(WHITE_SPACE)]
+    units: list[tuple[str | None, bool, str]] = []          # (speaker tag in force, starts a turn, sentence)
+    speaker, starts = None, False
+    for part in SPEAKER_SPLIT.split(text):
+        if SPEAKER_TAG.fullmatch(part):
+            speaker, starts = part, True
+            continue
+        for piece in SENTENCE_END.split(part):
+            if piece and piece.strip(WHITE_SPACE):
+                units.append((speaker, starts, piece.strip(WHITE_SPACE)))
+                starts = False
     chunks: list[str] = []
     current = ""
-    for piece in pieces:
-        if current and len(current) + 1 + len(piece) > max_chars:
+    for tag, start, piece in units:
+        add = f"{tag} {piece}" if start else piece
+        if current and len(current) + 1 + len(add) > max_chars:
             chunks.append(current)
-            current = piece
+            current = ""
+        if not current:
+            current = add if (start or tag is None) else f"{tag} {piece}"
         else:
-            current = f"{current} {piece}" if current else piece
+            current += ("\n" if start else " ") + add
     if current:
         chunks.append(current)
-    tagged, speaker = [], None
-    for chunk in chunks:
-        lead = re.match(r"\s*<\|speaker:(\d+)\|>", chunk)
-        if lead is None and speaker is not None:
-            chunk = f"<|speaker:{speaker}|> {chunk}"
-        tags = re.findall(r"<\|speaker:(\d+)\|>", chunk)
-        if tags:
-            speaker = tags[-1]
-        tagged.append(chunk)
-    return tagged
+    return chunks

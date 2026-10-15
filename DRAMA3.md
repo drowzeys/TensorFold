@@ -43,6 +43,16 @@ python -m tensorfold.drama3 --text "Hello there." --stream --out - | ffplay -nod
 
 - `<|speaker:0|>` .. `<|speaker:15|>` switch voices; `[bracketed directions]` (`[sighs]`, `[laughs]`,
   `[whispering]`...) steer delivery. Text without a tag is speaker 0.
+- Dialogue: each speaker turn is put on a line of its own before the prompt is built (a tag that starts mid-line
+  gets a line break before it), and long dialogue is chunked so every line opens on its speaker's tag. Drama 3
+  reads turns written on one line badly: on three dialogues x 16 seeds, streamed with the check and the stop rule,
+  12 of 48 takes dropped later turns and ran on for 10-24 s with turns on one line, 1 of 48 with each turn on its
+  line (9/16 -> 1/16 on "<|speaker:0|> [whispering] Did you hear that noise downstairs? <|speaker:1|> [sighs] It's
+  probably just the cat. Go back to sleep. <|speaker:0|> Cats don't knock on doors."; not streamed, with redraws,
+  0 of 48). The prompt rows match the reference builder (`drama3_prompt.py`) for the same text, and teacher-forced
+  main-token and code-head logits of a failing take match the PyTorch reference (KL ~0.002): this is the model's
+  behaviour, not the port's. Those failures have no p(EOS) signal, so a streamed take cannot be stopped early;
+  only the frame cap ends them.
 - `--ref-audio/--ref-text` (repeatable) clone a voice from a clip and its transcript; `--ref-codes x.npy` reuses
   saved codes. Any sample rate or channel count; it is resampled to 44.1 kHz mono.
 - Long text is split at sentence ends into chunks of about `--max-chars` (300). Without a reference, later chunks
@@ -96,6 +106,44 @@ for piece in stream_wav(gen, text, seed=0):    # bytes: WAV header, then 16-bit 
 `Drama3Generator.iter_frames(rows, sampling, seed=, max_frames=, stop=)` yields each frame as it is drawn and
 returns the `Result`; `generate_rows` (unchanged signature, plus `stop=`) runs it to the end.
 
+### Persistent server (`--serve`)
+
+`python -m tensorfold.drama3 --serve` (or `--serve 1`, as TensorFold's CUDA engine `drama3-generate --serve 1`)
+loads the model, the codec and (unless `--no-verify`) Whisper once, warms the compiled decode step and the codec
+windows, and serves until its stdin closes. The other command-line options (`--model`, sampling, `--asr`,
+`--max-chars`, `--first-window`, `--holdback`, `--no-stop-rule`, `--no-verify`) set the defaults of the requests.
+
+- stdin: one JSON request a line. Stdout is used only for audio when a request asks for `"pcm": "-"`.
+- stderr: the protocol and the logs. Every protocol line is one JSON object starting with `{`; log lines never
+  do. First `{"ready":true,"engine":"tensorfold-drama3-mlx","load_s":..,"verify":true,"stream":true}` (or
+  `{"ok":false,"error":"load failed: ..."}`), then exactly one answer line a request, in order.
+
+Request fields (only `text` is required):
+
+| field | | default |
+|---|---|---|
+| `text` | what is said (speaker tags, [directions]; long text is chunked as on the command line) | |
+| `wav` | write the take there (16-bit WAV; while streaming it grows and gets its sizes at the end) | none |
+| `pcm` | raw s16le 44.1 kHz mono, written as it is made (`"-"`: stdout) | none |
+| `stream` | stream while generating (the stop rule holds back a suspect tail; no redraws) | true when `pcm` is given |
+| `ref_audio` + `ref_text` | a voice to clone (encoded once and cached by path and mtime) | |
+| `ref_codes` + `ref_text` | a reference as saved codes (.npy, [10, frames] or [frames, 10]) | |
+| `refs` | several references: `[{"audio" or "codes", "text"}]` | |
+| `temperature`, `top_k`, `top_p`, `seed`, `greedy` | sampling | 1.0, 30, 0.9, 0, false |
+| `max_frames` | frame cap a chunk | from the text length |
+| `max_chars` | chunk size | 300 |
+| `verify`, `verify_retries`, `stop_rule` | the end-of-text guards | true, 2, true |
+| `first_window`, `holdback` | streaming | 10, 0 |
+| `save_codes`, `stats` | also save the frames (.npy) / the full stats (JSON) there | |
+| `id` | echoed back | |
+
+Answer: `{"ok":true,"id","frames","eos","audio_s","prompt_rows","ref_frames","encode_ms","prefill_ms",
+"first_audio_ms","total_ms","fps","rtf","wav","pcm","stream","chunks","finish","stop_rule","verify",
+"peak_memory_gb"}` (`eos`: every chunk ended by itself, not at its frame cap; `finish` per chunk: `stop`,
+`stop_rule` or `length`; `first_audio_ms` includes the reference encode; `verify` per chunk as in `--stats`),
+or `{"ok":false,"error":"...","id"}` (a bad line: `{"ok":false,"error":"bad json"}`). The server keeps ~50 GB
+(model, codec, Whisper); the MLX cache is capped at 8 GB and cleared after every request.
+
 ## End-of-text check
 
 Drama 3 stops by sampling EOS. A draw that misses the stop keeps going past the end of the text (a *runaway*:
@@ -111,7 +159,10 @@ are spelled out on both sides, case and punctuation ignored, near-misses and spl
 - `trim` when the text is there and words follow it, or more than 1.2 s of sound follows the last word (4 s when
   the text ends with a [direction] such as [laughs]): the audio is cut 0.3 s after the last aligned word (before
   the next word starts), with a 40 ms fade, and the frames with it (the codec is causal);
-- `redraw` when under 85% of the words are heard, three or more in a row are missing, or the last two are: the
+- `redraw` when under 85% of the words are heard, three or more in a row are missing, the last two are, or the
+  last word is and it is a content word (not a short function word such as "to" or "you", not part of a number,
+  which Whisper writes in more than one way; [directions] are never words). A split or merged word only matches
+  when near-exact, so a dropped short word cannot hide in its neighbour. Then the
   chunk is drawn again with a new seed, up to `--verify-retries` times, keeping the best take.
 
 **The model's own signal (`--stop-rule`, `StopRule`).** Mid-text p(EOS) stays far below 0.1 (in 152 measured
