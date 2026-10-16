@@ -9,12 +9,19 @@ Stages (timed separately):
          (44100 / 512 a second), in windows of 200 AR frames that start every 100 and are averaged where they meet.
   dav    the decoder, in chunks with enough context on either side to equal one pass, then the reference's level
          rule (divide by 5 x std when that is above 1).
+
+``dit_mode="sequential"`` is diffusers' MiniMax Music 3 pipeline instead: the same 200 / 100-frame windows, but one
+after another, each conditioned on its own frames and holding its first 172 latent frames to the previous window's
+(re-noised to each step's level, then restored), each decoded on its own and cut where the next one takes over.
+A window needs only its own frames, so ``stream`` runs it while the AR is still drawing: the first audio comes after
+200 frames and one window, and each further 100 frames bring about 4 s more.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +31,8 @@ import mlx.core as mx
 import numpy as np
 
 from tensorfold.families.music3 import prompt as P
-from tensorfold.families.music3.model import (AR, C0_CODES, CODEBOOK_SIZE, CODEBOOKS, DAV, DiT, frames_to_latents)
+from tensorfold.families.music3.model import (AR, C0_CODES, CODEBOOK_SIZE, CODEBOOKS, DAV, DiT, frames_to_latents,
+                                              parse_quant, quant_name, quantize_ar, quantize_dit)
 
 FRAME_RATE = 25                      # AR frames a second
 SAMPLE_RATE = 44100
@@ -47,6 +55,15 @@ class Settings:
     steps: int = 30
     dit_cfg: float = 1.7
     window_batch: int = 8            # DiT windows run together in one forward (x2 for guidance)
+    dit_mode: str = "averaged"       # "averaged" (ComfyUI, the default) or "sequential" (diffusers; what streams)
+    overlap: bool = True             # streaming: a window's DiT steps go on their own GPU stream between AR frames
+                                     # (the same audio, byte for byte; faster)
+
+
+# diffusers' sequential windows: the first 172 latent frames of a window are held to the previous window's latents
+# [L - 344, L - 172); a decoded window drops its first 86 latent frames (not the first window) and its last 258
+# (not the last window)
+SEQ_OVERLAP, SEQ_CROP_LEFT, SEQ_CROP_RIGHT = 172, 86, 344 - 86
 
 
 @dataclass
@@ -90,6 +107,46 @@ def windows(length: int) -> list[tuple[int, int]]:
         start += hop
 
 
+class _no_stream:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+def sequential_starts(frames: int) -> list[int]:
+    """diffusers' window starts (in AR frames) for a song of ``frames`` frames: every 100, while 100 remain after."""
+
+    return [0] if frames <= WINDOW_FRAMES else list(range(0, frames - HOP_FRAMES, HOP_FRAMES))
+
+
+def sequential_crop(length: int, first: bool, last: bool) -> tuple[int, int]:
+    """The latent span [a, b) of a decoded sequential window that goes into the song."""
+
+    return (0 if first else SEQ_CROP_LEFT), (length if last else max(0, length - SEQ_CROP_RIGHT))
+
+
+class LevelRule:
+    """The reference's level rule (divide by 5 x std when that is above 1) applied as audio arrives: the divisor is
+    the largest the rule has asked for so far (it never falls, so a streamed song never gets louder mid-way)."""
+
+    def __init__(self) -> None:
+        self.sum = self.sumsq = 0.0
+        self.count = 0
+        self.level = 1.0
+
+    def __call__(self, audio: np.ndarray) -> np.ndarray:
+        x = audio.astype(np.float64)
+        self.sum += float(x.sum())
+        self.sumsq += float((x * x).sum())
+        self.count += x.size
+        if self.count > 1:
+            var = (self.sumsq - self.sum * self.sum / self.count) / (self.count - 1)
+            self.level = max(self.level, math.sqrt(max(var, 0.0)) * 5.0)
+        return (audio / self.level).astype(np.float32)
+
+
 class _Cache:
     """A key/value cache that grows by concatenation (the depth decoder holds at most 8 rows)."""
 
@@ -127,10 +184,12 @@ def guided_draw(logits: mx.array, cfg: float, top_k: int, key: mx.array, restric
 
 class Music3Generator:
     def __init__(self, model_dir: str | Path, *, dit_dtype=mx.float16, load_ar: bool = True,
-                 load_dit: bool = True, load_dav: bool = True) -> None:
+                 load_dit: bool = True, load_dav: bool = True, quant: str | dict | None = None) -> None:
         from tokenizers import Tokenizer
 
         started = time.perf_counter()
+        self.quant = parse_quant(quant) if not isinstance(quant, dict) else quant
+        self.quant_name = quant_name(self.quant)
         self.model_dir = Path(model_dir).expanduser()
         mx.set_cache_limit(CACHE_LIMIT)
         self.ar = self.dit = self.dav = self.tokenizer = None
@@ -144,6 +203,8 @@ class Music3Generator:
             self.ar.eval()
             mx.eval(self.ar.parameters())
             del weights
+            quantize_ar(self.ar, self.quant)
+            mx.clear_cache()
         if load_dit:
             self.dit = DiT()
             weights = DiT.remap(mx.load(str(self.model_dir / DIFFUSION)))
@@ -152,6 +213,8 @@ class Music3Generator:
             self.dit.eval()
             mx.eval(self.dit.parameters())
             del weights
+            quantize_dit(self.dit, self.quant)
+            mx.clear_cache()
         if load_dav:
             self.dav = DAV(mx.load(str(self.model_dir / DECODER)))
         self.dit_dtype = dit_dtype
@@ -184,11 +247,14 @@ class Music3Generator:
         return mx.stack(codes).astype(mx.int32), mx.stack(states)
 
     def ar_frames(self, caption: str, lyrics: str, s: Settings, progress: Callable | None = None,
-                  forced_codes: np.ndarray | None = None, trace: dict | None = None):
+                  forced_codes: np.ndarray | None = None, trace: dict | None = None,
+                  on_frame: Callable | None = None):
         """The AR stage: (frame states [T, 8 * 4096] bf16, stopped, stats).
 
         ``forced_codes`` [N, 8] (teacher forcing, for parity checks) replaces every drawn code with the given one;
-        ``trace`` (a dict) collects the per-frame code-0 logits [2, 16385] and depth logits [7, 2, 1024]."""
+        ``trace`` (a dict) collects the per-frame code-0 logits [2, 16385] and depth logits [7, 2, 1024].
+        ``on_frame(kept)`` is called with the list of kept frame states after each new one (streaming); the time it
+        takes is reported as ``hook_s`` and left out of ``ar_s`` / ``frames_per_s``."""
 
         from mlx_lm.models.cache import KVCache
 
@@ -208,6 +274,15 @@ class Music3Generator:
         pending = None                   # (frame index, its drawn code-0 token, its states)
         stopped = False
         first_frame_s = None
+        hook_s = 0.0
+
+        def hook():
+            nonlocal hook_s
+            if on_frame is not None:
+                t = time.perf_counter()
+                on_frame(kept)
+                hook_s += time.perf_counter() - t
+
         for frame in range(limit + 1):
             key, sub = mx.random.split(key)
             keys = mx.random.split(sub, CODEBOOKS)
@@ -235,6 +310,7 @@ class Music3Generator:
                     kept.append(p_state)
                     if progress is not None and len(kept) % 25 == 0:
                         progress("ar", len(kept), limit)
+                    hook()
                 if first_frame_s is None:
                     first_frame_s = time.perf_counter() - started
                 if len(kept) >= limit:
@@ -250,10 +326,12 @@ class Music3Generator:
             raise ValueError("MiniMax Music 3 drew its stop code before any audio frame")
         states = mx.stack(kept)
         mx.eval(states)
-        ar_s = time.perf_counter() - started
+        ar_s = time.perf_counter() - started - hook_s
         stats = {"prompt_tokens": len(ids), "frames": len(kept), "stopped": stopped, "prefill_s": round(prefill_s, 3),
                  "ar_s": round(ar_s, 3), "first_frame_s": round(first_frame_s or ar_s, 3),
                  "frames_per_s": round(len(kept) / max(ar_s - prefill_s, 1e-9), 2)}
+        if on_frame is not None:
+            stats["hook_s"] = round(hook_s, 3)
         return states, stopped, stats
 
     # -- DiT -------------------------------------------------------------------------------------------------------
@@ -303,23 +381,104 @@ class Music3Generator:
                 progress("dit", step + 1, s.steps)
         return x
 
+    def denoise_window(self, states: mx.array, index: int, s: Settings, previous: tuple | None = None,
+                       noise: mx.array | None = None, progress: Callable | None = None):
+        """One sequential (diffusers) window: its frame states [F, 32768] -> (latents [L, 128] float32, the carry
+        for the next window). ``previous`` is the carry of the window before: (latents, condition) over its
+        [L - 344, L - 172) latent frames, which this window's first 172 frames are held to."""
+
+        steps = self.window_steps(states, index, s, previous, noise)
+        step = 0
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+            step += 1
+            if progress is not None:
+                progress(step)
+
+    def window_steps(self, states: mx.array, index: int, s: Settings, previous: tuple | None = None,
+                     noise: mx.array | None = None, stream=None):
+        """``denoise_window`` one Euler step at a time: a generator that yields after each step and returns
+        (latents, carry). With ``stream`` (an MLX GPU stream) the steps are built on it and only submitted
+        (``async_eval``), so they can run on the GPU while the caller goes on drawing AR frames."""
+
+        dit = self.dit
+        dtype = self.dit_dtype
+        ctx = (lambda: mx.stream(stream)) if stream is not None else _no_stream
+        finish = mx.async_eval if stream is not None else mx.eval
+        with ctx():
+            cond = dit.condition(states.astype(dtype))
+            length = cond.shape[0]
+            null = dit.null_condition(length, dtype)
+            if noise is None:
+                noise = mx.random.normal((length, 128), key=mx.random.key(derive_seed(s.seed, "dit", index)))
+            noise = noise.astype(mx.float32)
+            overlap = 0
+            if previous is not None:
+                prev_latent, prev_cond = previous
+                overlap = min(prev_latent.shape[0], length)
+                cond = mx.concatenate([prev_cond[:overlap].astype(cond.dtype), cond[overlap:]])
+            x = noise
+            tables = dit.rope_tables(length + 1)
+            conds = mx.stack([cond, null])
+        sigmas = sigma_schedule(s.steps)
+        for step in range(s.steps):
+            sigma, following = sigmas[step], sigmas[step + 1]
+            t = 1.0 - sigma
+            with ctx():
+                if overlap:
+                    held = (1.0 - (1.0 - 1e-6) * t) * noise[:overlap] + t * prev_latent[:overlap]
+                    x = mx.concatenate([held, x[overlap:]])
+                xd = x.astype(dtype)
+                out = dit(mx.stack([xd, xd]), mx.full((2,), t, dtype=mx.float32), conds, tables).astype(mx.float32)
+                velocity = out[1] + (out[0] - out[1]) * s.dit_cfg
+                x = x + velocity * (following - sigma)
+                finish(x)
+            yield
+        with ctx():
+            if overlap:
+                x = mx.concatenate([prev_latent[:overlap], x[overlap:]])
+            a = max(0, length - 2 * SEQ_OVERLAP)
+            b = max(a, length - SEQ_OVERLAP)
+            carry = (x[a:b], cond[a:b])
+        mx.eval(x, *carry)
+        return x, carry
+
     # -- DAV -------------------------------------------------------------------------------------------------------
-    def decode(self, latents: mx.array, chunk: int = DAV_CHUNK, halo: int = DAV_HALO) -> np.ndarray:
-        """Latents [L, 128] -> stereo [2, 512 L] float32, decoded in chunks, then the reference's level rule."""
+    def decode_raw(self, latents: mx.array, chunk: int = DAV_CHUNK, halo: int = DAV_HALO,
+                   span: tuple[int, int] | None = None) -> np.ndarray:
+        """Latents [L, 128] -> stereo [2, 512 (b - a)] float32 for the latent span [a, b) (all of it by default),
+        decoded in chunks with ``halo`` latent frames of context on either side; no level rule."""
 
         length = latents.shape[0]
+        lo, hi = span if span is not None else (0, length)
         pieces = []
-        for start in range(0, length, chunk):
-            end = min(start + chunk, length)
+        for start in range(lo, hi, chunk):
+            end = min(start + chunk, hi)
             a, b = max(0, start - halo), min(length, end + halo)
             audio = self.dav(latents[a:b][None])[0]
             pieces.append(np.array(audio[:, (start - a) * 512:(end - a) * 512]))
-        audio = np.concatenate(pieces, axis=1)
+        return np.concatenate(pieces, axis=1) if pieces else np.zeros((2, 0), dtype=np.float32)
+
+    def decode(self, latents: mx.array, chunk: int = DAV_CHUNK, halo: int = DAV_HALO) -> np.ndarray:
+        """Latents [L, 128] -> stereo [2, 512 L] float32, decoded in chunks, then the reference's level rule."""
+
+        audio = self.decode_raw(latents, chunk, halo)
         level = max(1.0, float(np.std(audio.astype(np.float64), ddof=1)) * 5.0)
         return (audio / level).astype(np.float32)
 
     # -- all of it ---------------------------------------------------------------------------------------------------
-    def generate(self, caption: str, lyrics: str, s: Settings, progress: Callable | None = None) -> Song:
+    def generate(self, caption: str, lyrics: str, s: Settings, progress: Callable | None = None,
+                 sink: Callable | None = None) -> Song:
+        """A song. With ``sink`` it streams: sequential DiT windows run while the AR draws, and ``sink(audio)`` gets
+        each piece of the song (float32 [2, n], level rule applied as it goes) as soon as it is decoded."""
+
+        if sink is not None or s.dit_mode == "sequential":
+            return self._generate_sequential(caption, lyrics, s, progress, sink)
+        if s.dit_mode != "averaged":
+            raise ValueError(f"dit_mode is \"averaged\" or \"sequential\", not {s.dit_mode!r}")
         mx.reset_peak_memory()
         started = time.perf_counter()
         states, stopped, ar_stats = self.ar_frames(caption, lyrics, s, progress)
@@ -331,15 +490,155 @@ class Music3Generator:
         audio = self.decode(latents)
         dav_s = time.perf_counter() - t
         total = time.perf_counter() - started
-        seconds = audio.shape[1] / SAMPLE_RATE
-        stats = {**ar_stats, "dit_s": round(dit_s, 3), "dav_s": round(dav_s, 3), "total_s": round(total, 3),
-                 "audio_s": round(seconds, 3), "rtf": round(total / max(seconds, 1e-9), 3),
-                 "ar_rtf": round(ar_stats["ar_s"] / max(seconds, 1e-9), 3),
-                 "dit_rtf": round(dit_s / max(seconds, 1e-9), 3), "dav_rtf": round(dav_s / max(seconds, 1e-9), 3),
-                 "latent_frames": int(latents.shape[0]), "steps": s.steps, "seed": s.seed,
-                 "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 2), "ar_peak_memory_gb": round(ar_peak / 1e9, 2)}
+        stats = self._stats(ar_stats, dit_s, dav_s, total, audio, s, ar_peak)
+        stats.update(latent_frames=int(latents.shape[0]), dit_mode="averaged", stream=False,
+                     first_audio_s=round(total, 3))
         mx.clear_cache()
         return Song(audio=audio, frames=ar_stats["frames"], stopped=stopped, stats=stats)
+
+    def _stats(self, ar_stats, dit_s, dav_s, total, audio, s, ar_peak) -> dict:
+        seconds = audio.shape[1] / SAMPLE_RATE
+        return {**ar_stats, "dit_s": round(dit_s, 3), "dav_s": round(dav_s, 3), "total_s": round(total, 3),
+                "audio_s": round(seconds, 3), "rtf": round(total / max(seconds, 1e-9), 3),
+                "ar_rtf": round(ar_stats["ar_s"] / max(seconds, 1e-9), 3),
+                "dit_rtf": round(dit_s / max(seconds, 1e-9), 3), "dav_rtf": round(dav_s / max(seconds, 1e-9), 3),
+                "steps": s.steps, "seed": s.seed, "quant": self.quant_name,
+                "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 2), "ar_peak_memory_gb": round(ar_peak / 1e9, 2)}
+
+    def _generate_sequential(self, caption, lyrics, s: Settings, progress, sink) -> Song:
+        mx.reset_peak_memory()
+        started = time.perf_counter()
+        song = SequentialSong(self, s, sink, progress, started)
+        hook = song.ready if sink is not None else None
+        states, stopped, ar_stats = self.ar_frames(caption, lyrics, s, progress, on_frame=hook)
+        ar_peak = mx.get_peak_memory()
+        song.finish(states)
+        audio = song.audio()
+        total = time.perf_counter() - started
+        stats = self._stats(ar_stats, song.dit_s, song.dav_s, total, audio, s, ar_peak)
+        stats.update(dit_mode="sequential", stream=sink is not None, windows=song.windows, overlap=song.overlap,
+                     first_audio_s=round(song.first_audio_s if song.first_audio_s is not None else total, 3),
+                     seams_s=[round(x / SAMPLE_RATE, 3) for x in song.seams])
+        if song.emitted:
+            # the earliest a player could start and never run dry: each piece must be there before the audio
+            # before it has played out
+            stats["no_stall_start_s"] = round(max(t - before / SAMPLE_RATE for t, before in song.emitted), 3)
+        mx.clear_cache()
+        return Song(audio=audio, frames=ar_stats["frames"], stopped=stopped, stats=stats)
+
+
+class SequentialSong:
+    """diffusers' sequential windows over a growing list of frame states. ``ready(kept)`` runs the next window once
+    its 200 frames are there (streaming; with ``overlap``, one DiT step per AR frame, submitted on a second GPU
+    stream so the two can share the GPU); ``finish(states)`` runs the rest when the AR is done. Each window's piece of
+    the song is decoded at once; the last 258 latent frames of a window wait until it is known whether it is the
+    last (they are the song's end) or the next window takes over from them."""
+
+    def __init__(self, gen: Music3Generator, s: Settings, sink: Callable | None = None,
+                 progress: Callable | None = None, started: float | None = None) -> None:
+        self.gen, self.s, self.sink, self.progress = gen, s, sink, progress
+        self.started = time.perf_counter() if started is None else started
+        self.carry = None
+        self.windows = 0
+        self.held = None                         # (latents, from) of the newest window: its unsent tail
+        self.pieces: list[np.ndarray] = []
+        self.seams: list[int] = []               # sample positions where one window's audio meets the next's
+        self.sent = 0
+        self.level = LevelRule()
+        self.dit_s = self.dav_s = 0.0
+        self.first_audio_s = None
+        self.emitted: list[tuple[float, int]] = []   # (seconds since start, samples sent before this piece)
+        self.overlap = bool(s.overlap) and sink is not None
+        self.dit_stream = None
+        if self.overlap and mx.default_device() == mx.gpu:
+            self.dit_stream = mx.new_stream(mx.gpu)
+        self.job = None                          # [steps, window index, last, steps done] of the window in hand
+        self.expected = max(1, len(sequential_starts(min(int(round(s.seconds * FRAME_RATE)), MAX_FRAMES))))
+
+    def ready(self, kept: list) -> None:
+        if self.job is not None:
+            self._advance()
+        start = (self.windows + (self.job is not None)) * HOP_FRAMES
+        if len(kept) >= start + WINDOW_FRAMES:
+            if self.overlap:
+                if self.job is None:
+                    self._start(kept, start, last=False)
+                    self._advance()
+            else:
+                self._window(kept, start, last=False)
+
+    def finish(self, states) -> None:
+        while self.job is not None:
+            self._advance()
+        starts = sequential_starts(len(states))
+        if self.windows > len(starts):
+            raise RuntimeError("sequential windows ran past the song's end")
+        rest = starts[self.windows:]
+        for i, start in enumerate(rest):
+            self._window(states, start, last=i == len(rest) - 1)
+        if not rest and self.held is not None:             # the newest window was the last after all: its tail
+            latents, a = self.held
+            self._emit(latents, (a, latents.shape[0]), seam=False)
+        self.held = None
+
+    def _start(self, kept, start: int, last: bool) -> None:
+        window = kept[start:min(start + WINDOW_FRAMES, len(kept))]
+        states = mx.stack(window) if isinstance(window, list) else window
+        index = self.windows
+        steps = self.gen.window_steps(states, index, self.s, self.carry, stream=self.dit_stream)
+        self.job = [steps, index, last, 0]
+
+    def _advance(self) -> None:
+        """One Euler step of the window in hand; the window is finished (decoded and sent) after its last."""
+
+        steps, index, last, done = self.job
+        t = time.perf_counter()
+        try:
+            next(steps)
+            self.job[3] = done = done + 1
+            self.dit_s += time.perf_counter() - t
+            if self.progress is not None:
+                self.progress("dit", index * self.s.steps + done, max(self.expected, index + 1) * self.s.steps)
+            return
+        except StopIteration as end:
+            latents, self.carry = end.value
+        self.dit_s += time.perf_counter() - t
+        self.job = None
+        a, b = sequential_crop(latents.shape[0], index == 0, last)
+        self.held = None
+        self.windows += 1
+        self._emit(latents, (a, b), seam=index > 0)
+        if not last:
+            self.held = (latents, b)
+
+    def _window(self, kept, start: int, last: bool) -> None:
+        self._start(kept, start, last)
+        while self.job is not None:
+            self._advance()
+
+    def _emit(self, latents, span, seam: bool) -> None:
+        t = time.perf_counter()
+        audio = self.gen.decode_raw(latents, span=span)
+        self.dav_s += time.perf_counter() - t
+        if seam:
+            self.seams.append(self.sent)
+        self.sent += audio.shape[1]
+        if self.sink is not None:
+            audio = self.level(audio)
+            if self.first_audio_s is None and audio.shape[1]:
+                self.first_audio_s = time.perf_counter() - self.started
+            self.emitted.append((time.perf_counter() - self.started, self.sent - audio.shape[1]))
+            self.sink(audio)
+            if self.progress is not None:
+                self.progress("stream", int(self.sent / SAMPLE_RATE), int(self.s.seconds))
+        self.pieces.append(audio)
+
+    def audio(self) -> np.ndarray:
+        audio = np.concatenate(self.pieces, axis=1) if self.pieces else np.zeros((2, 0), dtype=np.float32)
+        if self.sink is None:                    # all of it at once: the reference's rule over the whole song
+            level = max(1.0, float(np.std(audio.astype(np.float64), ddof=1)) * 5.0) if audio.size > 1 else 1.0
+            audio = (audio / level).astype(np.float32)
+        return audio
 
 
 def save_wav(path: str | Path, audio: np.ndarray, rate: int = SAMPLE_RATE) -> None:
@@ -356,6 +655,76 @@ def save_wav(path: str | Path, audio: np.ndarray, rate: int = SAMPLE_RATE) -> No
         w.setsampwidth(2)
         w.setframerate(rate)
         w.writeframes(pcm.tobytes())
+
+
+STREAMING_SIZE = 0xFFFFFFFF
+
+
+def wav_header(data_bytes: int | None = None, rate: int = SAMPLE_RATE, channels: int = 2) -> bytes:
+    """A 44-byte 16-bit PCM WAV header; ``data_bytes`` None writes the "unknown length" sizes streams use (as
+    Drama 3's stream does)."""
+
+    import struct
+
+    data = STREAMING_SIZE - 36 if data_bytes is None else data_bytes
+    riff = STREAMING_SIZE if data_bytes is None else 36 + data_bytes
+    return (b"RIFF" + struct.pack("<I", riff) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate,
+                                                                           rate * channels * 2, channels * 2, 16)
+            + b"data" + struct.pack("<I", data))
+
+
+def pcm16(audio: np.ndarray) -> bytes:
+    """float32 [C, n] in [-1, 1] -> interleaved little-endian 16-bit PCM bytes."""
+
+    audio = np.atleast_2d(np.asarray(audio, dtype=np.float32))
+    return (np.clip(audio, -1.0, 1.0) * 32767.0).round().astype("<i2").T.tobytes()
+
+
+class GrowingWav:
+    """A stereo WAV written as audio arrives: readable while it grows (unknown-length header), its sizes set on
+    ``close``. ``path`` "-" writes the stream to stdout (sizes left unknown)."""
+
+    def __init__(self, path, rate: int = SAMPLE_RATE, channels: int = 2) -> None:
+        import sys
+
+        self.stdout = str(path) == "-"
+        if self.stdout:
+            self.f = sys.stdout.buffer
+        else:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.f = open(path, "wb")
+        self.rate, self.channels, self.bytes = rate, channels, 0
+        self.f.write(wav_header(None, rate, channels))
+        self.f.flush()
+
+    def write(self, audio: np.ndarray) -> None:
+        data = pcm16(audio)
+        self.f.write(data)
+        self.f.flush()
+        self.bytes += len(data)
+
+    def close(self) -> None:
+        if self.stdout:
+            self.f.flush()
+            return
+        self.f.seek(0)
+        self.f.write(wav_header(self.bytes, self.rate, self.channels))
+        self.f.close()
+
+
+class RawPcm:
+    """Raw interleaved 16-bit PCM appended as it comes (the ``pcm`` file a Drama 3 stream writes, stereo here)."""
+
+    def __init__(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(path, "wb")
+
+    def write(self, audio: np.ndarray) -> None:
+        self.f.write(pcm16(audio))
+        self.f.flush()
+
+    def close(self) -> None:
+        self.f.close()
 
 
 def write_stats(path: str | Path, stats: dict) -> None:

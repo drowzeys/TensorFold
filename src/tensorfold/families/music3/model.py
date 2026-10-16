@@ -169,6 +169,80 @@ class AR(nn.Module):
 AUDIO_TEXT_VOCAB = 151675
 
 
+# -- weight quantization (opt-in) -----------------------------------------------------------------------------------
+
+QUANT_PRESETS = {
+    "none": {},
+    "int8": {"body": 8, "head": 8, "depth": 8},
+    "int8-d6": {"body": 8, "head": 8, "depth": 6},
+    "int8-d4": {"body": 8, "head": 8, "depth": 4},
+    "int6": {"body": 6, "head": 8, "depth": 6},
+    "int4": {"body": 4, "head": 8, "depth": 4},
+}
+QUANT_PARTS = ("body", "head", "depth", "dit")
+
+
+def parse_quant(spec: str | None) -> dict:
+    """``--quant`` to a plan {"body", "head", "depth", "dit": bits or 0, "group": size}.
+
+    A preset name (none, int8, int8-d6, int8-d4, int6, int4), optionally followed by per-part overrides, or overrides
+    alone: "int8", "int8,dit=8", "body=8,head=8,depth=6,group=64". body = the AR's Qwen3-8B layers, head = its code-0
+    head, depth = the depth decoder (projection, 4 layers, 7 heads), dit = the DiT blocks' linears. Bits are MLX
+    affine quantization (2, 3, 4, 5, 6 or 8; 0 keeps bf16 / fp16); group is the quantization group (32, 64 or 128)."""
+
+    plan = {part: 0 for part in QUANT_PARTS}
+    plan["group"] = 64
+    for item in (spec or "none").replace(" ", "").split(","):
+        if not item:
+            continue
+        if "=" not in item:
+            if item not in QUANT_PRESETS:
+                raise ValueError(f"unknown --quant preset {item!r} (one of {', '.join(QUANT_PRESETS)})")
+            plan.update(QUANT_PRESETS[item])
+            continue
+        key, value = item.split("=", 1)
+        if key not in plan:
+            raise ValueError(f"unknown --quant part {key!r} (one of {', '.join(QUANT_PARTS)}, group)")
+        bits = 0 if value in ("0", "none", "bf16", "fp16") else int(value)
+        if key == "group" and bits not in (32, 64, 128):
+            raise ValueError("--quant group is 32, 64 or 128")
+        if key != "group" and bits not in (0, 2, 3, 4, 5, 6, 8):
+            raise ValueError(f"--quant {key} bits are 2, 3, 4, 5, 6 or 8")
+        plan[key] = bits
+    return plan
+
+
+def quant_name(plan: dict) -> str:
+    parts = [f"{p}={plan[p]}" for p in QUANT_PARTS if plan.get(p)]
+    return "none" if not parts else ",".join(parts + [f"group={plan['group']}"])
+
+
+def _linears(path: str, module) -> bool:
+    return isinstance(module, nn.Linear)
+
+
+def quantize_ar(ar: "AR", plan: dict) -> None:
+    """Swap the AR's linears for MLX quantized ones in place (embeddings stay bf16: only their rows are read)."""
+
+    group = plan["group"]
+    if plan.get("body"):
+        nn.quantize(ar.layers, group_size=group, bits=plan["body"], class_predicate=_linears)
+    if plan.get("head"):
+        ar.lm_head_pruned = nn.QuantizedLinear.from_linear(ar.lm_head_pruned, group, plan["head"])
+    if plan.get("depth"):
+        nn.quantize(ar.audio_decoder, group_size=group, bits=plan["depth"], class_predicate=_linears)
+    mx.eval(ar.parameters())
+
+
+def quantize_dit(dit: "DiT", plan: dict) -> None:
+    """The DiT blocks' linears (attention and feed-forward; 98% of the DiT's weights) quantized in place."""
+
+    if plan.get("dit"):
+        for block in dit.blocks:
+            nn.quantize(block, group_size=plan["group"], bits=plan["dit"], class_predicate=_linears)
+        mx.eval(dit.parameters())
+
+
 # -- the DiT -------------------------------------------------------------------------------------------------------
 
 def frames_to_latents(frames: int) -> int:

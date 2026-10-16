@@ -1,6 +1,7 @@
 """MiniMax Music 3: MLX vs a ComfyUI reference run (tools/ref_comfy.py dumps), stage by stage.
 
     python tools/music3_parity.py REF_DIR [--model DIR] [--caption-file C --lyrics-file L] [--stages ar,dit,dav,probe]
+        [--quant int8]
 
 ar     teacher forcing with the reference's drawn codes: code-0 logits (both rows) and depth logits, cosine and
        argmax agreement per frame; the frame states the DiT reads (8 x 4096 a frame), cosine; prompt ids equal.
@@ -154,16 +155,17 @@ def main() -> int:
     p.add_argument("--dit-cfg", type=float, default=1.7)
     p.add_argument("--dit-dtype", default="float16")
     p.add_argument("--comfy-rope", action="store_true", help="round DiT rope angles to the DiT dtype (as ComfyUI)")
+    p.add_argument("--quant", default="none", help="weights as the CLI's --quant (int8, int8-d6, body=8,depth=4, ...)")
     p.add_argument("--report", type=Path)
     a = p.parse_args()
     from tensorfold.families.music3.generate import Music3Generator
 
     stages = a.stages.split(",")
     gen = Music3Generator(a.model, dit_dtype=getattr(mx, a.dit_dtype), load_ar="ar" in stages,
-                          load_dit=bool({"dit", "probe"} & set(stages)), load_dav=bool({"dav", "probe"} & set(stages)))
+                          load_dit=bool({"dit", "probe"} & set(stages)), load_dav=bool({"dav", "probe"} & set(stages)), quant=a.quant)
     if gen.dit is not None and a.comfy_rope:
         gen.dit.angle_dtype = gen.dit_dtype
-    report: dict = {"ref": str(a.ref), "dit_dtype": a.dit_dtype, "comfy_rope": a.comfy_rope}
+    report: dict = {"ref": str(a.ref), "dit_dtype": a.dit_dtype, "comfy_rope": a.comfy_rope, "quant": gen.quant_name}
     if "ar" in stages:
         check_ar(gen, a.ref, a.caption_file.read_text(), a.lyrics_file.read_text(), report)
     if "probe" in stages:
