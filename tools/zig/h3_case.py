@@ -18,6 +18,7 @@ the finished picture, as families/h3/sampler.py `revoice` does; it needs the pro
 `--first-frame IMAGE` starts the clip from an image: its vision tokens join the prompt's rows and its encoded rows sit
 between the text and the audio, as tools/h3_generate_dev.py --first-frame does (the image is stretched onto the canvas).
 `--steps N` exports N forwards instead of the checkpoint's own count, rungs spread evenly from its first rung.
+`--at K` lets the reference take steps 0..K-1 and writes step K's rows and velocities (the native tool runs from=K).
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ def main() -> int:
     parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
                         help="with --decode: audio made again by the released model in this many steps")
     parser.add_argument("--first-frame", help="image the clip starts from (image to video)")
+    parser.add_argument("--at", type=int, default=0,
+                        help="the reference takes steps 0..AT-1 first; the case holds step AT (the native tool runs from=AT)")
     parser.add_argument("--no-reference", action="store_true",
                         help="skip the reference forward (its velocities are written as zeros): for renders, not parity")
     args = parser.parse_args()
@@ -170,9 +173,22 @@ def main() -> int:
     if args.no_reference:
         case["video_velocity"], case["audio_velocity"] = mx.zeros_like(video[held:]), mx.zeros_like(audio)
     else:
-        first = dit(video[None], audio[None], text, table, plan[0], packed.tags, packed.position_ids,
-                    packed.video_rows, packed.audio_rows, packed.text_rows)
-        mx.eval(*first)
+        pairs = (np.asarray(case["video_step"]), np.asarray(case["audio_step"]))
+        for i in range(args.at + 1):
+            first = dit(video[None], audio[None], text, table, plan[i], packed.tags, packed.position_ids,
+                        packed.video_rows, packed.audio_rows, packed.text_rows)
+            mx.eval(*first)
+            if i == args.at:
+                break
+            # the Euler step the native tool takes, on the generated rows only
+            (seen_v, ratio_v), (seen_a, ratio_a) = (float(x) for x in pairs[0][i]), (float(x) for x in pairs[1][i])
+            moved = video[held:].astype(mx.float32)
+            moved = ratio_v * moved + (1 - ratio_v) * (moved + seen_v * first[0][0, held:].astype(mx.float32))
+            video = mx.concatenate([video[:held].astype(mx.float32), moved]) if held else moved
+            audio = audio.astype(mx.float32)
+            audio = ratio_a * audio + (1 - ratio_a) * (audio + seen_a * first[1][0].astype(mx.float32))
+            mx.eval(video, audio)
+        case["video"], case["audio"] = video[held:].astype(mx.float32), audio.astype(mx.float32)
         case["video_velocity"] = first[0][0, held:].astype(mx.float32)
         case["audio_velocity"] = first[1][0].astype(mx.float32)
     mx.save_safetensors(str(out / "case.safetensors"), case)
