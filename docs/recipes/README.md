@@ -22,6 +22,7 @@ For agent-assisted contributions, read the [TensorFold contributor skill](SKILL.
 | Step-5-Preview | [Native Metal on one 256 GB Mac: 2-bit experts, MTP drafts, images](step-5-preview.md) |
 | Kolibri-1 | [Native CUDA, block FP8, research checkpoint](kolibri-1.md) |
 | MiniMax Music 3 (MiniMax-Music3) | [Lyrics and a caption to a song on one CUDA GPU (GB10)](minimax-music3-cuda.md) |
+| MiniMax Music 3 (MiniMax-Music3) | [Lyrics and a caption to a song on Metal (Apple M5)](minimax-music3-metal.md) |
 
 ## Capability floor
 
