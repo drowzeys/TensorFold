@@ -9,6 +9,7 @@ const router_k = @import("contract_router.zig");
 const mm_k = @import("contract_mm.zig");
 const rank_k = @import("contract_rank.zig");
 const drama3_k = @import("contract_drama3.zig");
+const music3_k = @import("contract_music3.zig");
 
 const contract = core.contract;
 const g = contract.gates;
@@ -22,7 +23,7 @@ const controls = struct {
 
 /// The embedded image a registration names (the controls' only when this binary was built with -Dnvcc).
 fn image(name: []const u8) []const u8 {
-    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit", "drama3", "drama3_fp8", "drama3_codec" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit", "drama3", "drama3_fp8", "drama3_codec", "music3" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
     return if (options.controls) &controls.bytes else &.{};
 }
 
@@ -95,6 +96,15 @@ pub fn run(gpu: check.Gpu) !void {
     var d3_norm = try drama3_k.Norm.init(gpu, s, d3_mod);
     defer d3_norm.deinit();
     try kernels.append(a, d3_norm.kernel());
+    var m3_mod = try cuda.Module.load(gpu.d, kk.music3);
+    defer m3_mod.unload();
+    var m3_norm = try music3_k.Norm.init(gpu, s, m3_mod);
+    defer m3_norm.deinit();
+    try kernels.append(a, m3_norm.kernel());
+    var m3_gemv: [3]music3_k.Gemv = undefined;
+    for (&m3_gemv, std.enums.values(music3_k.Kind)) |*m, kind| m.* = try music3_k.Gemv.init(gpu, s, m3_mod, kind);
+    defer for (&m3_gemv) |*m| m.deinit();
+    for (&m3_gemv) |*m| try kernels.append(a, m.kernel());
     var t: g.Tally = .{};
     const t0 = check.now(gpu.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);

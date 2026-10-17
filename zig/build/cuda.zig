@@ -55,6 +55,7 @@ const kernels = [_]Kernel{
     .{ .name = "drama3", .flags = &.{"-O3"} }, // ours: Fish Audio Drama 3's backbone, codebook tower and samplers
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} }, // fp8_experts.cu's kernels on FP8 rows with per-row scales (Drama 3)
     .{ .name = "drama3_codec", .flags = &.{"-O3"} }, // ours: Drama 3's audio codec glue between cuBLAS SGEMMs
+    .{ .name = "music3", .flags = &.{"-O3"} }, // ours: MiniMax Music 3's AR GEMVs, sampler and the DiT / DAV glue
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
@@ -165,6 +166,14 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = drama3Module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
     b.step("drama3-generate", "Fish Audio Drama 3 text to speech on one CUDA GPU").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
+    const m3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "music3", .module = music3Module(b, target, optimize, cuda, mods.core) } } });
+    const m3_exe = b.addExecutable(.{ .name = "music3-generate", .root_module = m3_tool });
+    b.step("music3-generate", "MiniMax Music 3 lyrics and a caption to a song on one CUDA GPU").dependOn(&b.addInstallArtifact(m3_exe, .{}).step);
+}
+
+/// MiniMax Music 3 on CUDA: config, prompt ids, weights, the AR frame engine, the DiT and the DAV.
+fn music3Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/music3.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
 }
 
 /// Fish Audio Drama 3 on CUDA: config, weights, kernels, the frame engine, prompt rows and the codec.
@@ -279,7 +288,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         @import("cortheon_fuzz.zig").add(b, host, native_modules.api, mods.tokenizer, template);
     }
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, lfm2Module(b, host, .debug, cuda, mods.core), drama3Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, lfm2Module(b, host, .debug, cuda, mods.core), drama3Module(b, host, .debug, cuda, mods.core), music3Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     // the GLM-5.3-Flash CUDA family's host side
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm })).step);

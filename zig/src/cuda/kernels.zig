@@ -59,6 +59,7 @@ pub const embed_rows: []const u8 = if (available) &Blob("fatbin_embed_rows").byt
 pub const drama3: []const u8 = if (available) &Blob("fatbin_drama3").bytes else &.{};
 pub const drama3_fp8: []const u8 = if (available) &Blob("fatbin_drama3_fp8").bytes else &.{};
 pub const drama3_codec: []const u8 = if (available) &Blob("fatbin_drama3_codec").bytes else &.{};
+pub const music3: []const u8 = if (available) &Blob("fatbin_music3").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
