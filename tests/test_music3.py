@@ -207,3 +207,36 @@ def test_listen_score():
     assert out["word_accuracy"] == 0.7 and out["sung_accuracy"] == 1.0
     assert out["lines"][0]["start"] == 1.0 and out["lines"][1]["end"] == 4.4 and out["lines"][2]["matched"] == 0
     assert out["lyrics"][6] == {"word": "songs", "line": 1, "start": 3.9, "end": 4.4}
+
+
+def test_listen_repeated_chorus_matches_first():
+    import importlib.util
+    import pathlib
+    from types import SimpleNamespace as W
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "tools" / "music3_listen.py"
+    spec = importlib.util.spec_from_file_location("music3_listen", path)
+    listen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(listen)
+    lyrics = "[Verse]\none two three\n[Chorus]\nla la hey\n[Verse]\nfour five six\n[Chorus]\nla la hey"
+    heard = [W(text=t, start=k, end=k + 0.5) for k, t in enumerate("one two three la la hey".split())]
+    out = listen.score(lyrics, heard)
+    assert out["matched"] == 6 and out["reached_words"] == 6 and out["sung_accuracy"] == 1.0
+
+
+def test_listen_union_and_stray_match():
+    import importlib.util
+    import pathlib
+    from types import SimpleNamespace as W
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "tools" / "music3_listen.py"
+    spec = importlib.util.spec_from_file_location("music3_listen", path)
+    listen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(listen)
+    lyrics = "a1 b1 c1 d1 e1 f1\ng1 h1 i1 j1\nyeah"
+    first = [W(text=t, start=k, end=k + 0.5) for k, t in enumerate("a1 b1 c1 yeah".split())]
+    second = [W(text=t, start=k, end=k + 0.5) for k, t in enumerate("d1 e1 f1".split(), start=3)]
+    one = listen.score(lyrics, first)
+    assert one["matched"] == 4 and one["reached_words"] == 3          # the stray "yeah" does not move "reached"
+    both = listen.union(lyrics, [one, listen.score(lyrics, second)])
+    assert both["matched"] == 7 and both["reached_words"] == 6 and both["sung_accuracy"] == 1.0
