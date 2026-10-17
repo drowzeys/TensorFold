@@ -21,6 +21,7 @@ For agent-assisted contributions, read the [TensorFold contributor skill](SKILL.
 | Qwen3.6-35B-A3B | [MLX with MTP drafts, one-GPU CUDA](qwen3.6-moe.md) |
 | Step-5-Preview | [Native Metal on one 256 GB Mac: 2-bit experts, MTP drafts, images](step-5-preview.md) |
 | Kolibri-1 | [Native CUDA, block FP8, research checkpoint](kolibri-1.md) |
+| MiniMax Music 3 (MiniMax-Music3) | [Lyrics and a caption to a song on one CUDA GPU (GB10)](minimax-music3-cuda.md) |
 
 ## Capability floor
 

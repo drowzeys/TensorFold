@@ -113,6 +113,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "drama3", .flags = &.{"-O3"} },
     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
     .{ .name = "drama3_codec", .flags = &.{"-O3"} },
+    .{ .name = "music3", .flags = &.{"-O3"} }, // ours: MiniMax Music 3's AR GEMVs, sampler and the DiT / DAV glue
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

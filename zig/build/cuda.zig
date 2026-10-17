@@ -127,6 +127,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
     b.step("drama3-generate", "Drama generation and replay controls on CUDA").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
+    const m3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "music3", .module = music3Module(b, target, optimize, cuda, mods.core) } } });
+    const m3_exe = b.addExecutable(.{ .name = "music3-generate", .root_module = m3_tool });
+    b.step("music3-generate", "MiniMax Music 3 lyrics and a caption to a song on one CUDA GPU").dependOn(&b.addInstallArtifact(m3_exe, .{}).step);
 }
 
 /// The GLM-5.3-Flash CUDA family over the runtime, the core, the lane core, canon's shares and core/heat.zig.
@@ -590,4 +593,9 @@ fn flashnextChecks(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     if (embed_model != null and prompt_ids != null) learn_run.addArgs(&.{ embed_model.?, prompt_ids.? });
     b.step("flashnext-learn", "Trainer forward identity and all-path finite-difference gates").dependOn(&learn_run.step);
     b.step("compile-flashnext-learn", "Compile the real trainer runner without executing it").dependOn(&learn_exe.step);
+}
+
+/// MiniMax Music 3 on CUDA: config, prompt ids, weights, the AR frame engine, the DiT and the DAV.
+fn music3Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/music3.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } } });
 }
