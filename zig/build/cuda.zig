@@ -127,7 +127,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
     b.step("drama3-generate", "Drama generation and replay controls on CUDA").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
-    const m3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "music3", .module = music3Module(b, target, optimize, cuda, mods.core) } } });
+    const m3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/music3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "music3", .module = music3Module(b, target, optimize, cuda, mods.core) } } });
     const m3_exe = b.addExecutable(.{ .name = "music3-generate", .root_module = m3_tool });
     b.step("music3-generate", "MiniMax Music 3 lyrics and a caption to a song on one CUDA GPU").dependOn(&b.addInstallArtifact(m3_exe, .{}).step);
 }
