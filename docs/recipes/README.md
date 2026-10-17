@@ -25,6 +25,7 @@ For agent-assisted contributions, read the [TensorFold contributor skill](SKILL.
 | LFM2.5-24B-A2B | [Native Metal, MLX 4-bit, shared rounds](lfm2.5-24b-a2b.md) |
 | Spark-X2.6-4B | [Native CUDA](spark-x2.6-4b-cuda.md), [native Metal, the bf16 release, contexts to 1M](spark-x2.6-4b-metal.md) |
 | MiniMax Music 3 (MiniMax-Music3) | [Lyrics and a caption to a song on one CUDA GPU (GB10)](minimax-music3-cuda.md) |
+| MiniMax Music 3 (MiniMax-Music3) | [Lyrics and a caption to a song on Metal (Apple M5)](minimax-music3-metal.md) |
 
 ## Capability floor
 
