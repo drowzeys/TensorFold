@@ -53,6 +53,8 @@ pub const decode_rows = 16; // rows a decode item holds at most (the plan's deco
 const prompt_warps = 8; // 16-column tiles a prompt CTA
 /// Decode CTAs: 4 warps split a tile's K, or (short K: fewer than `split_loads` loads a tile) a warp a tile, 4 tiles.
 const split_loads = 16;
+/// Decode grids of at most this many CTAs split K over 8 warps instead of 4.
+const wide_units = 384;
 const prompt_smem: u32 = 3 * 64 * 128 * 2; // three stages of 64 rows' 128 inputs
 
 /// Where byte `o` of a packed matrix comes from in the checkpoint's [n][k / KB][B] (tf_ggml_pack's map).
@@ -96,11 +98,11 @@ fn int(x: usize) c_int {
 /// The ggml module's kernels: decode (GEMV) and prompt entries per format and output, and the repack.
 pub const Kernels = struct {
     mod: Module,
-    gemv: [2][2][3]Function, // by Kind, K split or 4 tiles a CTA, then Out
+    gemv: [2][3][3]Function, // by Kind, K split (4 warps), 4 tiles a CTA or K split (8 warps), then Out
     prompt: [2][3]Function,
     pack_fn: Function,
 
-    /// Entry names: `form` is "gemv" (K split), "gemv4" (4 tiles a CTA) or "prompt".
+    /// Entry names: `form` is "gemv" (K split), "gemv4" (4 tiles a CTA), "gemv8" (K split over 8 warps) or "prompt".
     pub fn symbol(comptime kind: Kind, comptime form: []const u8, comptime out: Out) [:0]const u8 {
         return "tf_ggml_" ++ (if (kind == .iq2xxs) "iq2" else "q8") ++ "_" ++ form ++ "_" ++ @tagName(out);
     }
@@ -113,6 +115,7 @@ pub const Kernels = struct {
         inline for (.{ Kind.iq2xxs, Kind.q8_0 }, 0..) |kind, ki| inline for (.{ Out.f32, Out.relu2, Out.bf16 }, 0..) |out, oi| {
             g.gemv[ki][0][oi] = try mod.function(symbol(kind, "gemv", out));
             g.gemv[ki][1][oi] = try mod.function(symbol(kind, "gemv4", out));
+            g.gemv[ki][2][oi] = try mod.function(symbol(kind, "gemv8", out));
             g.prompt[ki][oi] = try mod.function(symbol(kind, "prompt", out));
             try g.prompt[ki][oi].allowDynamicShared(prompt_smem);
         };
@@ -168,7 +171,10 @@ pub const Kernels = struct {
         const loads = k / 32 / @as(usize, if (kind == .iq2xxs) 4 else 1);
         const tiles: usize = if (loads < split_loads) 4 else 1;
         const grid = (units * nt16 + tiles - 1) / tiles; // items past the plan's count return at once
-        try launch_.launch(g.gemv[ki][@intFromBool(tiles > 1)][oi], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+        // a grid too small to keep enough loads in flight splits K over 8 warps (GB10: 48 SMs)
+        const wide = tiles == 1 and loads >= 2 * split_loads and grid <= wide_units;
+        const form: usize = if (wide) 2 else @intFromBool(tiles > 1);
+        try launch_.launch(g.gemv[ki][form][oi], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = if (wide) 256 else 128 } }, s, &a);
     }
 
     /// Dense decode rows (at most 16): out (rows, n) = x (rows, k; rows `ldx` apart, 0 packed) times w.

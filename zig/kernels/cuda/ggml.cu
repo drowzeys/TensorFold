@@ -401,7 +401,7 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
 
 }  // namespace tf_ggml
 
-// Entries: format x (decode KW 4, decode TPC 4, prompt) x epilogue (0 fp32, 1 relu^2 bf16, 3 bf16); dense: no items.
+// Entries: format x (decode KW 4, decode TPC 4, decode KW 8 for grids too small to fill the GPU, prompt) x epilogue (0 fp32, 1 relu^2 bf16, 3 bf16); dense: no items.
 #define TF_GGML_GEMV(NAME, F, EPI, KW, TPC)                                                                            \
   extern "C" __global__ void __launch_bounds__(KW * TPC * 32) NAME(                                                   \
       const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint8_t* __restrict__ W, int KG, int NT16,   \
@@ -413,6 +413,7 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
 #define TF_GGML_ENTRIES(FMT, F, EPI, SUFFIX)                                                                          \
   TF_GGML_GEMV(tf_ggml_##FMT##_gemv_##SUFFIX, F, EPI, 4, 1)                                                          \
   TF_GGML_GEMV(tf_ggml_##FMT##_gemv4_##SUFFIX, F, EPI, 1, 4)                                                         \
+  TF_GGML_GEMV(tf_ggml_##FMT##_gemv8_##SUFFIX, F, EPI, 8, 1)                                                         \
   extern "C" __global__ void __launch_bounds__(256) tf_ggml_##FMT##_prompt_##SUFFIX(                                \
       const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint8_t* __restrict__ W, int KG, int NT16,   \
       const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,                \
