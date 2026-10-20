@@ -57,6 +57,40 @@ pub const Checkpoint = struct {
 /// An int8 projection (K, N) and its scale per output channel.
 const Quant = struct { w: mtl.Buffer, s: mtl.Buffer };
 
+/// A block's view of an adapter file (see `Model.prepare`) and the float32 buffer a merged projection is staged in.
+const Lora = struct {
+    tensors: ?*const Tensors,
+    scratch: ?mtl.Buffer,
+    block: usize,
+
+    const Factors = struct { a: Ref, b: Ref, rank: usize };
+
+    /// The factors of `projection` in this block for a (n, k) weight, or null when the adapter leaves it alone.
+    fn factors(self: Lora, device: mtl.Device, comptime projection: []const u8, k: usize, n: usize) !?Factors {
+        const t = self.tensors orelse return null;
+        var name: [96]u8 = undefined;
+        const a_name = try std.fmt.bufPrint(&name, "{d}." ++ projection ++ ".a", .{self.block});
+        const a = t.names.get(a_name) orelse return null;
+        if (a.rank != 2 or a.shape[1] != k) {
+            std.debug.print("adapter factor {s} is not (rank, {d})\n", .{ a_name, k });
+            return error.BadAdapter;
+        }
+        const rank = a.shape[0];
+        var name_b: [96]u8 = undefined;
+        const b_name = try std.fmt.bufPrint(&name_b, "{d}." ++ projection ++ ".b", .{self.block});
+        return .{ .a = try aligned(t, device, a_name, rank * k), .b = try aligned(t, device, b_name, n * rank), .rank = rank };
+    }
+
+    /// A float32 factor where the GPU can read it: in place, or copied out when the file left it unaligned.
+    fn aligned(t: *const Tensors, device: mtl.Device, name: []const u8, count: usize) !Ref {
+        const ref = try t.at(name, .f32, count);
+        if (ref.offset % 4 == 0) return ref;
+        const buffer = try device.buffer(count * 4, mtl.ResourceOptions.shared);
+        @memcpy(buffer.slice(u8, count * 4), t.map.bytes[ref.offset..][0 .. count * 4]);
+        return .{ .buffer = buffer };
+    }
+};
+
 const Block = struct { q: Quant, k: Quant, v: Quant, compress: Quant, out: Quant, fc_gate: Quant, fc_value: Quant, fc2: Quant, norm1: Ref, norm2: Ref, norm_q: Ref, norm_k: Ref, tables: Ref };
 
 /// Kernel shapes under test; `defines` goes ahead of the kernels' source.
@@ -79,6 +113,9 @@ pub const Model = struct {
     device: mtl.Device,
     queue: mtl.Queue,
     pipelines: [kernels.names.len]mtl.Pipeline,
+    weight_pipelines: [kernels.weight_names.len]mtl.Pipeline,
+    /// Block projections an adapter's factors were merged into.
+    adapted: usize = 0,
     checkpoint: Checkpoint,
     case: *Tensors,
     hidden: usize,
@@ -170,6 +207,11 @@ pub const Model = struct {
         @compileError("no kernel " ++ name);
     }
 
+    fn weightPipeline(self: *const Model, comptime name: []const u8) mtl.Pipeline {
+        inline for (kernels.weight_names, 0..) |n, i| if (comptime std.mem.eql(u8, n, name)) return self.weight_pipelines[i];
+        @compileError("no kernel " ++ name);
+    }
+
     fn paddedRows(self: *const Model) usize {
         return (self.rows + tile - 1) / tile * tile;
     }
@@ -180,20 +222,28 @@ pub const Model = struct {
 
     /// `checkpoint_dir`: the FastH3 transformer folder of `shards` files. `case`: tools/zig/h3_case.py's output.
     pub fn load(gpa: std.mem.Allocator, checkpoint_dir: []const u8, shards: usize, case: *Tensors, options: Options) !*Model {
+        const self = try prepare(gpa, checkpoint_dir, shards, null);
+        try self.attach(case, options);
+        return self;
+    }
+
+    /// The part of loading that needs no case: the checkpoint mapped and every block projection rounded to int8 on
+    /// the GPU, with `adapter`'s low-rank updates merged first when given. `adapter` is a safetensors file of
+    /// float32 factors from tools/zig/h3_case.py `--lora`: `{block}.{projection}.a` (R, K) and `.b` (N, R), the
+    /// strengths folded into b, for projections to_q, to_k, to_v, to_out, fc_value, fc_gate and fc2. The update is
+    /// added in float32 and rounded once with the weight, as families/h3/lora.py merges it ahead of its int8
+    /// kernels; nothing is written back to the checkpoint.
+    pub fn prepare(gpa: std.mem.Allocator, checkpoint_dir: []const u8, shards: usize, adapter: ?*const Tensors) !*Model {
         const device = try mtl.Device.init();
         if (!device.tensorUnits()) return error.NeedsTensorUnits;
         const self = try gpa.create(Model);
         self.gpa = gpa;
         self.device = device;
         self.queue = try device.queue();
-        self.case = case;
         self.dense = false;
-        self.swiglu_rows = options.swiglu_rows;
-        self.tile_scales = options.tile_scales;
-        // the int8 weights read one value scale a key tile
-        self.weights = if (options.tile_scales) options.weights else .half;
         self.profile = false;
         self.spent = @splat(0);
+        self.adapted = 0;
         self.checkpoint = try Checkpoint.open(gpa, device, checkpoint_dir, shards);
         const ck = &self.checkpoint;
         const to_q = ck.entry("transformer_blocks.0.attn.to_q.weight") orelse return error.MissingTensor;
@@ -205,6 +255,71 @@ pub const Model = struct {
         var layers: usize = 0;
         var name: [128]u8 = undefined;
         while (ck.entry(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.norm1.weight", .{layers})) != null) layers += 1;
+        const hidden = self.hidden;
+        const inner = self.inner;
+
+        const lib = try mtl.Library.fromSource(device, kernels.weights_source, mtl.CompileOptions.mlx());
+        defer lib.deinit();
+        for (kernels.weight_names, 0..) |kernel, i| self.weight_pipelines[i] = try mtl.Pipeline.init(device, lib, kernel, false);
+        // a merged projection is staged in float32, one at a time (the encoder below is serial)
+        const widest = @max(hidden * inner, self.mlp * hidden);
+        const scratch: ?mtl.Buffer = if (adapter != null) try device.buffer(widest * 4, mtl.ResourceOptions.private) else null;
+        defer if (scratch) |s| s.deinit();
+
+        self.blocks = try gpa.alloc(Block, layers);
+        for (self.blocks, 0..) |*b, i| {
+            const pool = mtl.objc.Pool.push();
+            defer pool.pop();
+            const cb = self.queue.commandBuffer();
+            const enc = cb.compute(.serial);
+            const square = hidden * inner;
+            const lo = Lora{ .tensors = adapter, .scratch = scratch, .block = i };
+            b.q = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_q.weight", .{i}), square), hidden, inner, lo, "to_q");
+            b.k = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_k.weight", .{i}), square), hidden, inner, lo, "to_k");
+            b.v = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_v.weight", .{i}), square), hidden, inner, lo, "to_v");
+            b.compress = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_gate_compress.weight", .{i}), square), hidden, inner, lo, "to_gate_compress");
+            b.out = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_out.0.weight", .{i}), square), inner, hidden, lo, "to_out");
+            // the checkpoint stores the SwiGLU's first projection as [value; gate]
+            const fc1 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.ff.net.0.proj.weight", .{i}), 2 * self.mlp * hidden);
+            b.fc_value = try self.quantize(enc, fc1, hidden, self.mlp, lo, "fc_value");
+            b.fc_gate = try self.quantize(enc, .{ .buffer = fc1.buffer, .offset = fc1.offset + self.mlp * hidden * 2 }, hidden, self.mlp, lo, "fc_gate");
+            b.fc2 = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.ff.net.2.weight", .{i}), self.mlp * hidden), self.mlp, hidden, lo, "fc2");
+            enc.end();
+            cb.commit();
+            cb.wait();
+            if (cb.failure()) |text| {
+                std.debug.print("command buffer failed: {s}\n", .{text});
+                return error.GpuFailed;
+            }
+            b.norm1 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.norm1.weight", .{i}), hidden);
+            b.norm2 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.norm2.weight", .{i}), hidden);
+            b.norm_q = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.norm_q.weight", .{i}), head_dim);
+            b.norm_k = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.norm_k.weight", .{i}), head_dim);
+        }
+        if (adapter) |t| {
+            // every factor in the file must have met its projection: a name that matched nothing is a mistake
+            const factors = t.names.count();
+            if (factors != 2 * self.adapted) {
+                std.debug.print("the adapter file holds {d} factors, {d} of them on a block projection\n", .{ factors, 2 * self.adapted });
+                return error.UnusedAdapterTensors;
+            }
+        }
+        return self;
+    }
+
+    /// The case-dependent part of loading: the kernels compiled for the case's sizes, its tables and work buffers.
+    pub fn attach(self: *Model, case: *Tensors, options: Options) !void {
+        const gpa = self.gpa;
+        const device = self.device;
+        self.case = case;
+        self.swiglu_rows = options.swiglu_rows;
+        self.tile_scales = options.tile_scales;
+        // the int8 weights read one value scale a key tile
+        self.weights = if (options.tile_scales) options.weights else .half;
+        var name: [128]u8 = undefined;
+        const hidden = self.hidden;
+        const inner = self.inner;
+        const heads = self.heads;
 
         // a case made for a first frame has a seventh count, the keyframe's rows
         const counts = (case.names.get("geometry") orelse return error.MissingTensor).shape[0];
@@ -219,9 +334,6 @@ pub const Model = struct {
         self.condition = if (counts > 6) @intCast(geometry[6]) else 0;
         self.rows = self.text + self.condition + self.audio + self.video;
         const rows = self.rows;
-        const hidden = self.hidden;
-        const inner = self.inner;
-        const heads = self.heads;
         self.video_in = (case.names.get("video_in.weight") orelse return error.MissingTensor).shape[1];
         self.audio_in = (case.names.get("audio_in.weight") orelse return error.MissingTensor).shape[1];
         self.lines = (case.names.get("tables.0") orelse return error.MissingTensor).shape[1];
@@ -299,33 +411,7 @@ pub const Model = struct {
         self.video_velocity = try device.buffer(self.video * self.video_in * 4, shared);
         self.audio_velocity = try device.buffer(self.audio * self.audio_in * 4, shared);
 
-        self.blocks = try gpa.alloc(Block, layers);
-        for (self.blocks, 0..) |*b, i| {
-            const pool = mtl.objc.Pool.push();
-            defer pool.pop();
-            const cb = self.queue.commandBuffer();
-            const enc = cb.compute(.serial);
-            const square = hidden * inner;
-            b.q = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_q.weight", .{i}), square), hidden, inner);
-            b.k = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_k.weight", .{i}), square), hidden, inner);
-            b.v = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_v.weight", .{i}), square), hidden, inner);
-            b.compress = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_gate_compress.weight", .{i}), square), hidden, inner);
-            b.out = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.to_out.0.weight", .{i}), square), inner, hidden);
-            // the checkpoint stores the SwiGLU's first projection as [value; gate]
-            const fc1 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.ff.net.0.proj.weight", .{i}), 2 * self.mlp * hidden);
-            b.fc_value = try self.quantize(enc, fc1, hidden, self.mlp);
-            b.fc_gate = try self.quantize(enc, .{ .buffer = fc1.buffer, .offset = fc1.offset + self.mlp * hidden * 2 }, hidden, self.mlp);
-            b.fc2 = try self.quantize(enc, try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.ff.net.2.weight", .{i}), self.mlp * hidden), self.mlp, hidden);
-            enc.end();
-            cb.commit();
-            cb.wait();
-            b.norm1 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.norm1.weight", .{i}), hidden);
-            b.norm2 = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.norm2.weight", .{i}), hidden);
-            b.norm_q = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.norm_q.weight", .{i}), head_dim);
-            b.norm_k = try ck.ref(try std.fmt.bufPrint(&name, "transformer_blocks.{d}.attn.norm_k.weight", .{i}), head_dim);
-            b.tables = try self.held(try std.fmt.bufPrint(&name, "tables.{d}", .{i}), .bf16, 6 * self.lines * hidden);
-        }
-        return self;
+        for (self.blocks, 0..) |*b, i| b.tables = try self.held(try std.fmt.bufPrint(&name, "tables.{d}", .{i}), .bf16, 6 * self.lines * hidden);
     }
 
     /// The case's tensor `name` in a buffer of its own (the case file's tensors start wherever its header ends).
@@ -337,11 +423,25 @@ pub const Model = struct {
         return .{ .buffer = buffer };
     }
 
-    /// `w` stored (n, k) in int8 (k, n) with a scale per output channel, written by the GPU.
-    fn quantize(self: *const Model, enc: mtl.ComputeEncoder, w: Ref, k: usize, n: usize) !Quant {
+    /// `w` stored (n, k) in int8 (k, n) with a scale per output channel, written by the GPU; with an adapter's
+    /// factors for `projection` of this block, `w + b a` in float32 is what is rounded.
+    fn quantize(self: *Model, enc: mtl.ComputeEncoder, w: Ref, k: usize, n: usize, lora: Lora, comptime projection: []const u8) !Quant {
         const q = Quant{ .w = try self.device.buffer(k * n, mtl.ResourceOptions.shared), .s = try self.device.buffer(n * 4, mtl.ResourceOptions.shared) };
-        enc.setPipeline(self.pipeline("h3_quant_weight_t"));
-        enc.setBuffer(w.buffer, w.offset, 0);
+        if (try lora.factors(self.device, projection, k, n)) |f| {
+            self.adapted += 1;
+            enc.setPipeline(self.weightPipeline("h3_lora_merge"));
+            enc.setBuffer(w.buffer, w.offset, 0);
+            enc.setBuffer(f.a.buffer, f.a.offset, 1);
+            enc.setBuffer(f.b.buffer, f.b.offset, 2);
+            enc.setValue([3]i32{ @intCast(k), @intCast(n), @intCast(f.rank) }, 3);
+            enc.setBuffer(lora.scratch.?, 0, 4);
+            enc.dispatchThreads(mtl.Size.of(k, n, 1), mtl.Size.of(256, 1, 1));
+            enc.setPipeline(self.weightPipeline("h3_quant_merged_t"));
+            enc.setBuffer(lora.scratch.?, 0, 0);
+        } else {
+            enc.setPipeline(self.weightPipeline("h3_quant_weight_t"));
+            enc.setBuffer(w.buffer, w.offset, 0);
+        }
         enc.setValue([2]i32{ @intCast(k), @intCast(n) }, 1);
         enc.setBuffer(q.w, 0, 2);
         enc.setBuffer(q.s, 0, 3);

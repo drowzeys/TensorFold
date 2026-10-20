@@ -7,24 +7,7 @@
 #define H3_TILES 289
 #endif
 
-// A projection stored (N, K) as checkpoints keep it, to int8 (K, N) with one scale per output channel n.
-// W: (N, K) bf16. P: K, N. W8: (K, N). WS: (N). Threadgroups [N, 1, 1] of [32, 1, 1].
-[[kernel]] void h3_quant_weight_t(
-  const device bfloat* W [[buffer(0)]],
-  const constant int32_t* P [[buffer(1)]],
-  device int8_t* W8 [[buffer(2)]],
-  device float* WS [[buffer(3)]],
-  uint lane [[thread_index_in_simdgroup]],
-  uint3 tg [[threadgroup_position_in_grid]]) {
-  const int K = P[0], N = P[1], n = int(tg.x);
-  const device bfloat* w = W + long(n) * K;
-  float top = 0.0f;
-  for (int k = int(lane); k < K; k += 32) top = max(top, abs(float(w[k])));
-  top = max(simd_max(top), 1e-12f);
-  if (lane == 0) WS[n] = top / 127.0f;
-  const float inverse = 127.0f / top;
-  for (int k = int(lane); k < K; k += 32) W8[long(k) * N + n] = int8_t(clamp(int(rint(float(w[k]) * inverse)), -127, 127));
-}
+// The block projections are quantized by weights.metal, compiled on its own before the case is read.
 
 // Y[row0 + r, n] = B[n] + sum over k of X[r, k] W[n, k]: the latent rows into the stream, float weights.
 // X: (R, K) float. W: (N, K) float. B: (N). P: R, K, N, row0. Y: (rows, N) bf16. Threads [N, R, 1].

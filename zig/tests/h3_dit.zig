@@ -7,6 +7,20 @@ const h3 = @import("h3");
 extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn fwrite(ptr: *const anyopaque, size: usize, count: usize, file: *anyopaque) usize;
 extern "c" fn fclose(file: *anyopaque) c_int;
+extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+extern "c" fn usleep(microseconds: c_uint) c_int;
+extern "c" fn getppid() c_int;
+
+/// Until `path` exists: the exporter writes its files under another name and renames them when complete. Gives
+/// up when the process that started this one is gone, or after `limit` seconds.
+fn waitFor(path: [*:0]const u8, parent: c_int, limit: f64) !void {
+    const started = mtl.clock.seconds();
+    while (access(path, 0) != 0) {
+        if (getppid() != parent) return error.ParentGone;
+        if (mtl.clock.seconds() - started > limit) return error.CaseTimedOut;
+        _ = usleep(10_000);
+    }
+}
 
 const Match = struct { cosine: f64, relative: f64, worst_row: f64 };
 
@@ -50,31 +64,45 @@ fn advance(x: []f32, velocity: []const f32, seen: f32, ratio: f32) void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 5 and args.len != 6) {
-        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | row-scales | half | w7 | profile | DEFINE, ...]\n", .{});
+        std.debug.print("usage: tf-h3-dit transformer_dir shards case.safetensors out_prefix [dense | swiglu64 | row-scales | half | w7 | profile | wait | lora=PATH | DEFINE, ...]\n", .{});
         return error.BadArguments;
     }
     const gpa = init.gpa;
+    const parent = getppid();
     const device = try mtl.Device.init();
-    var case = try h3.Tensors.open(gpa, device, args[3]);
-    defer case.deinit();
-    const loading = mtl.clock.seconds();
-    // the optional last argument names kernel shapes to try: "dense", "swiglu64", "row-scales", or defines such as "H3_ATT_FIXED"
+    // the optional last argument names kernel shapes to try: "dense", "swiglu64", "row-scales", or defines such as
+    // "H3_ATT_FIXED"; "wait" quantizes the checkpoint while the case is still being written (it appears under its
+    // own name when complete); "lora=PATH" merges an adapter's factors file (tools/zig/h3_case.py --lora) first
     var options = h3.Options{};
     var defines: [256]u8 = undefined;
     var used: usize = 0;
     var dense = false;
     var profile = false;
+    var wait = false;
+    var lora: ?[:0]u8 = null;
     if (args.len == 6) {
         var it = std.mem.splitScalar(u8, args[5], ',');
         while (it.next()) |word| {
-            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else if (std.mem.eql(u8, word, "row-scales")) options.tile_scales = false else if (std.mem.eql(u8, word, "half")) options.weights = .half else if (std.mem.eql(u8, word, "w7")) options.weights = .w7 else if (std.mem.eql(u8, word, "profile")) profile = true else {
+            if (std.mem.eql(u8, word, "dense")) dense = true else if (std.mem.eql(u8, word, "swiglu64")) options.swiglu_rows = 64 else if (std.mem.eql(u8, word, "row-scales")) options.tile_scales = false else if (std.mem.eql(u8, word, "half")) options.weights = .half else if (std.mem.eql(u8, word, "w7")) options.weights = .w7 else if (std.mem.eql(u8, word, "profile")) profile = true else if (std.mem.eql(u8, word, "wait")) wait = true else if (std.mem.startsWith(u8, word, "lora=")) lora = try gpa.dupeSentinel(u8, word[5..], 0) else {
                 const text = try std.fmt.bufPrint(defines[used..], "#define {s}\n", .{word});
                 used += text.len;
             }
         }
     }
     options.defines = defines[0..used];
-    const model = try h3.Model.load(gpa, args[1], try std.fmt.parseInt(usize, args[2], 10), &case, options);
+    const loading = mtl.clock.seconds();
+    var adapter: ?h3.Tensors = null;
+    if (lora) |path| {
+        if (wait) try waitFor(path.ptr, parent, 900);
+        adapter = try h3.Tensors.open(gpa, device, path.ptr);
+    }
+    const model = try h3.Model.prepare(gpa, args[1], try std.fmt.parseInt(usize, args[2], 10), if (adapter) |*a| a else null);
+    if (adapter) |*a| a.deinit();
+    std.debug.print("weights in {d:.1} s ({d} projections with an adapter merged)\n", .{ mtl.clock.seconds() - loading, model.adapted });
+    if (wait) try waitFor(args[3].ptr, parent, 900);
+    var case = try h3.Tensors.open(gpa, device, args[3]);
+    defer case.deinit();
+    try model.attach(&case, options);
     model.dense = dense;
     const steps = (case.names.get("video_step") orelse return error.MissingTensor).shape[0];
     const nv = model.video * model.video_in;
