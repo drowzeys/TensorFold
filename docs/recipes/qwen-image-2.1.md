@@ -49,4 +49,8 @@ One prompt (94 text tokens), 1344x768 (4,032 image tokens), seed 42, one run eac
   0.41 at 1024x576 and grass, rock and water come out under a fine regular mesh. ComfyUI runs the same nodes as
   saved (ManualSigmas). The prompt embeddings are the language model's last layer before its final RMSNorm, as in
   diffusers' pipeline and ComfyUI; mflux's text-to-image encoder applies the norm, and the development tool drops it.
+- `sampler.torch_noise` draws the starting noise ComfyUI and diffusers draw for a seed (`--noise torch` on the
+  development tool). With it, the saved nodes as saved and the pre-norm prompt state, a Turbo picture is the one
+  ComfyUI makes for the same seed (mean difference 2/255 in bfloat16 at 1344x768). `start_noise` (MLX's generator)
+  gives another picture for the same seed; over 24 seeds the two draws give the same amount of fine texture.
 - Not graded: text rendering, other sizes, more than one prompt and seed.

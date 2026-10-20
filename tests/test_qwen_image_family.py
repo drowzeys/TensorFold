@@ -95,6 +95,16 @@ def test_saved_nodes_read_from_the_pipeline_index(tmp_path):
     assert saved_nodes(tmp_path / "missing") is None
 
 
+def test_torch_noise_is_the_draw_comfyui_makes():
+    # torch.randn((1, 64, 2, 2), generator=torch.manual_seed(0)), flattened: values 0-3, 8 and the last two
+    x = np.asarray(sampler.torch_noise(0, 32, 32))
+    assert x.shape == (1, 4, 64) and x.dtype == np.float32
+    nchw = x.reshape(2, 2, 64).transpose(2, 0, 1).reshape(-1)
+    np.testing.assert_allclose(nchw[[0, 1, 2, 3, 8, -2, -1]],
+                               [-1.1258398, -1.1523602, -0.2505786, -0.4338788, 0.3222749, 1.9028565, 0.3903958],
+                               atol=1e-5)
+
+
 def test_rotary_text_advances_all_axes_and_image_is_centred():
     cos, sin = qdit.rotary_tables(TINY, text_len=3, rows=2, columns=4)
     assert cos.shape == (3 + 8, 8) and sin.shape == cos.shape

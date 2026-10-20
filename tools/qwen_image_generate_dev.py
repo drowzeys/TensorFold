@@ -69,6 +69,8 @@ def main() -> int:
     parser.add_argument("--raw-nodes", action="store_true",
                         help="run --nodes as given, without the resolution shift; with no --nodes, the checkpoint's own "
                         "sample_sigmas (Qwen-Image-2.1-Turbo)")
+    parser.add_argument("--noise", choices=("mlx", "torch"), default="mlx",
+                        help="torch: the starting noise ComfyUI and diffusers draw for the seed (the same picture as there)")
     parser.add_argument("--lora", help="adapter safetensors to merge before quantizing")
     parser.add_argument("--no-int8", action="store_true", help="keep every projection in bfloat16")
     parser.add_argument("--vae-dtype", default="float32", choices=("float32", "bfloat16"))
@@ -106,7 +108,8 @@ def main() -> int:
             parser.error(f"--raw-nodes without --nodes needs a checkpoint with sample_sigmas; {args.model_dir} has none")
     latents = sampler.denoise(dit, text, args.width, args.height, args.steps, args.seed, nodes,
                               on_step=lambda i, n: print(f"[tensorfold] step {i + 1}/{n}", file=sys.stderr),
-                              shift_nodes=not args.raw_nodes)
+                              shift_nodes=not args.raw_nodes,
+                              latents=sampler.torch_noise(args.seed, args.width, args.height) if args.noise == "torch" else None)
     mx.eval(latents)
     denoise_s = time.perf_counter() - mark
     forwards = len(nodes) if nodes else args.steps
