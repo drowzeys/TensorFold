@@ -14,9 +14,17 @@ from pathlib import Path
 
 
 def encode_prompt(model_dir: str, prompt: str):
-    """Prompt embeddings (1, tokens, 4096) from mflux's Qwen-Image-2.1 prompt encoder."""
+    """Prompt embeddings (1, tokens, 4096) from mflux's Qwen-Image-2.1 prompt encoder, taken before the language
+    model's final RMSNorm.
+
+    The transformer is conditioned on the last decoder layer's output before that norm: diffusers'
+    QwenImage21Pipeline hooks the norm out (transformers 5 would return it normed), and ComfyUI keeps the pre-norm
+    state too. mflux's text-to-image encoder applies the norm, which moves the picture and, with the Turbo nodes,
+    adds a fine mesh to textured areas; the norm is dropped here after its weights are loaded.
+    """
 
     import mlx.core as mx
+    from mlx import nn
     from mflux.models.common.tokenizer import TokenizerLoader
     from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_prompt_encoder import Qwen21PromptEncoder
     from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
@@ -35,6 +43,7 @@ def encode_prompt(model_dir: str, prompt: str):
     holder.text_encoder = Qwen21TextEncoder()
     tokenizers = TokenizerLoader.load_all(definitions=Qwen21WeightDefinition.get_tokenizers(), model_path=model_dir)
     Qwen21Initializer.load_components(holder, Path(model_dir), TextOnly, None)
+    holder.text_encoder.norm = nn.Identity()
     embeds, mask = Qwen21PromptEncoder.encode_prompt(prompt=prompt, prompt_cache={}, tokenizer=tokenizers["qwen21"],
                                                      text_encoder=holder.text_encoder)
     if int(mx.sum(mask).item()) != mask.shape[1]:
@@ -55,7 +64,13 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--nodes", help="comma-separated raw noise levels for a distilled adapter")
+    parser.add_argument("--nodes", help="comma-separated noise levels: a distilled adapter's training nodes (shifted "
+                        "by the image size), or with --raw-nodes a checkpoint's saved schedule")
+    parser.add_argument("--raw-nodes", action="store_true",
+                        help="run --nodes as given, without the resolution shift; with no --nodes, the checkpoint's own "
+                        "sample_sigmas (Qwen-Image-2.1-Turbo)")
+    parser.add_argument("--noise", choices=("mlx", "torch"), default="mlx",
+                        help="torch: the starting noise ComfyUI and diffusers draw for the seed (the same picture as there)")
     parser.add_argument("--lora", help="adapter safetensors to merge before quantizing")
     parser.add_argument("--no-int8", action="store_true", help="keep every projection in bfloat16")
     parser.add_argument("--vae-dtype", default="float32", choices=("float32", "bfloat16"))
@@ -70,6 +85,7 @@ def main() -> int:
     from PIL import Image
 
     from tensorfold.families.qwen_image import lora, sampler, vae, weights
+    from tensorfold.families.qwen_image.config import saved_nodes
 
     started = time.perf_counter()
     text = encode_prompt(args.model_dir, prompt)
@@ -86,8 +102,14 @@ def main() -> int:
 
     mark = time.perf_counter()
     nodes = tuple(float(v) for v in args.nodes.split(",")) if args.nodes else None
+    if nodes is None and args.raw_nodes:
+        nodes = saved_nodes(args.model_dir)
+        if nodes is None:
+            parser.error(f"--raw-nodes without --nodes needs a checkpoint with sample_sigmas; {args.model_dir} has none")
     latents = sampler.denoise(dit, text, args.width, args.height, args.steps, args.seed, nodes,
-                              on_step=lambda i, n: print(f"[tensorfold] step {i + 1}/{n}", file=sys.stderr))
+                              on_step=lambda i, n: print(f"[tensorfold] step {i + 1}/{n}", file=sys.stderr),
+                              shift_nodes=not args.raw_nodes,
+                              latents=sampler.torch_noise(args.seed, args.width, args.height) if args.noise == "torch" else None)
     mx.eval(latents)
     denoise_s = time.perf_counter() - mark
     forwards = len(nodes) if nodes else args.steps

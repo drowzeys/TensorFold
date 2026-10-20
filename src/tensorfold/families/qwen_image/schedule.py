@@ -18,11 +18,16 @@ def shift_for(width: int, height: int) -> float:
     return slope * (width * height / 256) + BASE_SHIFT - slope * BASE_TOKENS
 
 
-def sigmas(steps: int, width: int, height: int, nodes: tuple[float, ...] | None = None) -> np.ndarray:
+def sigmas(steps: int, width: int, height: int, nodes: tuple[float, ...] | None = None,
+           shift_nodes: bool = True) -> np.ndarray:
     """``steps + 1`` noise levels from 1 down to 0.
 
-    ``nodes`` replaces the even spacing with fixed raw levels (a distilled adapter's training nodes); those take
-    the shift but not the terminal stretch.
+    ``nodes`` replaces the even spacing with fixed levels, which never take the terminal stretch. A distilled
+    adapter's training nodes (Viggle's turbo LoRA) take the shift. A checkpoint's own saved schedule
+    (Qwen-Image-2.1-Turbo's ``sample_sigmas``, see ``config.saved_nodes``) is run as saved: ``shift_nodes=False``.
+    Shifted, the Turbo nodes ask for the clean picture from noise level 0.56 instead of 0.41 at 1024x576, and every
+    textured area (grass, rock, water) comes out under a fine regular mesh; as saved, the picture is the one
+    ComfyUI's ManualSigmas gives on the same nodes.
     """
 
     if nodes is None:
@@ -33,6 +38,8 @@ def sigmas(steps: int, width: int, height: int, nodes: tuple[float, ...] | None 
         raw = np.asarray(nodes, dtype=np.float32)
         if raw.ndim != 1 or len(raw) < 1 or np.any(raw <= 0) or np.any(raw > 1) or np.any(np.diff(raw) >= 0):
             raise ValueError("nodes must fall from at most 1 towards 0, exclusive of 0")
+    if nodes is not None and not shift_nodes:
+        return np.concatenate([raw, np.zeros(1, dtype=np.float32)]).astype(np.float32)
     scale = np.float32(math.exp(shift_for(width, height)))
     shifted = scale / (scale + (1.0 / raw - 1.0))
     if nodes is None:
