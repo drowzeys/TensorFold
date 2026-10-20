@@ -16,17 +16,18 @@ def start_noise(seed: int, width: int, height: int, channels: int = 64):
 
 
 def denoise(dit, text, width: int, height: int, steps: int = 40, seed: int = 0, nodes=None, on_step=None,
-            latents=None):
+            latents=None, shift_nodes: bool = True):
     """Image latents (1, channels, rows, columns) float32 from prompt embeddings ``text`` (1, tokens, dim).
 
-    ``nodes`` are fixed raw noise levels for a distilled adapter; ``steps`` is ignored when they are given.
+    ``nodes`` are fixed noise levels; ``steps`` is ignored when they are given. ``shift_nodes`` as in
+    ``schedule.sigmas``: True for an adapter's training nodes, False for a checkpoint's own saved schedule.
     ``on_step(index, total)`` is called after each step.
     """
 
     import mlx.core as mx
 
     rows, columns = latent_grid(width, height)
-    levels = make_sigmas(steps, width, height, nodes)
+    levels = make_sigmas(steps, width, height, nodes, shift_nodes)
     prefix = dit.prefix(text, rows, columns)
     x = start_noise(seed, width, height, dit.config.in_channels) if latents is None else latents
     x = x.astype(mx.float32)

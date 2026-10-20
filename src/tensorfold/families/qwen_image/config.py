@@ -22,6 +22,18 @@ def pipeline_root(model_dir) -> Path | None:
     return root if name == "QwenImage21Pipeline" else None
 
 
+def saved_nodes(model_dir) -> tuple[float, ...] | None:
+    """The noise levels a distilled checkpoint saves with itself (`sample_sigmas` in `model_index.json`, the
+    terminal 0 left out), or None. Qwen-Image-2.1-Turbo has eight; they are run as saved (no shift)."""
+
+    root = pipeline_root(model_dir)
+    if root is None:
+        return None
+    with open(root / "model_index.json") as handle:
+        nodes = json.load(handle).get("sample_sigmas")
+    return tuple(float(v) for v in nodes) if nodes else None
+
+
 @dataclass(frozen=True)
 class DiTConfig:
     in_channels: int = 64

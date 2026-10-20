@@ -73,6 +73,28 @@ def test_fixed_nodes_take_the_shift_but_not_the_terminal_stretch():
         schedule.sigmas(2, 1024, 1024, (0.5, 0.75))
 
 
+def test_saved_nodes_run_as_saved():
+    # Qwen-Image-2.1-Turbo's sample_sigmas, as ComfyUI's ManualSigmas runs them; shifted, the picture gets a mesh
+    nodes = (1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568)
+    for width, height in ((1024, 576), (1344, 768), (2048, 2048)):
+        levels = schedule.sigmas(8, width, height, nodes, shift_nodes=False)
+        assert levels.dtype == np.float32 and levels.shape == (9,) and levels[-1] == 0.0
+        np.testing.assert_array_equal(levels[:-1], np.array(nodes, dtype=np.float32))
+    assert schedule.sigmas(8, 1024, 576, nodes)[-2] == pytest.approx(0.5642, abs=1e-4)
+    with pytest.raises(ValueError):
+        schedule.sigmas(2, 1024, 1024, (0.5, 0.75), shift_nodes=False)
+
+
+def test_saved_nodes_read_from_the_pipeline_index(tmp_path):
+    saved_nodes = qconfig.saved_nodes
+    index = {"_class_name": "QwenImage21Pipeline"}
+    (tmp_path / "model_index.json").write_text(json.dumps(index))
+    assert saved_nodes(tmp_path) is None
+    (tmp_path / "model_index.json").write_text(json.dumps({**index, "sample_sigmas": [1.0, 0.5]}))
+    assert saved_nodes(tmp_path) == (1.0, 0.5)
+    assert saved_nodes(tmp_path / "missing") is None
+
+
 def test_rotary_text_advances_all_axes_and_image_is_centred():
     cos, sin = qdit.rotary_tables(TINY, text_len=3, rows=2, columns=4)
     assert cos.shape == (3 + 8, 8) and sin.shape == cos.shape
