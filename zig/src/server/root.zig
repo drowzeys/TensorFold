@@ -68,6 +68,7 @@ test {
     _ = @import("image_pieces.zig");
     _ = @import("media_fetch.zig");
     _ = @import("videos.zig");
+    _ = @import("vocab.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("stream_dsml_test.zig");
     _ = @import("logprobs_test.zig");
