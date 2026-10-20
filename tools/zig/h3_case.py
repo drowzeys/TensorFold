@@ -18,12 +18,22 @@ the finished picture, as families/h3/sampler.py `revoice` does; it needs the pro
 `--first-frame IMAGE` starts the clip from an image: its vision tokens join the prompt's rows and its encoded rows sit
 between the text and the audio, as tools/h3_generate_dev.py --first-frame does (the image is stretched onto the canvas).
 `--steps N` exports N forwards instead of the checkpoint's own count, rungs spread evenly from its first rung.
+`--lora PATH[:STRENGTH]` (repeatable) applies style adapters as families/h3/lora.py `merge` does: the block
+projections' low-rank factors go to lora.safetensors for the native tool (`lora=PATH`), which adds them to the bf16
+weights in float32 before its int8 rounding; updates on the small modules this export computes (the condition
+projection, token refiner, time embedder, modulation and final layers) are merged here. An adapter that changes
+anything else the native tool reads from the checkpoint (a norm, a dense projection correction) is refused with
+exit status 3. Without --no-reference the reference forward runs with the whole adapter merged in float32.
+Both outputs are written under another name and renamed when complete, so the native tool can start with `wait`
+before they exist.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,6 +58,8 @@ def main() -> int:
     parser.add_argument("--revoice", type=int, default=0, metavar="STEPS",
                         help="with --decode: audio made again by the released model in this many steps")
     parser.add_argument("--first-frame", help="image the clip starts from (image to video)")
+    parser.add_argument("--lora", action="append", default=[], metavar="PATH[:STRENGTH]",
+                        help="a style adapter (families/h3/lora.py layouts); its block factors go to lora.safetensors")
     parser.add_argument("--no-reference", action="store_true",
                         help="skip the reference forward (its velocities are written as zeros): for renders, not parity")
     args = parser.parse_args()
@@ -72,6 +84,8 @@ def main() -> int:
     lat_h, lat_w = args.height // h3.VAE_SPATIAL_RATIO, args.width // h3.VAE_SPATIAL_RATIO
     audio_l = h3.audio_latents(args.frames)
     config = fasth3.config(args.fasth3)
+    # first, so the native tool can merge the adapters while the prompt is encoded
+    small = export_lora(args.lora, config, out) if args.lora and not args.decode else ([], [])
 
     if args.decode:
         video = np.fromfile(args.decode + ".video.f32", dtype=np.float32).reshape(-1, config.latents_dim * 4)
@@ -118,6 +132,15 @@ def main() -> int:
     if image is not None:
         condition, keyframes = tool.encode_first_frame(root, image, args.width, args.height, config.patch_size), ("first",)
     dit, gates, fast = fasth3.load_fasth3(args.fasth3)
+    if args.lora and not args.no_reference:
+        from tensorfold.families.h3.lora import merge
+
+        # the reference forward sees every update: the whole adapter in float32, as the MLX engine merges it
+        for spec in args.lora:
+            path, _, strength = spec.partition(":")
+            merge(dit, path, float(strength or 1.0))
+    else:
+        merge_small(dit, *small)
     packed = layout(tags, frames_l, lat_h, lat_w, audio_l, config.patch_size, keyframes)
     held = packed.condition_video_rows
     # the keyframe's rows come first among the video rows, already at their noise level
@@ -175,13 +198,127 @@ def main() -> int:
         mx.eval(*first)
         case["video_velocity"] = first[0][0, held:].astype(mx.float32)
         case["audio_velocity"] = first[1][0].astype(mx.float32)
-    mx.save_safetensors(str(out / "case.safetensors"), case)
+    mx.save_safetensors(str(out / "case.partial.safetensors"), case)
+    os.replace(out / "case.partial.safetensors", out / "case.safetensors")
     print(json.dumps({"rows": packed.rows, "text": int(packed.text_rows.shape[0]), "audio": int(packed.audio_rows.shape[0]),
                       "video": int(packed.video_rows.shape[0]) - held, "keyframe": held, "timesteps": int(table.shape[0]),
                       "tiles": geometry.num_tiles, "prefix_tiles": geometry.num_prefix_tiles,
                       "hidden": config.hidden_size, "layers": config.num_layers,
                       "reference_forward_s": round(time.perf_counter() - mark, 1)}))
     return 0
+
+
+# the block projections whose factors the native tool merges: the H3 module name, and its own names for the parts
+NATIVE = re.compile(r"blocks\.(\d+)\.(attn\.qkv_proj|attn\.out_proj|mlp\.fc1|mlp\.fc2)$")
+# what this export computes itself, so an adapter's update there is merged into the MLX modules here
+SMALL = ("condition_proj.", "token_refiner.", "time_embedder.", "video_patch_proj.", "audio_patch_proj.",
+         "final_layer.")
+REFUSED = 3
+
+
+def export_lora(specs: list[str], config, out: Path) -> tuple[list, list]:
+    """Write the adapters' block factors to out/lora.safetensors; return the small modules' pairs and corrections.
+
+    Factors are float32 `{block}.{part}.a` (R, K) and `.b` (N, R), the strength folded into b and several adapters
+    (or several pairs of one) concatenated along R, for parts to_q, to_k, to_v (the H3 qkv rows are per head
+    [q, k, v]), to_out, fc_gate and fc_value (H3 fc1 is [gate; value]) and fc2: the checkpoint's own projections.
+    """
+
+    import mlx.core as mx
+
+    from tensorfold.families.h3 import lora
+
+    heads, dim, width = config.num_attention_heads, config.attention_head_dim, config.ffn_hidden_size
+    inner = heads * dim
+    parts: dict[str, list] = {}
+    pairs, diffs = [], []
+
+    def add(block: str, part: str, a, b) -> None:
+        if not bool(mx.any(b != 0)):
+            return  # FastVideo's format fills the slots of q, k and v it does not train with zeros
+        parts.setdefault(f"{block}.{part}", []).append((a, b))
+
+    for spec in specs:
+        path, _, strength = spec.partition(":")
+        strength = float(strength or 1.0)
+        adapter = lora.load(path, config)
+        for module, found in adapter.pairs.items():
+            native = NATIVE.match(module)
+            for a, b in found:
+                if native is None:
+                    if not module.startswith(SMALL) and not re.match(r"blocks\.\d+\.adaln_proj\.", module):
+                        refuse(path, module)
+                    pairs.append((module, a, b, strength))
+                    continue
+                block, kind = native.group(1), native.group(2)
+                b = b * strength
+                if kind == "attn.qkv_proj":
+                    rows = b.reshape(heads, 3, dim, b.shape[-1])
+                    for slot, part in enumerate(("to_q", "to_k", "to_v")):
+                        add(block, part, a, rows[:, slot].reshape(inner, b.shape[-1]))
+                elif kind == "mlp.fc1":
+                    add(block, "fc_gate", a, b[:width])
+                    add(block, "fc_value", a, b[width:])
+                else:
+                    add(block, "to_out" if kind == "attn.out_proj" else "fc2", a, b)
+        for parameter, diff in adapter.diffs.items():
+            if not parameter.startswith(SMALL) and not re.match(r"blocks\.\d+\.adaln_proj\.", parameter):
+                refuse(path, parameter)
+            diffs.append((parameter, diff, strength))
+    factors = {}
+    for name, found in parts.items():
+        factors[name + ".a"] = mx.concatenate([a for a, _ in found], axis=0).astype(mx.float32)
+        factors[name + ".b"] = mx.concatenate([b for _, b in found], axis=1).astype(mx.float32)
+    mx.eval(*factors.values())
+    save_aligned(out / "lora.partial.safetensors", factors)
+    os.replace(out / "lora.partial.safetensors", out / "lora.safetensors")
+    print(f"[h3_case] adapters: {len(parts)} block projections to the native tool, {len(pairs)} small updates and "
+          f"{len(diffs)} corrections merged here", file=sys.stderr, flush=True)
+    return pairs, diffs
+
+
+def save_aligned(path: Path, tensors: dict) -> None:
+    """float32 tensors to a safetensors file whose payload starts on 8 bytes, so the GPU reads every one in place."""
+
+    import numpy as np
+
+    arrays = {name: np.asarray(value, dtype=np.float32) for name, value in tensors.items()}
+    header, offset = {}, 0
+    for name, array in arrays.items():
+        header[name] = {"dtype": "F32", "shape": list(array.shape), "data_offsets": [offset, offset + array.nbytes]}
+        offset += array.nbytes
+    text = json.dumps(header).encode()
+    text += b" " * (-len(text) % 8)
+    with open(path, "wb") as handle:
+        handle.write(len(text).to_bytes(8, "little"))
+        handle.write(text)
+        for array in arrays.values():
+            handle.write(np.ascontiguousarray(array).tobytes())
+
+
+def refuse(path: str, name: str) -> None:
+    print(f"{Path(path).name} changes {name}, which the native tool reads from the checkpoint", file=sys.stderr)
+    raise SystemExit(REFUSED)
+
+
+def merge_small(dit, pairs: list, diffs: list) -> None:
+    """families/h3/lora.py `merge` for the small modules: float32 sums, vectors back to their own type."""
+
+    import mlx.core as mx
+
+    from tensorfold.families.h3.lora import _resolve
+
+    for module, a, b, strength in pairs:
+        owner, leaf = _resolve(dit, module)
+        linear = getattr(owner, leaf)
+        linear.weight = linear.weight.astype(mx.float32) + strength * (b @ a)
+        mx.eval(linear.weight)
+    for parameter, diff, strength in diffs:
+        owner, leaf = _resolve(dit, parameter)
+        current = getattr(owner, leaf)
+        updated = current.astype(mx.float32) + strength * diff
+        setattr(owner, leaf, updated.astype(current.dtype) if updated.ndim == 1 and leaf == "weight" else updated)
+        mx.eval(getattr(owner, leaf))
 
 
 def fasth3_keep(sparsity: float, video_tiles: int) -> int:
