@@ -48,6 +48,13 @@ const kernels = [_]Kernel{
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
+    .{ .name = "drama_backbone", .flags = glue },
+    .{ .name = "drama_backbone_gemm", .flags = &.{"-O3"} },
+    .{ .name = "drama_tower", .flags = glue },
+    .{ .name = "drama_tower_gemv", .flags = glue },
+    .{ .name = "drama_codec", .flags = glue },
+    .{ .name = "drama_codec_encode", .flags = glue },
+    .{ .name = "drama_probe", .flags = glue }, // tf-drama-probe's routed-expert statistics (families/drama/moe_stats.zig)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -78,7 +85,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, drama: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -90,7 +97,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
+    const drama = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    drama.addImport("cuda", cuda);
+    drama.addImport("core", core);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .drama = drama, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -122,7 +132,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cli.addImport("core", mods.core);
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
-    const native = engines(b, target, optimize, cuda, mods.lanes, mods.nemotron);
+    const native = engines(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.drama);
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
@@ -131,6 +141,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("core", mods.core);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
+    runner.addImport("drama", mods.drama);
     const exlr8 = exlr8_build.coreAlias(b, target, optimize, mods.core);
     runner.addImport("exlr8", exlr8);
     const exlr8_tests = exlr8_build.testModules(b, target, optimize, exlr8);
@@ -139,18 +150,287 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
-    nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
+    nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.drama, mods.tokenizer, build_options, true).root_module.strip = strip;
+    const codec_oracle = b.addExecutable(.{ .name = "tf-drama-codec-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_oracle = b.addInstallArtifact(codec_oracle, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-oracle", "Build the production-codec numerical oracle driver; does not run a GPU").dependOn(&install_oracle.step);
+    const codec_stream_oracle = b.addExecutable(.{ .name = "tf-drama-codec-stream-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_stream_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_stream_oracle = b.addInstallArtifact(codec_stream_oracle, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-stream-oracle", "Build the chunked-versus-whole codec driver; does not run a GPU").dependOn(&install_stream_oracle.step);
+    const codec_chunk = b.addExecutable(.{ .name = "tf-drama-codec-chunk", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_chunk.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_chunk = b.addInstallArtifact(codec_chunk, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-chunk", "Build the bounded-scratch codec byte-equality test; does not run a GPU").dependOn(&install_chunk.step);
+    const codec_rvq_replay = b.addExecutable(.{ .name = "tf-drama-codec-rvq-replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_rvq_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_codec_rvq_replay = b.addInstallArtifact(codec_rvq_replay, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-rvq-replay", "Build the isolated codec RVQ counterfactual; does not run a GPU").dependOn(&install_codec_rvq_replay.step);
+    const codec_weight_replay = b.addExecutable(.{ .name = "tf-drama-codec-weight-replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_weight_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_codec_weight_replay = b.addInstallArtifact(codec_weight_replay, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-weight-replay", "Build the isolated codec weight counterfactual; does not run a GPU").dependOn(&install_codec_weight_replay.step);
+    const tower_oracle = b.addExecutable(.{ .name = "tf-drama-tower-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_oracle = b.addInstallArtifact(tower_oracle, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-oracle", "Build the production-tower numerical oracle driver; does not run a GPU").dependOn(&install_tower_oracle.step);
+    const semantic_fixture = b.addExecutable(.{ .name = "tf-drama-semantic-fixture", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_semantic_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_semantic_fixture = b.addInstallArtifact(semantic_fixture, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-semantic-fixture", "Build the production generator fixture capture; does not run a GPU").dependOn(&install_semantic_fixture.step);
+    const backbone_oracle = b.addExecutable(.{ .name = "tf-drama-backbone-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_backbone_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_backbone_oracle = b.addInstallArtifact(backbone_oracle, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-backbone-oracle", "Build the production-backbone numerical oracle driver; does not run a GPU").dependOn(&install_backbone_oracle.step);
+    const reference_prefill = b.addExecutable(.{ .name = "tf-drama-reference-prefill", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_reference_prefill.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_reference_prefill = b.addInstallArtifact(reference_prefill, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-reference-prefill", "Build the voice-reference backbone prefill oracle driver; does not run a GPU").dependOn(&install_reference_prefill.step);
+    const cfg_pair = b.addExecutable(.{ .name = "tf-drama-cfg-pair", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_cfg_pair.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_cfg_pair = b.addInstallArtifact(cfg_pair, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-cfg-pair", "Build the batched-guidance identity driver (batched against unbatched decode); does not run a GPU").dependOn(&install_cfg_pair.step);
+    const gdn_oracle = b.addExecutable(.{ .name = "tf-drama-gdn-canonical-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_gdn_canonical_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_gdn_oracle = b.addInstallArtifact(gdn_oracle, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-gdn-canonical-oracle", "Build the GDN canonical controller verification driver; does not run a GPU").dependOn(&install_gdn_oracle.step);
+    const codec_trace = b.addExecutable(.{ .name = "tf-drama-codec-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_codec_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_trace = b.addInstallArtifact(codec_trace, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-codec-trace", "Build the production-codec trace/replay diagnostic; does not run a GPU").dependOn(&install_trace.step);
+    const backbone_trace = b.addExecutable(.{ .name = "tf-drama-backbone-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_backbone_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_backbone_trace = b.addInstallArtifact(backbone_trace, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-backbone-trace", "Build the production-backbone stage trace diagnostic; does not run a GPU").dependOn(&install_backbone_trace.step);
+    const backbone_replay = b.addExecutable(.{ .name = "tf-drama-backbone-replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_backbone_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_backbone_replay = b.addInstallArtifact(backbone_replay, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-backbone-replay", "Build the production-backbone operator replay diagnostic; does not run a GPU").dependOn(&install_backbone_replay.step);
+    // the converter's provenance names the commit it was built from
+    const commit = b.addSystemCommand(&.{ "git", "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*" });
+    commit.setCwd(b.path("."));
+    commit.has_side_effects = true;
+    const quant_convert = b.addExecutable(.{ .name = "tf-drama-quant", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_quant.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{.{ .name = "drama", .module = mods.drama }},
+    }) });
+    quant_convert.root_module.addAnonymousImport("tool_commit", .{ .root_source_file = commit.captureStdOut(.{}) });
+    b.step("drama-quant", "Build the CPU converter of Drama 3's experts to NVFP4 and dense projections to FP8 into zig-out/bin").dependOn(&b.addInstallArtifact(quant_convert, .{}).step);
+    const gdn_layer0 = b.addExecutable(.{ .name = "tf-drama-gdn-layer0-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_gdn_layer0_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_gdn_layer0 = b.addInstallArtifact(gdn_layer0, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-gdn-layer0-trace", "Build the layer-zero production attention scratch diagnostic; does not run a GPU").dependOn(&install_gdn_layer0.step);
+    const tower_mixer = b.addExecutable(.{ .name = "tf-drama-tower-mixer-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_mixer_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_mixer = b.addInstallArtifact(tower_mixer, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-mixer-trace", "Build the full-context tower mixer trace diagnostic; does not run a GPU").dependOn(&install_tower_mixer.step);
+    const tower_qk = b.addExecutable(.{ .name = "tf-drama-tower-qk-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_qk_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_qk = b.addInstallArtifact(tower_qk, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-qk-trace", "Build the full-context tower Q/K and rotary diagnostic; does not run a GPU").dependOn(&install_tower_qk.step);
+    const tower_head_replay = b.addExecutable(.{ .name = "tf-drama-tower-head-replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_head_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_head_replay = b.addInstallArtifact(tower_head_replay, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-head-replay", "Build the production-tower head9 identical-input replay diagnostic; does not run a GPU").dependOn(&install_tower_head_replay.step);
+    const tower_trace = b.addExecutable(.{ .name = "tf-drama-tower-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_trace = b.addInstallArtifact(tower_trace, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-trace", "Build the production-tower real-input stage trace diagnostic; does not run a GPU").dependOn(&install_tower_trace.step);
+    const tower_context = b.addExecutable(.{ .name = "tf-drama-tower-context-oracle", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_context_oracle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_context = b.addInstallArtifact(tower_context, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-context-oracle", "Build the full-context teacher-forced tower diagnostic; does not run a GPU").dependOn(&install_tower_context.step);
+    const tower_context_trace = b.addExecutable(.{ .name = "tf-drama-tower-context-trace", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_context_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "drama", .module = mods.drama } },
+    }) });
+    const install_tower_context_trace = b.addInstallArtifact(tower_context_trace, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-context-trace", "Build the full-context tower stage trace diagnostic; does not run a GPU").dependOn(&install_tower_context_trace.step);
+    const tower_linear_replay = b.addExecutable(.{ .name = "tf-drama-tower-linear-replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_tower_linear_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    }) });
+    const install_tower_linear_replay = b.addInstallArtifact(tower_linear_replay, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-tower-linear-replay", "Build the tower eh_proj cuBLASLt identical-input replay diagnostic; does not run a GPU").dependOn(&install_tower_linear_replay.step);
+    const probe = b.addExecutable(.{ .name = "tf-drama-probe", .root_module = probeModule(b, target, optimize, strip, cuda, mods.core, mods.drama, mods.tokenizer, native.api) });
+    const install_probe = b.addInstallArtifact(probe, .{ .dest_dir = .{ .override = .{ .custom = "oracle/bin" } } });
+    b.step("drama-probe", "Build the semantic-logits and routing-statistics probe (generate or teacher-forced); does not run a GPU").dependOn(&install_probe.step);
+}
+
+/// tf-drama-probe's root module (zig/tests/cuda/drama_probe.zig), for the tool and for its host tests.
+fn probeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: ?bool, cuda: *std.Build.Module, core: *std.Build.Module, drama: *std.Build.Module, tokenizer: *std.Build.Module, api: *std.Build.Module) *std.Build.Module {
+    const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const server = b.createModule(.{
+        .root_source_file = b.path("zig/src/server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } },
+    });
+    const host = b.createModule(.{
+        .root_source_file = b.path("zig/src/native/drama_host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "drama", .module = drama } },
+    });
+    const probe = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/drama_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "drama", .module = drama }, .{ .name = "engine_api", .module = api }, .{ .name = "drama_host", .module = host }, .{ .name = "server", .module = server } },
+    });
+    // a measurement names the code that made it: the checkout's commit, -dirty with uncommitted changes
+    const commit = b.addSystemCommand(&.{ "git", "describe", "--always", "--dirty", "--abbrev=40" });
+    commit.has_side_effects = true;
+    probe.addAnonymousImport("tool_commit", .{ .root_source_file = commit.captureStdOut(.{}) });
+    return probe;
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, drama: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "drama", .module = drama } },
     });
     return .{ .api = api, .engines = mod };
 }
@@ -161,8 +441,8 @@ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 }
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
-    const m = engines(b, target, optimize, cuda, lanes, nemotron);
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, drama: *std.Build.Module, tokenizer: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool) *std.Build.Step.Compile {
+    const m = engines(b, target, optimize, cuda, lanes, nemotron, drama);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -188,9 +468,15 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     all.dependOn(step);
     const host = b.graph.host;
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
+    // drama-fp8-dense's scorer and nearest-bf16 rounding (std only), checked here before any GPU run relies on them
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/drama_fp8_dense_score.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const native_modules = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron);
+    // drama-fp8-dense (e)'s source folder through the converter it feeds, with no GPU
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/drama_fp8_dense_folder.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama", .module = mods.drama } } }) })).step);
+    const native_modules = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.drama);
+    // tf-drama-probe's frame loop, teacher checks and rows ledger, which need no GPU
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = probeModule(b, host, .debug, null, cuda, mods.core, mods.drama, mods.tokenizer, native_modules.api) })).step);
     const native = native_modules.engines;
     // the HTTP server's unit tests (zig/src/server/root.zig), which the macOS build runs, on Linux hosts too
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
@@ -210,7 +496,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         @import("cortheon_fuzz.zig").add(b, host, native_modules.api, mods.tokenizer, template);
     }
     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.tokenizer, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.drama, mods.heat, mods.tokenizer, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // the NVFP4 MoE reference's checks (tf-cuda-test drama-nvfp4-*): their pure parts run without a GPU
+    const nvfp4_ref = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/drama_nvfp4_ref.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "drama", .module = mods.drama } } });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = nvfp4_ref })).step);
+    // tf-cuda-test drama-fp8-tower's error measures, which its GPU criteria rest on, on the host
+    const fp8_tower = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/drama_fp8_tower.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    for ([_][]const u8{ "cuda", "core", "drama" }, [_]*std.Build.Module{ cuda, mods.core, mods.drama }) |name, m| fp8_tower.addImport(name, m);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fp8_tower })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
@@ -246,7 +539,7 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
     const mods = family(b, target, .fast, cuda, draft_ids);
-    return nativeServer(b, target, .fast, cuda, mods.core, mods.lanes, mods.nemotron, mods.tokenizer, build_options, false);
+    return nativeServer(b, target, .fast, cuda, mods.core, mods.lanes, mods.nemotron, mods.drama, mods.tokenizer, build_options, false);
 }
 
 /// SASS targets every release fatbin holds: Ampere (sm_86), RTX 50 and RTX PRO Blackwell (sm_120), GB10 (sm_121).

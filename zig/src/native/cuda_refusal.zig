@@ -1,4 +1,4 @@
-//! What the native CUDA server refuses before any device work: flags no CUDA family serves, and --drafter per family.
+//! What the native CUDA server refuses before device work: flags no CUDA family serves, --drafter and Drama 3's flags.
 const std = @import("std");
 const api = @import("engine_api");
 
@@ -10,9 +10,14 @@ pub fn backend(o: api.Open) ?[]const u8 {
     return null;
 }
 
-/// A family takes --drafter only if it says so (`takes_drafter`); null when `o` may open `F`.
+/// Flags `F` does not take (--drafter unless `takes_drafter`, Drama 3's own); null when `o` may open `F`.
 pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
     if (o.drafter != null and !(@hasDecl(F, "takes_drafter") and F.takes_drafter)) return "--drafter loads a separate drafter, and this CUDA family drafts with its own MTP head: serve without --drafter";
+    if (o.max_frames != null) return "--max-frames bounds a Drama 3 speech synthesis: serve this text model without it";
+    if (o.silence_onset_s != 0) return "--silence-onset-s guards a Drama 3 speech synthesis: serve this text model without it";
+    if (o.silence_mid_s != 0) return "--silence-mid-s guards a Drama 3 speech synthesis: serve this text model without it";
+    if (o.cfg_every != null) return "--cfg-gamma and --cfg-allow-request-gamma guide a Drama 3 speech synthesis: serve this text model without them";
+    if (o.expert_mask != null) return "--expert-mask masks Drama 3's routed experts: serve this text model without it";
     return null;
 }
 
@@ -35,6 +40,14 @@ test "--drafter opens only a family that takes one" {
     try std.testing.expectStringStartsWith(family(Mtp, .{ .dir = "d", .model_type = "m", .drafter = "/x" }) orelse "", "--drafter loads a separate drafter");
     try std.testing.expect(family(Drafted, .{ .dir = "d", .model_type = "m", .drafter = "/x" }) == null);
     try std.testing.expect(family(Mtp, .{ .dir = "d", .model_type = "m" }) == null);
+}
+
+test "--max-frames, --silence-onset-s and --silence-mid-s are Drama 3's: a text family refuses them rather than ignore them" {
+    try std.testing.expectStringStartsWith(family(struct {}, .{ .dir = "d", .model_type = "nemotron_h", .max_frames = 4096 }) orelse "", "--max-frames bounds a Drama 3");
+    try std.testing.expectStringStartsWith(family(struct {}, .{ .dir = "d", .model_type = "nemotron_h", .silence_onset_s = 3 }) orelse "", "--silence-onset-s guards a Drama 3");
+    try std.testing.expectStringStartsWith(family(struct {}, .{ .dir = "d", .model_type = "nemotron_h", .silence_mid_s = 3 }) orelse "", "--silence-mid-s guards a Drama 3");
+    try std.testing.expectStringStartsWith(family(struct {}, .{ .dir = "d", .model_type = "nemotron_h", .cfg_every = 1 }) orelse "", "--cfg-gamma and --cfg-allow-request-gamma guide a Drama 3");
+    try std.testing.expectStringStartsWith(family(struct {}, .{ .dir = "d", .model_type = "nemotron_h", .expert_mask = "m.json" }) orelse "", "--expert-mask masks Drama 3's");
 }
 
 test "a family that explicitly declines a drafter refuses it" {

@@ -36,7 +36,7 @@ fn servedBy(list: []const []const u8, name: []const u8) bool {
 }
 
 /// The CUDA build's own flags and variables (the Metal build refuses them).
-const cuda_build = builtin.os.tag == .linux;
+pub const cuda_build = builtin.os.tag == .linux;
 
 /// Every Python serve flag (``cli_args.build_parser``), the ones this binary serves marked native.
 pub const flags = [_]Flag{
@@ -113,7 +113,8 @@ pub const flags = [_]Flag{
     .{ .name = "--learn-min-free-gib", .native = true },
     // the native server's own: Cortheon's reasoning program and server-run web research for every chat request
     .{ .name = "--cortheon", .kind = .store_true, .native = true },
-};
+    .{ .name = "--expert-mask", .native = cuda_build },
+} ++ @import("cli_speech.zig").flags;
 
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
 pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
@@ -170,6 +171,23 @@ pub const Args = struct {
     master_port: u16 = 29551,
     policy: []const u8 = "", // every --policy joined by commas
     cortheon: bool = false, // Cortheon's program, research before building, and cortheon_search/cortheon_fetch run by the server
+    voices: ?[]const u8 = null, // the directory of Drama 3 voice files a speech request's voice names
+    default_voice: ?[]const u8 = null, // the voice ``default`` (or no voice) names instead of the built-in one
+    long_form: bool = false, // a speech input longer than --long-form-chars is spoken in segments that hear earlier ones
+    long_form_chars: u32 = 500,
+    long_form_history: u8 = 1,
+    shift_pause_s: f32 = 0, // seconds of quiet at a `¶` the long-form cut at; 0: off
+    long_form_set: bool = false, // --long-form-chars, --long-form-history or --shift-pause-s was given
+    silence_redraw: @import("speech_redraw.zig").Policy = .{},
+    silence_redraw_set: bool = false, // a --silence-redraw-* option or --short-reply-ratio was given
+    register: @import("speech_register.zig").Policy = .{},
+    register_set: bool = false, // --register-redraw-high or --register-high-hz was given
+    max_frames: ?u32 = null, // frames one Drama 3 synthesis may generate; null: the engine's default
+    allowed_controls: ?[]const []const u8 = null, // the [...] controls a speech input keeps; null: all
+    silence_onset_s: f64 = 0, // seconds of silence that end a Drama 3 synthesis voiced for less than 1 s; 0: off
+    silence_mid_s: f64 = 0, // seconds of silence a Drama 3 synthesis's end of speech must fall in to be one; 0: off
+    cfg: @import("cli_speech.zig").Guidance = .{}, // the --cfg-* flags as given
+    expert_mask: ?[]const u8 = null, // a JSON file of the routed experts each Drama 3 layer may pick; null: all
 };
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
@@ -180,7 +198,7 @@ fn find(name: []const u8) ?Flag {
     return null;
 }
 
-fn fail(u: *Usage, a: Allocator, comptime fmt: []const u8, args: anytype) error{ Usage, OutOfMemory } {
+pub fn fail(u: *Usage, a: Allocator, comptime fmt: []const u8, args: anytype) error{ Usage, OutOfMemory } {
     u.message = try std.fmt.allocPrint(a, fmt, args);
     return error.Usage;
 }
@@ -220,17 +238,22 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
         try apply(a, &out, name, value, u, &alias, &keys);
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
+    if (out.long_form_set and !out.long_form) return fail(u, a, "--long-form-chars, --long-form-history and --shift-pause-s need --long-form", .{});
+    if (out.silence_redraw_set and out.silence_redraw.max == 0) return fail(u, a, "--silence-redraw-budget-s, --silence-redraw-plain, --silence-redraw-plain-scope and --short-reply-ratio need --silence-redraws from 1", .{});
+    if (out.silence_redraw.plain_scope != .cues and !out.silence_redraw.plain) return fail(u, a, "--silence-redraw-plain-scope controls needs --silence-redraw-plain", .{});
+    if (out.register_set and out.register.st == 0) return fail(u, a, "--register-redraw-high and --register-high-hz need --register-redraw-st above 0", .{});
+    if ((out.cfg.every != null or out.cfg.force_guided or out.cfg.batched) and @import("cli_speech.zig").guidance(out) == null) return fail(u, a, "--cfg-every, --cfg-force-guided and --cfg-batched need --cfg-gamma or --cfg-allow-request-gamma", .{});
     try ranks(u, a, out);
     out.alias = alias.items;
     out.api_key = keys.items;
     return out;
 }
 
-fn int(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!i64 {
+pub fn int(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!i64 {
     return std.fmt.parseInt(i64, std.mem.trim(u8, v, " "), 10) catch fail(u, a, "argument {s}: invalid int value: '{s}'", .{ name, v });
 }
 
-fn float(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!f64 {
+pub fn float(u: *Usage, a: Allocator, name: []const u8, v: []const u8) error{ Usage, OutOfMemory }!f64 {
     return @import("fields.zig").pyFloat(v) orelse fail(u, a, "argument {s}: invalid float value: '{s}'", .{ name, v });
 }
 
@@ -248,7 +271,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
             return std.mem.eql(u8, x, y);
         }
     }.f;
-    if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u)) return;
+    if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u) or try @import("cli_speech.zig").flag(a, out, name, v, u)) return;
     if (is(name, "--chat-template")) {
         out.chat_template = v;
         return;
@@ -341,7 +364,7 @@ pub fn parallelFixed(text: []const u8) bool {
 
 /// What a server asks of its engine, from its flags.
 pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args) !api.Open {
-    return .{
+    return @import("cli_speech.zig").withGuidance(args, .{
         .dir = dir,
         .model_type = model_type,
         .context = args.context,
@@ -359,6 +382,10 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .slide = args.slide,
         .device = args.device,
         .segments = args.segments,
+        .max_frames = args.max_frames,
+        .silence_onset_s = args.silence_onset_s,
+        .silence_mid_s = args.silence_mid_s,
+        .expert_mask = args.expert_mask,
         .mtp_drafts = args.mtp_drafts,
         .mtp_confidence = args.mtp_confidence,
         .keep = args.checkpoint_slots,
@@ -367,7 +394,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .master = args.master,
         .master_port = args.master_port,
         .policy = args.policy,
-    };
+    });
 }
 
 /// What ``capabilities --json`` reports about the engine side: its version, chip, backends and families.
@@ -446,6 +473,14 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqualStrings("graph.json", (try parse(a, &.{ "m", "--slide-graph", "graph.json" }, &u)).slide_graph.?);
     try std.testing.expect((try parse(a, &.{ "m", "--slide" }, &u)).slide);
     try std.testing.expect((try parse(a, &.{ "m", "--cortheon" }, &u)).cortheon and !(try parse(a, &.{"m"}, &u)).cortheon);
+    const voiced = try parse(a, &.{ "m", "--voices", "/v", "--default-voice=me" }, &u);
+    try std.testing.expect(std.mem.eql(u8, "/v", voiced.voices.?) and std.mem.eql(u8, "me", voiced.default_voice.?));
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"--voices\": {}") != null and std.mem.indexOf(u8, doc, "\"--default-voice\": {}") != null);
+    const plain = try parse(a, &.{"m"}, &u);
+    try std.testing.expect(!plain.long_form and plain.long_form_chars == 500 and plain.long_form_history == 1);
+    const long = try parse(a, &.{ "m", "--long-form", "--long-form-chars", "120", "--long-form-history=3" }, &u);
+    try std.testing.expect(long.long_form and long.long_form_chars == 120 and long.long_form_history == 3);
+    for ([_][]const []const u8{ &.{ "m", "--long-form-chars", "100" }, &.{ "m", "--long-form", "--long-form-history", "4" }, &.{ "m", "--long-form", "--long-form-chars", "0" } }) |bad| try std.testing.expectError(error.Usage, parse(a, bad, &u));
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"--cortheon\": {}") != null);
     try std.testing.expectEqual(@as(?f64, 0.5), (try parse(a, &.{ "m", "--compact-at", "0.5" }, &u)).compact_fraction);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--compact-at", "0" }, &u));
@@ -539,4 +574,15 @@ test "an engine is asked for what the flags say, and the defaults of the flags n
     try std.testing.expectEqual(@as(?f64, 0.5), gpu.mtp_confidence);
     try std.testing.expectEqual(@as(?i64, 3), gpu.keep);
     try std.testing.expectEqualStrings("matrix=off", gpu.policy);
+}
+
+test "--max-frames reaches the engine on CUDA builds, 1 to 8191; absent, the engine keeps its own limit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    try std.testing.expectEqual(@as(?u32, null), (try request(a, "d", "t", try parse(a, &.{"m"}, &u))).max_frames);
+    if (!cuda_build) return std.testing.expectError(error.Usage, parse(a, &.{ "m", "--max-frames", "4096" }, &u));
+    try std.testing.expectEqual(@as(?u32, 4096), (try request(a, "d", "t", try parse(a, &.{ "m", "--max-frames=4096" }, &u))).max_frames);
+    for ([_][]const u8{ "0", "-1", "8192", "4k" }) |bad| try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--max-frames", bad }, &u));
 }

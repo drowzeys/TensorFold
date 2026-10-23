@@ -40,6 +40,17 @@ pub fn packScales(out: []f32, scale_inv: []const f32, n: usize, k: usize) void {
     };
 }
 
+/// Row scales [n, k/64] (one per row and 64 inputs) as the kernel's tiles [npad/64][k/64][64] of fp32, rows past n one.
+pub fn packRowScales(out: []f32, scale_inv: []const f32, n: usize, k: usize) void {
+    const npad = padded(n);
+    const kg = k / group;
+    std.debug.assert(out.len == npad * kg and scale_inv.len == n * kg);
+    for (0..npad / 64) |t| for (0..kg) |g| for (0..64) |c| {
+        const row = t * 64 + c;
+        out[(t * kg + g) * 64 + c] = if (row < n) scale_inv[row * kg + g] else 1.0;
+    };
+}
+
 /// The lane matmul's view of a packed block-FP8 projection.
 pub fn weight(codes: u64, scales: u64, n: usize, k: usize) qmmf.Weight {
     return .{ .mode = .fp8g, .codes = codes, .scales = scales, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(padded(n)) };
@@ -76,4 +87,46 @@ test "scale tiles: each 64-input group takes its 128 x 128 block's scale, padded
     try std.testing.expectEqual(@as(f32, 2), out[(0 * 4 + 3) * 64 + 5]); // row 5, group 3 -> block (0, 1)
     try std.testing.expectEqual(@as(f32, 3), out[(2 * 4 + 0) * 64 + 1]); // row 129 -> block (1, 0)
     try std.testing.expectEqual(@as(f32, 1), out[(2 * 4 + 1) * 64 + 2]); // row 130: padding
+}
+
+test "row scale tiles against a brute-force index map; fused rows pack as the concatenation of their packs" {
+    const gpa = std.testing.allocator;
+    const n = 192; // one 128-row block and a padded one
+    const k = 256;
+    const kg = k / group;
+    var inv: [n * kg]f32 = undefined;
+    for (&inv, 0..) |*v, i| v.* = @floatFromInt(i + 2); // distinct, and never the padding's 1.0
+    var out: [padded(n) * kg]f32 = undefined;
+    packRowScales(&out, &inv, n, k);
+    var seen: [n * kg]bool = @splat(false);
+    for (out, 0..) |v, i| {
+        const t = i / (kg * 64);
+        const g = (i / 64) % kg;
+        const row = t * 64 + i % 64;
+        if (row >= n) {
+            try std.testing.expectEqual(@as(f32, 1), v);
+            continue;
+        }
+        try std.testing.expectEqual(inv[row * kg + g], v);
+        try std.testing.expect(!seen[row * kg + g]);
+        seen[row * kg + g] = true;
+    }
+    for (seen) |s| try std.testing.expect(s);
+    // the loader packs each part of a fused group alone: rows 0..127 and 128..191 of the same matrix
+    var top: [128 * kg]f32 = undefined;
+    packRowScales(&top, inv[0 .. 128 * kg], 128, k);
+    var low: [128 * kg]f32 = undefined;
+    packRowScales(&low, inv[128 * kg ..], n - 128, k);
+    try std.testing.expectEqualSlices(f32, &(top ++ low), &out);
+    const codes = try gpa.alloc(u8, n * k);
+    defer gpa.free(codes);
+    for (codes, 0..) |*c, i| c.* = @truncate(i * 13 + 5);
+    const whole = try gpa.alloc(u8, padded(n) * k);
+    defer gpa.free(whole);
+    packCodes(whole, codes, n, k);
+    const parts = try gpa.alloc(u8, padded(n) * k);
+    defer gpa.free(parts);
+    packCodes(parts[0 .. 128 * k], codes[0 .. 128 * k], 128, k);
+    packCodes(parts[128 * k ..], codes[128 * k ..], n - 128, k);
+    try std.testing.expectEqualSlices(u8, whole, parts);
 }

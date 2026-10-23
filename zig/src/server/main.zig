@@ -1,4 +1,4 @@
-//! ``tensorfold-native``: ``capabilities --json`` for the Python switch, and ``serve MODEL [flags]`` with no Python.
+//! ``tensorfold-native``: ``capabilities --json``, ``serve MODEL [flags]`` with no Python, and ``voice encode``.
 const std = @import("std");
 const json = @import("json.zig");
 const cli = @import("cli.zig");
@@ -9,8 +9,9 @@ const serve = @import("serve.zig");
 const hf_text = @import("hf_text.zig");
 const startup = @import("startup.zig");
 const checkpoint_cli = @import("checkpoint_cli");
+const voice_cli = @import("voice_cli.zig");
 
-const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--cortheon] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
+const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--cortheon] [--voices DIR] [--default-voice NAME] [--long-form] [--long-form-chars N] [--long-form-history K] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] [--max-frames N] model\n";
 
 /// The flags past the common ones this binary's backend serves; cli.zig reads them from the root.
 pub const serves = engines.serves;
@@ -28,7 +29,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
     if (argv.len == 2 and (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h"))) {
-        try std.Io.File.stdout().writeStreamingAll(io, "usage: tensorfold-native --version | capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags]\n" ++ usage_line);
+        try std.Io.File.stdout().writeStreamingAll(io, "usage: tensorfold-native --version | capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags] | voice encode CLIP.wav [flags]\n" ++ usage_line ++ voice_cli.usage);
         return 0;
     }
     if (argv.len >= 3 and std.mem.eql(u8, argv[1], "serve")) {
@@ -39,6 +40,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // the checkpoint commands need no model, GPU or driver either
     if (argv.len >= 2 and checkpoint_cli.wants(@ptrCast(argv[1..]))) return checkpoint_cli.main(init, argv[1..]);
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "voice")) return voiceEncode(init, a, argv[2..]);
     log.init(io, false);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "capabilities") and std.mem.eql(u8, argv[2], "--json")) {
         var out: std.Io.Writer.Allocating = .init(a);
@@ -47,7 +49,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
     if (argv.len < 2 or !std.mem.eql(u8, argv[1], "serve")) {
-        std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags]\n", .{});
+        std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags] | voice encode CLIP.wav [flags]\n", .{});
         return 2;
     }
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
@@ -95,6 +97,56 @@ fn loadText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, template: ?[]co
         if (problem.len == 0) problem.* = @errorName(e);
         return e;
     };
+}
+
+/// ``voice encode``: a clip and its transcript to a ``--voices`` file through the native codec encoder.
+fn voiceEncode(init: std.process.Init, a: std.mem.Allocator, argv: []const []const u8) !u8 {
+    const io = init.io;
+    var problem: []const u8 = "";
+    const args = voice_cli.parse(argv, &problem) orelse {
+        std.debug.print("{s}tensorfold-native voice: error: {s}\n", .{ voice_cli.usage, problem });
+        return 2;
+    };
+    const dir = try hub.resolve(a, io, init.environ_map, args.model, &problem) orelse return fail(problem);
+    const wav = std.Io.Dir.cwd().readFileAlloc(io, args.clip, a, .limited(1 << 30)) catch |e|
+        return fail(try std.fmt.allocPrint(a, "{s}: {s}", .{ args.clip, @errorName(e) }));
+    const encoding = engines.encodeVoice(a, init.gpa, io, dir, wav, &problem) catch |e|
+        return fail(try std.fmt.allocPrint(a, "the native codec encoder failed ({s})", .{@errorName(e)}));
+    const encoded = encoding orelse return fail(problem);
+    const codec = try std.fs.path.join(a, &.{ dir, "codec.pth" });
+    const codec_sha256 = fileSha256(io, codec) catch |e| return fail(try std.fmt.allocPrint(a, "{s}: {s}", .{ codec, @errorName(e) }));
+    const encoder = try json.newObject(a);
+    try encoder.put(a, "engine", .{ .string = "tensorfold-native " ++ @import("build_options").version });
+    try encoder.put(a, "codec_sha256", .{ .string = &codec_sha256 });
+    try encoder.put(a, "sample_rate", try json.intValue(a, encoded.sample_rate));
+    try encoder.put(a, "frame_length", try json.intValue(a, encoded.frame_length));
+    try encoder.put(a, "dtype", .{ .string = "bfloat16" });
+    try encoder.put(a, "device", .{ .string = encoded.device });
+    try encoder.put(a, "peak_device_bytes", try json.intValue(a, encoded.peak_device_bytes));
+    const bytes = try voice_cli.voiceFile(a, args.text, encoded.codes, wav, .{ .object = encoder }, &problem) orelse return fail(problem);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args.out, .data = bytes }) catch |e|
+        return fail(try std.fmt.allocPrint(a, "{s}: {s}", .{ args.out, @errorName(e) }));
+    // drama_voice.py's summary: the file without its codes
+    const summary = (try json.parse(a, bytes)).ok;
+    _ = summary.object.orderedRemove("vq_codes");
+    try std.Io.File.stdout().writeStreamingAll(io, try std.mem.concat(a, u8, &.{ try json.stringify(a, summary, .{ .ascii = false }), "\n" }));
+    std.debug.print("tensorfold-native voice: {d} frames encoded in {d:.3} s\n", .{ encoded.codes.len, encoded.seconds });
+    return 0;
+}
+
+fn fileSha256(io: std.Io, path: []const u8) ![64]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [1 << 16]u8 = undefined;
+    var at: u64 = 0;
+    while (true) {
+        const n = try file.readPositionalAll(io, &buf, at);
+        if (n == 0) break;
+        h.update(buf[0..n]);
+        at += n;
+    }
+    return std.fmt.bytesToHex(h.finalResult(), .lower);
 }
 
 fn fail(message: []const u8) u8 {

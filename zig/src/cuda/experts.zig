@@ -27,6 +27,7 @@ pub const Layer = struct {
     experts: usize,
     limit: f32 = 0.0, // fp8g, nvfp4: the SwiGLU clamp, 0 for none
     relu2: bool = false, // nvfp4: up is one projection under relu^2 (Nemotron), not SwiGLU's gate and up
+    silu_f32: bool = false, // nvfp4 decode: Drama's SwiGLU, bf16(silu(bf16 gate) * bf16 up) with silu kept fp32
 };
 
 /// A call's epilogue: up with its format's activation (affine4 relu^2, else SwiGLU), down to fp32 or to bf16 sums.
@@ -270,8 +271,8 @@ pub const Fp8Experts = struct {
 /// NVFP4 experts (nvfp4_experts.cu): decode rows 16 pairs at a time; prompt rows staged, 64 pairs a CTA.
 pub const Nvfp4Experts = struct {
     mod: Module,
-    fns: [4]Function, // by Epi, then relu^2 up
-    resident: [4]usize, // blocks the grid may hold: per SM times SMs
+    fns: [5]Function, // by Epi, then relu^2 up, then Drama's SwiGLU up
+    resident: [5]usize, // blocks the grid may hold: per SM times SMs
     prompt_fns: [3]Function, // relu^2 up, SwiGLU gate-up, bf16 sums down
 
     pub const cols = 32; // output columns a block
@@ -282,6 +283,7 @@ pub const Nvfp4Experts = struct {
         pub const down_f32 = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi0ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const down_bf16 = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi3ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const up_relu2 = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi1ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const gate_up_f32 = "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi2ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const prompt = [3][:0]const u8{ "tf_nvfp4_prompt_relu2", "tf_nvfp4_prompt_swiglu", "tf_nvfp4_prompt_down" };
     };
 
@@ -300,7 +302,7 @@ pub const Nvfp4Experts = struct {
         var mod = try Module.load(d, kernels.nvfp4_experts);
         errdefer mod.unload();
         var e: Nvfp4Experts = .{ .mod = mod, .fns = undefined, .resident = undefined, .prompt_fns = undefined };
-        for ([_][:0]const u8{ symbols.gate_up, symbols.down_f32, symbols.down_bf16, symbols.up_relu2 }, 0..) |name, i| {
+        for ([_][:0]const u8{ symbols.gate_up, symbols.down_f32, symbols.down_bf16, symbols.up_relu2, symbols.gate_up_f32 }, 0..) |name, i| {
             e.fns[i] = try mod.function(name);
             e.resident[i] = @max(1, try e.fns[i].occupancy(128, 0)) * sms;
         }
@@ -320,7 +322,7 @@ pub const Nvfp4Experts = struct {
         const gate = epi == .up;
         const kg = (if (gate) l.dims else l.width) / 32;
         const nb = (if (gate) l.width else l.dims) / cols;
-        const ei: usize = if (gate and l.relu2) 3 else @backingInt(epi);
+        const ei: usize = if (gate and l.relu2) 3 else if (gate and l.silu_f32) 4 else @backingInt(epi);
         const grid = @min((items * nb + 3) / 4, e.resident[ei]);
         if (grid < 1) return;
         var a: launch_.Args = .{};
@@ -341,7 +343,7 @@ pub const Nvfp4Experts = struct {
     /// Prompt rows on a plan of at most `items` items of 64 pairs: up (relu^2 or SwiGLU by the layer), bf16 sums down.
     pub fn runPrompt(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
         if (epi == .down_f32) return error.EpilogueNotBuilt;
-        if (skip >= 0) return error.OptionNotBuilt;
+        if (skip >= 0 or l.silu_f32) return error.OptionNotBuilt;
         const gate = epi == .up;
         const parts: usize = if (gate and !l.relu2) 2 else 1;
         const nb = (if (gate) l.width else l.dims) / cols;
@@ -442,6 +444,11 @@ test "nvfp4 rows of either kind are refused when the format is not loaded" {
     const p: Plan = .{ .members = 0, .items = 0, .counts = 0, .rank = 0, .hist = 0 };
     try std.testing.expectError(error.FormatNotLoaded, g.prompt(s, .up, .{ .x = 0, .stride = 64 }, l, p, 0, 1, -1));
     try std.testing.expectError(error.FormatNotLoaded, g.decode(s, .down_bf16, .{ .x = 0, .stride = 64 }, l, p, 0, 1, -1));
+    const e: Nvfp4Experts = undefined; // never reached: Drama's SwiGLU has no prompt form
+    var drama = l;
+    drama.relu2 = false;
+    drama.silu_f32 = true;
+    try std.testing.expectError(error.OptionNotBuilt, e.runPrompt(s, .up, .{ .x = 0, .stride = 64 }, drama, p, 0, 1, -1));
     try std.testing.expectEqual(@as(usize, 2 * 2 * 3 * 144 * 4), Nvfp4Experts.bytes(2, 64, 96, 1));
     try std.testing.expectEqual(@as(u32, 2 * 17408), Nvfp4Experts.promptSmem(1, 8)); // 64 rows x 64 inputs, 8 x 2 blocks
     try std.testing.expectEqual(@as(u32, 2 * 17408), Nvfp4Experts.promptSmem(2, 4));

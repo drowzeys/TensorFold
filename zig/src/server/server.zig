@@ -23,6 +23,11 @@ const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
 const cortheon = @import("cortheon/cortheon.zig");
+const drama_voice = @import("drama_voice.zig");
+const drama_long = @import("drama_long.zig");
+const speech_redraw = @import("speech_redraw.zig");
+const speech_register = @import("speech_register.zig");
+const drama_cfg = @import("drama_cfg.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -61,6 +66,22 @@ pub const Config = struct {
     cortheon: bool = false,
     /// BRAVE_SEARCH_API_KEY: Cortheon searches through Brave instead of DuckDuckGo.
     cortheon_search_key: ?[]const u8 = null,
+    /// --voices: the voice files a Drama 3 speech request's ``voice`` names.
+    voices: []const drama_voice.Voice = &.{},
+    /// --default-voice: the one of `voices` that ``default`` (or no voice) names; null: the built-in voice.
+    default_voice: ?*const drama_voice.Voice = null,
+    /// --long-form: a speech input longer than one segment is spoken segment by segment; null: one synthesis.
+    long_form: ?drama_long.Options = null,
+    /// --silence-redraws: a whole speech reply the silence guard ended is drawn again while this allows.
+    silence_redraw: speech_redraw.Policy = .{},
+    /// --register-redraw-st: a whole speech reply with a phrase that opens far above the others is drawn once more.
+    register: speech_register.Policy = .{},
+    /// --silence-mid-s is on: whole speech replies count the draws it ended as silence in X-Silence-Mid-Trips.
+    silence_mid: bool = false,
+    /// --allowed-controls: the only ``[...]`` delivery controls a speech input keeps, any case; null: all of them.
+    allowed_controls: ?[]const []const u8 = null,
+    /// --cfg-gamma, --cfg-allow-request-gamma: guidance on a referenced speech prompt; null: off, X-Cfg-Gamma unread.
+    cfg: ?drama_cfg.Options = null,
     timeouts: http_conn.Timeouts = .{},
 };
 
@@ -104,6 +125,10 @@ pub const Server = struct {
         const srv = try gpa.create(Server);
         srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
+        if (!srv.info.text_generation) {
+            if (config.cortheon) return error.CortheonRequiresTextGeneration;
+            return srv;
+        }
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {

@@ -1,6 +1,7 @@
 //! TensorFold's tokenizer for Hugging Face tokenizer.json files: encode equals tokenizers' encode(text, add_special_tokens=False).
 const std = @import("std");
-const unicode = @import("unicode.zig");
+/// General categories and White_Space, for the server's text rules too.
+pub const unicode = @import("unicode.zig");
 const steps = @import("steps.zig");
 const models = @import("model.zig");
 const Allocator = std.mem.Allocator;

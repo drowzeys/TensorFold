@@ -90,7 +90,39 @@ pub const Request = struct {
     prompt_logprobs: ?u8 = null,
 };
 
-pub const Reason = enum { stop, length, cancelled, failed };
+/// Mono PCM written before a successful speech request's finished event; `hollow`: --silence-mid-s's hole, in samples.
+pub const SpeechResult = struct { samples: usize = 0, hollow: usize = 0 };
+
+/// Caller-owned until finished, even on cancellation; a streamed request's pcm[0..n] is the caller's after ``audio`` n.
+pub const SpeechRequest = struct {
+    prompt: []const u32,
+    /// Each prompt row's codebook codes, zero on text rows (a voice reference's audio rows); empty: a plain prompt.
+    codes: []const [10]u32 = &.{},
+    /// Caller storage (len >= max_frames) for each generated frame's codes, code 0 first; empty: none kept.
+    generated: [][10]u32 = &.{},
+    pcm: []f32,
+    result: *SpeechResult,
+    seed: u64,
+    max_frames: u32 = 1024,
+    temperature: f32 = 1,
+    top_p: f32 = 0.9,
+    top_k: u32 = 30,
+    /// Guidance by this turn as a plain prompt: the main token from l_c + (cfg_gamma - 1)(l_c - l_u); empty: unguided.
+    unconditioned: []const u32 = &.{},
+    cfg_gamma: f32 = 1,
+    /// Decode while generating and report each final prefix with ``audio`` events; false: one decode after EOS.
+    stream: bool = false,
+};
+
+pub const SpeechInfo = struct {
+    sample_rate: u32,
+    frame_length: u32,
+    max_frames: u32,
+    max_prompt_tokens: u32,
+};
+
+/// `silence`: a speech synthesis ended by its silence guard, its audio kept as a `length` one keeps its clipped audio.
+pub const Reason = enum { stop, length, cancelled, failed, silence };
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
 pub const Stats = struct {
@@ -118,6 +150,8 @@ pub const Event = union(enum) {
     prompt_logprobs: []const LogprobRow,
     /// Tokens committed for this request, in order; valid only during the call.
     tokens: []const u32,
+    /// A streamed speech request's samples now final, from its start: whole frames, rising, all before ``finished``.
+    audio: usize,
     /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
     finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
 };
@@ -131,6 +165,9 @@ pub const Sink = struct {
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
     name: []const u8 = "lanes",
+    /// Speech-only models must not be offered through the text completion routes.
+    text_generation: bool = true,
+    speech: ?SpeechInfo = null,
     lanes: u32 = 1,
     /// Prompt plus reply tokens one request may use (0: no limit).
     context_window: u32 = 0,
@@ -213,6 +250,18 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    /// --max-frames: the frames one speech synthesis may generate; null: the engine's default.
+    max_frames: ?u32 = null,
+    /// --silence-onset-s: seconds of silence that end a speech synthesis voiced for less than 1 s; 0: off.
+    silence_onset_s: f64 = 0,
+    /// --silence-mid-s: seconds of silence that make a speech synthesis's end of speech after 1 s voiced a silence.
+    silence_mid_s: f64 = 0,
+    /// --cfg-every, with guidance on: frames between the speech engine's second-sequence runs; null: no guidance.
+    cfg_every: ?u32 = null,
+    /// --cfg-batched, with guidance on: the speech engine decodes a guided frame's two sequences as one batch.
+    cfg_batched: bool = false,
+    /// --expert-mask: a JSON file of the routed experts each Drama 3 backbone layer may pick; null: all of them.
+    expert_mask: ?[]const u8 = null,
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
@@ -259,7 +308,8 @@ pub const Status = struct {
     generation_tokens: u64 = 0,
 };
 
-pub const SubmitError = error{ Closed, Busy, InvalidSpans };
+pub const SubmitError = error{ Closed, Busy, InvalidSpans, Unsupported };
+pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
 
 /// A worked example for the learner: token ids, the answer from `start`; `decide`: its assistant header's last row.
 pub const Example = struct { ids: []const u32, start: u32, decide: u32, subject: u32 = 0, value: u32 = 0 }; // subject: the row of its last token; value: the row before its answer's value (0: none)
@@ -340,6 +390,8 @@ pub const Engine = struct {
         score: ?*const fn (ctx: *anyopaque, prompt: []const u32, labels: []const u32, logits: []f64) error{Failed}!f64 = null,
         /// Queue `request` for the family's learner; it stays valid until `done`. Null: this engine does not learn.
         learn: ?*const fn (ctx: *anyopaque, request: *const LearnRequest, sink: LearnSink) LearnError!void = null,
+        /// One synthesis; caller storage lives until finished. Null: this engine does not synthesize speech.
+        submit_speech: ?*const fn (ctx: *anyopaque, id: Id, request: *const SpeechRequest, sink: Sink) SpeechSubmitError!void = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -348,6 +400,10 @@ pub const Engine = struct {
     pub fn submit(e: Engine, id: Id, request: *const Request, sink: Sink) SubmitError!void {
         try @import("cache_modes.zig").validate(request.decode_spans);
         return e.vtable.submit(e.ctx, id, request, sink);
+    }
+    pub fn submitSpeech(e: Engine, id: Id, request: *const SpeechRequest, sink: Sink) SpeechSubmitError!void {
+        const f = e.vtable.submit_speech orelse return error.Unsupported;
+        return f(e.ctx, id, request, sink);
     }
     pub fn cancel(e: Engine, id: Id) void {
         e.vtable.cancel(e.ctx, id);

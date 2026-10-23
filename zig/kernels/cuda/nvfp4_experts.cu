@@ -101,6 +101,32 @@ __device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* 
   }
 }
 
+// EPI 4, Drama's SwiGLU (drama_silu_mul): gate and up to bf16, silu and its product in fp32, one bf16 rounding.
+template <int EPI, int M>
+__device__ __forceinline__ void store(const float (&acc)[M][1][NTW][4], void* out, int N, int col0, int pr0, int pr1,
+                                      bool v0, bool v1, float limit) {
+  if constexpr (EPI == 4) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      if (!(h ? v1 : v0)) continue;
+      const size_t row = (size_t)(h ? pr1 : pr0) * N;
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) {
+        float o[2];
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+          const float g = bf(acc[0][0][j][2 * h + q]);
+          o[q] = g / (1.f + expf(-g)) * bf(acc[M - 1][0][j][2 * h + q]);
+        }
+        *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + col0 + 8 * j) =
+            __floats2bfloat162_rn(o[0], o[1]);
+      }
+    }
+  } else {
+    epilogue<EPI, M, 1>(acc, 0, out, N, col0, pr0, pr1, v0, v1, limit);
+  }
+}
+
 template <int M, int EPI, int WARPS>
 __global__ void __launch_bounds__(WARPS * 32)
     nvfp4_expert_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
@@ -135,7 +161,7 @@ __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
           for (int q = 0; q < 4; ++q) acc[m][0][j][q] *= g;
       }
-      epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
+      store<EPI, M>(acc, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
     }
   }
 }
@@ -309,11 +335,12 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
 #undef TF_TILES
 }
 
-// The instances: SwiGLU gate-up, fp32 and bf16 down, and relu^2 up for experts without a gate (Nemotron).
+// The instances: SwiGLU gate-up (EPI 4: Drama's rounding), fp32 and bf16 down, relu^2 up for experts without a gate.
 template __global__ void nvfp4_expert_kernel<2, 2, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void nvfp4_expert_kernel<1, 0, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void nvfp4_expert_kernel<1, 3, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void nvfp4_expert_kernel<1, 1, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void nvfp4_expert_kernel<2, 4, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 }
 
 // The prompt form's entries, 4 row tiles a warp in one row of WN warps: relu^2 up, SwiGLU gate-up, bf16 sums down.

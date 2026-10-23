@@ -49,6 +49,7 @@ Prefer a restricted file over command-line keys, which can appear in the operati
 | `GET /metrics`, `GET /v1/metrics` | Prometheus text: requests, KV occupancy, drafts and latency (both servers) |
 | `GET /dashboard` | Native live dashboard page when `--dashboard` is enabled |
 | `GET /stats` | Native JSON dashboard snapshot when `--dashboard` is enabled |
+| `GET /v1/voices` | Native Drama 3: the `--voices` files loaded ([Drama 3 voices](drama-voices.md)) |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
 | `POST /v1/completions` | Raw text without a chat template, or token IDs |
 | `POST /v1/messages` | Anthropic Messages: text, supported images, function tools and thinking; JSON or SSE |

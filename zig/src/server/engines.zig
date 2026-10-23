@@ -31,3 +31,16 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_t
     }
     return native.follow(a, gpa, io, try cli.request(a, dir, model_type, args), problem);
 }
+
+/// A clip's Drama 3 voice codes [frames][10], the codec's rate and frame, and the device, peak bytes and seconds.
+pub const EncodedVoice = struct { codes: []const [10]u32, sample_rate: u32, frame_length: u32, device: []const u8, peak_device_bytes: u64, seconds: f64 };
+
+/// ``voice encode``: the WAV clip `wav` through the backend's codec encoder, or null with ``problem`` set.
+pub fn encodeVoice(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, wav: []const u8, problem: *[]const u8) !?EncodedVoice {
+    if (!@hasDecl(native, "encodeVoice")) {
+        problem.* = "this build has no Drama 3 voice encoder; it runs on the CUDA backend";
+        return null;
+    }
+    const e = try native.encodeVoice(a, gpa, io, dir, wav, problem) orelse return null;
+    return .{ .codes = e.codes, .sample_rate = e.sample_rate, .frame_length = e.frame_length, .device = e.device, .peak_device_bytes = e.peak_device_bytes, .seconds = e.seconds };
+}

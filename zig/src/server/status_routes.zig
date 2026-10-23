@@ -1,4 +1,4 @@
-//! GET /health, /v1/models, /metrics, and the opt-in dashboard.
+//! GET /health, /v1/models, /v1/voices, /metrics, and the opt-in dashboard.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json.zig");
@@ -58,6 +58,31 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64) Alloca
         try m.put(a, "max_model_len", try json.intValue(a, info.context_window));
     }
     return .{ .object = m };
+}
+
+/// The --voices files a speech request can name; voices are encoded offline, so there is no upload route.
+pub fn voices(srv: *Server, conn: *Conn, a: Allocator) !void {
+    const speech = srv.info.speech orelse return routes.unknown(conn, a);
+    const data = try a.alloc(Value, srv.config.voices.len);
+    for (srv.config.voices, data) |voice, *slot| {
+        var frames: usize = 0;
+        for (voice.references) |reference| frames += reference.frames.len;
+        const seconds = @as(f64, @floatFromInt(frames * speech.frame_length)) / @as(f64, @floatFromInt(speech.sample_rate));
+        const source = try json.newObject(a);
+        try source.put(a, "kind", .{ .string = @tagName(voice.source) });
+        const v = try json.newObject(a);
+        try v.put(a, "object", .{ .string = "voice" });
+        try v.put(a, "name", .{ .string = voice.name });
+        try v.put(a, "references", try json.intValue(a, voice.references.len));
+        try v.put(a, "frames", try json.intValue(a, frames));
+        try v.put(a, "seconds", .{ .float = @round(seconds * 100) / 100 });
+        try v.put(a, "source", .{ .object = source });
+        slot.* = .{ .object = v };
+    }
+    const o = try json.newObject(a);
+    try o.put(a, "object", .{ .string = "list" });
+    try o.put(a, "data", .{ .array = data });
+    routes.sendValue(conn, a, 200, .{ .object = o });
 }
 
 /// Prometheus text, version 0.0.4.

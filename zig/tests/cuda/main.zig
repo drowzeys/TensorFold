@@ -29,6 +29,17 @@ const norms_tests = @import("norms_tests.zig");
 const norm_rows_tests = @import("norm_rows_tests.zig");
 const pocket_tests = @import("pocket_tests.zig");
 const recapture_tests = @import("recapture_tests.zig");
+const drama_conv_tests = @import("drama_conv_tests.zig");
+const drama_qk_tests = @import("drama_qk_tests.zig");
+const drama_fp8_tower = @import("drama_fp8_tower.zig");
+const drama_pdl_tests = @import("drama_pdl_tests.zig");
+const drama_nvfp4_moe_tests = @import("drama_nvfp4_moe_tests.zig");
+const drama_probe_tests = @import("drama_probe_tests.zig");
+const drama_nvfp4_load = @import("drama_nvfp4_load.zig");
+const drama_fp8_dense_tests = @import("drama_fp8_dense_tests.zig");
+const drama_gemv_tests = @import("drama_gemv_tests.zig");
+const drama_topk_tests = @import("drama_topk_tests.zig");
+const drama_compact_tests = @import("drama_compact_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -47,6 +58,17 @@ const usage =
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
     \\  norms                     RMS norm and the residual step against float64 references (synthetic)
     \\  norm-rows                 bf16-residual and gated norms, token rows against float64 (synthetic)
+    \\  drama-conv                phase-specific causal convolution, history and chunk boundaries (synthetic)
+    \\  drama-qk                  Q/K norm and rotary precision, positions and cache bounds (synthetic)
+    \\  drama-fp8-tower CKPT [LAYERS]   the tower's fp8g lane against project() and float64, mixed layers; LAYERS (0,4,..) its stored FP8
+    \\  drama-pdl on|off [dir]    the backbone's PDL decision for the embedded images; off for images from dir
+    \\  drama-nvfp4-moe           the MoE on synthetic NVFP4 experts: float64 envelope, held-out sets, exact epilogue and combine
+    \\  drama-nvfp4-load CKPT LAYERS [SRC]   CKPT through the production loader, LAYERS (0,1,..) replayed against its files
+    \\  drama-fp8-dense [CKPT LAYER [SRC]]   dense groups stored FP8 on the lane: float64, BF16 path, row counts, splits, mixed formats; or CKPT's LAYER
+    \\  drama-probe-stats         tf-drama-probe's statistics kernel against its CPU reference bit for bit (synthetic)
+    \\  drama-gemv-rows           the batched backbone GEMV against one-row GEMVs and the tiled GEMM, byte for byte (synthetic)
+    \\  drama-topk [base.fatbin]  the router with and without an expert mask or slot table; a base image's unmasked bytes
+    \\  drama-compact FULL COMPACT [MASK]   COMPACT against FULL under MASK: every layer's picks and weights, hidden, logits
     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
     \\  glue                      Nemotron's glue kernels against their host references at its shapes (synthetic rows)
     \\  pocket [reps]             the pocket's two kernels against tf_pocket_rows byte for byte; reps > 0 times them too
@@ -130,6 +152,17 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "norms")) return norms_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "norm-rows")) return norm_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-conv")) return drama_conv_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-qk")) return drama_qk_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-fp8-tower")) return drama_fp8_tower.run(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
+    if (std.mem.eql(u8, cmd, "drama-pdl")) return drama_pdl_tests.run(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else null);
+    if (std.mem.eql(u8, cmd, "drama-nvfp4-moe")) return drama_nvfp4_moe_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-nvfp4-load")) return drama_nvfp4_load.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else null);
+    if (std.mem.eql(u8, cmd, "drama-fp8-dense")) return if (rest.len == 0) drama_fp8_dense_tests.run(gpu) else drama_fp8_dense_tests.file(gpu, rest[0], try arg(rest, 1), if (rest.len > 2) rest[2] else null);
+    if (std.mem.eql(u8, cmd, "drama-probe-stats")) return drama_probe_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-gemv-rows")) return drama_gemv_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "drama-topk")) return drama_topk_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+    if (std.mem.eql(u8, cmd, "drama-compact")) return drama_compact_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) rest[2] else null);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "pocket"))
         return pocket_tests.run(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 0);

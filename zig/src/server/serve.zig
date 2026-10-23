@@ -9,6 +9,7 @@ const live = @import("live.zig");
 const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
+const drama_voice = @import("drama_voice.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
@@ -104,6 +105,24 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
+    if ((args.voices != null or args.long_form) and s.engine.info().speech == null) {
+        std.debug.print("tensorfold: {s} needs a speech model\n", .{if (args.long_form) "--long-form" else "--voices"});
+        return 2;
+    }
+    const voices: []const drama_voice.Voice = if (args.voices) |dir| (drama_voice.load(a, io, dir, &problem) catch return 1) orelse {
+        std.debug.print("tensorfold: {s}\n", .{problem});
+        return 1;
+    } else &.{};
+    if (s.engine.info().speech) |sp| {
+        if (drama_voice.overflow(a, s.text, voices, sp.max_prompt_tokens) catch return 1) |why| {
+            std.debug.print("tensorfold: --voices {s}: {s}\n", .{ args.voices.?, why });
+            return 2;
+        }
+    }
+    const default_voice = if (args.default_voice) |name| drama_voice.find(voices, name) orelse {
+        std.debug.print("tensorfold: --default-voice {s}: --voices holds no {s}.json\n", .{ name, name });
+        return 2;
+    } else null;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -125,6 +144,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .slide_graph = args.slide_graph,
         .cortheon = args.cortheon,
         .cortheon_search_key = env(s, "BRAVE_SEARCH_API_KEY"),
+        .voices = voices,
+        .default_voice = default_voice,
+        .long_form = if (args.long_form) .{ .chars = args.long_form_chars, .history = args.long_form_history, .shift_pause_s = args.shift_pause_s } else null,
+        .silence_redraw = args.silence_redraw,
+        .register = args.register,
+        .silence_mid = args.silence_mid_s > 0,
+        .allowed_controls = args.allowed_controls,
+        .cfg = @import("cli_speech.zig").guidance(args),
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
@@ -159,6 +186,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
+    if (args.voices) |dir| log.line("voices: {d} from {s}; default voice: {s}", .{ voices.len, dir, if (default_voice) |v| v.name else "built-in" });
+    if (args.long_form) log.line("long-form speech: segments of up to {d} characters, each hearing {d} before it; at most 12 segments and 6000 frames a reply", .{ args.long_form_chars, args.long_form_history });
+    if (args.shift_pause_s > 0) log.line("shift pauses: a \u{b6} after a sentence end cuts a segment there, and the join gets at least {d:.2}s of quiet, its span sent as X-Pause-Spans", .{args.shift_pause_s});
+    if (args.allowed_controls) |list| log.line("allowed controls: {d} ({s}); every other [...] delivery control (drama_cues.txt) and scoped tag is taken out of a speech input first, the count sent as X-Controls-Stripped", .{ list.len, std.mem.join(a, ", ", list) catch "" });
+    if (args.silence_redraw.max > 0) log.line("silence redraws: up to {d} a whole reply, each started only if it should end within {d:.1}s of receipt (or X-Deadline-S if sooner); redraws speak the input {s}{s}; a stop under {d:.2} of the input's expected length is redrawn too (0: off)", .{ args.silence_redraw.max, args.silence_redraw.budget_s, if (args.silence_redraw.plain) "without its " else "as sent", if (args.silence_redraw.plain) @tagName(args.silence_redraw.plain_scope) else "", args.silence_redraw.short_ratio });
+    if (args.register.st > 0) log.line("register redraws: a whole reply is drawn once more if a phrase after the first opens {d:.2} st or more above the median of its other phrase openings with {d:.0}% or more of its voiced frames over {d:.0} Hz, started only if it should end within {d:.1}s of receipt (or X-Deadline-S if sooner); the draw with the smaller jump is sent", .{ args.register.st, args.register.high * 100, args.register.high_hz, args.silence_redraw.budget_s });
+    if (args.silence_mid_s > 0) log.line("silence mid trips: end of speech inside {d:.2}s or more of silence after 1 s voiced ends a synthesis as silence, redrawn as a silence is; whole replies say how often in X-Silence-Mid-Trips", .{args.silence_mid_s});
+    if (config.cfg) |g| log.line("guidance: a referenced speech prompt's main token is drawn from l_c + (gamma - 1)(l_c - l_u), l_u from the same turn as a plain prompt, gamma {d}{s}{s}, the unconditioned sequence run every {d} frames{s}; each reply says its gamma in X-Cfg-Gamma", .{ g.gamma, if (g.request_gamma) " unless the request's X-Cfg-Gamma sets it (1 to 5)" else "", if (g.force_guided) ", gamma 1 guided too (--cfg-force-guided, a diagnostic: it must draw as unguided)" else "", args.cfg.every orelse 1, if (args.cfg.batched) " in one batch with the referenced one (--cfg-batched)" else "" });
     live.columns_env = env(s, "COLUMNS");
     var ticker: live.Ticker = .{ .engine = s.engine };
     const drawing = live.wanted(io, if (env(s, "TENSORFOLD_NO_LIVE")) |v| std.mem.eql(u8, v, "1") else false);

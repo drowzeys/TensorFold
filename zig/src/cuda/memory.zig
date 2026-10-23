@@ -12,6 +12,36 @@ var device_bytes: std.atomic.Value(u64) = .init(0);
 var host_bytes: std.atomic.Value(u64) = .init(0);
 var peak_bytes: std.atomic.Value(u64) = .init(0);
 var counts_mutex: std.atomic.Mutex = .unlocked;
+var allocation_limit: ?u64 = null;
+var reserved_bytes: u64 = 0;
+
+/// Process-local limit for DeviceBuffers plus pinned HostBuffers. Driver/library-private allocations are not counted.
+/// Returns the previous limit for the owning engine to restore after its buffers are freed.
+pub fn setAllocationLimit(limit: ?u64) Error!?u64 {
+    lockCounts();
+    defer counts_mutex.unlock();
+    const used = device_bytes.load(.monotonic) +| host_bytes.load(.monotonic) +| reserved_bytes;
+    if (limit) |cap| if (used > cap) return error.OutOfDeviceMemory;
+    const previous = allocation_limit;
+    allocation_limit = limit;
+    return previous;
+}
+
+fn reserveAllocation(n: usize) Error!void {
+    lockCounts();
+    defer counts_mutex.unlock();
+    const used = device_bytes.load(.monotonic) +| host_bytes.load(.monotonic) +| reserved_bytes;
+    if (allocation_limit) |cap| if (n > cap -| used) return error.OutOfDeviceMemory;
+    reserved_bytes = std.math.add(u64, reserved_bytes, n) catch return error.OutOfDeviceMemory;
+}
+
+/// A failed driver call refunds its reservation without changing usage or the measured allocation peak.
+fn finishAllocation(counter: ?*std.atomic.Value(u64), n: usize) void {
+    lockCounts();
+    defer counts_mutex.unlock();
+    reserved_bytes -= n;
+    if (counter) |c| recordAllocation(c, n);
+}
 
 /// The counts now; `reset_peak` starts a new peak at the current device bytes. Safe from any thread.
 pub fn usage(reset_peak: bool) Usage {
@@ -30,18 +60,20 @@ fn usageWithHook(reset_peak: bool, hook: anytype) Usage {
     return .{ .device = now, .host = host_bytes.load(.monotonic), .peak = @max(now, peak_bytes.load(.monotonic)) };
 }
 
-fn held(counter: *std.atomic.Value(u64), n: usize) void {
-    const device = counter == &device_bytes;
-    if (device) lockCounts();
-    defer if (device) counts_mutex.unlock();
+fn recordAllocation(counter: *std.atomic.Value(u64), n: usize) void {
     const now = counter.fetchAdd(n, .monotonic) + n;
     if (counter == &device_bytes) _ = peak_bytes.fetchMax(now, .monotonic);
 }
 
+fn held(counter: *std.atomic.Value(u64), n: usize) void {
+    lockCounts();
+    defer counts_mutex.unlock();
+    recordAllocation(counter, n);
+}
+
 fn freed(counter: *std.atomic.Value(u64), n: usize) void {
-    const device = counter == &device_bytes;
-    if (device) lockCounts();
-    defer if (device) counts_mutex.unlock();
+    lockCounts();
+    defer counts_mutex.unlock();
     _ = counter.fetchSub(n, .monotonic);
 }
 
@@ -57,9 +89,11 @@ pub const DeviceBuffer = struct {
 
     /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
+        try reserveAllocation(len);
+        errdefer finishAllocation(null, len);
         var p: abi.DevicePtr = 0;
         if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
-        held(&device_bytes, len);
+        finishAllocation(&device_bytes, len);
         return .{ .d = d, .ptr = p, .len = len };
     }
 
@@ -171,9 +205,11 @@ pub const HostBuffer = struct {
 
     fn allocFlags(d: *const Driver, len: usize, flags: c_uint) Error!HostBuffer {
         if (len == 0) return error.Invalid;
+        try reserveAllocation(len);
+        errdefer finishAllocation(null, len);
         var p: ?*anyopaque = null;
         try d.check(d.api.cuMemHostAlloc(&p, len, flags), "cuMemHostAlloc");
-        held(&host_bytes, len);
+        finishAllocation(&host_bytes, len);
         const base: [*]align(16) u8 = @ptrCast(@alignCast(p.?));
         return .{ .d = d, .bytes = base[0..len] };
     }
@@ -250,4 +286,32 @@ test "peak reset preserves an allocation between its read and store" {
     const after = usage(false);
     try std.testing.expectEqual(before.device + 100, after.device);
     try std.testing.expectEqual(before.device + 400, after.peak);
+}
+
+test "allocation cap includes pinned and in-flight bytes and refunds failed driver calls" {
+    const before = usage(true);
+    const base = before.device + before.host;
+    const previous = try setAllocationLimit(base + 16);
+    defer _ = setAllocationLimit(previous) catch unreachable;
+    var pending: usize = 0;
+    defer if (pending > 0) finishAllocation(null, pending);
+
+    try reserveAllocation(12);
+    pending = 12;
+    try std.testing.expectError(error.OutOfDeviceMemory, reserveAllocation(5));
+    try std.testing.expectEqual(before.device, usage(false).device);
+    finishAllocation(null, 12);
+    pending = 0;
+    try std.testing.expectEqual(before.peak, usage(false).peak);
+
+    try reserveAllocation(12);
+    finishAllocation(&host_bytes, 12);
+    defer freed(&host_bytes, 12);
+    try reserveAllocation(4);
+    finishAllocation(&device_bytes, 4);
+    defer freed(&device_bytes, 4);
+    try std.testing.expectError(error.OutOfDeviceMemory, reserveAllocation(1));
+    try std.testing.expectError(error.OutOfDeviceMemory, setAllocationLimit(base + 15));
+    try std.testing.expectEqual(before.host + 12, usage(false).host);
+    try std.testing.expectEqual(before.device + 4, usage(false).device);
 }

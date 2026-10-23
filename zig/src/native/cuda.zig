@@ -8,6 +8,9 @@ const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
+const drama_host = @import("drama_host.zig");
+const drama_voice_encode = @import("drama_voice_encode.zig");
+const drama = @import("drama");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{nemotron.native};
@@ -22,8 +25,9 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
-    var out: [registry.len]api.Family = undefined;
+    var out: [registry.len + 1]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+    out[registry.len] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
     const final = out;
     break :blk &final;
 };
@@ -96,28 +100,6 @@ fn weightBytes(io: std.Io, dir: []const u8) u64 {
         total += st.size;
     }
     return total;
-}
-
-/// The pool now, read on the thread whose context is current; `problem` names a bad variable.
-fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?budget.Pool {
-    const unified = (try ctx.attribute(.integrated)) != 0;
-    const card = try ctx.memInfo();
-    const text = if (unified) budget.procText(a, io, "/proc/meminfo") else null;
-    const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
-        problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
-        return null;
-    };
-    const free = available.available;
-    const total = available.total;
-    const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total, unified) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from {d} to the memory's size", .{ getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?, budget.floor(unified).least });
-        return null;
-    };
-    const limit = budget.limitBytes(getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_MEMORY_LIMIT_GB={s}: a positive number of GiB whose byte count fits in a 64-bit size", .{getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB").?});
-        return null;
-    };
-    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified };
 }
 
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
@@ -247,11 +229,54 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
+    if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
+}
+
+fn openDrama(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    if (o.tp != 1 or o.rank != 0 or (o.lanes_fixed and o.lanes != 1)) {
+        problem.* = "Drama 3 serves one synthesis on one CUDA device: use --parallel 1 and no tensor parallelism";
+        return null;
+    }
+    const frames = o.max_frames orelse drama_host.default_max_frames;
+    const window = o.context orelse 8192;
+    if (window <= frames or window > 8192) {
+        problem.* = try std.fmt.allocPrint(a, "Drama 3 supports --context {d} through 8192 at --max-frames {d}: the context holds the prompt and every frame", .{ frames + 1, frames });
+        return null;
+    }
+    if (o.slide or o.drafter != null or o.mtp_drafts != null or o.mtp_confidence != null or
+        (o.prompt_cache_gib != null and o.prompt_cache_gib.? != 0) or
+        (o.keep != null and o.keep.? != 0) or o.policy.len != 0)
+    {
+        problem.* = "Drama 3 does not support learned weights, speculative drafts, retained prompt caches, or text-engine policies";
+        return null;
+    }
+    const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
+    const segments = try setting(a, o.segments, "TF_CUDA_SEGMENTS", 1, problem) orelse return null;
+    if (segments != 1) {
+        problem.* = "Drama 3 uses one prompt segment at a time: use --segments 1";
+        return null;
+    }
+    if (getenv("TENSORFOLD_CUDA_KERNELS")) |path| if (path.len > 0 and !std.mem.eql(u8, path, "native")) {
+        problem.* = "Drama 3 uses embedded native kernels, not captured kernel sets: unset TENSORFOLD_CUDA_KERNELS or set it to native";
+        return null;
+    };
+    const mask = if (o.expert_mask) |path| try drama.expert_mask.read(a, io, path, problem) orelse return null else null;
+    return drama_host.open(gpa, io, o.dir, "", .{ .context = @intCast(window), .max_frames = frames, .silence_onset_s = o.silence_onset_s, .silence_mid_s = o.silence_mid_s, .cfg_every = o.cfg_every, .cfg_batched = o.cfg_batched, .device = device, .expert_mask = mask }) catch |e| {
+        const hint = if (e == error.OutOfDeviceMemory and o.max_frames != null) "; the codec's buffers grow with --max-frames" else "";
+        problem.* = try std.fmt.allocPrint(a, "the native Drama 3 CUDA engine could not load the checkpoint ({s}){s}", .{ @errorName(e), hint });
+        return null;
+    };
+}
+
+/// `voice encode`: a WAV clip's Drama 3 codes from the codec in `dir`, on the device TF_CUDA_DEVICE picks.
+pub fn encodeVoice(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, wav: []const u8, problem: *[]const u8) !?drama_voice_encode.Encoded {
+    const device = try setting(a, null, "TF_CUDA_DEVICE", 0, problem) orelse return null;
+    return drama_voice_encode.encode(a, gpa, io, dir, wav, device, problem);
 }
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -321,7 +346,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             return null;
         },
     };
-    const before = try pool(a, io, &g.ctx, problem) orelse return null;
+    const before = try budget.readPool(a, io, &g.ctx, problem) orelse return null;
     const weights = weightBytes(io, o.dir);
     const held0 = cuda.usage(false).device;
     if (weights > before.room(held0)) {
@@ -334,7 +359,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
-    const after = try pool(a, io, &g.ctx, problem) orelse return null;
+    const after = try budget.readPool(a, io, &g.ctx, problem) orelse return null;
     const room = after.room(model) -| loaded.learn_bytes;
     const free = loaded.free_streams;
     const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
@@ -396,6 +421,7 @@ fn toGib(bytes: u64) f64 {
 test {
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
     _ = refusals;
+    _ = drama_host; // its CPU tests: limits and request admission
     _ = lane_backend;
 }
 
@@ -412,11 +438,6 @@ test "chip classes name the compute capability as gate entries do" {
     const name = chipClass(a, 121).?;
     defer a.free(name);
     try std.testing.expectEqualStrings("nvidia-sm121", name);
-}
-
-test "every registered family is listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len), families.len);
-    try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
 }
 
 test "variables: unset or empty means the default, anything but a whole number is refused" {

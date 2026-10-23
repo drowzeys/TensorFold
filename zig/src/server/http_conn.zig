@@ -301,14 +301,20 @@ pub const Conn = struct {
 
     /// A JSON reply with Python's ``_send_json`` headers.
     pub fn sendJson(c: *Conn, code: u16, body: []const u8) void {
-        c.sendJsonOr(code, body) catch {};
+        c.sendJsonOr(code, body, null) catch {};
     }
 
-    fn sendJsonOr(c: *Conn, code: u16, body: []const u8) !void {
+    /// `sendJson` with one more header, when given.
+    pub fn sendJsonWith(c: *Conn, code: u16, body: []const u8, extra: ?Header) void {
+        c.sendJsonOr(code, body, extra) catch {};
+    }
+
+    fn sendJsonOr(c: *Conn, code: u16, body: []const u8, extra: ?Header) !void {
         try c.startResponse(code, null);
         try c.addHeader("Content-Type", "application/json");
         var len: [24]u8 = undefined;
         try c.addHeader("Content-Length", try std.fmt.bufPrint(&len, "{d}", .{body.len}));
+        if (extra) |h| try c.addHeader(h.name, h.value);
         if (c.close) try c.addHeader("Connection", "close");
         try c.finish(body);
     }

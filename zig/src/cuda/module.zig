@@ -53,6 +53,12 @@ pub const Module = struct {
         try self.d.check(self.d.api.cuModuleGetGlobal_v2(&g.ptr, &g.len, self.handle, name.ptr), "cuModuleGetGlobal");
         return g;
     }
+
+    /// Whether the loaded image defines device global `name`: a marker test, so a missing name is no error.
+    pub fn holds(self: Module, name: [:0]const u8) bool {
+        var g: Global = .{ .ptr = 0, .len = 0 };
+        return self.d.api.cuModuleGetGlobal_v2(&g.ptr, &g.len, self.handle, name.ptr) == abi.success;
+    }
 };
 
 pub const Function = struct {
