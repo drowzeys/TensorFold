@@ -279,6 +279,39 @@ pub const Engine = struct {
         if (c0 + t == n) g.copy(e.hfin + (t - 1) * H * 2, e.hlast, H * 2);
     }
 
+    /// A prompt prefix's recurrent states and attention cache rows, copied out for prompts that share it.
+    pub const Prefix = struct { rows: usize, states: [2]u64, kv_bb: [cfg.layers][2]u64, kv_tw: [cfg.tower_layers][2]u64 };
+
+    const kv_row = cfg.kv_heads * cfg.head_dim * 2;
+
+    /// Copies the state after prompt rows [0, rows) into new buffers (enqueued; the next wait completes it).
+    pub fn savePrefix(e: *Engine, rows: usize) !Prefix {
+        var p: Prefix = .{ .rows = rows, .states = undefined, .kv_bb = @splat(.{ 0, 0 }), .kv_tw = undefined };
+        for (0..2) |i| p.states[i] = try e.alloc(e.state_bytes[i]);
+        for (0..cfg.layers) |li| if (e.c.full_attention[li]) {
+            p.kv_bb[li] = .{ try e.alloc(rows * kv_row), try e.alloc(rows * kv_row) };
+        };
+        for (0..cfg.tower_layers) |ti| p.kv_tw[ti] = .{ try e.alloc(rows * kv_row), try e.alloc(rows * kv_row) };
+        e.movePrefix(p, true);
+        return p;
+    }
+
+    /// Puts a saved prefix's state back: the prompt continues at row p.rows.
+    pub fn loadPrefix(e: *Engine, p: Prefix) void {
+        e.movePrefix(p, false);
+    }
+
+    fn movePrefix(e: *Engine, p: Prefix, out: bool) void {
+        const g = e.g;
+        for (0..2) |i| if (out) g.copy(e.state_bufs[i], p.states[i], e.state_bytes[i]) else g.copy(p.states[i], e.state_bufs[i], e.state_bytes[i]);
+        for (0..cfg.layers) |li| if (e.c.full_attention[li]) for (0..2) |kv| {
+            if (out) g.copy(e.kv_bb[li][kv], p.kv_bb[li][kv], p.rows * kv_row) else g.copy(p.kv_bb[li][kv], e.kv_bb[li][kv], p.rows * kv_row);
+        };
+        for (0..cfg.tower_layers) |ti| for (0..2) |kv| {
+            if (out) g.copy(e.kv_tw[ti][kv], p.kv_tw[ti][kv], p.rows * kv_row) else g.copy(p.kv_tw[ti][kv], e.kv_tw[ti][kv], p.rows * kv_row);
+        };
+    }
+
     pub fn finishPrompt(e: *Engine, rows: []const [W]i32) !void {
         const n = rows.len;
         // decode state: the last prompt row is the newest row, and the RAS window holds the last 16 main tokens

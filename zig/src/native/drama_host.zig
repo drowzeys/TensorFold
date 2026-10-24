@@ -13,6 +13,9 @@ const Limit = if (is_cuda) @import("drama_limit.zig").Limit else struct {
 };
 const Warm = if (is_cuda) struct {} else d3.residency.Warm;
 const Session = struct { e: *d3.Engine, t: *d3.tts.Tts };
+/// Metal: a voice reference's prompt prefix and its saved state, reused by later prompts with the same rows.
+const Cached = if (is_cuda) struct {} else struct { rows: [][11]i32, prefix: d3.Engine.Prefix };
+const cache_size = 8;
 const Job = struct {
     id: api.Id,
     request: *const api.SpeechRequest,
@@ -50,6 +53,8 @@ const Host = struct {
     worker: ?std.Thread = null,
     closing: bool = false,
     failed: completion.State = .{},
+    cache: [cache_size]?Cached = @splat(null),
+    cache_next: usize = 0,
     const vtable: api.Engine.VTable = .{
         .info = info,
         .submit = submitText,
@@ -181,10 +186,17 @@ const Host = struct {
                 try s.e.startPrompt(r.frames);
                 if (is_cuda) try s.t.c.reset(s.t.cs) else try s.t.c.reset();
                 j.state.started = true;
+                if (!is_cuda) if (h.cached(r.frames)) |c| {
+                    s.e.loadPrefix(c.prefix);
+                    j.state.prompt = c.prefix.rows;
+                };
             }
-            const count = s.e.o.promptRows(r.frames.len - j.state.prompt);
+            const cut = if (is_cuda) 0 else h.prefixCut(r.frames);
+            const end = if (j.state.prompt < cut) cut else r.frames.len;
+            const count = s.e.o.promptRows(end - j.state.prompt);
             try s.e.promptChunk(r.frames.len, j.state.prompt, count, null);
             j.state.prompt += count;
+            if (!is_cuda and j.state.prompt == cut and h.cached(r.frames) == null) try h.remember(s.e, r.frames, cut);
             if (j.state.prompt == r.frames.len) {
                 try s.e.finishPrompt(r.frames);
                 h.lock();
@@ -216,6 +228,32 @@ const Host = struct {
         if (r.stream) j.sink.event(j.sink.ctx, j.id, &.{ .audio = j.samples });
         if (j.guard.tripped) return h.finish(i, .silence, "");
         if (j.state.frames == r.max_frames) h.finish(i, .length, "");
+    }
+    /// Where a prompt's cacheable prefix ends: one row before its last reference code row, so the tower's next-row
+    /// labels for every cached row are still reference rows; 0 for a prompt without a reference.
+    fn prefixCut(h: *Host, rows: []const [11]i32) usize {
+        const sem = h.sessions[0].e.c.ids.sem_begin;
+        var last: usize = 0;
+        for (rows, 0..) |row, i| if (row[0] >= sem and row[0] < sem + 4096) {
+            last = i;
+        };
+        return if (last >= 32) last else 0;
+    }
+    fn cached(h: *Host, rows: []const [11]i32) ?*const Cached {
+        const cut = h.prefixCut(rows);
+        if (cut == 0) return null;
+        for (&h.cache) |*slot| if (slot.*) |*c| if (c.prefix.rows == cut and c.rows.len == cut + 1) {
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(c.rows), std.mem.sliceAsBytes(rows[0 .. cut + 1]))) return c;
+        };
+        return null;
+    }
+    fn remember(h: *Host, e: *d3.Engine, rows: []const [11]i32, cut: usize) !void {
+        const copy = try h.gpa.dupe([11]i32, rows[0 .. cut + 1]);
+        errdefer h.gpa.free(copy);
+        const prefix = try e.savePrefix(cut);
+        if (h.cache[h.cache_next]) |old| h.gpa.free(old.rows);
+        h.cache[h.cache_next] = .{ .rows = copy, .prefix = prefix };
+        h.cache_next = (h.cache_next + 1) % cache_size;
     }
     fn copyAudio(p: *anyopaque, samples: []const f32) !void {
         const j: *Job = @ptrCast(@alignCast(p));
