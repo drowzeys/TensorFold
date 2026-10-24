@@ -12,6 +12,10 @@ const Allocator = std.mem.Allocator;
 
 const Frame = drama.tower.Frame;
 const Codes = [10]u32;
+/// A voice reference's prompt rows and the backbone and tower state after them, reused by later prompts that start
+/// with the same rows: they restore it and prefill only what follows.
+const Cached = struct { prompt: []u32, codes: []Codes, backbone: drama.backbone.Sequence.Prefix, tower: drama.tower.Model.Prefix };
+const cache_size = 8;
 
 /// Backbone and tower rows a prompt pass takes at most.
 pub const chunk_rows = 128;
@@ -77,6 +81,9 @@ const Host = struct {
     // Worker-thread only: the prompt pass's frames and the generated codes, sized once at open.
     frames: [chunk_rows + 1]Frame = undefined,
     codes: []Codes = &.{},
+    cache: [cache_size]?Cached = @splat(null),
+    cache_next: usize = 0,
+    cache_off: bool = false, // a prefix could not be saved (device memory): every prompt is prefilled whole
 
     // Under `mutex`: the one admitted request and what status reports of it.
     mutex: std.Io.Mutex = .init,
@@ -283,7 +290,7 @@ const Host = struct {
         try h.check();
         try h.ctx.makeCurrent(); // CUDA binds per thread: the worker's calls need the context current
         const guided = if (r.unconditioned.len > 0) try h.guide.?.prefill(h, r) else null;
-        const last = try prefill(&h.backbone, &h.tower, h.stream, &h.frames, r.prompt, r.codes, chunk_rows, r.seed, {}, h);
+        const last = try h.prefillVoice(r);
         const prefilled = h.now();
         stats.prefill_seconds = @as(f64, @floatFromInt(prefilled - began)) / 1e9;
         h.notePrefill(r.prompt.len + r.unconditioned.len, began, prefilled);
@@ -365,6 +372,52 @@ const Host = struct {
         }
     };
 
+    /// `prefill`, with a voice reference's first whole chunks restored from the cache when an earlier prompt had the
+    /// same rows, or run and saved for the next; the output bytes match an uncached prefill either way.
+    fn prefillVoice(h: *Host, r: *const api.SpeechRequest) !Row {
+        const b = &h.backbone;
+        const t = &h.tower;
+        const cut = prefixCut(r.prompt, h.semantic_start, h.semantic_end);
+        if (cut == 0 or r.codes.len != r.prompt.len) return prefill(b, t, h.stream, &h.frames, r.prompt, r.codes, chunk_rows, r.seed, {}, h);
+        try b.reset(h.stream);
+        try t.reset(h.stream, r.prompt, r.seed);
+        if (h.cached(r.prompt, r.codes, cut)) |c| {
+            try b.seq.loadPrefix(&c.backbone, h.stream);
+            try t.loadPrefix(h.stream, &c.tower);
+        } else {
+            _ = try prefillRange(b, t, h.stream, &h.frames, r.prompt, r.codes, chunk_rows, 0, cut, {}, h);
+            if (!h.cache_off) h.remember(r.prompt, r.codes, cut) catch |e| {
+                h.cache_off = true;
+                std.log.warn("drama: voice prefix cache off: {s}", .{@errorName(e)});
+            };
+        }
+        const last = try prefillRange(b, t, h.stream, &h.frames, r.prompt, r.codes, chunk_rows, cut, r.prompt.len, {}, h);
+        return .{ .hidden = try lastRow(last.hidden, last.rows, b.hidden * 2), .logits = try lastRow(last.semantic_logits, 1, logit_cols * 4) };
+    }
+
+    fn cached(h: *Host, prompt: []const u32, codes: []const Codes, cut: usize) ?*const Cached {
+        for (&h.cache) |*slot| if (slot.*) |*c| if (c.prompt.len == cut + 1 and
+            std.mem.eql(u32, c.prompt, prompt[0 .. cut + 1]) and
+            std.mem.eql(u8, std.mem.sliceAsBytes(c.codes), std.mem.sliceAsBytes(codes[0 .. cut + 1]))) return c;
+        return null;
+    }
+
+    /// Saves the state after rows [0, cut), keyed by rows [0, cut] (row cut is the tower's last label).
+    fn remember(h: *Host, prompt: []const u32, codes: []const Codes, cut: usize) !void {
+        const p = try h.gpa.dupe(u32, prompt[0 .. cut + 1]);
+        errdefer h.gpa.free(p);
+        const c = try h.gpa.dupe(Codes, codes[0 .. cut + 1]);
+        errdefer h.gpa.free(c);
+        var bp = try h.backbone.seq.savePrefix(h.stream);
+        errdefer bp.free();
+        var tp = try h.tower.savePrefix(h.stream);
+        errdefer tp.free();
+        try h.stream.synchronize();
+        if (h.cache[h.cache_next]) |*old| freeCached(h.gpa, old);
+        h.cache[h.cache_next] = .{ .prompt = p, .codes = c, .backbone = bp, .tower = tp };
+        h.cache_next = (h.cache_next + 1) % cache_size;
+    }
+
     fn notePrefill(h: *Host, tokens: usize, began: i96, done: i96) void {
         h.lock();
         defer h.unlock();
@@ -386,14 +439,21 @@ pub const Row = struct { hidden: cuda.DeviceBuffer, logits: cuda.DeviceBuffer };
 /// Resets both models for a synthesis seeded `seed`, then the prompt pass in chunks of `chunk` (up to chunk_rows) rows,
 /// each staged in the tower, run through the backbone (runTraced), all but the last row teacher-forced; check() each.
 pub fn prefill(b: *drama.backbone.Model, t: *drama.tower.Model, s: cuda.Stream, frames: *[chunk_rows + 1]Frame, prompt: []const u32, codes: []const Codes, chunk: usize, seed: u64, trace: anytype, check: anytype) !Row {
-    if (chunk == 0 or chunk > chunk_rows) return error.BadDramaChunk;
     try b.reset(s);
     try t.reset(s, prompt, seed);
+    const last = try prefillRange(b, t, s, frames, prompt, codes, chunk, 0, prompt.len, trace, check);
+    return .{ .hidden = try lastRow(last.hidden, last.rows, b.hidden * 2), .logits = try lastRow(last.semantic_logits, 1, logit_cols * 4) };
+}
+
+/// Prompt rows [from, to) in chunks of `chunk`, after rows [0, from) left the models' state; the last chunk's rows.
+fn prefillRange(b: *drama.backbone.Model, t: *drama.tower.Model, s: cuda.Stream, frames: *[chunk_rows + 1]Frame, prompt: []const u32, codes: []const Codes, chunk: usize, from: usize, to: usize, trace: anytype, check: anytype) !drama.backbone.Rows {
+    if (chunk == 0 or chunk > chunk_rows) return error.BadDramaChunk;
+    if (from >= to or to > prompt.len) return error.DramaRowsMismatch;
     var last: drama.backbone.Rows = undefined;
-    var start: usize = 0;
-    while (start < prompt.len) {
+    var start: usize = from;
+    while (start < to) {
         if (@TypeOf(check) != void) try check.check();
-        const end = @min(start + chunk, prompt.len);
+        const end = @min(start + chunk, to);
         const n = end - start;
         const look = @min(end + 1, prompt.len); // this chunk's frames and the next row's, for its last label
         for (frames[0 .. look - start], start..) |*frame, i| frame.* = promptFrame(prompt, codes, i);
@@ -406,7 +466,26 @@ pub fn prefill(b: *drama.backbone.Model, t: *drama.tower.Model, s: cuda.Stream, 
         if (end == prompt.len and taught > 0) _ = try t.setInput(s, frames[n - 1 .. n]);
         start = end;
     }
-    return .{ .hidden = try lastRow(last.hidden, last.rows, b.hidden * 2), .logits = try lastRow(last.semantic_logits, 1, logit_cols * 4) };
+    return last;
+}
+
+/// Where a prompt's reusable voice prefix ends: the last whole prefill chunk at or before its last reference code row.
+/// The tower's next-row labels for every saved row are then still reference rows, and the rows after it run in the
+/// same chunk an uncached prefill gives them, so the output bytes are the same; 0 when no whole chunk is reference.
+fn prefixCut(prompt: []const u32, semantic_start: u32, semantic_end: u32) usize {
+    var last: usize = 0;
+    for (prompt, 0..) |token, i| if (token >= semantic_start and token <= semantic_end) {
+        last = i;
+    };
+    const cut = last / chunk_rows * chunk_rows;
+    return if (cut > 0 and cut + 1 < prompt.len) cut else 0;
+}
+
+fn freeCached(gpa: Allocator, c: *Cached) void {
+    c.backbone.free();
+    c.tower.free();
+    gpa.free(c.prompt);
+    gpa.free(c.codes);
 }
 
 /// Feeds `frame` to the backbone as the next row, its codes staged in the tower: the next step's source.
@@ -573,6 +652,7 @@ fn close(ctx: *anyopaque) void {
     h.thread = null;
     h.ctx.makeCurrent() catch {}; // the closing thread frees device memory
     h.stream.synchronize() catch {};
+    for (&h.cache) |*slot| if (slot.*) |*c| freeCached(h.gpa, c);
     h.codec.deinit();
     h.tower.deinit();
     if (h.guide) |g| g.destroy(h.gpa);
