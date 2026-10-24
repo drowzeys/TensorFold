@@ -1,10 +1,10 @@
-# Drama 3 CUDA prompt chunks
+# Drama 3 prompt chunks
 
 The native speech host advances each prompt by at most `TF_DRAMA_PREFILL_ROWS` rows per shared round. The setting accepts integers from 1 through 1024 and defaults to 128. `drama3-generate --max-rows` selects its engine capacity, from 1 through 8192, also defaulting to 128. The larger engine bound accommodates whole-context oracle scratch; it is not the recommended serving batch. Invalid capacities fail before checkpoint or GPU allocation. Attention query chunks must be from 1 through 1024; their effective size is bounded by the allocated row capacity.
 
 Each prompt starts at offset zero and takes full chunks followed by its remaining rows. Chunk boundaries do not depend on the number of active lanes, request timing or queue order. The last backbone row is retained for decode; the tower consumes only prompt rows with a successor. A shared round still returns to the scheduler after its chunk. Cancellation granularity is therefore a chunk, not a row.
 
-The setting `TF_DRAMA_PREFILL_ROWS=1` restores single-row CUDA prompt arithmetic and scheduling. Metal's native host remains at single-row prefill, and its engine's non-probe prefill is unchanged. Shared default scratch capacities are smaller on both backends.
+The setting `TF_DRAMA_PREFILL_ROWS=1` restores single-row prompt arithmetic and scheduling. Metal's native host reads the same setting with the same default; its engine's non-probe prefill, used by `drama3-generate`, is unchanged. Shared default scratch capacities are smaller on both backends.
 
 ## Memory and synchronization
 
@@ -22,6 +22,10 @@ Chunk size is an arithmetic setting, not a promise of identical hidden bits acro
 - The causal convolution and GDN recurrence retain their sequential row order and FP32 state arithmetic. Their inputs can nevertheless differ after a changed dense projection. Row-local normalization, rotary preparation and embedding operations do not introduce a cross-row sum.
 
 Consequently, code selection near a logit tie can differ across capacities. Do not use exact cross-capacity frames or PCM as the fidelity gate. Keep the chosen capacity fixed for a request and record it in receipts. No GPU kernel implementation is changed by this patch.
+
+## Metal arithmetic
+
+Metal's row count changes dispatch shapes, not any row's sums. `d3_rows_r1` and `d3_rows_r8` instantiate the same `rows_body` with one or eight rows a threadgroup; each output keeps the same lane split, k order and simdgroup reduction. Prompt experts go through `d3_plan`'s member lists into the same `fp8_rows` dot per pair as decode. Router, normalization, rotary, attention and FP8 activation quantization run one threadgroup a row with the same code. The causal convolution and GDN recurrence still advance rows in order. Metal frames and PCM are therefore expected to equal single-row prefill at every capacity, and the Metal gate requires that equality.
 
 ## Qualification
 

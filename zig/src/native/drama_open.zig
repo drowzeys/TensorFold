@@ -24,11 +24,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
-    const prefill_rows = try setting(a, null, "TF_DRAMA_PREFILL_ROWS", 128, problem) orelse return null;
-    if (prefill_rows == 0 or prefill_rows > 1024) {
-        problem.* = "TF_DRAMA_PREFILL_ROWS must be 1 through 1024";
-        return null;
-    }
+    const prefill_rows = try prefillRows(a, problem) orelse return null;
     const segments = try setting(a, o.segments, "TF_CUDA_SEGMENTS", 1, problem) orelse return null;
     if (segments != 1) {
         problem.* = "Drama 3 uses one prompt segment at a time: use --segments 1";
@@ -49,6 +45,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     };
 }
 
+/// TF_DRAMA_PREFILL_ROWS, the prompt rows a shared round advances: 1 through 1024, default 128.
+fn prefillRows(a: Allocator, problem: *[]const u8) !?u32 {
+    const rows = try setting(a, null, "TF_DRAMA_PREFILL_ROWS", 128, problem) orelse return null;
+    if (rows == 0 or rows > 1024) {
+        problem.* = "TF_DRAMA_PREFILL_ROWS must be 1 through 1024";
+        return null;
+    }
+    return rows;
+}
+
 pub fn openMetal(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const window = o.context orelse 8192;
     if (window < 1025 or window > 8192 or o.tp != 1 or o.rank != 0 or
@@ -62,7 +68,12 @@ pub fn openMetal(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
         problem.* = "Drama 3 needs context 1025..8192, 1..8 frame lanes and no text, vision, TP or cache modifiers";
         return null;
     }
-    return drama_host.open(gpa, io, o.dir, "", .{ .context = @intCast(window), .lanes = if (o.lanes_fixed) o.lanes else 2 }) catch |err| {
+    const prefill_rows = try prefillRows(a, problem) orelse return null;
+    return drama_host.open(gpa, io, o.dir, "", .{
+        .context = @intCast(window),
+        .lanes = if (o.lanes_fixed) o.lanes else 2,
+        .prefill_rows = prefill_rows,
+    }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Drama 3 Metal checkpoint load failed ({s})", .{@errorName(err)});
         return null;
     };

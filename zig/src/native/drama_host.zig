@@ -23,7 +23,7 @@ pub const Options = struct {
     context: u32 = 8192,
     device: u32 = 0,
     lanes: u32 = 2,
-    prefill_rows: u32 = if (is_cuda) 128 else 1,
+    prefill_rows: u32 = 128,
 };
 
 const Host = struct {
