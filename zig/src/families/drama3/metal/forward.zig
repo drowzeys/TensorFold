@@ -59,18 +59,24 @@ fn moe(e: *Engine, L: *const wts.Layer, t: usize) void {
     const g = e.g;
     const mp = cfg.moe_proj;
     k.linear(g, L.moe_in, e.xn, H, H, mp, e.sp, mp, t, false);
-    k.router(g, e.sp, mp, 2 * cfg.shared_width, e.picks, e.rw, t);
+    k.router(g, e.sp, mp, 2 * cfg.shared_width, e.picks, e.rw, L.keep, t);
     k.swiglu(g, e.sp, mp, 0, cfg.shared_width, cfg.shared_width, e.sact, t);
     k.linear(g, L.shared_down, e.sact, cfg.shared_width, cfg.shared_width, H, e.shout, H, t, false);
     const pairs = t * cfg.top_k;
     const prompt = t > 1;
     if (prompt) k.plan(g, e.picks, pairs, e.counts, e.members, e.o.max_rows * cfg.top_k);
-    const r: k.Route = .{ .table = L.experts, .picks = e.picks, .counts = e.counts, .members = e.members, .cap = e.o.max_rows * cfg.top_k, .pairs = pairs, .prompt = prompt };
-    // activations to FP8 per row and 128 inputs before each expert projection, as the reference serves them
-    k.actQuant(g, e.xn, H, e.xq, H, e.xsc, t, H);
-    k.experts(g, true, e.xq, e.xsc, r, H, cfg.expert_width, e.gu);
-    k.actQuant(g, e.gu, cfg.expert_width, e.gq, cfg.expert_width, e.gsc, pairs, cfg.expert_width);
-    k.experts(g, false, e.gq, e.gsc, r, cfg.expert_width, H, e.down);
+    const r: k.Route = .{ .table = L.experts, .picks = e.picks, .counts = e.counts, .members = e.members, .cap = e.o.max_rows * cfg.top_k, .pairs = pairs, .prompt = prompt, .fp4 = e.w.fp4 };
+    if (e.w.fp4) {
+        // NVFP4 experts take the bf16 rows as they are (W4A16)
+        k.experts(g, true, e.xn, e.xsc, r, H, cfg.expert_width, e.gu);
+        k.experts(g, false, e.gu, e.gsc, r, cfg.expert_width, H, e.down);
+    } else {
+        // activations to FP8 per row and 128 inputs before each expert projection, as the reference serves them
+        k.actQuant(g, e.xn, H, e.xq, H, e.xsc, t, H);
+        k.experts(g, true, e.xq, e.xsc, r, H, cfg.expert_width, e.gu);
+        k.actQuant(g, e.gu, cfg.expert_width, e.gq, cfg.expert_width, e.gsc, pairs, cfg.expert_width);
+        k.experts(g, false, e.gq, e.gsc, r, cfg.expert_width, H, e.down);
+    }
     k.moeCombine(g, e.x, e.down, e.rw, e.shout, e.sp, mp, 2 * cfg.shared_width + cfg.experts, H, t);
 }
 

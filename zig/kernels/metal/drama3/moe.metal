@@ -6,18 +6,21 @@ struct RouterArgs {
 };
 
 // fp32 softmax over the 256 router logits of a row, top 8 (ties to the lower expert), renormalized; 256 threads.
+// keep: bit e of word e / 32 set when the layer has expert e (a pruned checkpoint's others get -inf, never picked).
 [[max_total_threads_per_threadgroup(256)]] kernel void d3_router(device const bf16* sp [[buffer(0)]], device int* picks [[buffer(1)]],
-                      device float* weights [[buffer(2)]], constant RouterArgs& a [[buffer(3)]],
+                      device float* weights [[buffer(2)]], device const uint* keep [[buffer(3)]],
+                      constant RouterArgs& a [[buffer(4)]],
                       uint t [[threadgroup_position_in_grid]], uint e [[thread_index_in_threadgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float scratch[32];
   threadgroup float wv[8], best_v[8];
   threadgroup int wi[8], best_i[8];
-  const float lg = b2f(sp[(ulong)t * a.ss + a.r_off + e]);
+  const bool kept = (keep[e >> 5] >> (e & 31u)) & 1u;
+  const float lg = kept ? b2f(sp[(ulong)t * a.ss + a.r_off + e]) : -INFINITY;
   const float m = group_max(lg, scratch, sg, lane, 8);
   const float p = precise::exp(lg - m);
   const float sum = group_sum(p, scratch + 8, sg, lane, 8);
-  float mine = p / sum;
+  float mine = kept ? p / sum : -1.0f;
   for (int k = 0; k < 8; ++k) {
     float v = mine;
     int idx = int(e);
@@ -203,5 +206,111 @@ inline void fp8_rows(device const uchar* const* w, device const float* const* ws
     fp8_rows<4>(rows, sc, a.K, gq + (ulong)pair * a.K, gsc + (ulong)pair * groups, lane, v);
     if (lane == 0)
       for (int c = 0; c < 4; ++c) down[(ulong)pair * a.N + n0 + c] = v[c];
+  }
+}
+
+// NVFP4 experts (W4A16, as ModelOpt stores them): e2m1 codes two a byte (element 2i in the low nibble), an e4m3 scale
+// every 16 inputs and one fp32 scale a matrix; bf16 activations, fp32 sums.
+struct Fp4Ptrs {
+  device const uchar* g;
+  device const uchar* gs;
+  device const uchar* u;
+  device const uchar* us;
+  device const uchar* d;
+  device const uchar* ds;
+  float g2, u2, d2, pad;
+};
+
+constant float e2m1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+// One e4m3 byte as a float.
+inline float e4m3f(uint b) { return e4m3x2(b & 0xFFu).x * 256.0f; }
+
+// Sixteen e2m1 weights (8 bytes) against sixteen bf16 inputs: an fma chain in k order.
+inline float fp4_dot16(uint2 w, device const bf16* x) {
+  float p = 0.0f;
+  for (int q = 0; q < 4; ++q) {
+    const float4 xv = bf4(((device const uint2*)x)[q]);
+    const uint h = (q < 2 ? w.x : w.y) >> ((q & 1) * 16);
+    p = fma(e2m1[h & 0xFu], xv.x, p);
+    p = fma(e2m1[(h >> 4) & 0xFu], xv.y, p);
+    p = fma(e2m1[(h >> 8) & 0xFu], xv.z, p);
+    p = fma(e2m1[(h >> 12) & 0xFu], xv.w, p);
+  }
+  return p;
+}
+
+// C NVFP4 rows against bf16 x: per lane, each 16-input group's sum times its scale, then simd_sum.
+template <int C>
+inline void fp4_rows(device const uchar* const* w, device const uchar* const* wsc, uint K, device const bf16* x,
+                     uint lane, thread float* out) {
+  float acc[C];
+  for (int c = 0; c < C; ++c) acc[c] = 0.0f;
+  for (uint k0 = lane * 16; k0 < K; k0 += 512) {
+    uint2 wv[C];
+    for (int c = 0; c < C; ++c) {
+      device const uint* p = (device const uint*)(w[c] + k0 / 2); // checkpoint tensors are 4-byte aligned
+      wv[c] = uint2(p[0], p[1]);
+    }
+    for (int c = 0; c < C; ++c) acc[c] = fma(fp4_dot16(wv[c], x + k0), e4m3f(wsc[c][k0 / 16]), acc[c]);
+  }
+  for (int c = 0; c < C; ++c) out[c] = simd_sum(acc[c]);
+}
+
+// d3_expert_up on NVFP4 experts and bf16 rows x (xsc unused).
+[[max_total_threads_per_threadgroup(128)]] kernel void d3_expert_up_fp4(device const bf16* x [[buffer(0)]], device const float* xsc [[buffer(1)]],
+                             device const Fp4Ptrs* table [[buffer(2)]], device const int* picks [[buffer(3)]],
+                             device const int* counts [[buffer(4)]], device const int* members [[buffer(5)]],
+                             device bf16* gu [[buffer(6)]], constant XpArgs& a [[buffer(7)]],
+                             uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  const uint n0 = (tg.x * 4 + sg) * 2;
+  const int e = a.prompt ? int(tg.y) : picks[tg.y];
+  const int cnt = a.prompt ? counts[e] : 1;
+  if (cnt == 0) return;
+  const Fp4Ptrs w = table[e];
+  const uint hk = a.K / 2, gk = a.K / 16;
+  device const uchar* const rows[4] = {w.g + (ulong)n0 * hk, w.g + (ulong)(n0 + 1) * hk, w.u + (ulong)n0 * hk,
+                                       w.u + (ulong)(n0 + 1) * hk};
+  device const uchar* const sc[4] = {w.gs + (ulong)n0 * gk, w.gs + (ulong)(n0 + 1) * gk, w.us + (ulong)n0 * gk,
+                                     w.us + (ulong)(n0 + 1) * gk};
+  for (int j = 0; j < cnt; ++j) {
+    const uint pair = a.prompt ? uint(members[(ulong)e * a.cap + j]) : tg.y;
+    const uint row = pair / a.slots;
+    float v[4];
+    fp4_rows<4>(rows, sc, a.K, x + (ulong)row * a.K, lane, v);
+    if (lane == 0)
+      for (int c = 0; c < 2; ++c) {
+        const float g = rb(v[c] * w.g2), u = rb(v[2 + c] * w.u2);
+        gu[(ulong)pair * a.N + n0 + c] = f2b(g / (1.0f + precise::exp(-g)) * u);
+      }
+  }
+}
+
+// d3_expert_down on NVFP4 experts and bf16 pair rows gu (xsc unused).
+[[max_total_threads_per_threadgroup(128)]] kernel void d3_expert_down_fp4(device const bf16* gu [[buffer(0)]], device const float* xsc [[buffer(1)]],
+                               device const Fp4Ptrs* table [[buffer(2)]], device const int* picks [[buffer(3)]],
+                               device const int* counts [[buffer(4)]], device const int* members [[buffer(5)]],
+                               device float* down [[buffer(6)]], constant XpArgs& a [[buffer(7)]],
+                               uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  const uint n0 = (tg.x * 4 + sg) * 4;
+  const int e = a.prompt ? int(tg.y) : picks[tg.y];
+  const int cnt = a.prompt ? counts[e] : 1;
+  if (cnt == 0) return;
+  const Fp4Ptrs w = table[e];
+  const uint hk = a.K / 2, gk = a.K / 16;
+  device const uchar* rows[4];
+  device const uchar* sc[4];
+  for (uint c = 0; c < 4; ++c) {
+    rows[c] = w.d + (ulong)(n0 + c) * hk;
+    sc[c] = w.ds + (ulong)(n0 + c) * gk;
+  }
+  for (int j = 0; j < cnt; ++j) {
+    const uint pair = a.prompt ? uint(members[(ulong)e * a.cap + j]) : tg.y;
+    float v[4];
+    fp4_rows<4>(rows, sc, a.K, gu + (ulong)pair * a.K, lane, v);
+    if (lane == 0)
+      for (int c = 0; c < 4; ++c) down[(ulong)pair * a.N + n0 + c] = v[c] * w.d2;
   }
 }
