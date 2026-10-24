@@ -653,6 +653,38 @@ pub const Model = struct {
         // cache would be wasted work and is not needed for request isolation.
     }
 
+    /// The tower's KV rows after its first prompt rows (its position), copied out for prompts that share them.
+    pub const Prefix = struct {
+        rows: usize,
+        cache: Buffer, // per layer: k rows then v rows, bf16 [rows][kv_width]
+
+        pub fn free(q: *Prefix) void {
+            q.cache.free();
+            q.* = undefined;
+        }
+    };
+
+    pub fn savePrefix(self: *const Model, stream: cuda.Stream) !Prefix {
+        const p = self.impl;
+        const rows = p.position;
+        const full = p.options.context * kv_width * 2;
+        const part = rows * kv_width * 2;
+        var cache = try Buffer.alloc(p.driver, layer_count * 2 * part);
+        errdefer cache.free();
+        for (0..layer_count * 2) |i| try cache.copyFrom(i * part, p.cache.ptr + i * full, part, stream.handle);
+        return .{ .rows = rows, .cache = cache };
+    }
+
+    /// After reset: the tower continues at row q.rows, its earlier rows' KV as a run of the same prompt left them.
+    pub fn loadPrefix(self: *Model, stream: cuda.Stream, q: *const Prefix) !void {
+        const p = self.impl;
+        if (q.rows > p.options.context or p.position != 0) return error.BadTowerRows;
+        const full = p.options.context * kv_width * 2;
+        const part = q.rows * kv_width * 2;
+        for (0..layer_count * 2) |i| try p.cache.copyFrom(i * full, q.cache.ptr + i * part, part, stream.handle);
+        p.position = q.rows;
+    }
+
     /// Stage input frames once, before the backbone consumes the same rows.
     /// The returned BF16 codebook-1 embedding is borrowed until the next setInput.
     pub fn setInput(self: *Model, stream: cuda.Stream, frames: []const Frame) !?Buffer {

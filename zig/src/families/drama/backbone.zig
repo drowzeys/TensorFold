@@ -129,6 +129,57 @@ pub const Sequence = struct {
         return context * config.kv_heads * config.head_dim * 2;
     }
 
+    /// The state after this sequence's first `rows` rows, copied out: DeltaNet conv and recurrent banks with their
+    /// row caches and chunk metadata, and each attention layer's first `rows` KV rows.
+    pub const Prefix = struct {
+        rows: usize,
+        state: cuda.DeviceBuffer,
+        kv: cuda.DeviceBuffer, // per attention layer: k rows then v rows, bf16 [rows][kv_heads][head_dim]
+        meta: [config.linear_layers]Meta,
+
+        const Meta = struct { pending: usize, committed_bank: u1 };
+
+        pub fn free(p: *Prefix) void {
+            p.kv.free();
+            p.state.free();
+            p.* = undefined;
+        }
+    };
+
+    /// Copies the state now (after `q.pos` rows) into new buffers, in `stream` order.
+    pub fn savePrefix(q: *const Sequence, stream: cuda.Stream) !Prefix {
+        const d = q.state_buf.d;
+        const rows = q.pos;
+        var state = try cuda.DeviceBuffer.alloc(d, state_bytes);
+        errdefer state.free();
+        var kv = try cuda.DeviceBuffer.alloc(d, config.full_layers * 2 * kvBytes(rows));
+        errdefer kv.free();
+        try state.copyFrom(0, q.state_buf.ptr, state_bytes, stream.handle);
+        for (0..config.full_layers) |slot| {
+            try kv.copyFrom((2 * slot) * kvBytes(rows), q.kCache(slot), kvBytes(rows), stream.handle);
+            try kv.copyFrom((2 * slot + 1) * kvBytes(rows), q.vCache(slot), kvBytes(rows), stream.handle);
+        }
+        var p: Prefix = .{ .rows = rows, .state = state, .kv = kv, .meta = undefined };
+        for (&p.meta, q.gdn_states) |*m, st| m.* = .{ .pending = st.pending, .committed_bank = st.committed_bank };
+        return p;
+    }
+
+    /// Puts a saved prefix back: the sequence continues at row p.rows, as if it had just run them.
+    pub fn loadPrefix(q: *Sequence, p: *const Prefix, stream: cuda.Stream) !void {
+        if (p.rows > q.context) return error.DramaContextOverflow;
+        try q.state_buf.copyFrom(0, p.state.ptr, state_bytes, stream.handle);
+        for (0..config.full_layers) |slot| {
+            try q.kv_buf.copyFrom((2 * slot) * kvBytes(q.context), p.kv.ptr + (2 * slot) * kvBytes(p.rows), kvBytes(p.rows), stream.handle);
+            try q.kv_buf.copyFrom((2 * slot + 1) * kvBytes(q.context), p.kv.ptr + (2 * slot + 1) * kvBytes(p.rows), kvBytes(p.rows), stream.handle);
+        }
+        for (&q.gdn_states, p.meta) |*st, m| {
+            st.pending = m.pending;
+            st.committed_bank = m.committed_bank;
+        }
+        q.pos = p.rows;
+        q.poisoned = false;
+    }
+
     fn convState(q: *const Sequence, slot: usize) u64 {
         return q.state_buf.ptr + slot * conv_state_bytes;
     }
