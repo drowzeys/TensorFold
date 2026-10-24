@@ -6,6 +6,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Drama 3 on CUDA prefills bounded row chunks in each shared round. `TF_DRAMA_PREFILL_ROWS` selects 1 through 1024 rows (default 128); the generation tool uses `--max-rows`. Batched projections and attention can change rounding relative to single-row prefill; oracle checks now compare the selected prompt chunks at their reference-row offsets.
 - Drama 3 on Metal prefills the same bounded row chunks a shared round, with the same `TF_DRAMA_PREFILL_ROWS` setting and default. Metal's per-row arithmetic does not depend on the chunk, so its audio equals single-row prefill.
+- Drama 3 on Metal serves ModelOpt NVFP4 experts and pruned expert sets: the router never picks an expert a layer leaves out, and the experts compute with bf16 activations.
 
 ## 1.1.1
 

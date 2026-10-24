@@ -22,6 +22,8 @@ pub const P = enum {
     d3_plan,
     d3_expert_up,
     d3_expert_down,
+    d3_expert_up_fp4,
+    d3_expert_down_fp4,
     d3_argmax,
     d3_sample_main,
     d3_sample_code,

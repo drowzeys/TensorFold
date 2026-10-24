@@ -524,6 +524,8 @@ pub const metal = [_]M{
     .{ .name = "drama3 moe d3_plan", .threads = 1024, .tg_memory = 1024, .reserved = 1024 },
     .{ .name = "drama3 moe d3_expert_up", .threads = 128, .tg_memory = 0, .reserved = 128 },
     .{ .name = "drama3 moe d3_expert_down", .threads = 128, .tg_memory = 0, .reserved = 128 },
+    .{ .name = "drama3 moe d3_expert_up_fp4", .threads = 128, .tg_memory = 0, .reserved = 128 },
+    .{ .name = "drama3 moe d3_expert_down_fp4", .threads = 128, .tg_memory = 0, .reserved = 128 },
     .{ .name = "drama3 sample d3_argmax", .threads = 1024, .tg_memory = 256, .reserved = 1024 },
     .{ .name = "drama3 sample d3_sample_main", .threads = 256, .tg_memory = 3632, .reserved = 256 },
     .{ .name = "drama3 sample d3_sample_code", .threads = 256, .tg_memory = 3632, .reserved = 256 },
