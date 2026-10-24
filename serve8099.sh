@@ -1,6 +1,7 @@
 #!/bin/zsh
 # serve8099.sh [ENV=VAL...]: Cosmos3-Edge reasoner on :8099 (name cosmos3), pid in ~/tf-src/srv8099.pid
 cd ~/tf-src
+: ${COSMOS_EXTRA=--keep-warm 0}  # beside Bolt and Drama: no idle GPU ticks (voice turns stay at their no-Cosmos latency)
 [ -f srv8099.pid ] && kill $(cat srv8099.pid) 2>/dev/null && sleep 1
 env "$@" zig-out-cosmos/native/bin/tensorfold-native serve ~/models/cosmos3-tf --name cosmos3 --host 127.0.0.1 --port 8099 --no-update-check --vision --context 16384 --parallel 2 ${=COSMOS_EXTRA} > srv8099.log 2>&1 &
 P=$!; echo $P > srv8099.pid
