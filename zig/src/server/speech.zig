@@ -73,6 +73,12 @@ pub fn post(srv: *Server, c: *Conn, a: Allocator) !void {
     synthesize(srv, c, &cx, id, sp, plan, received, &metadata);
 }
 
+/// TF_DRAMA_SEED, when set, seeds every request alike; otherwise each prompt seeds its own draw.
+fn seedOf(prompt: []const u32, salt: i64) u64 {
+    const v = std.c.getenv("TF_DRAMA_SEED") orelse return api.seedFor(prompt, salt);
+    return std.fmt.parseInt(u64, std.mem.span(v), 10) catch api.seedFor(prompt, salt);
+}
+
 fn listed(names: []const []const u8, key: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, name, key)) return true;
     return false;
@@ -125,9 +131,9 @@ fn prepare(srv: *Server, cx: *Cx, sp: api.SpeechInfo, raw: Value) errors.Refused
             return cx.fail(.request, drama_prompt.error_prefix ++ " unknown voice {s}; see /v1/voices", .{name});
         return cx.fail(.request, drama_prompt.error_prefix ++ " unknown voice {s}; only the default voice is supported", .{name});
     };
-    if (try @import("drama_voice.zig").requestPrompt(cx, srv.text, sp, input, refs)) |made| return .{ .input = input, .prompt = made.prompt, .frames = made.frames, .refs = refs, .reference_rows = made.reference_rows, .seed = api.seedFor(made.prompt, srv.config.seed_salt), .format = format, .stream = stream };
+    if (try @import("drama_voice.zig").requestPrompt(cx, srv.text, sp, input, refs)) |made| return .{ .input = input, .prompt = made.prompt, .frames = made.frames, .refs = refs, .reference_rows = made.reference_rows, .seed = seedOf(made.prompt, srv.config.seed_salt), .format = format, .stream = stream };
     const prompt = try promptOf(srv, cx, sp, input);
-    return .{ .input = input, .prompt = prompt, .seed = api.seedFor(prompt, srv.config.seed_salt), .format = format, .stream = stream };
+    return .{ .input = input, .prompt = prompt, .seed = seedOf(prompt, srv.config.seed_salt), .format = format, .stream = stream };
 }
 
 /// The prompt ids of a valid UTF-8 input, refused when it cannot be spoken or is too long.
