@@ -20,7 +20,8 @@ pub const Layer = struct {
     attn: Attn = undefined,
     moe_in: u64, // [1288, 2048]
     shared_down: u64, // [2048, 512]
-    experts: u64, // [256] ExpertPtrs: gate, gate scales, up, up scales, down, down scales (GPU addresses)
+    experts: u64, // [256] ExpertPtrs: gate, gate scales, up, up scales, down, down scales (GPU addresses); NVFP4: Fp4Ptrs
+    keep: u64, // u32 [8]: bit e set when the checkpoint has expert e (a pruned one leaves the others out)
 };
 
 pub const TowerLayer = struct {
@@ -51,6 +52,7 @@ pub const Weights = struct {
     heads: [cfg.codebooks - 1]u64,
     bytes: usize, // copied bf16 bytes
     mapped: usize, // checkpoint bytes read in place
+    fp4: bool, // NVFP4 experts (ModelOpt: e2m1 codes, e4m3 scales a 16, fp32 scale a matrix), maybe pruned
     sh: Shards,
 
     pub fn deinit(w: *Weights, io: std.Io) void {
@@ -118,6 +120,60 @@ fn mapShards(g: *Gpu, sh: *const Shards) ![]u64 {
     return out;
 }
 
+/// Whether the checkpoint's experts are NVFP4: layer 0's first expert present has u8 codes.
+fn nvfp4(sh: *const Shards) !bool {
+    var nb: [160]u8 = undefined;
+    for (0..cfg.experts) |e| {
+        const name = fmt(&nb, "model.language_model.layers.0.mlp.experts.{d}.gate_proj.weight", .{e});
+        if (sh.map.get(name) == null) continue; // pruned (get would log it as missing)
+        return (try sh.get(name)).dtype == .u8;
+    }
+    return error.NoExperts;
+}
+
+/// Layer li's NVFP4 experts as [256] Fp4Ptrs, its kept experts in keep (u32 [8]); missing experts' rows stay zero.
+fn expertTableFp4(l: *Loader, li: usize, maps: []const u64, keep: u64) !u64 {
+    const row = 8 * 8; // six pointers, four floats
+    const table = try l.g.alloc(cfg.experts * row);
+    const bytes = l.g.host(table, cfg.experts * row);
+    @memset(bytes, 0);
+    const bits = std.mem.bytesAsSlice(u32, l.g.host(keep, 32));
+    @memset(bits, 0);
+    const n = cfg.expert_width;
+    const k = cfg.hidden;
+    const parts = [_]struct { []const u8, [2]usize }{ .{ "gate_proj", .{ n, k } }, .{ "up_proj", .{ n, k } }, .{ "down_proj", .{ k, n } } };
+    var nb: [160]u8 = undefined;
+    var kept: usize = 0;
+    for (0..cfg.experts) |e| {
+        if (l.sh.map.get(fmt(&nb, "model.language_model.layers.{d}.mlp.experts.{d}.gate_proj.weight", .{ li, e })) == null) continue; // pruned
+        const ptrs = std.mem.bytesAsSlice(u64, bytes[e * row ..][0..48]);
+        const globals = std.mem.bytesAsSlice(f32, bytes[e * row + 48 ..][0..16]);
+        for (parts, 0..) |p, j| {
+            const wname = fmt(&nb, "model.language_model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ li, e, p[0] });
+            try Loader.expect(try l.sh.get(wname), .u8, &.{ p[1][0], p[1][1] / 2 }, wname);
+            const wl = try l.sh.locate(wname);
+            if (wl.offset % 4 != 0) return error.MisalignedExpert; // read as 32-bit words
+            ptrs[2 * j] = l.g.gpuAddress(maps[wl.file] + wl.offset);
+            const sname = fmt(&nb, "model.language_model.layers.{d}.mlp.experts.{d}.{s}.weight_scale", .{ li, e, p[0] });
+            try Loader.expect(try l.sh.get(sname), .f8_e4m3, &.{ p[1][0], p[1][1] / 16 }, sname);
+            const sl = try l.sh.locate(sname);
+            ptrs[2 * j + 1] = l.g.gpuAddress(maps[sl.file] + sl.offset);
+            const gname = fmt(&nb, "model.language_model.layers.{d}.mlp.experts.{d}.{s}.weight_scale_2", .{ li, e, p[0] });
+            const gt = try l.sh.get(gname);
+            if (gt.dtype != .f32 or gt.bytes.len != 4) {
+                std.log.err("drama3: {s} is not one fp32", .{gname});
+                return error.BadTensor;
+            }
+            globals[j] = @bitCast(std.mem.readInt(u32, gt.bytes[0..4], .little));
+            l.w.mapped += p[1][0] * p[1][1] / 2 + p[1][0] * p[1][1] / 16;
+        }
+        bits[e / 32] |= @as(u32, 1) << @intCast(e % 32);
+        kept += 1;
+    }
+    if (kept < cfg.top_k) return error.TooFewExperts;
+    return table;
+}
+
 /// The 256 experts of layer li: FP8 [512, 2048] gate / up, [2048, 512] down and their fp32 block scales, checked.
 fn expertTable(l: *Loader, li: usize, maps: []const u64) !u64 {
     const table = try l.g.alloc(cfg.experts * 6 * 8);
@@ -152,6 +208,7 @@ pub fn load(g: *Gpu, io: std.Io, dir: []const u8, c: cfg.Config) !*Weights {
     w.mapped = 0;
     w.sh = try Shards.open(g.gpa, io, dir);
     errdefer w.sh.close(io);
+    w.fp4 = try nvfp4(&w.sh);
     const first = g.bufs.items.len;
     errdefer g.releaseFrom(first);
     const maps = try mapShards(g, &w.sh);
@@ -159,6 +216,9 @@ pub fn load(g: *Gpu, io: std.Io, dir: []const u8, c: cfg.Config) !*Weights {
     var l: Loader = .{ .g = g, .sh = &w.sh, .w = w };
     const H = cfg.hidden;
     var nb: [6][192]u8 = undefined;
+    // every expert, for a checkpoint that has them all
+    const all = try g.alloc(32);
+    @memset(g.host(all, 32), 0xFF);
 
     w.embed = try l.one("model.language_model.embed_tokens.weight", &.{ cfg.vocab, H });
     w.cb_emb = try l.one("audio_decoder.codebook_embeddings.weight", &.{ cfg.codebooks * cfg.codebook_size, H });
@@ -201,7 +261,13 @@ pub fn load(g: *Gpu, io: std.Io, dir: []const u8, c: cfg.Config) !*Weights {
         }
         L.moe_in = try l.stack(&.{ fmt(&nb[0], pre ++ "mlp.shared_expert.gate_proj.weight", .{li}), fmt(&nb[1], pre ++ "mlp.shared_expert.up_proj.weight", .{li}), fmt(&nb[2], pre ++ "mlp.gate.weight", .{li}), fmt(&nb[3], pre ++ "mlp.shared_expert_gate.weight", .{li}) }, &.{ cfg.shared_width, cfg.shared_width, cfg.experts, 1 }, H, cfg.moe_proj);
         L.shared_down = try l.one(fmt(&nb[0], pre ++ "mlp.shared_expert.down_proj.weight", .{li}), &.{ H, cfg.shared_width });
-        L.experts = try expertTable(&l, li, maps);
+        if (w.fp4) {
+            L.keep = try g.alloc(32);
+            L.experts = try expertTableFp4(&l, li, maps, L.keep);
+        } else {
+            L.keep = all;
+            L.experts = try expertTable(&l, li, maps);
+        }
     }
     for (0..cfg.tower_layers) |ti| {
         const shared = ti < cfg.shared_layers;
@@ -228,6 +294,6 @@ pub fn load(g: *Gpu, io: std.Io, dir: []const u8, c: cfg.Config) !*Weights {
         T.final_norm = try l.one(tn(&nb[0], p, idx, "final_layernorm.weight"), &.{H});
     }
     for (0..cfg.codebooks - 1) |hi| w.heads[hi] = try l.one(fmt(&nb[0], "audio_decoder_mtp.heads.{d}.weight", .{hi}), &.{ cfg.codebook_size, H });
-    std.log.info("drama3: {d:.2} GB of bf16 weights copied, {d:.2} GB of FP8 experts read in place", .{ @as(f64, @floatFromInt(w.bytes)) / 1e9, @as(f64, @floatFromInt(w.mapped)) / 1e9 });
+    std.log.info("drama3: {d:.2} GB of bf16 weights copied, {d:.2} GB of {s} experts read in place", .{ @as(f64, @floatFromInt(w.bytes)) / 1e9, @as(f64, @floatFromInt(w.mapped)) / 1e9, if (w.fp4) "NVFP4" else "FP8" });
     return w;
 }

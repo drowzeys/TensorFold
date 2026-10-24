@@ -84,9 +84,10 @@ pub fn attn(g: *Gpu, q: u64, kc: u64, vc: u64, pos0: u64, proj: u64, ps: usize, 
     g.go(.d3_attn, .{ t, 16, 1 }, 256, &.{ q, kc, vc, pos0, proj, out }, A{ .ps = u(ps), .go = u(lay.gate_off), .ghs = u(lay.gate_head_stride) });
 }
 
-pub fn router(g: *Gpu, sp: u64, ss: usize, r_off: usize, picks: u64, weights: u64, t: usize) void {
+/// keep: the layer's experts, u32 [8] (bit e of word e / 32); a pruned checkpoint's missing experts are never picked.
+pub fn router(g: *Gpu, sp: u64, ss: usize, r_off: usize, picks: u64, weights: u64, keep: u64, t: usize) void {
     const A = extern struct { ss: u32, off: u32 };
-    g.go(.d3_router, .{ t, 1, 1 }, 256, &.{ sp, picks, weights }, A{ .ss = u(ss), .off = u(r_off) });
+    g.go(.d3_router, .{ t, 1, 1 }, 256, &.{ sp, picks, weights, keep }, A{ .ss = u(ss), .off = u(r_off) });
 }
 
 /// x rows to FP8 values (kept in bf16) and their scales [rows, kdim / 128].
@@ -100,14 +101,15 @@ pub fn plan(g: *Gpu, picks: u64, pairs: usize, counts: u64, members: u64, cap: u
     g.go(.d3_plan, .{ 1, 1, 1 }, 1024, &.{ picks, counts, members }, A{ .pairs = u(pairs), .cap = u(cap) });
 }
 
-pub const Route = struct { table: u64, picks: u64, counts: u64, members: u64, cap: usize, pairs: usize, prompt: bool };
+pub const Route = struct { table: u64, picks: u64, counts: u64, members: u64, cap: usize, pairs: usize, prompt: bool, fp4: bool = false };
 
-/// Routed experts: `up` maps token rows (x) to SwiGLU pair rows, else pair rows to fp32 down rows.
+/// Routed experts: `up` maps token rows (x) to SwiGLU pair rows, else pair rows to fp32 down rows; NVFP4 ignores xsc.
 pub fn experts(g: *Gpu, up: bool, x: u64, xsc: u64, r: Route, kdim: usize, n: usize, out: u64) void {
     const A = extern struct { K: u32, N: u32, prompt: u32, cap: u32, slots: u32 };
     const a: A = .{ .K = u(kdim), .N = u(n), .prompt = @intFromBool(r.prompt), .cap = u(r.cap), .slots = 8 };
     const gy: usize = if (r.prompt) 256 else r.pairs;
-    g.go(if (up) .d3_expert_up else .d3_expert_down, .{ n / @as(usize, if (up) 8 else 16), gy, 1 }, 128, &.{ x, xsc, r.table, r.picks, r.counts, r.members, out }, a);
+    const pipe: gpu.P = if (r.fp4) (if (up) .d3_expert_up_fp4 else .d3_expert_down_fp4) else (if (up) .d3_expert_up else .d3_expert_down);
+    g.go(pipe, .{ n / @as(usize, if (up) 8 else 16), gy, 1 }, 128, &.{ x, xsc, r.table, r.picks, r.counts, r.members, out }, a);
 }
 
 /// Greedy: cand_ids non-zero picks a main token (frame[0..2]), zero a code (frame[0]).
