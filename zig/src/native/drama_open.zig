@@ -76,6 +76,13 @@ pub fn openMetal(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
         problem.* = why;
         return null;
     }
+    // one row a round runs a prompt as that many waited single-row passes (~10 ms a row on an M5 Ultra), so Metal takes
+    // 128 rows a round unless TF_DRAMA_PREFILL_ROWS says otherwise; the audio is the same
+    const prefill_rows = try setting(a, null, "TF_DRAMA_PREFILL_ROWS", 128, problem) orelse return null;
+    if (prefill_rows == 0 or prefill_rows > 1024) {
+        problem.* = "TF_DRAMA_PREFILL_ROWS must be 1 through 1024";
+        return null;
+    }
     return drama_host.open(gpa, io, o.dir, "", .{
         .context = @intCast(window),
         .lanes = if (o.lanes_fixed) o.lanes else 2,
@@ -83,6 +90,7 @@ pub fn openMetal(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
         .max_frames = o.max_frames,
         .cfg_enabled = o.cfg_enabled,
         .cfg_batched = o.cfg_batched,
+        .prefill_rows = prefill_rows,
     }) catch |err| {
         problem.* = if (err == error.OverMemoryLimit)
             try std.fmt.allocPrint(a, "Drama 3 needs more memory than this Mac's load limit allows (70% of RAM, or DRAMA_LOAD_LIMIT_GB); the log names the sizes", .{})
