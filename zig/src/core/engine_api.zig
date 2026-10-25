@@ -256,6 +256,11 @@ pub const Open = struct {
     silence_onset_s: f64 = 0,
     /// --silence-mid-s: seconds of silence that make a speech synthesis's end of speech after 1 s voiced a silence.
     silence_mid_s: f64 = 0,
+    /// --silence-floor-dbfs, --silence-seconds, --silence-mid-min-voiced-s: the speech silence guard's floor, its tail
+    /// and the mid rule's voiced minimum; null: the engine's defaults.
+    silence_floor_dbfs: ?f64 = null,
+    silence_seconds: ?f64 = null,
+    silence_mid_min_voiced_s: ?f64 = null,
     /// --cfg-every, with guidance on: frames between the speech engine's second-sequence runs; null: no guidance.
     cfg_every: ?u32 = null,
     /// --cfg-batched, with guidance on: the speech engine decodes a guided frame's two sequences as one batch.

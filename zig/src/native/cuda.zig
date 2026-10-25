@@ -266,7 +266,7 @@ fn openDrama(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]
         return null;
     };
     const mask = if (o.expert_mask) |path| try drama.expert_mask.read(a, io, path, problem) orelse return null else null;
-    return drama_host.open(gpa, io, o.dir, "", .{ .context = @intCast(window), .max_frames = frames, .silence_onset_s = o.silence_onset_s, .silence_mid_s = o.silence_mid_s, .cfg_every = o.cfg_every, .cfg_batched = o.cfg_batched, .device = device, .expert_mask = mask }) catch |e| {
+    return drama_host.open(gpa, io, o.dir, "", .{ .context = @intCast(window), .max_frames = frames, .silence_onset_s = o.silence_onset_s, .silence_mid_s = o.silence_mid_s, .silence = .{ .floor_dbfs = o.silence_floor_dbfs, .seconds = o.silence_seconds, .mid_min_voiced_s = o.silence_mid_min_voiced_s }, .cfg_every = o.cfg_every, .cfg_batched = o.cfg_batched, .device = device, .expert_mask = mask }) catch |e| {
         const hint = if (e == error.OutOfDeviceMemory and o.max_frames != null) "; the codec's buffers grow with --max-frames" else "";
         problem.* = try std.fmt.allocPrint(a, "the native Drama 3 CUDA engine could not load the checkpoint ({s}){s}", .{ @errorName(e), hint });
         return null;
