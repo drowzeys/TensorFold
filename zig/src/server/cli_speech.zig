@@ -32,12 +32,25 @@ pub const flags = [_]cli.Flag{
     .{ .name = "--max-frames", .native = cli.cuda_build },
     .{ .name = "--silence-onset-s", .native = cli.cuda_build },
     .{ .name = "--silence-mid-s", .native = cli.cuda_build },
+    .{ .name = "--silence-floor-dbfs", .native = cli.cuda_build },
+    .{ .name = "--silence-seconds", .native = cli.cuda_build },
+    .{ .name = "--silence-mid-min-voiced-s", .native = cli.cuda_build },
     .{ .name = "--cfg-gamma", .native = cli.cuda_build },
     .{ .name = "--cfg-every", .native = cli.cuda_build },
     .{ .name = "--cfg-allow-request-gamma", .kind = .store_true, .native = cli.cuda_build },
     .{ .name = "--cfg-force-guided", .kind = .store_true, .native = cli.cuda_build },
     .{ .name = "--cfg-batched", .kind = .store_true, .native = cli.cuda_build },
 };
+
+/// Why the silence flags do not fit together, or null: the onset and mid runs end below the tail, and the mid
+/// rule's voiced minimum needs the mid rule.
+pub fn silenceProblem(out: cli.Args) ?[]const u8 {
+    const tail = out.silence_seconds orelse 10; // drama_generate.seconds
+    if (out.silence_mid_s >= tail) return "--silence-mid-s must be below --silence-seconds (10 s when not given)";
+    if (out.silence_onset_s >= tail) return "--silence-onset-s must be below --silence-seconds (10 s when not given)";
+    if (out.silence_mid_min_voiced_s != null and out.silence_mid_s == 0) return "--silence-mid-min-voiced-s needs --silence-mid-s";
+    return null;
+}
 
 /// --cfg-gamma (0: off), --cfg-every (null: not given), and the store-true --cfg-* flags as given.
 pub const Guidance = struct { gamma: f32 = 0, every: ?u32 = null, request_gamma: bool = false, force_guided: bool = false, batched: bool = false };
@@ -104,10 +117,23 @@ pub fn flag(a: Allocator, out: *cli.Args, name: []const u8, v: []const u8, u: *c
         if (!(s == 0 or (s >= 1 and s < 10))) return cli.fail(u, a, "argument --silence-onset-s: seconds of silence that end a synthesis voiced for less than 1 s, 0 (off) or 1 to below 10: '{s}'", .{v});
         out.silence_onset_s = s;
     } else if (is(u8, name, "--silence-mid-s")) {
-        // past 0, at least 3 s: replayed draws ending in silence held 1.0-2.65 s; every judged one at 3.2 s+ lost words
+        // at -40 dBFS, replayed draws ending in silence held 1.0-2.65 s and every judged one at 3.2 s+ lost words;
+        // TensorFold 1.1.4 serves 2 s at -30 dBFS: any length below the tail (--silence-seconds) is taken
         const s = try cli.float(u, a, name, v);
-        if (!(s == 0 or (s >= 3 and s < 10))) return cli.fail(u, a, "argument --silence-mid-s: seconds of silence end of speech must fall in to end a synthesis as silence, 0 (off) or 3 to below 10: '{s}'", .{v});
+        if (!(s == 0 or (s > 0 and s < 60))) return cli.fail(u, a, "argument --silence-mid-s: seconds of silence end of speech must fall in to end a synthesis as silence, 0 (off) or above 0 and below --silence-seconds: '{s}'", .{v});
         out.silence_mid_s = s;
+    } else if (is(u8, name, "--silence-floor-dbfs")) {
+        const db = try cli.float(u, a, name, v);
+        if (!(db >= -120 and db <= 0)) return cli.fail(u, a, "argument --silence-floor-dbfs: the level a silent frame stays below, -120 to 0 dBFS: '{s}'", .{v});
+        out.silence_floor_dbfs = db;
+    } else if (is(u8, name, "--silence-seconds")) {
+        const s = try cli.float(u, a, name, v);
+        if (!(s > 0 and s <= 60)) return cli.fail(u, a, "argument --silence-seconds: seconds of silence that end a synthesis, above 0 to 60: '{s}'", .{v});
+        out.silence_seconds = s;
+    } else if (is(u8, name, "--silence-mid-min-voiced-s")) {
+        const s = try cli.float(u, a, name, v);
+        if (!(s > 0 and s <= 60)) return cli.fail(u, a, "argument --silence-mid-min-voiced-s: voiced seconds --silence-mid-s needs first, above 0 to 60: '{s}'", .{v});
+        out.silence_mid_min_voiced_s = s;
     } else if (is(u8, name, "--cfg-gamma")) {
         const g = try cli.float(u, a, name, v);
         if (!(g == 0 or drama_cfg.valid(g))) return cli.fail(u, a, "argument --cfg-gamma: the guidance weight on a referenced prompt's semantic logits, 0 (off) or 1 (unguided) to 5: '{s}'", .{v});
@@ -242,7 +268,29 @@ test "--silence-mid-s: off by default, CUDA builds only, 0 or 3 to below 10 s, a
     if (@import("builtin").os.tag != .linux) return std.testing.expectError(error.Usage, cli.parse(a, &.{ "m", "--silence-mid-s", "3" }, &u));
     try std.testing.expectEqual(@as(f64, 3.5), (try cli.request(a, "d", "t", try cli.parse(a, &.{ "m", "--silence-mid-s=3.5" }, &u))).silence_mid_s);
     try std.testing.expectEqual(@as(f64, 0), (try cli.parse(a, &.{ "m", "--silence-mid-s", "0" }, &u)).silence_mid_s);
-    for ([_][]const u8{ "2.9", "-1", "10", "nan", "3s" }) |bad| try std.testing.expectError(error.Usage, cli.parse(a, &.{ "m", "--silence-mid-s", bad }, &u));
+    for ([_][]const u8{ "-1", "10", "nan", "3s" }) |bad| try std.testing.expectError(error.Usage, cli.parse(a, &.{ "m", "--silence-mid-s", bad }, &u));
+}
+
+test "--silence-floor-dbfs, --silence-seconds, --silence-mid-min-voiced-s: unset by default, checked, and they reach the engine" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: cli.Usage = .{};
+    const off = try cli.request(a, "d", "t", try cli.parse(a, &.{"m"}, &u));
+    try std.testing.expect(off.silence_floor_dbfs == null and off.silence_seconds == null and off.silence_mid_min_voiced_s == null);
+    if (@import("builtin").os.tag != .linux) return std.testing.expectError(error.Usage, cli.parse(a, &.{ "m", "--silence-seconds", "4" }, &u));
+    const on = try cli.request(a, "d", "t", try cli.parse(a, &.{ "m", "--silence-floor-dbfs=-30", "--silence-seconds=4", "--silence-mid-s=2", "--silence-mid-min-voiced-s=1", "--silence-redraws=3", "--silence-redraw-budget-s=90" }, &u));
+    try std.testing.expect(on.silence_floor_dbfs.? == -30 and on.silence_seconds.? == 4 and on.silence_mid_s == 2 and on.silence_mid_min_voiced_s.? == 1);
+    for ([_][]const []const u8{
+        &.{ "m", "--silence-floor-dbfs", "1" },
+        &.{ "m", "--silence-floor-dbfs", "nan" },
+        &.{ "m", "--silence-seconds", "0" },
+        &.{ "m", "--silence-seconds", "61" },
+        &.{ "m", "--silence-seconds", "4", "--silence-mid-s", "4" },
+        &.{ "m", "--silence-seconds", "4", "--silence-onset-s", "5" },
+        &.{ "m", "--silence-mid-min-voiced-s", "1" },
+        &.{ "m", "--silence-mid-s", "2", "--silence-mid-min-voiced-s", "0" },
+    }) |bad| try std.testing.expectError(error.Usage, cli.parse(a, bad, &u));
 }
 
 test "--allowed-controls: unset by default; a comma list of names normalized as controls are, brackets refused" {

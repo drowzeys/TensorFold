@@ -40,6 +40,8 @@ pub const Options = struct {
     silence_onset_s: f64 = 0,
     /// --silence-mid-s: seconds of silence that make end of speech after 1 s voiced a silence; 0: off.
     silence_mid_s: f64 = 0,
+    /// --silence-floor-dbfs, --silence-seconds, --silence-mid-min-voiced-s; null fields: the guard's defaults.
+    silence: generation.Tuning = .{},
     cfg_every: ?u32 = null, // --cfg-every: frames between a guided request's second-sequence runs; null: no guidance
     cfg_batched: bool = false, // --cfg-batched: a guided frame's two sequences decode as one batch
     device: u32 = 0,
@@ -59,6 +61,7 @@ const Host = struct {
     context: usize,
     silence_onset_s: f64 = 0,
     silence_mid_s: f64 = 0,
+    silence: generation.Tuning = .{},
     driver: cuda.Driver = undefined,
     ctx: cuda.Context = undefined,
     stream: cuda.Stream = undefined,
@@ -302,7 +305,7 @@ const Host = struct {
         const codes: []Codes = if (r.generated.len > 0) r.generated else h.codes;
         const cadence: generation.Cadence = if (r.stream) .{ .first = 1, .chunk = stream_chunk_frames } else .{ .first = whole_chunk_frames, .chunk = whole_chunk_frames };
         h.codec.begin();
-        const ending = try generation.run(&steps, codes[0..r.max_frames], cadence, .init(sample_rate, h.silence_onset_s, h.silence_mid_s), frame_length);
+        const ending = try generation.run(&steps, codes[0..r.max_frames], cadence, .tuned(sample_rate, h.silence_onset_s, h.silence_mid_s, h.silence), frame_length);
         if (h.guide) |g| g.note(h, job.id, guided != null, ending.frames, began);
         if (ending.frames == 0) return error.EmptySpeech;
         return .{ .samples = ending.frames * frame_length, .reason = ending.reason, .hollow = ending.hollow };
@@ -480,7 +483,7 @@ pub fn open(gpa: Allocator, io: std.Io, checkpoint_dir: []const u8, kernel_dir: 
     const speech = speechInfo(options.context, options.max_frames) orelse return error.BadDramaContext;
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
-    h.* = .{ .gpa = gpa, .io = io, .context = options.context, .silence_onset_s = options.silence_onset_s, .silence_mid_s = options.silence_mid_s };
+    h.* = .{ .gpa = gpa, .io = io, .context = options.context, .silence_onset_s = options.silence_onset_s, .silence_mid_s = options.silence_mid_s, .silence = options.silence };
     h.codes = try gpa.alloc(Codes, options.max_frames);
     errdefer gpa.free(h.codes);
 

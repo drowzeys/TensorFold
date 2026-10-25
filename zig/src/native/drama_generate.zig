@@ -12,30 +12,58 @@ const floor_power = 1e-4;
 /// Voiced seconds after which only the 10 s rule applies: 42 of 189 measured collapses voiced less before collapsing.
 pub const onset_voiced_seconds = 1;
 
+/// --silence-floor-dbfs, --silence-seconds and --silence-mid-min-voiced-s (TensorFold 1.1.4's names); null: the
+/// defaults above (-40 dBFS, 10 s, 1 s). A stall can sit in a flat hum near -36 dBFS, above the default floor.
+pub const Tuning = struct {
+    floor_dbfs: ?f64 = null,
+    seconds: ?f64 = null,
+    mid_min_voiced_s: ?f64 = null,
+
+    pub fn floorDbfs(t: Tuning) f64 {
+        return t.floor_dbfs orelse -40; // floor_power's level
+    }
+    pub fn tailSeconds(t: Tuning) f64 {
+        return t.seconds orelse seconds;
+    }
+    pub fn midVoicedSeconds(t: Tuning) f64 {
+        return t.mid_min_voiced_s orelse onset_voiced_seconds;
+    }
+};
+
 /// The samples of the current run of silent frames, and of the voiced frames so far.
 pub const Guard = struct {
     limit: usize,
+    /// A frame whose mean power is below this is silent.
+    floor: f32 = floor_power,
     /// --silence-onset-s in samples: a silent run this long ends a synthesis voiced less than `voiced_limit`; 0: off.
     onset: usize = 0,
-    /// --silence-mid-s in samples: end of speech in a silent run this long, after `voiced_limit`, is silence; 0: off.
+    /// --silence-mid-s in samples: end of speech in a silent run this long, after `mid_voiced`, is silence; 0: off.
     mid: usize = 0,
     voiced_limit: usize,
+    /// --silence-mid-min-voiced-s in samples: the voiced audio the mid rule needs first.
+    mid_voiced: usize = 0,
     run: usize = 0,
     voiced: usize = 0,
 
     pub fn init(sample_rate: u32, onset_s: f64, mid_s: f64) Guard {
+        return tuned(sample_rate, onset_s, mid_s, .{});
+    }
+
+    pub fn tuned(sample_rate: u32, onset_s: f64, mid_s: f64, t: Tuning) Guard {
         const per_s: f64 = @floatFromInt(sample_rate);
         return .{
-            .limit = seconds * @as(usize, sample_rate),
+            .limit = @intFromFloat(@round(t.tailSeconds() * per_s)),
+            .floor = if (t.floor_dbfs) |db| @floatCast(std.math.pow(f64, 10, db / 10)) else floor_power,
             .onset = @intFromFloat(@round(onset_s * per_s)),
             .mid = @intFromFloat(@round(mid_s * per_s)),
             .voiced_limit = onset_voiced_seconds * @as(usize, sample_rate),
+            .mid_voiced = @intFromFloat(@round(t.midVoicedSeconds() * per_s)),
         };
     }
 
     /// The samples of the --silence-mid-s hole end of speech now falls in, or 0: in replays every such draw lost words.
     pub fn hollow(g: *const Guard) usize {
-        return if (g.mid > 0 and g.run >= g.mid and g.voiced >= g.voiced_limit) g.run else 0;
+        return if (g.mid > 0 and g.run >= g.mid and g.voiced >= g.mid_voiced) g.run else 0;
     }
 
     /// Hears whole frames of `frame_length` samples; the frames up to the one ending a run that ends it, or null.
@@ -46,7 +74,7 @@ pub const Guard = struct {
             heard += 1;
             var power: f32 = 0;
             for (samples) |x| power += x * x;
-            if (power < floor_power * @as(f32, @floatFromInt(samples.len))) {
+            if (power < g.floor * @as(f32, @floatFromInt(samples.len))) {
                 g.run += samples.len;
             } else {
                 g.run = 0;
@@ -389,4 +417,24 @@ test "under 1 s voiced a hole is the onset rule's, cut at 3 s; from 1 s voiced, 
             }
         }
     }
+}
+
+test "tuned: a -36 dBFS hum the default floor hears as voiced trips a -30 dBFS, 4 s guard; defaults are as before" {
+    const hum36: f32 = 0.0158; // -36 dBFS
+    var levels: [140 + 300]f32 = undefined;
+    @memset(levels[0..140], speech);
+    @memset(levels[140..], hum36);
+    const four = 87; // the frame that completes 4 s of silence (86.13 frames)
+    const t: Tuning = .{ .floor_dbfs = -30, .seconds = 4, .mid_min_voiced_s = 1 };
+    for ([_]Cadence{ stream, whole }) |cadence| {
+        try std.testing.expectEqual(Ending{ .frames = levels.len, .reason = .stop }, (try ends(&levels, 4096, cadence))[0]);
+        try std.testing.expectEqual(Ending{ .frames = 140 + four, .reason = .silence }, (try guardEnds(&levels, 4096, cadence, .tuned(rate, 0, 0, t)))[0]);
+        // a 2.5 s hum before end of speech is the mid rule's under the tuned floor, and voiced under the default one
+        const hole = levels[0 .. 140 + 54];
+        try std.testing.expectEqual(Ending{ .frames = hole.len, .reason = .silence, .hollow = 54 * frame }, (try guardEnds(hole, 4096, cadence, .tuned(rate, 0, 2, t)))[0]);
+        try std.testing.expectEqual(Ending{ .frames = hole.len, .reason = .stop }, (try guardEnds(hole, 4096, cadence, .init(rate, 0, 2)))[0]);
+    }
+    const d: Guard = .init(rate, 1, 3);
+    const same: Guard = .tuned(rate, 1, 3, .{});
+    try std.testing.expectEqual(d, same);
 }

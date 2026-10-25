@@ -186,6 +186,9 @@ pub const Args = struct {
     allowed_controls: ?[]const []const u8 = null, // the [...] controls a speech input keeps; null: all
     silence_onset_s: f64 = 0, // seconds of silence that end a Drama 3 synthesis voiced for less than 1 s; 0: off
     silence_mid_s: f64 = 0, // seconds of silence a Drama 3 synthesis's end of speech must fall in to be one; 0: off
+    silence_floor_dbfs: ?f64 = null, // the Drama 3 silence guard's floor; null: the engine's (-40 dBFS)
+    silence_seconds: ?f64 = null, // the silent run that ends a Drama 3 synthesis; null: the engine's (10 s)
+    silence_mid_min_voiced_s: ?f64 = null, // the voiced audio --silence-mid-s needs first; null: the engine's (1 s)
     cfg: @import("cli_speech.zig").Guidance = .{}, // the --cfg-* flags as given
     expert_mask: ?[]const u8 = null, // a JSON file of the routed experts each Drama 3 layer may pick; null: all
 };
@@ -241,6 +244,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
     if (out.long_form_set and !out.long_form) return fail(u, a, "--long-form-chars, --long-form-history and --shift-pause-s need --long-form", .{});
     if (out.silence_redraw_set and out.silence_redraw.max == 0) return fail(u, a, "--silence-redraw-budget-s, --silence-redraw-plain, --silence-redraw-plain-scope and --short-reply-ratio need --silence-redraws from 1", .{});
     if (out.silence_redraw.plain_scope != .cues and !out.silence_redraw.plain) return fail(u, a, "--silence-redraw-plain-scope controls needs --silence-redraw-plain", .{});
+    if (@import("cli_speech.zig").silenceProblem(out)) |why| return fail(u, a, "{s}", .{why});
     if (out.register_set and out.register.st == 0) return fail(u, a, "--register-redraw-high and --register-high-hz need --register-redraw-st above 0", .{});
     if ((out.cfg.every != null or out.cfg.force_guided or out.cfg.batched) and @import("cli_speech.zig").guidance(out) == null) return fail(u, a, "--cfg-every, --cfg-force-guided and --cfg-batched need --cfg-gamma or --cfg-allow-request-gamma", .{});
     try ranks(u, a, out);
@@ -385,6 +389,9 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .max_frames = args.max_frames,
         .silence_onset_s = args.silence_onset_s,
         .silence_mid_s = args.silence_mid_s,
+        .silence_floor_dbfs = args.silence_floor_dbfs,
+        .silence_seconds = args.silence_seconds,
+        .silence_mid_min_voiced_s = args.silence_mid_min_voiced_s,
         .expert_mask = args.expert_mask,
         .mtp_drafts = args.mtp_drafts,
         .mtp_confidence = args.mtp_confidence,

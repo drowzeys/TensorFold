@@ -16,6 +16,8 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
     if (o.max_frames != null) return "--max-frames bounds a Drama 3 speech synthesis: serve this text model without it";
     if (o.silence_onset_s != 0) return "--silence-onset-s guards a Drama 3 speech synthesis: serve this text model without it";
     if (o.silence_mid_s != 0) return "--silence-mid-s guards a Drama 3 speech synthesis: serve this text model without it";
+    if (o.silence_floor_dbfs != null or o.silence_seconds != null or o.silence_mid_min_voiced_s != null)
+        return "--silence-floor-dbfs, --silence-seconds and --silence-mid-min-voiced-s tune a Drama 3 speech synthesis's silence guard: serve this text model without them";
     if (o.cfg_every != null) return "--cfg-gamma and --cfg-allow-request-gamma guide a Drama 3 speech synthesis: serve this text model without them";
     if (o.expert_mask != null) return "--expert-mask masks Drama 3's routed experts: serve this text model without it";
     return null;
