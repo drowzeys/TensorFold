@@ -34,6 +34,8 @@ pub const pages = @import("cuda_pages.zig");
 pub const slide = @import("cuda_slide.zig");
 pub const worker = @import("cuda_worker.zig");
 pub const omni = @import("cuda_native_omni.zig");
+/// Nemotron 3.5 Bolt over libbolt (nemotron_h_puzzle): the lane backend a recipe copies in beside this file.
+pub const bolt = @import("bolt_native.zig");
 pub const identity = @import("core").checkpoint_identity;
 
 test {
