@@ -23,6 +23,19 @@ const window: u32 = 8;
 /// Prompt rows a cancel waits for at most, and the smaller piece while other streams decode.
 const piece_rows: usize = 2048;
 const busy_piece_rows: usize = 512;
+/// A cache mark this close to the prompt's end is kept at the end instead: one forward, not two (BOLT_TAIL_MERGE, 0: off).
+/// A state at the end is a prefix of the next turn too (its reply follows the same opening), and a lookahead-0 state keys
+/// at any row; the store never resumes a prompt at its own end, so the first token always has a row of its own.
+var tail_merge: usize = 0; // Metal: off by default (its later snapshot copy cost decode more than the merge saved; BOLT_TAIL_MERGE=8 turns it on)
+/// Keep a merged end mark after the first token instead of before it (BOLT_MARK_LATE=0: before).
+var defer_mark = true;
+
+/// Keep a stream's merged end mark now, while its sequence still ends at the prompt (libbolt refuses a copy otherwise).
+fn settleMark(s: *lanes.Stream, slot: *Slot) void {
+    if (!slot.mark_due) return;
+    slot.mark_due = false;
+    if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(slot.at));
+}
 /// Streams and rows one shared forward carries (libbolt's SEG_MAX and BATCH_MAX).
 const max_segs: usize = 16;
 const max_batch: u32 = 128;
@@ -52,6 +65,7 @@ const Slot = struct {
     decoding: bool = false, // the prompt pass is over
     held: [window]u32 = @splat(0), // the drafts held for the stream's next window
     held_n: u32 = 0,
+    mark_due: bool = false, // a merged end-of-prompt mark not kept yet: the state is still the prompt's end
 };
 
 /// Draws wait here between the forward and the round loop reading them back.
@@ -145,16 +159,23 @@ const Engine = struct {
         if (slot.at >= prompt_len) return true;
         const rows: usize = if (e.decoding > 0) busy_piece_rows else piece_rows;
         var end = @min(prompt_len, slot.at + rows);
+        var merged = false; // a mark in the last few rows, kept at the prompt's end by this piece
         for (s.reuse.marks) |m| {
-            if (m > slot.at and m < end) end = m;
+            if (m > slot.at and m < end) {
+                if (prompt_len - m <= tail_merge) merged = true else end = m;
+            }
         }
+        merged = merged and end == prompt_len;
         const last = end == prompt_len;
         const cand: c_int = if (last) candCount(s) else 0;
         const rc = e.api.prefill(e.model, slot.seq, slot.ids.ptr + slot.at, @intCast(end - slot.at), cand);
         if (rc != 0) return error.BoltForward;
         slot.at = end;
         if (s.reuse.hook) |hk| {
-            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(slot.at)) != null) hk.at(hk.ptr, s, @intCast(slot.at));
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(slot.at)) != null) hk.at(hk.ptr, s, @intCast(slot.at)) else if (merged) {
+                // its copy (and the drafter's catch-up on the prompt) waits until the first token has gone out
+                if (defer_mark) slot.mark_due = true else hk.at(hk.ptr, s, @intCast(slot.at));
+            }
         }
         if (!last) return false;
         e.gpa.free(slot.ids);
@@ -199,6 +220,7 @@ const Engine = struct {
             .handle => |h| e.ring[h % draw_ring],
             .value => |v| v,
         };
+        settleMark(s, slot);
         const ids = [1]c_int{@intCast(tok)};
         const k = candCount(s);
         // a one-row window, kept at once: the same attention arithmetic as every verify window, alone or among streams
@@ -228,6 +250,7 @@ const Engine = struct {
         e.maskbuf.clearRetainingCapacity();
         for (windows, 0..) |w, i| {
             const slot = try e.slotOf(w.stream);
+            settleMark(w.stream, slot);
             const rows = w.rows();
             if (rows > window or w.parents != null or total + rows > max_batch) return error.WindowTooWide;
             if (w.masks.len != 0) {
@@ -300,6 +323,7 @@ const Engine = struct {
         var n: usize = 0;
         for (requests) |r| {
             const slot = try e.slotOf(r.stream);
+            settleMark(r.stream, slot);
             slot.held_n = 0;
             // a shared round drafts before it keeps: cut the stream back to its kept rows first (a repeat is a no-op)
             if (r.rows) |rows| e.api.keep(e.model, slot.seq, @intCast(rows.len));
@@ -329,6 +353,7 @@ const Engine = struct {
 
     fn release(ptr: *anyopaque, s: *lanes.Stream) void {
         const e: *Engine = @ptrCast(@alignCast(ptr));
+        if (e.slots.get(s)) |live| settleMark(s, live); // its copy finds the sequence through the slot
         const kv = e.slots.fetchRemove(s) orelse return;
         const slot = kv.value;
         if (slot.decoding) e.decoding -|= 1;
@@ -353,7 +378,9 @@ const Engine = struct {
                 .release = Engine.release,
             };
         };
-        return .{ .ptr = e, .vtable = &vt.v };
+        // the first token leaves before LiLiCorr's first proposal (BOLT_FIRST_EARLY=0: after it)
+        const early = if (std.c.getenv("BOLT_FIRST_EARLY")) |v| v[0] != '0' else true;
+        return .{ .ptr = e, .vtable = &vt.v, .first_before_draft = early };
     }
 };
 
@@ -367,6 +394,18 @@ pub const Loaded = struct {
     deinit: *const fn (*anyopaque) void,
     target: *anyopaque, // the prompt cache's opaque handle: the engine
 };
+
+/// The server's idle keepalive tick: libbolt commits a tiny command buffer on its queue.
+pub fn keepTick(p: *anyopaque) void {
+    const e: *Engine = @ptrCast(@alignCast(p));
+    if (e.api.tick) |t| t(e.model);
+}
+
+/// Whether the loaded libbolt has a keepalive tick.
+pub fn canTick(p: *anyopaque) bool {
+    const e: *Engine = @ptrCast(@alignCast(p));
+    return e.api.tick != null;
+}
 
 fn shutdown(p: *anyopaque) void {
     const e: *Engine = @ptrCast(@alignCast(p));
@@ -414,6 +453,8 @@ pub fn open(gpa: std.mem.Allocator, dir: []const u8, o: Options) !Loaded {
         return error.BoltMissing;
     };
     const api = try lib.Api.load(handle);
+    if (std.c.getenv("BOLT_TAIL_MERGE")) |v| tail_merge = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tail_merge;
+    if (std.c.getenv("BOLT_MARK_LATE")) |v| defer_mark = v[0] != '0';
     if (api.abi() != lib.abi_version) {
         std.log.err("bolt: libbolt.dylib speaks ABI {d}, this server {d}: build it from the same source", .{ api.abi(), lib.abi_version });
         return error.BoltMissing;

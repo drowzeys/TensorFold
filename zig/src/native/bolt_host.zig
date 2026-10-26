@@ -83,8 +83,13 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         }, .{ .lookahead = bolt.snap_lookahead, .min_prompt = 0, .warm = .waits }, plan.budget_bytes);
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
+        // after a reply, the conversation and the next turn's opening prefill once the engine has been quiet 150 ms, so the
+        // next turn resumes past the reply (the server's warm turns; CUDA Bolt has them through its family's warm_quiet)
+        h.host.info_.warm_turns = true;
+        h.host.warm_quiet = 150 * std.time.ns_per_ms;
     }
     errdefer if (h.cache) |*store| store.deinit();
+    if (bolt.canTick(loaded.ctx)) h.host.keepalive_target = .{ .ctx = loaded.ctx, .tick = bolt.keepTick };
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

@@ -1623,3 +1623,34 @@ extern "C" int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
 extern "C" void* bolt_snap_save(Bolt* b, int at) { return bolt_snap_save_seq(b, 0, at); }
 extern "C" int bolt_snap_restore(Bolt* b, void* handle) { return bolt_snap_restore_seq(b, 0, handle); }
 extern "C" void bolt_snap_drop(Bolt*, void* handle) { delete (Snap*)handle; }
+
+// The server's idle keepalive (--keep-warm): one tiny command buffer on Bolt's queue, so the GPU and the wired weights
+// stay ready between requests (a lone request after a second of quiet otherwise starts about 170 ms later on an M5 Ultra).
+extern "C" void bolt_tick(Bolt*) {
+    @autoreleasepool {
+        static id<MTLBuffer> scratch = [G.dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        static id<MTLComputePipelineState> copy = pso("copy_f32");   // first tick: idle, the engine thread is not encoding
+        if (getenv("BOLT_TICK_BLIT")) {
+            id<MTLCommandBuffer> cb = [G.q commandBuffer];
+            id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+            [e fillBuffer:scratch range:NSMakeRange(0, 64) value:0];
+            [e endEncoding];
+            [cb commit];
+            return;
+        }
+        id<MTLCommandBuffer> cb = [G.q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e useResources:G.bufs.data() count:G.bufs.size() usage:MTLResourceUsageRead];
+        [e useResource:scratch usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        CopyArgs a{};
+        a.src = scratch.gpuAddress;
+        a.dst = scratch.gpuAddress + 32;
+        a.n = 1;
+        [e setComputePipelineState:copy];
+        [e setBytes:&a length:sizeof(a) atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+    }
+}
+

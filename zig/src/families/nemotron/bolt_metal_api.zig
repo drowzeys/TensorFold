@@ -40,6 +40,7 @@ pub const Api = struct {
     snap_save: *const fn (?*anyopaque, c_int, c_int) callconv(.c) ?*anyopaque,
     snap_restore: *const fn (?*anyopaque, c_int, ?*anyopaque) callconv(.c) c_int,
     snap_drop: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
+    tick: ?*const fn (?*anyopaque) callconv(.c) void, // the idle keepalive's command buffer (null: a libbolt without one)
 
     pub fn load(handle: ?*anyopaque) !Api {
         return .{
@@ -68,6 +69,7 @@ pub const Api = struct {
             .snap_save = try sym(*const fn (?*anyopaque, c_int, c_int) callconv(.c) ?*anyopaque, handle, "bolt_snap_save_seq"),
             .snap_restore = try sym(*const fn (?*anyopaque, c_int, ?*anyopaque) callconv(.c) c_int, handle, "bolt_snap_restore_seq"),
             .snap_drop = try sym(*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void, handle, "bolt_snap_drop"),
+            .tick = @ptrCast(@alignCast(dlsym(handle, "bolt_tick"))),
         };
     }
 
