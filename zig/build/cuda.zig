@@ -2,6 +2,7 @@
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 const golden_build = @import("golden.zig");
+const bolt_build = @import("bolt.zig");
 const catalog = @import("cuda_kernels.zig");
 pub const Kernel = catalog.Kernel;
 pub const kernels = catalog.kernels;
@@ -46,6 +47,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const prebuilt = opts.fatbins;
     const sms = opts.sms;
     const strip = opts.strip;
+    bolt_build.steps(b, nvcc);
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
         const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
@@ -351,6 +353,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     }) });
     bolt.dependOn(&compile_bolt.step);
     step.dependOn(&compile_bolt.step);
+    // the libbolt lane backend (zig/src/families/nemotron/bolt_native.zig, copied in from a recipe) without a GPU or the library
+    const compile_lib = b.addObject(.{ .name = "bolt_lib_compile", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/bolt_lib_compile.zig"),
+        .target = cuda_target,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = check_cuda }, .{ .name = "nemotron", .module = check_mods.nemotron } },
+    }) });
+    b.step("compile-bolt-family", "Compile the libbolt lane backend (nemotron_h_puzzle) without a GPU").dependOn(&compile_lib.step);
     for ([_]*std.Build.Module{ mods.nemotron, mods.lanes, mods.radio }) |m|
         bolt.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const video_step = b.step("test-omni-video-host", "Actual RADIO and Bolt video boundaries without a GPU or decoder library");

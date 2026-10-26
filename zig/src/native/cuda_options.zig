@@ -41,6 +41,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
     if (@hasField(F.Options, "prompt_int8")) opts.prompt_int8 = o.prompt_int8;
     if (@hasField(F.Options, "loops")) opts.loops = o.loops;
+    if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes; // a family that keeps one sequence of state per stream
     return true;
 }
 
