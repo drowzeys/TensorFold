@@ -43,6 +43,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "probe", .flags = &.{"-O3"} },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "qmm_prefill", .flags = &.{"-O3"} },
+    .{ .name = "qmm_midrow", .flags = &.{"-O3"} }, // ours: qmm_prefill's bits on tiles sized to a prompt's rows
     .{ .name = "flashnext_fact", .flags = &.{"-O3"} }, // ours: prompt rows on qmm.cu's factored arithmetic
     .{ .name = "flashnext_hcf", .flags = glue }, // ours: the hyper-connection read-out's prompt tiles, fn_hc's bits
     .{ .name = "flashnext_fexp", .flags = &.{"-O3"} }, // ours: prompt pairs' experts on expert_rows' factored arithmetic

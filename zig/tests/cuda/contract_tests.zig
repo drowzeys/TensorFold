@@ -208,6 +208,9 @@ pub fn run(gpu: check.Gpu) !void {
     }
     defer for (&verify_controls) |*m| m.deinit();
     for (&verify_controls) |*m| if (m.kernel()) |k| try kernels.append(a, k);
+    var mid_set: @import("contract_qmm_mid.zig").Set = .{};
+    defer mid_set.deinit();
+    try mid_set.add(gpu, s, &affine4, mods[5], &kernels);
     var mx = [_]mx_k.Product{
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .clusters = true },
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane_reduce, .clusters = false },

@@ -157,6 +157,9 @@ their 64-value sums bit-equal to the fp32 tree).
 CUDA also checks the MLX affine token rows (4 bits, and 2 to 6 or 8 bits times a bf16 scale, each
 output bit-equal to float64 at its rounding points; two controls, one dropping the rounding point, one folding the scale
 into the group's scale and bias).
+CUDA also checks `qmm_midrow`'s ten affine 4-bit prompt tiles (16 to 128 rows by 32 to 256 columns, which GB10 serves
+for prompts of tens to hundreds of rows), each bit-equal to `qmm_prefill`'s 128-row tile on Qwen3.8-27B's projections
+and every tile edge (control: the 80 by 256 tile summing K's groups last to first).
 CUDA also checks qk_rows' attention inputs at head dims to 512 with a unit v norm and MLX's bf16
 rows (three controls, each dropping one option).
 CUDA also checks `window_attention`'s rows at head dims 256 and 512 (`window_rows.cu`: decode chunks and their merge,

@@ -342,3 +342,13 @@ TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_gs, tf_act_l2::US | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_us, tf_act_l2::GS | tf_act_l2::PROD)
 TF_CTL_SWIGLU_L2(tf_ctl_swiglu_l2_drop_prod, tf_act_l2::GS | tf_act_l2::US)
 #undef TF_CTL_SWIGLU_L2
+
+#include "qmm_midrow.cuh"
+
+// qmm_midrow's 80x256 tile with K's groups last to first: the same fp32 terms, not qmm_prefill's bits.
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_qmm_mid_reverse(const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w,
+                                                                       const __nv_bfloat16* __restrict__ s, const __nv_bfloat16* __restrict__ b,
+                                                                       __nv_bfloat16* __restrict__ out, int M, int N, int K, int npad, int ldx,
+                                                                       int group) {
+    tf_qmm_midrow::mid<80, 256, 1, 8, 2, true>(x, w, s, b, out, M, N, K, npad, ldx, group);
+}
