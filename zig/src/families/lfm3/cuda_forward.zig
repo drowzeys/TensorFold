@@ -37,6 +37,11 @@ const Pass = struct {
             };
             return g.run(p.s, x, v.codes, out, rows, v.n, v.k, .bf16);
         }
+        // a lane weight with a plain twin (`loadTwins`): prompt rows through cuBLASLt as torch's Linear
+        if (p.prompt) if (p.gemm) |g| if (p.m.w.twinOf(w)) |t| {
+            const v = t.bf16;
+            return g.run(p.s, x, v.codes, out, rows, v.n, v.k, .bf16);
+        };
         const lin = p.k.linear();
         const in: cuda.qlinear.Rows = .{ .x = x, .part = p.m.s.part };
         if (p.prompt and w == .nvfp4) return lin.prompt(p.s, w, in, out, rows);

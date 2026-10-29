@@ -38,10 +38,21 @@ pub const Weights = struct {
     buffers: std.ArrayList(DeviceBuffer) = .empty,
     /// bf16 projections kept as stored [n, k] for a prompt-only GEMM (`loadPlain`); no lane decode layout.
     plain: bool = false,
+    /// `loadTwins`: each lane projection's plain copy, by its lane codes, for prompt rows through cuBLASLt.
+    twins: std.AutoHashMapUnmanaged(u64, Proj) = .empty,
+
+    /// The plain copy prompt rows read for lane weight `w`, if it has one.
+    pub fn twinOf(w: *const Weights, p: Proj) ?Proj {
+        return switch (p) {
+            .bf16 => |b| w.twins.get(b.codes),
+            else => null,
+        };
+    }
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
         w.buffers.deinit(w.gpa);
+        w.twins.deinit(w.gpa);
         w.gpa.free(w.layers);
         w.config.deinit();
         w.* = undefined;
@@ -78,6 +89,7 @@ const Ctx = struct {
     k: *const kern.Kernels,
     ck: *core.checkpoint.Checkpoint,
     stage: DeviceBuffer,
+    twins: bool = false,
 
     fn tensor(x: *Ctx, name: []const u8, dtype: core.checkpoint.DType, shape: []const usize) !u64 {
         return x.w.upload(x.d, (try x.ck.expect(name, dtype, shape)).bytes);
@@ -106,8 +118,14 @@ const Ctx = struct {
         }
         const out = try x.w.alloc(x.d, cuda.modelopt.padded(n) * k * 2);
         try x.k.pack.bf16Lane(x.s, src, out, n, k);
+        const lane: Proj = .{ .bf16 = cuda.modelopt.bf16Weight(out, n, k) };
+        if (x.twins and src == x.stage.ptr) {
+            const rows = try x.w.alloc(x.d, n * k * 2);
+            try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(rows, src, n * k * 2, x.s.handle), "cuMemcpyDtoDAsync");
+            try x.w.twins.put(x.w.gpa, out, .{ .bf16 = cuda.modelopt.bf16Weight(rows, n, k) });
+        }
         try x.s.synchronize(); // the next projection's staging overwrites this one's
-        return .{ .bf16 = cuda.modelopt.bf16Weight(out, n, k) };
+        return lane;
     }
 
     /// NVFP4 projections [n_i, k] sharing one tensor scale, stacked along n as one `.nvfp4` lane weight.
@@ -169,21 +187,30 @@ fn named(b: []u8, prefix: []const u8, suffix: []const u8) ![]const u8 {
 
 /// Every tensor checked against the admitted geometry and packed for the lane; `layers` caps them (tests).
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8, layers: ?usize) !Weights {
-    return loadWith(gpa, io, d, s, k, dir, layers, false);
+    return loadWith(gpa, io, d, s, k, dir, layers, .lane);
+}
+
+/// `load` of the bf16 release with each projection's plain copy beside its lane one (`twinOf`): prompts on cuBLASLt.
+pub fn loadTwins(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8) !Weights {
+    return loadWith(gpa, io, d, s, k, dir, null, .twins);
 }
 
 /// `load` with the bf16 release's projections kept plain (`Weights.plain`); the tied head stays a lane weight.
 pub fn loadPlain(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8) !Weights {
-    return loadWith(gpa, io, d, s, k, dir, null, true);
+    return loadWith(gpa, io, d, s, k, dir, null, .plain);
 }
 
-fn loadWith(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8, layers: ?usize, plain: bool) !Weights {
+/// Lane weights alone, plain rows alone (d1's prompt-only GEMM), or both (prompt rows plain, decode rows on the lane).
+const Mode = enum { lane, plain, twins };
+
+fn loadWith(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8, layers: ?usize, mode: Mode) !Weights {
+    const plain = mode == .plain;
     var config = try c.Config.read(gpa, io, dir);
     if (config.scheme == .mlx_affine or (config.scheme == .modelopt_nvfp4 and config.kind != .text)) {
         config.deinit();
         return error.UnsupportedLfm3Quantization; // MLX affine and FP8 exports: other loaders of the same layers
     }
-    if (plain and config.scheme != .bf16) {
+    if (mode != .lane and config.scheme != .bf16) {
         config.deinit();
         return error.UnsupportedLfm3Quantization;
     }
@@ -200,7 +227,7 @@ fn loadWith(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.S
     const h = c.hidden;
     var stage = try DeviceBuffer.alloc(d, stage_bytes);
     defer stage.free();
-    var x: Ctx = .{ .w = &w, .d = d, .s = s, .k = k, .ck = &ck, .stage = stage };
+    var x: Ctx = .{ .w = &w, .d = d, .s = s, .k = k, .ck = &ck, .stage = stage, .twins = mode == .twins };
     var nb1: [96]u8 = undefined;
     w.embed = try x.tensor(try named(&nb1, root, "embed_tokens.weight"), .bf16, &.{ c.vocab, h });
     w.head = try x.pack(w.embed, c.vocab, h); // tied: the lane's copy of the embedding

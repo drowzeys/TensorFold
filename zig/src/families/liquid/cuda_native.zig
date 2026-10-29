@@ -22,8 +22,8 @@ pub fn Native(comptime F: type) type {
 
         /// The server's reading of the room left after the weights; null if unreadable.
         pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
-        /// No `precision` field: the server refuses --precision for this family by name.
-        pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 8, lanes_fixed: bool = false, room: ?Room = null };
+        /// No `precision` field (refused by name); `prompt_gemm`: bf16 prompt rows on cuBLASLt (`wts.loadTwins`).
+        pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 8, lanes_fixed: bool = false, room: ?Room = null, prompt_gemm: bool = false };
 
         pub const Loaded = struct {
             backend: lanes.backend.Backend,
@@ -40,7 +40,7 @@ pub fn Native(comptime F: type) type {
             engine_paged: bool = true,
         };
 
-        const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: kern.Kernels, s: cuda.Stream, m: mdl.Model, lb: be.Liquid };
+        const Owned = struct { gpa: std.mem.Allocator, w: wts.Weights, k: kern.Kernels, s: cuda.Stream, m: mdl.Model, lb: be.Liquid, g: ?cuda.vit.Gemms = null };
 
         /// Streams to allocate in `room`: as asked, else the most that fit; a fixed count past them refuses.
         fn fit(room: u64, asked: u32, fixed: bool, plan: anytype) !usize {
@@ -94,7 +94,8 @@ pub fn Native(comptime F: type) type {
             errdefer own.k.deinit();
             own.s = try cuda.Stream.init(ctx.d, false);
             errdefer own.s.deinit();
-            own.w = try wts.load(gpa, io, ctx.d, own.s, &own.k, dir, null);
+            const twins = comptime @hasDecl(wts, "loadTwins");
+            own.w = if (twins and o.prompt_gemm) try wts.loadTwins(gpa, io, ctx.d, own.s, &own.k, dir) else try wts.load(gpa, io, ctx.d, own.s, &own.k, dir, null);
             errdefer own.w.deinit();
             try F.check(&own.w.config);
             const context = @min(mdl.Model.positions(o.context), own.w.config.context);
@@ -112,6 +113,11 @@ pub fn Native(comptime F: type) type {
             errdefer own.m.deinit();
             own.lb = try be.Liquid.init(gpa, ctx.d, &own.m, &own.k, own.s);
             errdefer own.lb.deinit();
+            if (twins and o.prompt_gemm) {
+                own.g = try cuda.vit.Gemms.init(gpa, ctx.d);
+                own.lb.gemm = &own.g.?;
+            }
+            errdefer if (own.g) |*g| g.deinit();
             return .{
                 .backend = own.lb.backend(),
                 .facts = own.lb.facts(),
@@ -181,6 +187,7 @@ pub fn Native(comptime F: type) type {
         fn release(p: *anyopaque) void {
             const own: *Owned = @ptrCast(@alignCast(p));
             own.lb.deinit();
+            if (own.g) |*g| g.deinit();
             own.m.deinit();
             own.w.deinit();
             own.s.deinit();
