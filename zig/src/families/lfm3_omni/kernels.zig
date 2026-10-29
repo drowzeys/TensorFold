@@ -165,7 +165,7 @@ pub const Kernels = struct {
         a.add(i(ld));
         a.add(i(ldy));
         a.add(eps);
-        a.add(@intFromEnum(mode));
+        a.add(@backingInt(mode));
         a.add(i(ldw));
         try go(k.fns.om_rmsnorm, s, rows, 256, 0, &a);
     }
@@ -357,7 +357,7 @@ pub const Kernels = struct {
         a.add(i(rows));
         a.add(i(cols));
         a.add(@as(i32, @intFromBool(per_row)));
-        a.add(@intFromEnum(act));
+        a.add(@backingInt(act));
         try go(k.fns.om_bias_act, s, blocks(rows * cols, 256), 256, 0, &a);
     }
 

@@ -13,4 +13,5 @@ pub const Engine = engine.Engine;
 test {
     _ = mel;
     _ = prompt;
+    _ = engine;
 }

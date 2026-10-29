@@ -1015,3 +1015,42 @@ fn pickCode(logits: []f32, q: usize, smp: Sampling, rng: std.Random, history: []
     }
     return @intCast(logits.len - 1);
 }
+
+test "overlap-add: streamed chunks give the samples of one whole decode" {
+    const gpa = std.testing.allocator;
+    var window: [cfg.n_fft]f32 = undefined;
+    for (&window, 0..) |*w, i| w.* = @floatCast(0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / cfg.n_fft));
+    const rows = 37;
+    const frames = try gpa.alloc(f32, rows * cfg.n_fft);
+    defer gpa.free(frames);
+    var prng = std.Random.DefaultPrng.init(7);
+    for (frames) |*x| x.* = prng.random().float(f32) - 0.5;
+    var whole = OverlapAdd.init(gpa, &window);
+    defer whole.deinit();
+    const a = try gpa.dupe(f32, try whole.add(frames, true));
+    defer gpa.free(a);
+    try std.testing.expectEqual(@as(usize, rows * cfg.hop), a.len);
+    var parts = OverlapAdd.init(gpa, &window);
+    defer parts.deinit();
+    var b: std.ArrayList(f32) = .empty;
+    defer b.deinit(gpa);
+    var at: usize = 0;
+    for ([_]usize{ 6, 6, 12, 1, 12 }) |n| {
+        try b.appendSlice(gpa, try parts.add(frames[at * cfg.n_fft .. (at + n) * cfg.n_fft], at + n == rows));
+        at += n;
+    }
+    try std.testing.expectEqualSlices(f32, a, b.items);
+}
+
+test "synthesis basis: a cosine bin comes back as the windowed cosine" {
+    const gpa = std.testing.allocator;
+    var window: [cfg.n_fft]f32 = @splat(1);
+    const m = try synthesisBasis(gpa, &window);
+    defer gpa.free(m);
+    // the spectrum of cos(2 pi 3 t / n) is n / 2 at bin 3 (real)
+    for (0..cfg.n_fft) |t| {
+        const want = @cos(2.0 * std.math.pi * 3.0 * @as(f64, @floatFromInt(t)) / cfg.n_fft);
+        const got = @as(f64, m[3 * cfg.n_fft + t]) * cfg.n_fft / 2.0;
+        try std.testing.expectApproxEqAbs(want, got, 1e-5);
+    }
+}
