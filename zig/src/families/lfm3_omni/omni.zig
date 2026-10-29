@@ -5,6 +5,7 @@ pub const stack = @import("stack.zig");
 pub const kernels = @import("kernels.zig");
 pub const engine = @import("engine.zig");
 pub const prompt = @import("prompt.zig");
+pub const serve = @import("serve.zig");
 pub const wav = @import("wav");
 
 pub const Engine = engine.Engine;

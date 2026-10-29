@@ -95,6 +95,9 @@ fn msSince(io: std.Io, t0: i128) f64 {
 
 const Mode = enum { text, audio, interleaved };
 
+/// Frames the device's repetition window holds (the reference's default window).
+const hist_cap = 64;
+
 const Downsample = struct {
     conv_in_w: u64,
     conv_in_b: u64,
@@ -215,6 +218,18 @@ pub const Engine = struct {
     lin_b: u64,
     basis: u64, // f32 [1282, 1280]
 
+    // the log-mel front end on the device
+    mel_pcm: u64, // f32 [samples]
+    mel_win: u64, // f32 [400]
+    mel_dft: u64, // f32 [400, 2 * 201]: cos | sin
+    mel_fb: u64, // f32 [201, 128]
+    mel_fr: u64, // f32 [frames, 400]
+    mel_s: u64, // f32 [frames, 402]
+    mel_p: u64, // f32 [frames, 201]
+    mel_m: u64, // f32 [frames, 128]
+    // the device's frame: order | codes | masked (i32 [3 * 12]) and the repetition window's frames (a ring)
+    dframe: u64,
+    hist: u64,
     // scratch
     mel_f32: u64,
     mel_bf: u64,
@@ -387,6 +402,28 @@ pub const Engine = struct {
         const w1 = (F + 1) / 2;
         const w2 = (w1 + 1) / 2;
         e.mel_f32 = try a.alloc(cfg.mel_bins * F * 4);
+        e.mel_pcm = try a.alloc((e.o.max_input_s * melmod.sample_rate + melmod.n_fft) * 4);
+        e.mel_fr = try a.alloc(F * melmod.n_fft * 4);
+        e.mel_s = try a.alloc(F * 2 * melmod.bins * 4);
+        e.mel_p = try a.alloc(F * melmod.bins * 4);
+        e.mel_m = try a.alloc(F * melmod.mels * 4);
+        {
+            const gpa = e.gpa;
+            const win = try gpa.alloc(f32, melmod.n_fft);
+            defer gpa.free(win);
+            for (win, e.mel.window) |*w, x| w.* = @floatCast(x);
+            e.mel_win = try a.upload(std.mem.sliceAsBytes(win));
+            const dft = try gpa.alloc(f32, melmod.n_fft * 2 * melmod.bins);
+            defer gpa.free(dft);
+            for (0..melmod.n_fft) |n| for (0..melmod.bins) |kk| {
+                dft[n * 2 * melmod.bins + kk] = @floatCast(e.mel.cos[n][kk]);
+                dft[n * 2 * melmod.bins + melmod.bins + kk] = @floatCast(e.mel.sin[n][kk]);
+            };
+            e.mel_dft = try a.upload(std.mem.sliceAsBytes(dft));
+            e.mel_fb = try a.upload(std.mem.sliceAsBytes(&e.mel.filters));
+        }
+        e.dframe = try a.alloc(3 * cfg.codebooks * 4);
+        e.hist = try a.zeroed(hist_cap * cfg.codebooks * 4);
         e.mel_bf = try a.alloc(cfg.mel_bins * F * 2);
         e.a1 = try a.alloc(C * 64 * w1 * 2);
         e.a2 = try a.alloc(C * 32 * w2 * 2);
@@ -451,13 +488,29 @@ pub const Engine = struct {
         e.mel.compute(pcm, out);
     }
 
-    /// The speech encoder and projector over host features [128, nf]: `audio_emb` holds one row per 8 frames.
-    pub fn encode(e: *Engine, feats: []const f32, nf: usize) !usize {
+    /// Log-mel features of 16 kHz `pcm` on the device (into `mel_f32`, [128, frames]); returns the frames.
+    pub fn featuresDevice(e: *Engine, pcm: []const f32) !usize {
+        const k = &e.k;
+        const s = e.stream;
+        const nf = melmod.frames(pcm.len);
+        if (nf > melmod.frames(e.o.max_input_s * melmod.sample_rate)) return error.InputTooLong;
+        try e.h2d(e.mel_pcm, std.mem.sliceAsBytes(pcm));
+        try k.melFrames(s, e.mel_pcm, pcm.len, e.mel_win, e.mel_fr, nf, melmod.n_fft, melmod.hop);
+        try k.matmul(s, false, false, nf, 2 * melmod.bins, melmod.n_fft, e.mel_fr, e.mel_dft, e.mel_s, .f32, .f32);
+        try k.power(s, e.mel_s, e.mel_p, nf, melmod.bins);
+        try k.matmul(s, false, false, nf, melmod.mels, melmod.bins, e.mel_p, e.mel_fb, e.mel_m, .f32, .f32);
+        try k.logmel(s, e.mel_m, e.mel_f32, nf, melmod.mels, -12.0);
+        return nf;
+    }
+
+    /// The speech encoder and projector over host features [128, nf] (null: `featuresDevice`'s, on the device):
+    /// `audio_emb` holds one row per 8 frames.
+    pub fn encode(e: *Engine, feats: ?[]const f32, nf: usize) !usize {
         const k = &e.k;
         const s = e.stream;
         const C = cfg.conv_channels;
         if (nf > melmod.frames(e.o.max_input_s * melmod.sample_rate)) return error.InputTooLong;
-        try e.h2d(e.mel_f32, std.mem.sliceAsBytes(feats));
+        if (feats) |fh| try e.h2d(e.mel_f32, std.mem.sliceAsBytes(fh));
         try k.f32ToBf16(s, e.mel_f32, e.mel_bf, cfg.mel_bins * nf);
         const w1 = (nf + 1) / 2;
         const w2 = (w1 + 1) / 2;
@@ -603,6 +656,34 @@ pub const Engine = struct {
         return codes;
     }
 
+    /// A speech frame on the device, from the last hidden state: the passes of the mask schedule each pick their
+    /// codebooks (`om_depth_pick`); the frame (all end-of-speech if any code is) is left in `dframe`'s codes and fed
+    /// to the backbone's next row in `bb_x`. `hn` frames of the repetition window are in `hist`.
+    fn frameDevice(e: *Engine, smp: Sampling, order: *const [cfg.codebooks]i32, frame: usize, hn: usize) !void {
+        const k = &e.k;
+        const s = e.stream;
+        const NQ = cfg.codebooks;
+        var init: [3 * NQ]i32 = undefined;
+        @memcpy(init[0..NQ], order);
+        @memset(init[NQ .. 2 * NQ], 0);
+        @memset(init[2 * NQ ..], 1);
+        try e.h2d(e.dframe, std.mem.sliceAsBytes(&init));
+        const codes = e.dframe + NQ * 4;
+        const masked = e.dframe + 2 * NQ * 4;
+        try e.depthStart();
+        var at: usize = 0;
+        for (cfg.maskgit_schedule) |n| {
+            try k.depthIn(s, e.din, e.mask_emb, e.depth_tables, codes, masked, e.dx, NQ, cfg.depth_d, cfg.codebook_size);
+            try e.depth.reset(s);
+            try e.depth.forward(k, s, e.dx, NQ, e.dout);
+            try k.rmsnormRows(s, e.dout, 0, e.depth_norms, cfg.depth_d, e.dz, cfg.depth_d, cfg.depth_d, cfg.depth_d, NQ, 1e-5, .head);
+            try k.linearBatched(s, e.depth_tables, cfg.codebook_size * cfg.depth_d, e.dz, cfg.depth_d, cfg.depth_d, cfg.codebook_size, e.dlog, cfg.codebook_size, 1, NQ);
+            try k.depthPick(s, .{ .logits = e.dlog, .order = e.dframe, .p0 = at, .n = n, .hist = e.hist, .hn = hn, .penalty = smp.audio_repetition_penalty, .temperature = smp.audio_temperature, .seed = smp.seed, .frame = frame, .codes = codes, .masked = masked, .nq = NQ, .size = cfg.codebook_size });
+            at += n;
+        }
+        try k.frameEnd(s, codes, NQ, cfg.audio_eos_code);
+    }
+
     // ---- the codec
 
     /// Decodes `frames` (each 12 codes) after those already decoded; windowed frames for the overlap-add (host).
@@ -612,12 +693,8 @@ pub const Engine = struct {
         const n = frames.len;
         if (n == 0) return &.{};
         if (n > e.o.codec_chunk) return error.CodecChunkTooLong;
-        var codes: [cfg.codebooks * 256]i32 = undefined;
-        for (frames, 0..) |fr, t| for (fr, 0..) |c, q| {
-            codes[q * n + t] = c;
-        };
-        try e.h2d(e.c_codes, std.mem.sliceAsBytes(codes[0 .. cfg.codebooks * n]));
-        try k.fsqDecode(s, e.c_codes, n, e.c_lat, n, cfg.codebooks);
+        try e.h2d(e.c_codes, std.mem.sliceAsBytes(frames));
+        try k.fsqDecode(s, e.c_codes, e.c_lat, n, cfg.codebooks);
         try k.linearF32(s, e.po_w, e.c_lat, cfg.codebooks * 4, cfg.codebooks * 4, cfg.quantizer_dim, e.c_f32, n);
         try k.biasAct(s, e.c_f32, e.po_b, e.c_p1, n, cfg.quantizer_dim, false, .none);
         try k.linearF32(s, e.fq_w, e.c_p1, cfg.quantizer_dim, cfg.quantizer_dim, cfg.codec_d, e.c_f32, n);
@@ -668,13 +745,28 @@ pub const Engine = struct {
         var fi: usize = 0; // forced: the next reference frame
         var si: usize = 1; // forced: the next reference slot (0 is the interleaved marker)
         var step: usize = 0;
+        // the device path samples frames on the GPU (one copy back a frame); teacher forcing and top-k use the host's
+        const device = forced == null and smp.audio_top_k == 0;
+        var hist_n: usize = 0;
         while (step < smp.max_new) : (step += 1) {
             const interleaving = mode == .interleaved;
+            const last_step = step + 1 == smp.max_new;
             var finished = false;
             if (mode == .audio or (interleaving and speaking)) {
                 const t0 = nowNs(io);
-                const lo = history.items.len -| smp.audio_repetition_window;
-                var codes = try e.sampleFrame(smp, rng, history.items[lo..]);
+                var codes: [cfg.codebooks]i32 = undefined;
+                if (device) {
+                    var order: [cfg.codebooks]i32 = undefined;
+                    var perm: [cfg.codebooks]usize = undefined;
+                    for (&perm, 0..) |*x, i| x.* = i;
+                    if (!smp.identity_order) rng.shuffle(usize, &perm);
+                    for (&order, perm) |*o, x| o.* = @intCast(x);
+                    try e.frameDevice(smp, &order, step, @min(hist_n, hist_cap));
+                    try e.d2h(std.mem.sliceAsBytes(&codes), e.dframe + cfg.codebooks * 4);
+                } else {
+                    const lo = history.items.len -| smp.audio_repetition_window;
+                    codes = try e.sampleFrame(smp, rng, history.items[lo..]);
+                }
                 st_.depth_ms += msSince(io, t0);
                 if (forced) |fc| {
                     // the reference's returned slots leave out its end-of-speech frames: a text slot where a frame
@@ -705,14 +797,17 @@ pub const Engine = struct {
                     codes = @splat(cfg.audio_eos_code);
                     mode = .text;
                 } else {
-                    try history.append(e.gpa, codes);
+                    if (device) {
+                        try e.k.histPush(e.stream, e.dframe + cfg.codebooks * 4, e.hist, hist_n % hist_cap, cfg.codebooks);
+                        hist_n += 1;
+                    } else try history.append(e.gpa, codes);
                     st_.frames += 1;
                     if (st_.frames == 1) st_.first_frame_ms = msSince(io, t_req);
                     if (sink.frame) |f| try f(sink.ctx, &codes);
                     try pending.append(e.gpa, codes);
                 }
-                try e.h2d(e.dcodes, std.mem.sliceAsBytes(&codes));
-                try e.k.embedCodes(e.stream, e.cb_embed, e.dcodes, e.bb_x, 1, cfg.hidden, cfg.codebooks, cfg.codebook_size);
+                if (!device) try e.h2d(e.dframe + cfg.codebooks * 4, std.mem.sliceAsBytes(&codes));
+                try e.k.embedCodes(e.stream, e.cb_embed, e.dframe + cfg.codebooks * 4, e.bb_x, 1, cfg.hidden, cfg.codebooks, cfg.codebook_size);
             } else {
                 var tok = try e.textPick();
                 if (forced) |fc| {
@@ -741,9 +836,11 @@ pub const Engine = struct {
                     speaking = false;
                     text_done = false;
                 }
-                const id: i32 = @intCast(tok);
-                try e.h2d(e.ids, std.mem.asBytes(&id));
-                try e.k.embed(e.stream, e.embed, e.ids, e.bb_x, 1, cfg.hidden);
+                if (forced != null) {
+                    const id: i32 = @intCast(tok);
+                    try e.h2d(e.pick, std.mem.asBytes(&id));
+                }
+                try e.k.embed(e.stream, e.embed, e.pick, e.bb_x, 1, cfg.hidden);
             }
             if (interleaving and !text_done) {
                 slots_left -= 1;
@@ -752,21 +849,36 @@ pub const Engine = struct {
                     slots_left = if (speaking) cfg.interleaved_n_audio else cfg.interleaved_n_text;
                 }
             }
-            // the codec, between steps: the first frames as soon as they exist, then whole chunks
-            if (stream.audio) {
-                const want: usize = if (decoded == 0) stream.first else stream.chunk;
-                if (pending.items.len >= want or (finished and pending.items.len > 0) or (mode == .text and pending.items.len > 0)) {
-                    try e.flushCodec(&ola, &pending, &decoded, sink, st_, t_req, false);
-                }
-            }
             if (forced) |fc| if (si >= fc.seq.len and mode != .audio and !(mode == .interleaved and speaking)) {
                 finished = true;
             };
-            if (finished or step + 1 == smp.max_new) break;
+            // the codec before the next backbone row: the first frames as soon as they exist, then whole chunks
+            var frames_out: []const f32 = &.{};
+            if (stream.audio) {
+                const want: usize = if (decoded == 0) stream.first else stream.chunk;
+                if (pending.items.len >= want or (pending.items.len > 0 and (finished or mode == .text))) {
+                    const t2 = nowNs(io);
+                    frames_out = try e.codecChunk(pending.items, null);
+                    decoded += pending.items.len;
+                    pending.clearRetainingCapacity();
+                    st_.codec_ms += msSince(io, t2);
+                }
+            }
+            const go_on = !(finished or last_step);
             const t1 = nowNs(io);
-            try e.stepRow();
-            st_.step_ms += msSince(io, t1);
+            if (go_on) try e.stepRow();
+            // the overlap-add on the host while the row runs
+            if (frames_out.len > 0) {
+                const pcm = try ola.add(frames_out, false);
+                if (pcm.len > 0) {
+                    if (st_.samples == 0) st_.first_pcm_ms = msSince(io, t_req);
+                    st_.samples += pcm.len;
+                    if (sink.pcm) |f| try f(sink.ctx, pcm);
+                }
+            }
+            if (!go_on) break;
             if (sink.hidden) |f| try f(sink.ctx);
+            st_.step_ms += msSince(io, t1);
         }
         if (stream.audio) try e.flushCodec(&ola, &pending, &decoded, sink, st_, t_req, true);
         st_.total_ms = msSince(io, t_req);

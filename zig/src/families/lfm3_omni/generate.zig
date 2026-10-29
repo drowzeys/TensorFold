@@ -8,11 +8,14 @@ const cfg = om.config;
 const Engine = om.Engine;
 
 const usage =
-    \\usage: lfm3-omni-generate --model DIR --wav IN.wav [--out REPLY.wav] [--system TEXT | --system-file FILE]
+    \\usage: lfm3-omni-generate --model DIR --serve HOST:PORT [--system TEXT | --system-file FILE] [sampling flags]
+    \\       lfm3-omni-generate --model DIR --wav IN.wav [--out REPLY.wav] [--system TEXT | --system-file FILE]
     \\                          [--audio-temperature 0.4] [--audio-repetition-penalty 1.2] [--audio-top-k 0]
     \\                          [--identity-order 1] [--seed 0] [--max-new 512] [--first-chunk 1] [--chunk 8]
     \\                          [--dump DIR] [--force DIR] [--repeat 1]
     \\
+    \\--serve: POST /v1/audio/chat {"audio": base64 WAV, "system"?, "stream"? (true), "audio_temperature"?, "seed"?,
+    \\  "max_new"?} answers with server-sent events (text deltas, base64 pcm16 24 kHz audio, then done) or one JSON.
     \\The input is any PCM or float WAV, resampled to 16 kHz; the reply is 16-bit PCM mono at 24 kHz.
     \\--dump DIR (an existing directory) writes the stages as raw little-endian arrays: mel.f32 [128, frames],
     \\  enc.f32 and audio_emb.f32 [tokens, ...], input_ids.i32, prefill_hidden.f32 [rows, 2048], first_logits.f32,
@@ -21,6 +24,7 @@ const usage =
     \\--codec-ref DIR: with --dump, codec_lin.f32 and reply.f32 decode DIR's gen_codes.i32 ([12, frames]) instead.
     \\--depth-check DIR: the depth decoder alone on DIR's depth_h.f32 [n, 2048] and depth_codes.i32 [n, 12]: three
     \\  passes a row (identity order), every pass's logits written to depth_check.f32 [n, 3, 12, 2017]; no reply.
+    \\--host-mel 1 computes the log-mel features on the host (a float64 DFT) instead of the device.
     \\--force DIR reads a reference's gen_seq.i32 and gen_codes.i32 ([12, frames]) and feeds them back, scoring the
     \\  engine's own picks (greedy text, its audio sampling settings) at every slot.
     \\The last stderr line is "RESULT lfm3-omni OK ..." with the timings.
@@ -39,6 +43,8 @@ const Args = struct {
     codec_ref: ?[]const u8 = null,
     depth_check: ?[]const u8 = null,
     repeat: usize = 1,
+    host_mel: bool = false,
+    serve: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -57,7 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
         const v = argv[i + 1];
         if (eq(k, "--model")) a.model = v else if (eq(k, "--wav")) a.wav = v else if (eq(k, "--out")) a.out = v else if (eq(k, "--system")) a.system = v else if (eq(k, "--system-file")) {
             a.system = std.mem.trim(u8, try std.Io.Dir.cwd().readFileAlloc(io, v, arena, .limited(1 << 20)), " \n\r\t");
-        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else {
+        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--serve")) a.serve = v else if (eq(k, "--host-mel")) a.host_mel = !eq(v, "0") else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else {
             std.debug.print("unknown flag {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -66,6 +72,21 @@ pub fn main(init: std.process.Init) !u8 {
         const e = try Engine.create(gpa, io, a.model, .{});
         defer e.destroy();
         try depthCheck(arena, io, e, dc);
+        return 0;
+    }
+    if (a.serve) |hp| {
+        if (a.model.len == 0) {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return error.ServeIsHostColonPort;
+        const tpath0 = try std.fs.path.join(arena, &.{ a.model, "tokenizer.json" });
+        var tok0 = try core.tokenizer.loadTokenizer(io, gpa, tpath0);
+        defer tok0.deinit();
+        const e = try Engine.create(gpa, io, a.model, .{});
+        defer e.destroy();
+        try warm(gpa, io, e, &tok0, a);
+        try om.serve.run(gpa, io, e, &tok0, .{ .host = hp[0..colon], .port = try std.fmt.parseInt(u16, hp[colon + 1 ..], 10), .system = a.system, .smp = a.smp, .stream = a.stream });
         return 0;
     }
     if (a.model.len == 0 or a.wav.len == 0) {
@@ -85,6 +106,25 @@ pub fn main(init: std.process.Init) !u8 {
     var r: usize = 0;
     while (r < a.repeat) : (r += 1) try run(gpa, io, a, e, &tok, pcm, r + 1 == a.repeat);
     return 0;
+}
+
+/// One short turn on a second of quiet noise, so the first request finds cuBLAS's plans and the kernels loaded.
+fn warm(gpa: std.mem.Allocator, io: std.Io, e: *Engine, tok: *const core.tokenizer.Tokenizer, a: Args) !void {
+    var ar_state = std.heap.ArenaAllocator.init(gpa);
+    defer ar_state.deinit();
+    const ar = ar_state.allocator();
+    const pcm = try ar.alloc(f32, om.mel.sample_rate);
+    var prng = std.Random.DefaultPrng.init(1);
+    for (pcm) |*x| x.* = (prng.random().float(f32) - 0.5) * 0.002;
+    const nf = try e.featuresDevice(pcm);
+    const n = try e.encode(null, nf);
+    const p = try om.prompt.build(ar, tok, a.system, n);
+    try e.prefill(p.ids, p.audio_at, null);
+    var st: om.engine.Stats = .{};
+    var smp = a.smp;
+    smp.max_new = 24;
+    var sink_ctx: u8 = 0;
+    try e.reply(smp, .{}, .{ .ctx = &sink_ctx }, null, &st, om.engine.nowNs(io));
 }
 
 fn eq(x: []const u8, y: []const u8) bool {
@@ -149,15 +189,16 @@ fn run(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *Engine, tok: *const core
     var st: om.engine.Stats = .{};
     const t_req = om.engine.nowNs(io);
     // speech in
-    const nf = om.mel.frames(pcm.len);
+    var nf = om.mel.frames(pcm.len);
     const feats = try ar.alloc(f32, cfg.mel_bins * nf);
-    e.features(pcm, feats);
+    if (a.host_mel) e.features(pcm, feats) else nf = try e.featuresDevice(pcm);
     st.mel_ms = @as(f64, @floatFromInt(om.engine.nowNs(io) - t_req)) / 1e6;
     const t_enc = om.engine.nowNs(io);
-    const n_audio = try e.encode(feats, nf);
+    const n_audio = try e.encode(if (a.host_mel) feats else null, nf);
     const dump = if (last) a.dump else null;
     if (dump) |d| {
         try e.stream.synchronize();
+        if (!a.host_mel) try e.d2h(std.mem.sliceAsBytes(feats), e.mel_f32);
         try writeRaw(io, d, "mel.f32", std.mem.sliceAsBytes(feats));
         try writeRaw(io, d, "enc.f32", std.mem.sliceAsBytes(try deviceRows(ar, e, e.enc_out, n_audio * cfg.enc_d)));
         try writeRaw(io, d, "audio_emb.f32", std.mem.sliceAsBytes(try deviceRows(ar, e, e.audio_emb, n_audio * cfg.hidden)));
@@ -205,7 +246,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *Engine, tok: *const core
         try writeRaw(io, d, "reply_stream.f32", std.mem.sliceAsBytes(out.pcm.items));
         var frames: []const [cfg.codebooks]i32 = out.frames.items;
         if (a.codec_ref) |cr| frames = try readFrames(ar, io, cr);
-        try dumpDepthAndCodec(ar, io, e, d, p.ids, p.audio_at, frames);
+        try dumpDepthAndCodec(ar, io, e, d, p.ids, p.audio_at, frames, a.stream);
         hidden.deinit(gpa);
     }
     if (forced) |f| std.debug.print("FORCED text {d}/{d} codes {d}/{d} frames {d}/{d}\n", .{ f.text_hits, f.text_total, f.code_hits, f.code_total, f.frame_hits, f.frame_total });
@@ -261,7 +302,7 @@ fn deviceRows(ar: std.mem.Allocator, e: *Engine, src: u64, n: usize) ![]f32 {
 }
 
 /// The first frame's depth logits from the prompt (every codebook masked) and the whole reply through the codec.
-fn dumpDepthAndCodec(ar: std.mem.Allocator, io: std.Io, e: *Engine, d: []const u8, ids: []const u32, audio_at: usize, frames: []const [cfg.codebooks]i32) !void {
+fn dumpDepthAndCodec(ar: std.mem.Allocator, io: std.Io, e: *Engine, d: []const u8, ids: []const u32, audio_at: usize, frames: []const [cfg.codebooks]i32, sm: om.engine.Streaming) !void {
     // the reference scores the prompt without the interleaved marker
     try e.prefill(ids[0 .. ids.len - 1], audio_at, null);
     try e.depthStart();
@@ -274,8 +315,9 @@ fn dumpDepthAndCodec(ar: std.mem.Allocator, io: std.Io, e: *Engine, d: []const u
     var ola = om.engine.OverlapAdd.init(ar, &e.window);
     var wav: std.ArrayList(f32) = .empty;
     var at: usize = 0;
+    // in the streaming chunks the server uses: the first `first` frames, then `chunk` at a time
     while (at < frames.len) {
-        const n = @min(e.o.codec_chunk, frames.len - at);
+        const n = @min(if (at == 0) sm.first else sm.chunk, frames.len - at);
         const l = try ar.alloc(f32, n * cfg.frame_stack * 2 * cfg.spec_bins);
         const fr = try e.codecChunk(frames[at .. at + n], l);
         try lin.appendSlice(ar, l);

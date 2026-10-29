@@ -28,7 +28,22 @@ const Fns = struct {
     om_repeat_rows: cuda.Function,
     om_polar: cuda.Function,
     om_argmax: cuda.Function,
+    om_gemv_1: cuda.Function,
+    om_gemv_4: cuda.Function,
+    om_gemv_8: cuda.Function,
+    om_gemv_12: cuda.Function,
+    om_gemv_16: cuda.Function,
+    om_depth_pick: cuda.Function,
+    om_frame_end: cuda.Function,
+    om_hist_push: cuda.Function,
+    om_mel_frames: cuda.Function,
+    om_power: cuda.Function,
+    om_logmel: cuda.Function,
 };
+
+/// Rows the few-row product takes; more go through cuBLAS.
+pub const gemv_rows = 16;
+const gemv_shared = 96 << 10;
 
 pub const Act = enum(i32) { none = 0, silu = 1, gelu = 2 };
 pub const Norm = enum(i32) { lfm = 0, head = 1 };
@@ -47,6 +62,7 @@ pub const Kernels = struct {
         const info = @typeInfo(Fns).@"struct";
         inline for (info.field_names) |name| @field(k.fns, name) = try k.mod.function(name);
         try k.fns.om_attention.allowDynamicShared(64 << 10);
+        inline for (.{ "om_gemv_1", "om_gemv_4", "om_gemv_8", "om_gemv_12", "om_gemv_16" }) |name| try @field(k.fns, name).allowDynamicShared(gemv_shared);
         const ws_bytes: usize = 32 << 20;
         k.ws = try cuda.DeviceBuffer.alloc(d, ws_bytes);
         errdefer k.ws.free();
@@ -74,13 +90,39 @@ pub const Kernels = struct {
 
     // ---- matrix products (row-major views over cuBLAS's column-major API)
 
+    /// Whether `t` rows of `kdim` (rows `ldx` apart) take the few-row product.
+    fn few(t: usize, kdim: usize, ldx: usize, x: u64) bool {
+        return t <= gemv_rows and kdim % 8 == 0 and ldx % 8 == 0 and x % 16 == 0 and t * kdim * 2 <= gemv_shared;
+    }
+
+    /// The few-row product: y (bf16, rows `ldy` apart) and / or yf (fp32, rows n apart), `batch` products.
+    pub fn gemv(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, t: usize, y: u64, ldy: usize, yf: u64, batch: usize, sw: usize, sx: usize, sy: usize) !void {
+        const f = if (t <= 1) k.fns.om_gemv_1 else if (t <= 4) k.fns.om_gemv_4 else if (t <= 8) k.fns.om_gemv_8 else if (t <= 12) k.fns.om_gemv_12 else k.fns.om_gemv_16;
+        var a: cuda.Args = .{};
+        a.add(w);
+        a.add(x);
+        a.add(i(ldx));
+        a.add(i(kdim));
+        a.add(i(n));
+        a.add(i(t));
+        a.add(y);
+        a.add(i(ldy));
+        a.add(yf);
+        a.add(@as(i64, @intCast(sw)));
+        a.add(@as(i64, @intCast(sx)));
+        a.add(@as(i64, @intCast(sy)));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(blocks(n, 8)), .y = @intCast(batch) }, .block = .{ .x = 256 }, .shared = @intCast(t * kdim * 2) }, s, &a);
+    }
+
     /// y [t, n] = x [t, k] w^T with w [n, k]; x rows `ldx` apart, y rows `ldy` apart; bf16 out, fp32 accumulate.
     pub fn linear(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, y: u64, ldy: usize, t: usize) !void {
+        if (few(t, kdim, ldx, x)) return k.gemv(s, w, x, ldx, kdim, n, t, y, ldy, 0, 1, 0, 0, 0);
         try k.blas.gemm(s, .t, .n, n, t, kdim, 1.0, w, kdim, 0, x, ldx, 0, 0.0, y, ldy, 0, 1, .bf16, .bf16);
     }
 
     /// As `linear`, the result in fp32 (for a bias added before the one rounding).
     pub fn linearF32(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, y: u64, t: usize) !void {
+        if (few(t, kdim, ldx, x)) return k.gemv(s, w, x, ldx, kdim, n, t, 0, n, y, 1, 0, 0, 0);
         try k.blas.gemm(s, .t, .n, n, t, kdim, 1.0, w, kdim, 0, x, ldx, 0, 0.0, y, n, 0, 1, .bf16, .f32);
     }
 
@@ -97,6 +139,7 @@ pub const Kernels = struct {
 
     /// `batch` products y_j [t, n] = x_j [t, kd] w_j^T, the operands `sw`, `sx`, `sy` elements apart; bf16 out.
     pub fn linearBatched(k: *const Kernels, s: cuda.Stream, w: u64, sw: usize, x: u64, sx: usize, kd: usize, n: usize, y: u64, sy: usize, t: usize, batch: usize) !void {
+        if (few(t, kd, kd, x) and sx % 8 == 0) return k.gemv(s, w, x, kd, kd, n, t, y, n, 0, batch, sw, sx, sy);
         try k.blas.gemm(s, .t, .n, n, t, kd, 1.0, w, kd, sw, x, kd, sx, 0.0, y, n, sy, batch, .bf16, .bf16);
     }
 
@@ -334,10 +377,9 @@ pub const Kernels = struct {
         try go(k.fns.om_bf16_f32, s, blocks(n, 256), 256, 0, &a);
     }
 
-    pub fn fsqDecode(k: *const Kernels, s: cuda.Stream, codes: u64, stride: usize, l: u64, n: usize, nq: usize) !void {
+    pub fn fsqDecode(k: *const Kernels, s: cuda.Stream, codes: u64, l: u64, n: usize, nq: usize) !void {
         var a: cuda.Args = .{};
         a.add(codes);
-        a.add(i(stride));
         a.add(l);
         a.add(i(n));
         a.add(i(nq));
@@ -371,5 +413,88 @@ pub const Kernels = struct {
         a.add(i(ns));
         a.add(out);
         try go(k.fns.om_argmax, s, 1, 1024, 0, &a);
+    }
+
+    pub const Pick = struct {
+        logits: u64,
+        order: u64,
+        p0: usize,
+        n: usize,
+        hist: u64,
+        hn: usize,
+        penalty: f32,
+        temperature: f32,
+        seed: u64,
+        frame: usize,
+        codes: u64,
+        masked: u64,
+        nq: usize,
+        size: usize,
+    };
+
+    pub fn depthPick(k: *const Kernels, s: cuda.Stream, p: Pick) !void {
+        var a: cuda.Args = .{};
+        a.add(p.logits);
+        a.add(p.order);
+        a.add(i(p.p0));
+        a.add(p.hist);
+        a.add(i(p.hn));
+        a.add(p.penalty);
+        a.add(p.temperature);
+        a.add(p.seed);
+        a.add(i(p.frame));
+        a.add(p.codes);
+        a.add(p.masked);
+        a.add(i(p.nq));
+        a.add(i(p.size));
+        try go(k.fns.om_depth_pick, s, p.n, 256, p.size, &a);
+    }
+
+    pub fn frameEnd(k: *const Kernels, s: cuda.Stream, codes: u64, nq: usize, eos: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(codes);
+        a.add(i(nq));
+        a.add(i(eos));
+        try go(k.fns.om_frame_end, s, 1, 32, 0, &a);
+    }
+
+    pub fn histPush(k: *const Kernels, s: cuda.Stream, codes: u64, hist: u64, slot: usize, nq: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(codes);
+        a.add(hist);
+        a.add(i(slot));
+        a.add(i(nq));
+        try go(k.fns.om_hist_push, s, 1, 32, 0, &a);
+    }
+
+    pub fn melFrames(k: *const Kernels, s: cuda.Stream, x: u64, len: usize, win: u64, fr: u64, nf: usize, nfft: usize, hop: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(i(len));
+        a.add(win);
+        a.add(fr);
+        a.add(i(nf));
+        a.add(i(nfft));
+        a.add(i(hop));
+        try go(k.fns.om_mel_frames, s, blocks(nf * nfft, 256), 256, 0, &a);
+    }
+
+    pub fn power(k: *const Kernels, s: cuda.Stream, spec: u64, p: u64, nf: usize, nb: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(spec);
+        a.add(p);
+        a.add(i(nf));
+        a.add(i(nb));
+        try go(k.fns.om_power, s, blocks(nf * nb, 256), 256, 0, &a);
+    }
+
+    pub fn logmel(k: *const Kernels, s: cuda.Stream, m: u64, out: u64, nf: usize, mels: usize, floor: f32) !void {
+        var a: cuda.Args = .{};
+        a.add(m);
+        a.add(out);
+        a.add(i(nf));
+        a.add(i(mels));
+        a.add(floor);
+        try go(k.fns.om_logmel, s, blocks(nf * mels, 256), 256, 0, &a);
     }
 };
