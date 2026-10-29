@@ -85,7 +85,10 @@ extern "C" __global__ void om_head_norm(bf* __restrict__ X, const bf* __restrict
 // RoPE in place on heads of `hd` (rotate-half pairs i, i + hd/2), row t at position pos0 + t; INV holds hd/2 inverse
 // frequencies (zero past the rotated part). mode 0: fp32 cos/sin; 1: cos/sin rounded to bf16, fp32 products;
 // 2: every product and the sum rounded (the speech encoder's bf16 arithmetic).
-extern "C" __global__ void om_rope(bf* __restrict__ X, const float* __restrict__ INV, int T, int H, int hd, int ld, int pos0, int mode) {
+// POSP, if given, holds pos0 (a replayed graph's position).
+extern "C" __global__ void om_rope(bf* __restrict__ X, const float* __restrict__ INV, int T, int H, int hd, int ld, int pos0, int mode,
+                                   const int* __restrict__ POSP) {
+    if (POSP) pos0 = *POSP;
     const int half = hd >> 1;
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)T * H * half) return;
@@ -107,12 +110,19 @@ extern "C" __global__ void om_rope(bf* __restrict__ X, const float* __restrict__
     }
 }
 
-// Copies T rows of `n` bf16 from S (rows `lds` apart) to rows `ldd` apart in D.
-extern "C" __global__ void om_copy_rows(const bf* __restrict__ S, bf* __restrict__ D, int T, int n, int lds, int ldd) {
+// Copies T rows of `n` bf16 from S (rows `lds` apart) to rows `ldd` apart in D, from row *POSP of D if given.
+extern "C" __global__ void om_copy_rows(const bf* __restrict__ S, bf* __restrict__ D, int T, int n, int lds, int ldd,
+                                        const int* __restrict__ POSP) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)T * n) return;
     const int t = (int)(i / n), c = (int)(i % n);
-    D[(long long)t * ldd + c] = S[(long long)t * lds + c];
+    const long long at = POSP ? (long long)*POSP : 0;
+    D[(at + t) * ldd + c] = S[(long long)t * lds + c];
+}
+
+// *P = v (set 1) or *P += v (set 0): a stack's cache position on the device.
+extern "C" __global__ void om_pos(int* __restrict__ P, int v, int set) {
+    if (threadIdx.x == 0) *P = set ? v : *P + v;
 }
 
 // Liquid's gated short conv over T rows: BCx rows (B | C | x, `ld` apart), y = C * conv(B * x) with the K-1 rows of
@@ -144,9 +154,14 @@ extern "C" __global__ void om_short_conv(const bf* __restrict__ BCx, int ld, con
 extern "C" __global__ void __launch_bounds__(128) om_attention(const bf* __restrict__ Q, int ldq, const bf* __restrict__ Kc,
                                                               const bf* __restrict__ Vc, int ldkv, bf* __restrict__ O, int ldo,
                                                               int H, int Hkv, int hd, int pos0, int kv_len, int window,
-                                                              int causal, float scale) {
+                                                              int causal, float scale, const int* __restrict__ POSP) {
     extern __shared__ float sm[];
     __shared__ float red[32];
+    if (POSP) {
+        // a replayed graph's row: one row at the device's position, the cache through it
+        pos0 = *POSP;
+        kv_len = pos0 + 1;
+    }
     float* q = sm;          // hd
     float* sc = sm + 128;   // keys
     const int t = blockIdx.x / H, h = blockIdx.x % H, kh = h / (H / Hkv);
@@ -489,8 +504,13 @@ __device__ __forceinline__ unsigned long long mix64(unsigned long long z) {
 extern "C" __global__ void __launch_bounds__(256) om_depth_pick(const bf* __restrict__ LOG, const int* __restrict__ ORDER, int p0,
                                                                const int* __restrict__ HIST, int hn, float penalty, float temp,
                                                                unsigned long long seed, int frame, int* __restrict__ CODES,
-                                                               int* __restrict__ MASKED, int NQ, int size) {
+                                                               int* __restrict__ MASKED, int NQ, int size, const int* __restrict__ META) {
     extern __shared__ unsigned char seen[];
+    if (META) {
+        // a replayed graph's frame: the window's frames and the frame number on the device
+        hn = META[0];
+        frame = META[1];
+    }
     __shared__ float bv[8];
     __shared__ int bi[8];
     const int q = ORDER[p0 + blockIdx.x];
@@ -582,4 +602,143 @@ extern "C" __global__ void om_logmel(const float* __restrict__ M, float* __restr
     if (i >= (long long)nf * mels) return;
     const int t = (int)(i / mels), m = (int)(i % mels);
     OUT[(long long)m * nf + t] = (fmaxf(log10f(M[i]), floor_) + 4.f) / 4.f;
+}
+
+// ---- prompt rows: the short conv across rows and channels at once, and tiled attention
+
+// As om_short_conv for many rows: one thread a (row, channel), the K taps read from B * x rows (or STATE before
+// the first row); the state is left alone (om_conv_state follows).
+extern "C" __global__ void om_short_conv_rows(const bf* __restrict__ BCx, int ld, const bf* __restrict__ Wc, const bf* __restrict__ STATE,
+                                              bf* __restrict__ Y, int ldy, int T, int D, int K) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)T * D) return;
+    const int t = (int)(i / D), d = (int)(i % D);
+    float acc = 0.f;
+    for (int j = 0; j < K; ++j) {
+        const int src = t - (K - 1) + j;
+        float v;
+        if (src >= 0) {
+            const bf* row = BCx + (long long)src * ld;
+            v = rb(f(row[d]) * f(row[2 * D + d]));
+        } else {
+            v = f(STATE[d * (K - 1) + (K - 1 + src)]);
+        }
+        acc += f(Wc[d * K + j]) * v;
+    }
+    Y[(long long)t * ldy + d] = b(f(BCx[(long long)t * ld + D + d]) * rb(acc));
+}
+
+// The conv state after T rows: the last K-1 values of B * x (older ones shifted from the state).
+extern "C" __global__ void om_conv_state(const bf* __restrict__ BCx, int ld, bf* __restrict__ STATE, int T, int D, int K) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    for (int j = 0; j < K - 1; ++j) {
+        const int src = T - (K - 1) + j;
+        if (src >= 0) {
+            const bf* row = BCx + (long long)src * ld;
+            STATE[d * (K - 1) + j] = b(f(row[d]) * f(row[2 * D + d]));
+        } else {
+            STATE[d * (K - 1) + j] = STATE[d * (K - 1) + j + T];
+        }
+    }
+}
+
+// Attention for many query rows: a block takes 16 rows of one head and walks the cache in tiles of 64 keys held in
+// shared memory, with an online softmax per row (4 warps, 4 rows each). Masks as om_attention. hd <= 128, hd % 32 == 0.
+#define AT_Q 16
+#define AT_K 64
+extern "C" __global__ void __launch_bounds__(128) om_attention_tiles(const bf* __restrict__ Q, int ldq, const bf* __restrict__ Kc,
+                                                                    const bf* __restrict__ Vc, int ldkv, bf* __restrict__ O, int ldo,
+                                                                    int T, int H, int Hkv, int hd, int pos0, int kv_len, int window,
+                                                                    int causal, float scale) {
+    extern __shared__ float sm[];
+    const int hdp = hd + 2;  // padded rows (bf16) against bank conflicts
+    float* qs = sm;                                    // [AT_Q][hd]
+    float* ss = qs + AT_Q * hd;                        // [AT_Q][AT_K]
+    bf* ks = reinterpret_cast<bf*>(ss + AT_Q * AT_K);  // [AT_K][hdp]
+    bf* vs = ks + AT_K * hdp;                          // [AT_K][hdp]
+    const int h = blockIdx.y, kh = h / (H / Hkv);
+    const int r0 = blockIdx.x * AT_Q;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int dpl = hd >> 5;
+    for (int i = threadIdx.x; i < AT_Q * hd; i += 128) {
+        const int r = i / hd, c = i % hd;
+        qs[i] = r0 + r < T ? f(Q[(long long)(r0 + r) * ldq + h * hd + c]) : 0.f;
+    }
+    const int last = min(T, r0 + AT_Q) - 1;
+    int hi = causal ? pos0 + last + 1 : kv_len;
+    hi = min(hi, kv_len);
+    int lo = (causal && window > 0) ? max(0, pos0 + r0 + 1 - window) : 0;
+    float m[4], l[4], acc[4][4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        m[a] = -INFINITY;
+        l[a] = 0.f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[a][c] = 0.f;
+    }
+    for (int k0 = lo; k0 < hi; k0 += AT_K) {
+        const int nk = min(AT_K, hi - k0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nk * (hd / 2); i += 128) {
+            const int k = i / (hd / 2), c = (i % (hd / 2)) * 2;
+            const long long g = (long long)(k0 + k) * ldkv + kh * hd + c;
+            *reinterpret_cast<__nv_bfloat162*>(ks + k * hdp + c) = *reinterpret_cast<const __nv_bfloat162*>(Kc + g);
+            *reinterpret_cast<__nv_bfloat162*>(vs + k * hdp + c) = *reinterpret_cast<const __nv_bfloat162*>(Vc + g);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < AT_Q * AT_K; i += 128) {
+            const int r = i / AT_K, k = i % AT_K;
+            const int pos = pos0 + r0 + r, kp = k0 + k;
+            float s = -INFINITY;
+            if (k < nk && r0 + r < T && (!causal || kp <= pos) && (!(causal && window > 0) || kp > pos - window)) {
+                s = 0.f;
+                const float* q = qs + r * hd;
+                const bf* kr = ks + k * hdp;
+                for (int c = 0; c < hd; c += 2) {
+                    const float2 kv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(kr + c));
+                    s += q[c] * kv.x + q[c + 1] * kv.y;
+                }
+                s *= scale;
+            }
+            ss[i] = s;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            const int r = warp * 4 + a;
+            float* sr = ss + r * AT_K;
+            float mx = fmaxf(sr[lane], sr[lane + 32]);
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float mn = fmaxf(m[a], mx);
+            if (mn == -INFINITY) continue;  // nothing visible yet
+            const float sc = __expf(m[a] - mn);
+            const float p0 = __expf(sr[lane] - mn), p1 = __expf(sr[lane + 32] - mn);
+            sr[lane] = p0;
+            sr[lane + 32] = p1;
+            float ps = p0 + p1;
+            for (int o = 16; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+            l[a] = l[a] * sc + ps;
+            m[a] = mn;
+            __syncwarp();
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][c] *= sc;
+            for (int k = 0; k < nk; ++k) {
+                const float p = sr[k];
+                const bf* vr = vs + k * hdp;
+#pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    if (c < dpl) acc[a][c] += p * f(vr[lane + 32 * c]);
+            }
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const int r = r0 + warp * 4 + a;
+        if (r >= T) continue;
+        const float inv = 1.f / l[a];
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            if (c < dpl) O[(long long)r * ldo + h * hd + lane + 32 * c] = b(acc[a][c] * inv);
+    }
 }

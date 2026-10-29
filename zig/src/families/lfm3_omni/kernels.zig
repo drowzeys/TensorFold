@@ -39,6 +39,10 @@ const Fns = struct {
     om_mel_frames: cuda.Function,
     om_power: cuda.Function,
     om_logmel: cuda.Function,
+    om_short_conv_rows: cuda.Function,
+    om_conv_state: cuda.Function,
+    om_attention_tiles: cuda.Function,
+    om_pos: cuda.Function,
 };
 
 /// Rows the few-row product takes; more go through cuBLAS.
@@ -62,6 +66,7 @@ pub const Kernels = struct {
         const info = @typeInfo(Fns).@"struct";
         inline for (info.field_names) |name| @field(k.fns, name) = try k.mod.function(name);
         try k.fns.om_attention.allowDynamicShared(64 << 10);
+        try k.fns.om_attention_tiles.allowDynamicShared(64 << 10);
         inline for (.{ "om_gemv_1", "om_gemv_4", "om_gemv_8", "om_gemv_12", "om_gemv_16" }) |name| try @field(k.fns, name).allowDynamicShared(gemv_shared);
         const ws_bytes: usize = 32 << 20;
         k.ws = try cuda.DeviceBuffer.alloc(d, ws_bytes);
@@ -177,7 +182,7 @@ pub const Kernels = struct {
         try go(k.fns.om_head_norm, s, blocks(t * h * 32, 256), 256, 0, &a);
     }
 
-    pub fn rope(k: *const Kernels, s: cuda.Stream, x: u64, inv: u64, t: usize, h: usize, hd: usize, ld: usize, pos0: usize, mode: u8) !void {
+    pub fn rope(k: *const Kernels, s: cuda.Stream, x: u64, inv: u64, t: usize, h: usize, hd: usize, ld: usize, pos0: usize, mode: u8, posp: u64) !void {
         var a: cuda.Args = .{};
         a.add(x);
         a.add(inv);
@@ -187,10 +192,11 @@ pub const Kernels = struct {
         a.add(i(ld));
         a.add(i(pos0));
         a.add(@as(i32, mode));
+        a.add(posp);
         try go(k.fns.om_rope, s, blocks(t * h * hd / 2, 256), 256, 0, &a);
     }
 
-    pub fn copyRows(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, t: usize, n: usize, lds: usize, ldd: usize) !void {
+    pub fn copyRows(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, t: usize, n: usize, lds: usize, ldd: usize, posp: u64) !void {
         var a: cuda.Args = .{};
         a.add(src);
         a.add(dst);
@@ -198,10 +204,41 @@ pub const Kernels = struct {
         a.add(i(n));
         a.add(i(lds));
         a.add(i(ldd));
+        a.add(posp);
         try go(k.fns.om_copy_rows, s, blocks(t * n, 256), 256, 0, &a);
     }
 
+    /// The device position: set to `v`, or advanced by it.
+    pub fn pos(k: *const Kernels, s: cuda.Stream, p: u64, v: usize, set: bool) !void {
+        var a: cuda.Args = .{};
+        a.add(p);
+        a.add(i(v));
+        a.add(@as(i32, @intFromBool(set)));
+        try go(k.fns.om_pos, s, 1, 32, 0, &a);
+    }
+
     pub fn shortConv(k: *const Kernels, s: cuda.Stream, bcx: u64, ld: usize, w: u64, state: u64, y: u64, ldy: usize, t: usize, d: usize, kw: usize) !void {
+        if (t > 4) {
+            var a: cuda.Args = .{};
+            a.add(bcx);
+            a.add(i(ld));
+            a.add(w);
+            a.add(state);
+            a.add(y);
+            a.add(i(ldy));
+            a.add(i(t));
+            a.add(i(d));
+            a.add(i(kw));
+            try go(k.fns.om_short_conv_rows, s, blocks(t * d, 256), 256, 0, &a);
+            var c: cuda.Args = .{};
+            c.add(bcx);
+            c.add(i(ld));
+            c.add(state);
+            c.add(i(t));
+            c.add(i(d));
+            c.add(i(kw));
+            return go(k.fns.om_conv_state, s, blocks(d, 128), 128, 0, &c);
+        }
         var a: cuda.Args = .{};
         a.add(bcx);
         a.add(i(ld));
@@ -231,10 +268,35 @@ pub const Kernels = struct {
         kv_len: usize,
         window: usize,
         causal: bool,
+        /// A replayed graph's row: the position on the device, the cache sized for `max_ctx` keys.
+        posp: u64 = 0,
+        max_ctx: usize = 0,
     };
 
     pub fn attention(k: *const Kernels, s: cuda.Stream, p: Attn) !void {
-        const span = if (p.causal and p.window > 0) @min(p.window, p.kv_len) else p.kv_len;
+        if (p.t > 1 and p.posp == 0 and p.hd % 32 == 0 and p.hd <= 128) {
+            const shared = (16 * p.hd + 16 * 64) * 4 + 2 * 64 * (p.hd + 2) * 2;
+            var a: cuda.Args = .{};
+            a.add(p.q);
+            a.add(i(p.ldq));
+            a.add(p.kc);
+            a.add(p.vc);
+            a.add(i(p.ldkv));
+            a.add(p.o);
+            a.add(i(p.ldo));
+            a.add(i(p.t));
+            a.add(i(p.heads));
+            a.add(i(p.kv_heads));
+            a.add(i(p.hd));
+            a.add(i(p.pos0));
+            a.add(i(p.kv_len));
+            a.add(i(p.window));
+            a.add(@as(i32, @intFromBool(p.causal)));
+            a.add(1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))));
+            return cuda.launch.launch(k.fns.om_attention_tiles, .{ .grid = .{ .x = @intCast(blocks(p.t, 16)), .y = @intCast(p.heads) }, .block = .{ .x = 128 }, .shared = @intCast(shared) }, s, &a);
+        }
+        const keys = if (p.posp != 0) p.max_ctx else p.kv_len;
+        const span = if (p.causal and p.window > 0) @min(p.window, keys) else keys;
         const shared = (128 + span) * 4;
         if (shared > 64 << 10) return error.AttentionSpanTooLong;
         var a: cuda.Args = .{};
@@ -253,6 +315,7 @@ pub const Kernels = struct {
         a.add(i(p.window));
         a.add(@as(i32, @intFromBool(p.causal)));
         a.add(1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))));
+        a.add(p.posp);
         try go(k.fns.om_attention, s, p.t * p.heads, 128, shared, &a);
     }
 
@@ -430,6 +493,8 @@ pub const Kernels = struct {
         masked: u64,
         nq: usize,
         size: usize,
+        /// [hn, frame] on the device (a replayed graph's), else the values above.
+        meta: u64 = 0,
     };
 
     pub fn depthPick(k: *const Kernels, s: cuda.Stream, p: Pick) !void {
@@ -447,6 +512,7 @@ pub const Kernels = struct {
         a.add(p.masked);
         a.add(i(p.nq));
         a.add(i(p.size));
+        a.add(p.meta);
         try go(k.fns.om_depth_pick, s, p.n, 256, p.size, &a);
     }
 

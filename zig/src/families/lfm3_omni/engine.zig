@@ -22,6 +22,8 @@ pub const Options = struct {
     /// Longest reply in speech frames (12.5 a second) and the codec's largest chunk.
     max_frames: usize = 1024,
     codec_chunk: usize = 64,
+    /// Replay the backbone's row and the depth decoder's frame as CUDA graphs.
+    graphs: bool = true,
 };
 
 pub const Sampling = struct {
@@ -230,6 +232,10 @@ pub const Engine = struct {
     // the device's frame: order | codes | masked (i32 [3 * 12]) and the repetition window's frames (a ring)
     dframe: u64,
     hist: u64,
+    step_graph: ?cuda.graph.Exec = null,
+    frame_graph: ?cuda.graph.Exec = null,
+    /// The sampling settings the frame graph was captured with (its kernels' arguments).
+    frame_smp: Sampling = .{},
     // scratch
     mel_f32: u64,
     mel_bf: u64,
@@ -295,6 +301,9 @@ pub const Engine = struct {
         e.mel = try gpa.create(melmod.Mel);
         errdefer gpa.destroy(e.mel);
         e.mel.init();
+        e.step_graph = null;
+        e.frame_graph = null;
+        e.frame_smp = .{};
         try e.loadModel(model_dir);
         try e.allocScratch();
         return e;
@@ -302,6 +311,8 @@ pub const Engine = struct {
 
     pub fn destroy(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.step_graph) |*g| g.deinit();
+        if (e.frame_graph) |*g| g.deinit();
         e.gpa.free(e.host_frames);
         e.gpa.free(e.host_logits);
         for ([_]*Stack{ &e.enc, &e.bb, &e.depth, &e.codec }) |s| e.gpa.free(s.layers);
@@ -422,7 +433,7 @@ pub const Engine = struct {
             e.mel_dft = try a.upload(std.mem.sliceAsBytes(dft));
             e.mel_fb = try a.upload(std.mem.sliceAsBytes(&e.mel.filters));
         }
-        e.dframe = try a.alloc(3 * cfg.codebooks * 4);
+        e.dframe = try a.alloc((3 * cfg.codebooks + 2) * 4);
         e.hist = try a.zeroed(hist_cap * cfg.codebooks * 4);
         e.mel_bf = try a.alloc(cfg.mel_bins * F * 2);
         e.a1 = try a.alloc(C * 64 * w1 * 2);
@@ -576,8 +587,24 @@ pub const Engine = struct {
 
     /// One backbone row from the embedding in `bb_x` row 0; the state lands in `bb_out` row 0.
     fn stepRow(e: *Engine) !void {
-        try e.bb.forward(&e.k, e.stream, e.bb_x, 1, e.bb_out);
         e.last = e.bb_out;
+        if (!e.o.graphs) return e.bb.forward(&e.k, e.stream, e.bb_x, 1, e.bb_out);
+        if (e.bb.pos + 1 > e.bb.s.max_ctx) return error.ContextFull;
+        if (e.step_graph == null) {
+            const saved = e.bb.pos;
+            try cuda.graph.beginCapture(e.stream, .thread_local);
+            e.bb.forwardAt(&e.k, e.stream, e.bb_x, 1, e.bb_out, true) catch |er| {
+                var g = cuda.graph.endCapture(e.stream) catch return er;
+                g.deinit();
+                return er;
+            };
+            var g = try cuda.graph.endCapture(e.stream);
+            defer g.deinit();
+            e.step_graph = try g.instantiate();
+            e.bb.pos = saved;
+        }
+        try e.step_graph.?.launchOn(e.stream);
+        e.bb.pos += 1;
     }
 
     /// The greedy text token from the last hidden state (placeholders excluded), left on the device in `pick`.
@@ -660,14 +687,45 @@ pub const Engine = struct {
     /// codebooks (`om_depth_pick`); the frame (all end-of-speech if any code is) is left in `dframe`'s codes and fed
     /// to the backbone's next row in `bb_x`. `hn` frames of the repetition window are in `hist`.
     fn frameDevice(e: *Engine, smp: Sampling, order: *const [cfg.codebooks]i32, frame: usize, hn: usize) !void {
+        const NQ = cfg.codebooks;
+        var init: [3 * NQ + 2]i32 = undefined;
+        @memcpy(init[0..NQ], order);
+        @memset(init[NQ .. 2 * NQ], 0);
+        @memset(init[2 * NQ .. 3 * NQ], 1);
+        init[3 * NQ] = @intCast(hn);
+        init[3 * NQ + 1] = @intCast(frame);
+        try e.h2d(e.dframe, std.mem.sliceAsBytes(&init));
+        // the graph reads the hidden state from `bb_out` row 0
+        if (e.last != e.bb_out) {
+            try e.d2d(e.bb_out, e.last, cfg.hidden * 2);
+            e.last = e.bb_out;
+        }
+        if (!e.o.graphs) return e.frameLaunches(smp, 0, frame, hn);
+        const same = e.frame_smp.audio_repetition_penalty == smp.audio_repetition_penalty and e.frame_smp.audio_temperature == smp.audio_temperature and e.frame_smp.seed == smp.seed;
+        if (e.frame_graph != null and !same) {
+            e.frame_graph.?.deinit();
+            e.frame_graph = null;
+        }
+        if (e.frame_graph == null) {
+            try cuda.graph.beginCapture(e.stream, .thread_local);
+            e.frameLaunches(smp, e.dframe + 3 * NQ * 4, 0, 0) catch |er| {
+                var g = cuda.graph.endCapture(e.stream) catch return er;
+                g.deinit();
+                return er;
+            };
+            var g = try cuda.graph.endCapture(e.stream);
+            defer g.deinit();
+            e.frame_graph = try g.instantiate();
+            e.frame_smp = smp;
+        }
+        try e.frame_graph.?.launchOn(e.stream);
+    }
+
+    /// The frame's launches: `meta` (the window's frames and the frame number on the device) or `frame` and `hn`.
+    fn frameLaunches(e: *Engine, smp: Sampling, meta: u64, frame: usize, hn: usize) !void {
         const k = &e.k;
         const s = e.stream;
         const NQ = cfg.codebooks;
-        var init: [3 * NQ]i32 = undefined;
-        @memcpy(init[0..NQ], order);
-        @memset(init[NQ .. 2 * NQ], 0);
-        @memset(init[2 * NQ ..], 1);
-        try e.h2d(e.dframe, std.mem.sliceAsBytes(&init));
         const codes = e.dframe + NQ * 4;
         const masked = e.dframe + 2 * NQ * 4;
         try e.depthStart();
@@ -678,7 +736,7 @@ pub const Engine = struct {
             try e.depth.forward(k, s, e.dx, NQ, e.dout);
             try k.rmsnormRows(s, e.dout, 0, e.depth_norms, cfg.depth_d, e.dz, cfg.depth_d, cfg.depth_d, cfg.depth_d, NQ, 1e-5, .head);
             try k.linearBatched(s, e.depth_tables, cfg.codebook_size * cfg.depth_d, e.dz, cfg.depth_d, cfg.depth_d, cfg.codebook_size, e.dlog, cfg.codebook_size, 1, NQ);
-            try k.depthPick(s, .{ .logits = e.dlog, .order = e.dframe, .p0 = at, .n = n, .hist = e.hist, .hn = hn, .penalty = smp.audio_repetition_penalty, .temperature = smp.audio_temperature, .seed = smp.seed, .frame = frame, .codes = codes, .masked = masked, .nq = NQ, .size = cfg.codebook_size });
+            try k.depthPick(s, .{ .logits = e.dlog, .order = e.dframe, .p0 = at, .n = n, .hist = e.hist, .hn = hn, .penalty = smp.audio_repetition_penalty, .temperature = smp.audio_temperature, .seed = smp.seed, .frame = frame, .codes = codes, .masked = masked, .nq = NQ, .size = cfg.codebook_size, .meta = meta });
             at += n;
         }
         try k.frameEnd(s, codes, NQ, cfg.audio_eos_code);

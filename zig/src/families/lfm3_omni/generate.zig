@@ -24,6 +24,7 @@ const usage =
     \\--codec-ref DIR: with --dump, codec_lin.f32 and reply.f32 decode DIR's gen_codes.i32 ([12, frames]) instead.
     \\--depth-check DIR: the depth decoder alone on DIR's depth_h.f32 [n, 2048] and depth_codes.i32 [n, 12]: three
     \\  passes a row (identity order), every pass's logits written to depth_check.f32 [n, 3, 12, 2017]; no reply.
+    \\--graphs 0 launches the backbone's rows and the depth decoder's frames one kernel at a time (no CUDA graphs).
     \\--host-mel 1 computes the log-mel features on the host (a float64 DFT) instead of the device.
     \\--force DIR reads a reference's gen_seq.i32 and gen_codes.i32 ([12, frames]) and feeds them back, scoring the
     \\  engine's own picks (greedy text, its audio sampling settings) at every slot.
@@ -45,6 +46,7 @@ const Args = struct {
     repeat: usize = 1,
     host_mel: bool = false,
     serve: ?[]const u8 = null,
+    graphs: bool = true,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -63,7 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
         const v = argv[i + 1];
         if (eq(k, "--model")) a.model = v else if (eq(k, "--wav")) a.wav = v else if (eq(k, "--out")) a.out = v else if (eq(k, "--system")) a.system = v else if (eq(k, "--system-file")) {
             a.system = std.mem.trim(u8, try std.Io.Dir.cwd().readFileAlloc(io, v, arena, .limited(1 << 20)), " \n\r\t");
-        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--serve")) a.serve = v else if (eq(k, "--host-mel")) a.host_mel = !eq(v, "0") else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else {
+        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--serve")) a.serve = v else if (eq(k, "--graphs")) a.graphs = !eq(v, "0") else if (eq(k, "--host-mel")) a.host_mel = !eq(v, "0") else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else {
             std.debug.print("unknown flag {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -83,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
         const tpath0 = try std.fs.path.join(arena, &.{ a.model, "tokenizer.json" });
         var tok0 = try core.tokenizer.loadTokenizer(io, gpa, tpath0);
         defer tok0.deinit();
-        const e = try Engine.create(gpa, io, a.model, .{});
+        const e = try Engine.create(gpa, io, a.model, .{ .graphs = a.graphs });
         defer e.destroy();
         try warm(gpa, io, e, &tok0, a);
         try om.serve.run(gpa, io, e, &tok0, .{ .host = hp[0..colon], .port = try std.fmt.parseInt(u16, hp[colon + 1 ..], 10), .system = a.system, .smp = a.smp, .stream = a.stream });
@@ -97,7 +99,7 @@ pub fn main(init: std.process.Init) !u8 {
     var tok = try core.tokenizer.loadTokenizer(io, gpa, tpath);
     defer tok.deinit();
     const t_load = om.engine.nowNs(io);
-    const e = try Engine.create(gpa, io, a.model, .{});
+    const e = try Engine.create(gpa, io, a.model, .{ .graphs = a.graphs });
     defer e.destroy();
     std.log.info("lfm3-omni: loaded in {d:.1} s, {d:.2} GB on the device", .{ @as(f64, @floatFromInt(om.engine.nowNs(io) - t_load)) / 1e9, @as(f64, @floatFromInt(e.deviceBytes())) / 1e9 });
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, a.wav, arena, .limited(1 << 30));

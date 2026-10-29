@@ -78,8 +78,9 @@ pub const Stack = struct {
     tmp: u64,
     states: u64,
     states_bytes: usize,
-    /// Rows already in the caches (the next row's position).
+    /// Rows already in the caches (the next row's position), and the same on the device (i32) for replayed graphs.
     pos: usize = 0,
+    dpos: u64 = 0,
     d: *const cuda.Driver,
 
     pub fn nq(st_: *const Stack) usize {
@@ -95,13 +96,21 @@ pub const Stack = struct {
     /// Clears the conv states and the cache position (the caches' rows are overwritten as they fill).
     pub fn reset(x: *Stack, s: cuda.Stream) !void {
         x.pos = 0;
+        try x.d.check(x.d.api.cuMemsetD8Async(x.dpos, 0, 4, s.handle), "cuMemsetD8Async");
         if (x.states_bytes > 0) try x.d.check(x.d.api.cuMemsetD8Async(x.states, 0, x.states_bytes, s.handle), "cuMemsetD8Async");
     }
 
     /// Runs `t` rows of `x` (the residual stream, [t, D], updated in place) at the cache position, then the final
     /// norm into `out` ([t, D]); the rows join the caches.
     pub fn forward(x_: *Stack, k: *const kern.Kernels, s: cuda.Stream, x: u64, t: usize, out: u64) !void {
+        return x_.forwardAt(k, s, x, t, out, false);
+    }
+
+    /// `forward`; with `graph` one row at the device's position (the launches a captured graph replays).
+    pub fn forwardAt(x_: *Stack, k: *const kern.Kernels, s: cuda.Stream, x: u64, t: usize, out: u64, graph: bool) !void {
         const sp = x_.s;
+        if (graph and t != 1) return error.GraphRowsAreOne;
+        const posp: u64 = if (graph) x_.dpos else 0;
         const D = sp.d;
         if (t == 0) return;
         if (t > sp.max_rows) return error.TooManyRows;
@@ -123,12 +132,13 @@ pub const Stack = struct {
                     try k.headNorm(s, x_.proj, l.q_norm, t, sp.heads, sp.head_dim, cols, sp.eps);
                     try k.headNorm(s, x_.proj + nq_ * 2, l.k_norm, t, sp.kv_heads, sp.head_dim, cols, sp.eps);
                     const inv = if (l.kind == .sliding) x_.inv_sliding else x_.inv_full;
-                    try k.rope(s, x_.proj, inv, t, sp.heads, sp.head_dim, cols, x_.pos, sp.rope_mode);
-                    try k.rope(s, x_.proj + nq_ * 2, inv, t, sp.kv_heads, sp.head_dim, cols, x_.pos, sp.rope_mode);
-                    try k.copyRows(s, x_.proj + nq_ * 2, l.kc + x_.pos * nk_ * 2, t, nk_, cols, nk_);
-                    try k.copyRows(s, x_.proj + (nq_ + nk_) * 2, l.vc + x_.pos * nk_ * 2, t, nk_, cols, nk_);
+                    try k.rope(s, x_.proj, inv, t, sp.heads, sp.head_dim, cols, x_.pos, sp.rope_mode, posp);
+                    try k.rope(s, x_.proj + nq_ * 2, inv, t, sp.kv_heads, sp.head_dim, cols, x_.pos, sp.rope_mode, posp);
+                    const row: usize = if (graph) 0 else x_.pos;
+                    try k.copyRows(s, x_.proj + nq_ * 2, l.kc + row * nk_ * 2, t, nk_, cols, nk_, posp);
+                    try k.copyRows(s, x_.proj + (nq_ + nk_) * 2, l.vc + row * nk_ * 2, t, nk_, cols, nk_, posp);
                     const windowed = l.kind == .sliding or (sp.window_all and sp.window > 0);
-                    try k.attention(s, .{ .q = x_.proj, .ldq = cols, .kc = l.kc, .vc = l.vc, .ldkv = nk_, .o = x_.y, .ldo = nq_, .t = t, .heads = sp.heads, .kv_heads = sp.kv_heads, .hd = sp.head_dim, .pos0 = x_.pos, .kv_len = x_.pos + t, .window = if (windowed) sp.window else 0, .causal = sp.causal });
+                    try k.attention(s, .{ .q = x_.proj, .ldq = cols, .kc = l.kc, .vc = l.vc, .ldkv = nk_, .o = x_.y, .ldo = nq_, .t = t, .heads = sp.heads, .kv_heads = sp.kv_heads, .hd = sp.head_dim, .pos0 = x_.pos, .kv_len = x_.pos + t, .window = if (windowed) sp.window else 0, .causal = sp.causal, .posp = posp, .max_ctx = sp.max_ctx });
                     if (sp.lfm3) try k.gate(s, x_.y, nq_, x_.proj + (nq_ + 2 * nk_) * 2, cols, t, sp.heads, sp.head_dim);
                     try k.linear(s, l.o_proj, x_.y, nq_, nq_, D, x_.tmp, D, t);
                 },
@@ -143,6 +153,7 @@ pub const Stack = struct {
         }
         try k.rmsnorm(s, x, pending, x_.final_norm, out, D, D, D, t, sp.eps, .lfm);
         x_.pos += t;
+        if (graph) try k.pos(s, x_.dpos, 1, false) else try k.pos(s, x_.dpos, x_.pos, true);
     }
 };
 
@@ -282,6 +293,7 @@ pub fn load(gpa: std.mem.Allocator, a: *Arena, f: *const st.File, sp: Spec) !Sta
         x.layers[i] = l;
     }
     x.final_norm = try one(a, f, try cat(&nbuf[1], P, "embedding_norm.weight"), &.{D});
+    x.dpos = try a.zeroed(4);
     x.inv_full = try invFreq(gpa, a, sp.rope_full, hd);
     x.inv_sliding = try invFreq(gpa, a, sp.rope_sliding, hd);
     const R = sp.max_rows;
