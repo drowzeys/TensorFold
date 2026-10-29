@@ -145,19 +145,31 @@ const Engine = struct {
         var trunk = d.trunk;
         const pics = a.alloc(vision.Picture, d.pictures.len) catch return error.Failed;
         var runs: std.ArrayList(Run) = .empty;
+        var jobs: []Prep = &.{};
+        // the pictures' host rows stay until the decision ends: their uploads are queued on the stream
+        defer if (jobs.len > 0) {
+            e.stream.synchronize() catch {};
+            for (jobs) |*job| job.free();
+        };
         if (d.pictures.len > 0) {
             if (e.tower == null) return refuse(d, "this checkpoint has no vision tower");
             if (d.pictures.len > max_pictures) return refuse(d, std.fmt.allocPrint(a, "at most {d} pictures a decision", .{max_pictures}) catch return error.Failed);
             var ids: std.ArrayList(u32) = .empty;
             ids.appendSlice(a, d.trunk[0..d.at]) catch return error.Failed;
+            // each picture decoded, resized and cut into patches on its own thread, before the GPU is taken
+            jobs = a.alloc(Prep, d.pictures.len) catch return error.Failed;
+            for (jobs) |*job| job.* = .{ .io = e.io, .url = "" };
+            const threads = a.alloc(?std.Thread, d.pictures.len) catch return error.Failed;
+            for (d.pictures, jobs, threads) |url, *job, *th| {
+                job.* = .{ .io = e.io, .url = url };
+                th.* = std.Thread.spawn(.{}, Prep.run, .{job}) catch null;
+                if (th.* == null) job.run();
+            }
+            for (threads) |th| if (th) |t| t.join();
             var row: usize = 0;
-            for (d.pictures, pics) |url, *pic| {
-                var problem: []const u8 = "";
-                const rgb = lfm2.image.load(e.io, a, url, &problem) catch return error.Failed;
-                pic.* = vision.prepare(a, rgb orelse return refuse(d, problem)) catch |err| switch (err) {
-                    error.PictureTooLarge => return refuse(d, "a picture past the tower's patch limit"),
-                    else => return error.Failed,
-                };
+            for (jobs, pics) |*job, *pic| {
+                if (job.problem.len > 0) return refuse(d, job.problem);
+                pic.* = job.pic orelse return error.Failed;
                 ids.append(a, vision.vision_start) catch return error.Failed;
                 runs.append(a, .{ .at = ids.items.len, .count = pic.tokens(), .row = row }) catch return error.Failed;
                 ids.appendNTimes(a, vision.image_token, pic.tokens()) catch return error.Failed;
@@ -235,6 +247,36 @@ const Engine = struct {
             start = end;
         }
     }
+
+    /// One picture's CPU work on its own thread, in a thread-safe allocator (freed after the decision).
+    const Prep = struct {
+        io: std.Io,
+        url: []const u8,
+        pic: ?vision.Picture = null,
+        problem: []const u8 = "",
+        failed: bool = false,
+
+        fn run(p: *Prep) void {
+            const a = std.heap.smp_allocator;
+            var problem: []const u8 = "";
+            const rgb = lfm2.image.load(p.io, a, p.url, &problem) catch {
+                p.failed = true;
+                return;
+            } orelse {
+                p.problem = problem;
+                return;
+            };
+            defer a.free(rgb.pixels);
+            p.pic = vision.prepare(a, rgb) catch |err| {
+                if (err == error.PictureTooLarge) p.problem = "a picture past the tower's patch limit" else p.failed = true;
+                return;
+            };
+        }
+
+        fn free(p: *Prep) void {
+            if (p.pic) |*pic| vision.free(std.heap.smp_allocator, pic);
+        }
+    };
 
     /// A picture's tokens in the prompt: `count` from position `at`, its rows from feature row `row`.
     const Run = struct { at: usize, count: usize, row: usize };
