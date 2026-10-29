@@ -23,9 +23,20 @@ const Pass = struct {
     rows: usize,
     prompt: bool,
     set: ?Set = null,
+    gemm: ?*cuda.vit.Gemms = null,
 
     /// out = x w: FP4 prompt rows on the prompt GEMM, the rest on the lane a round at a time (bits free of chunk cuts).
     fn project(p: Pass, w: wts.Proj, x: u64, out: u64, rows: usize) !void {
+        if (p.m.w.plain) {
+            // plain bf16 rows [n, k]: prompt rows through cuBLASLt, fp32 sums rounded once as torch's Linear
+            const g = p.gemm orelse return error.PlainNeedsGemm;
+            if (!p.prompt) return error.PlainPromptsOnly;
+            const v = switch (w) {
+                .bf16 => |b| b,
+                else => return error.PlainNeedsGemm,
+            };
+            return g.run(p.s, x, v.codes, out, rows, v.n, v.k, .bf16);
+        }
         const lin = p.k.linear();
         const in: cuda.qlinear.Rows = .{ .x = x, .part = p.m.s.part };
         if (p.prompt and w == .nvfp4) return lin.prompt(p.s, w, in, out, rows);
@@ -120,7 +131,8 @@ const Pass = struct {
                 for ([_]u64{ qa, x.kv, st.group, ya }) |ptr| a.add(ptr);
                 for ([_]usize{ rows, c.query_heads, c.kv_heads, st.state }) |n| a.add(@as(c_int, @intCast(n)));
                 a.add(kern.scale);
-                try cuda.launch.launch(st.kernel, .{ .grid = .{ .x = @intCast(rows), .y = c.query_heads, .z = 1 }, .block = .{ .x = 32 } }, p.s, &a);
+                // tf_lfm3v_set_attn_tiled: 4 rows x the 4 query heads of a kv head a block of 16 warps
+                try cuda.launch.launch(st.kernel, .{ .grid = .{ .x = @intCast((rows + 3) / 4), .y = c.kv_heads, .z = 1 }, .block = .{ .x = 512 } }, p.s, &a);
             } else if (p.prompt) {
                 try p.k.prompt(p.s, qa, kc, vc, ya, group[0].p0, rows, m.tableOf(group[0].slot), mdl.page_elems);
             } else {
@@ -150,7 +162,7 @@ pub const Insert = struct { at: usize, src: u64, count: usize };
 pub const Set = struct { kernel: cuda.Function, group: u64, state: usize };
 
 /// What a decision forward adds: rows over the embedding, `set` attention, the logits of rows `heads_at` (in order).
-pub const Opts = struct { inserts: []const Insert = &.{}, set: ?Set = null, heads_at: []const usize = &.{} };
+pub const Opts = struct { inserts: []const Insert = &.{}, set: ?Set = null, heads_at: []const usize = &.{}, gemm: ?*cuda.vit.Gemms = null };
 
 /// Every chain's rows (a prompt chunk, or windows); logits rows [head0, head0 + heads); conv states end at last rows.
 pub fn forward(m: *const Model, k: *const Kernels, s: Stream, chains: []const Chain, prompt: bool, head0: usize, heads: usize) !void {
@@ -173,7 +185,7 @@ pub fn forwardWith(m: *const Model, k: *const Kernels, s: Stream, chains: []cons
     if (opts.set != null and !(prompt and chains.len == 1 and chains[0].p0 == 0)) return error.BadWindow;
     if (opts.heads_at.len > mdl.round_rows) return error.BadWindow;
     for (opts.heads_at) |r| if (r >= rows) return error.BadWindow;
-    const p: Pass = .{ .m = m, .k = k, .s = s, .chains = chains, .rows = rows, .prompt = prompt, .set = opts.set };
+    const p: Pass = .{ .m = m, .k = k, .s = s, .chains = chains, .rows = rows, .prompt = prompt, .set = opts.set, .gemm = opts.gemm };
     const x = m.s;
     try k.embed.bf16(s, x.ids, m.w.embed, x.h, rows, c.hidden);
     for (inserts) |in| {

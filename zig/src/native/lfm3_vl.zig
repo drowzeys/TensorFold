@@ -82,7 +82,7 @@ const Engine = struct {
                 inserts[k] = .{ .at = lo - at, .src = e.feats.?.ptr + (r.row + lo - r.at) * c.hidden * 2, .count = hi - lo };
                 k += 1;
             }
-            try lfm3.forward.forwardWith(&e.m, &e.k, e.stream, &.{.{ .slot = 0, .p0 = at, .tokens = ids[at..][0..n] }}, true, if (last) n - 1 else 0, @intFromBool(last), .{ .inserts = inserts[0..k] });
+            try lfm3.forward.forwardWith(&e.m, &e.k, e.stream, &.{.{ .slot = 0, .p0 = at, .tokens = ids[at..][0..n] }}, true, if (last) n - 1 else 0, @intFromBool(last), .{ .inserts = inserts[0..k], .gemm = &e.tower.?.g });
             at += n;
         }
         const d = &e.driver;
@@ -107,6 +107,7 @@ const Engine = struct {
             .inserts = inserts[0..runs.len],
             .set = .{ .kernel = e.set_fn.?, .group = e.groups.?.ptr, .state = state },
             .heads_at = ends,
+            .gemm = &e.tower.?.g,
         });
         try d.check(d.api.cuMemcpyDtoHAsync_v2(e.rows.ptr, e.m.s.logits, ends.len * c.vocab * 2, e.stream.handle), "cuMemcpyDtoHAsync");
         try e.stream.synchronize();
@@ -288,7 +289,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer e.stream.deinit();
     e.k = try lfm3.kernels.Kernels.load(&e.ctx);
     errdefer e.k.deinit();
-    e.w = lfm3.weights.load(gpa, io, &e.driver, e.stream, &e.k, o.dir, null) catch |err| {
+    e.w = lfm3.weights.loadPlain(gpa, io, &e.driver, e.stream, &e.k, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "d1 (LFM3-VL): the bf16 text decoder did not load ({s})", .{@errorName(err)});
         return null;
     };
@@ -309,7 +310,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const causal = forced != null and std.mem.eql(u8, std.mem.span(forced.?), "causal");
     if (mode.set and !causal) {
         e.set_size = mode.size;
-        e.set_fn = try e.tower.?.glue.mod.function("tf_lfm3v_set_attn");
+        e.set_fn = try e.tower.?.glue.mod.function("tf_lfm3v_set_attn_tiled");
         e.groups = try cuda.DeviceBuffer.alloc(&e.driver, mdl.prompt_rows * 4);
         e.rows = try gpa.alloc(u16, mdl.round_rows * c.vocab);
         var tok = try core.tokenizer.loadTokenizer(io, gpa, try std.fs.path.join(a, &.{ o.dir, "tokenizer.json" }));

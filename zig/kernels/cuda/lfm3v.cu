@@ -159,3 +159,73 @@ extern "C" __global__ void __launch_bounds__(32) tf_lfm3v_set_attn(const __nv_bf
 #pragma unroll
     for (int i = 0; i < 4; ++i) out[static_cast<int64_t>(row) * H * D + head * D + lane + 32 * i] = __float2bfloat16_rn(o[i] / l);
 }
+
+// tf_lfm3v_set_attn's arithmetic, tiled: a block of 16 warps takes 4 query rows x the 4 query heads of one kv head and
+// stages 32 keys' K and V rows in shared memory for all of them; a tile no row of the block may see is skipped.
+// Same order of sums a (row, head) as the untiled kernel (keys in order, fp32 online softmax, flash's bf16 P for P.V).
+extern "C" __global__ void __launch_bounds__(512) tf_lfm3v_set_attn_tiled(const __nv_bfloat16* __restrict__ q,
+                                                                          const __nv_bfloat16* __restrict__ kv,
+                                                                          const int* __restrict__ group, __nv_bfloat16* __restrict__ out,
+                                                                          int R, int H, int Hk, int state, float scale) {
+    constexpr int D = 128, ROWS = 4, TILE = 32;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int kvh = blockIdx.y, per = H / Hk;  // per == 4: the block's heads are kvh * 4 .. + 3
+    const int row = blockIdx.x * ROWS + warp / per, head = kvh * per + warp % per;
+    const int kw = Hk * D;
+    __shared__ __nv_bfloat16 ks[TILE][D];
+    __shared__ __nv_bfloat16 vs[TILE][D];
+    __shared__ int gs[TILE];
+    const bool live = row < R;
+    float qv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int g = 0;
+    if (live) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) qv[i] = bf(q[static_cast<int64_t>(row) * H * D + head * D + lane + 32 * i]);
+        g = group[row];
+    }
+    // the block's rows: whether any is in the state, and their groups' span (questions are contiguous runs)
+    const int r0 = blockIdx.x * ROWS, r1 = min(R, r0 + ROWS);
+    const bool block_state = r0 < state;
+    const int g_lo = group[r0], g_hi = group[r1 - 1];
+    float m = -INFINITY, l = 0.0f, o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int t0 = 0; t0 < R; t0 += TILE) {
+        const int t1 = min(R, t0 + TILE);
+        // a tile past the state that holds none of the block's groups is seen by no row here
+        if (!block_state && t0 >= state) {
+            const int a = group[t0], b = group[t1 - 1];
+            if (b < g_lo || a > g_hi) continue;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < TILE * D / 8; i += blockDim.x) {
+            const int r = i / (D / 8), c = (i % (D / 8)) * 8, key = t0 + r;
+            uint4 kk = make_uint4(0, 0, 0, 0), vv = kk;
+            if (key < R) {
+                const __nv_bfloat16* src = kv + static_cast<int64_t>(key) * 2 * kw + kvh * D + c;
+                kk = *reinterpret_cast<const uint4*>(src);
+                vv = *reinterpret_cast<const uint4*>(src + kw);
+            }
+            *reinterpret_cast<uint4*>(&ks[r][c]) = kk;
+            *reinterpret_cast<uint4*>(&vs[r][c]) = vv;
+        }
+        if (threadIdx.x < TILE) gs[threadIdx.x] = t0 + threadIdx.x < R ? group[t0 + threadIdx.x] : -2;
+        __syncthreads();
+        if (!live) continue;
+        for (int r = 0; r < t1 - t0; ++r) {
+            const int j = t0 + r;
+            if (!(row < state || j < state || gs[r] == g)) continue;
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s = __fmaf_rn(qv[i], bf(ks[r][lane + 32 * i]), s);
+            s = warp_sum(s) * scale;
+            const float mn = fmaxf(m, s);
+            const float c = __expf(m - mn), p = __expf(s - mn);
+            l = l * c + p;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) o[i] = o[i] * c + rbf(p) * bf(vs[r][lane + 32 * i]);
+            m = mn;
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) out[static_cast<int64_t>(row) * H * D + head * D + lane + 32 * i] = __float2bfloat16_rn(o[i] / l);
+}
