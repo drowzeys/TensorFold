@@ -236,6 +236,8 @@ pub const Info = struct {
     decision_lead: []const u8 = "",
     /// The checkpoint's calibrated temperature for option answers (d1's `calibration.json` default): scores / it.
     decision_temperature: f64 = 1,
+    /// Pictures a decision request may carry: TensorFold 0.6's ImageLimits.max_images unless the engine reads more.
+    max_pictures: u32 = 4,
     /// Decisions may carry pictures (`Decision.pictures`).
     pictures: bool = false,
     /// Image input (--vision); null: text only.

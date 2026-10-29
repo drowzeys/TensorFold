@@ -20,7 +20,6 @@ const bos = "<|startoftext|>";
 const yes_forms = [_][]const u8{ "yes", "Yes", "YES" };
 const no_forms = [_][]const u8{ "no", "No", "NO" };
 const media = [_][]const u8{ "input_audio", "audio", "video_url", "video" };
-const max_pictures = 4; // TensorFold 0.6's ImageLimits.max_images
 
 const Kind = enum { noul, choice, score };
 
@@ -64,7 +63,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
 pub fn reply(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     const state = body.get("state") orelse return cx.refuse("a request needs a state (null when the question is the whole state)");
     const raw_questions = body.get("questions") orelse return cx.refuse("a request needs questions");
-    const seen = try pictures(cx, body, state);
+    const seen = try pictures(cx, body, state, srv.engine.info().max_pictures);
     if (raw_questions != .object or raw_questions.object.count() == 0) return cx.refuse("questions is a non-empty object of id: question");
     const questions = try cx.a.alloc(Question, raw_questions.object.count());
     for (raw_questions.object.keys(), raw_questions.object.values(), questions) |id, raw, *q| q.* = try parse(cx, id, raw);
@@ -107,7 +106,7 @@ pub fn reply(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
 const Seen = struct { urls: []const []const u8, state: Value };
 
 /// The pictures (files, images, then the state's image parts) and the state without them; other media refused.
-fn pictures(cx: *Cx, body: Value, state: Value) errors.Refused!Seen {
+fn pictures(cx: *Cx, body: Value, state: Value, max_pictures: u32) errors.Refused!Seen {
     var urls: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "files", "images" }) |key| if (body.get(key)) |v| switch (v) {
         .null => {},

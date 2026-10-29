@@ -22,6 +22,7 @@ const Pass = struct {
     chains: []const Chain,
     rows: usize,
     prompt: bool,
+    set: ?Set = null,
 
     /// out = x w: FP4 prompt rows on the prompt GEMM, the rest on the lane a round at a time (bits free of chunk cuts).
     fn project(p: Pass, w: wts.Proj, x: u64, out: u64, rows: usize) !void {
@@ -114,7 +115,13 @@ const Pass = struct {
             try p.k.kvWrite(p.s, sg, x.kv + row0 * 2 * mdl.kv_width * 2, rows);
             const qa = x.q + row0 * c.hidden * 2;
             const ya = x.att + row0 * c.hidden * 2;
-            if (p.prompt) {
+            if (p.set) |st| {
+                var a: cuda.Args = .{};
+                for ([_]u64{ qa, x.kv, st.group, ya }) |ptr| a.add(ptr);
+                for ([_]usize{ rows, c.query_heads, c.kv_heads, st.state }) |n| a.add(@as(c_int, @intCast(n)));
+                a.add(kern.scale);
+                try cuda.launch.launch(st.kernel, .{ .grid = .{ .x = @intCast(rows), .y = c.query_heads, .z = 1 }, .block = .{ .x = 32 } }, p.s, &a);
+            } else if (p.prompt) {
                 try p.k.prompt(p.s, qa, kc, vc, ya, group[0].p0, rows, m.tableOf(group[0].slot), mdl.page_elems);
             } else {
                 const xa = x.xs + row0 * (c.hidden / 64) * 4;
@@ -133,8 +140,26 @@ const Pass = struct {
     }
 };
 
+/// Rows of a forward's embedding replaced by other rows (a picture's projected features): `count` rows from `src`
+/// at row `at` of the forward, bf16 [count, hidden].
+pub const Insert = struct { at: usize, src: u64, count: usize };
+
+/// d1's `set` attention on the full-attention layers of one whole prompt row from position 0: the state's rows
+/// [0, state) and every row's group (int32 [rows] on the device: -1 in the state, else its question), read by `kernel`
+/// (lfm3v.cu tf_lfm3v_set_attn). Sliding and conv layers stay causal, as d1 keeps them.
+pub const Set = struct { kernel: cuda.Function, group: u64, state: usize };
+
+/// What a decision forward adds: rows over the embedding, `set` attention, the logits of rows `heads_at` (in order).
+pub const Opts = struct { inserts: []const Insert = &.{}, set: ?Set = null, heads_at: []const usize = &.{} };
+
 /// Every chain's rows (a prompt chunk, or windows); logits rows [head0, head0 + heads); conv states end at last rows.
 pub fn forward(m: *const Model, k: *const Kernels, s: Stream, chains: []const Chain, prompt: bool, head0: usize, heads: usize) !void {
+    return forwardWith(m, k, s, chains, prompt, head0, heads, .{});
+}
+
+/// `forward` with a decision's options (`Opts`); with `heads_at`, those rows' logits instead of [head0, head0 + heads).
+pub fn forwardWith(m: *const Model, k: *const Kernels, s: Stream, chains: []const Chain, prompt: bool, head0: usize, heads: usize, opts: Opts) !void {
+    const inserts = opts.inserts;
     var rows: usize = 0;
     for (chains) |ch| {
         if (ch.tokens.len == 0 or ch.slot >= m.slots or ch.p0 + ch.tokens.len > m.context) return error.BadChain;
@@ -145,9 +170,16 @@ pub fn forward(m: *const Model, k: *const Kernels, s: Stream, chains: []const Ch
     if (rows > @as(usize, if (prompt) mdl.prompt_rows else mdl.round_rows) or (prompt and chains.len != 1)) return error.BadWindow;
     if (chains.len > mdl.round_rows or heads > mdl.round_rows or head0 + heads > rows) return error.BadWindow;
     try upload(m, s, chains, rows);
-    const p: Pass = .{ .m = m, .k = k, .s = s, .chains = chains, .rows = rows, .prompt = prompt };
+    if (opts.set != null and !(prompt and chains.len == 1 and chains[0].p0 == 0)) return error.BadWindow;
+    if (opts.heads_at.len > mdl.round_rows) return error.BadWindow;
+    for (opts.heads_at) |r| if (r >= rows) return error.BadWindow;
+    const p: Pass = .{ .m = m, .k = k, .s = s, .chains = chains, .rows = rows, .prompt = prompt, .set = opts.set };
     const x = m.s;
     try k.embed.bf16(s, x.ids, m.w.embed, x.h, rows, c.hidden);
+    for (inserts) |in| {
+        if (in.at + in.count > rows) return error.BadWindow;
+        try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(x.h + in.at * c.hidden * 2, in.src, in.count * c.hidden * 2, s.handle), "cuMemcpyDtoDAsync");
+    }
     var conv_at: usize = 0;
     var full_at: usize = 0;
     var sliding_at: usize = 0;
@@ -170,8 +202,13 @@ pub fn forward(m: *const Model, k: *const Kernels, s: Stream, chains: []const Ch
     }
     try p.norm(post, m.w.final_norm);
     try commitAll(m, k, s, chains, prompt);
-    if (heads == 0) return;
     const lin = k.linear();
+    if (opts.heads_at.len > 0) {
+        // the asked rows side by side in r (free after the last block), then their logits in order
+        for (opts.heads_at, 0..) |r, i| try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(x.r + i * c.hidden * 2, x.x + r * c.hidden * 2, c.hidden * 2, s.handle), "cuMemcpyDtoDAsync");
+        return lin.decode(s, m.w.head, .{ .x = x.r, .part = x.part }, x.logits, opts.heads_at.len);
+    }
+    if (heads == 0) return;
     try lin.decode(s, m.w.head, .{ .x = x.x + head0 * c.hidden * 2, .part = x.part }, x.logits, heads);
 }
 

@@ -85,6 +85,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "lfm2", .flags = glue }, // ours: LFM2's short convolution, QK norm and rotary, gates and label rows
     .{ .name = "lfm2_moe", .flags = glue }, // ours: LFM2.5-24B-A2B's router, Liquid's 3-tap conv and commit (liquid_conv.cuh)
     .{ .name = "lfm3", .flags = glue }, // ours: LFM3's 7-tap Liquid conv and commit (liquid_conv.cuh)
+    .{ .name = "lfm3v", .flags = glue }, // ours: LFM3-VL's vision glue: RMSNorm, q/k norm and axial RoPE, gated 3x3 conv
     .{ .name = "vit", .flags = glue }, // ours: vision towers' LayerNorm, Linear epilogues, activations, unshuffle
     .{ .name = "tree_round", .flags = &.{"-O3"} }, // ours: verified tree rounds for every family (cuda/tree_round.zig)
     .{ .name = "act_rows", .flags = &.{"-O3"} }, // ours: SwiGLU, output gates, group sums (cuda/act_rows.zig)
