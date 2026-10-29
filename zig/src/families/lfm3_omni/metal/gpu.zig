@@ -6,6 +6,7 @@ const mtl = @import("metal");
 /// Every pipeline of lfm3_omni.metallib, by its kernel name.
 pub const P = enum {
     om_rmsnorm,
+    om_rmsnorm_1k,
     om_head_norm,
     om_layernorm,
     om_rope,
@@ -16,9 +17,9 @@ pub const P = enum {
     om_short_conv,
     om_short_conv_rows,
     om_conv_state,
-    om_attention,
     om_attention_tiles,
-    om_gate,
+    om_attend,
+    om_qk_prep,
     om_swiglu,
     om_bias_act,
     om_embed,
@@ -30,7 +31,8 @@ pub const P = enum {
     om_fsq_decode,
     om_repeat_rows,
     om_polar,
-    om_argmax,
+    om_argmax_part,
+    om_argmax_final,
     om_rows_1,
     om_rows_4,
     om_rows_8,
@@ -157,6 +159,21 @@ pub const Gpu = struct {
             e.setBuffer(r.buf, r.off, i);
         }
         if (@TypeOf(args) != void) e.setBytes(std.mem.asBytes(&args), bufs.len);
+        e.dispatchGroups(mtl.Size.of(groups[0], groups[1], groups[2]), mtl.Size.of(threads, 1, 1));
+        g.encoded += 1;
+        g.dispatches += 1;
+    }
+
+    /// `go` with `tg_bytes` of threadgroup memory at threadgroup index 0.
+    pub fn goTg(g: *Gpu, p: P, groups: [3]usize, threads: usize, bufs: []const u64, args: anytype, tg_bytes: usize) void {
+        const e = g.encoder();
+        e.setPipeline(g.pipes[@backingInt(p)]);
+        for (bufs, 0..) |a, i| {
+            const r = g.ref(a);
+            e.setBuffer(r.buf, r.off, i);
+        }
+        e.setBytes(std.mem.asBytes(&args), bufs.len);
+        e.setThreadgroupMemory(std.mem.alignForward(usize, @max(tg_bytes, 16), 16), 0);
         e.dispatchGroups(mtl.Size.of(groups[0], groups[1], groups[2]), mtl.Size.of(threads, 1, 1));
         g.encoded += 1;
         g.dispatches += 1;

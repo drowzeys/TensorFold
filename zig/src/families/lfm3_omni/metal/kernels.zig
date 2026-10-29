@@ -30,15 +30,24 @@ pub const Kernels = struct {
     // ---- matrix products
 
     /// Whether `t` rows of `kdim` (rows `ldx` apart) take the few-row product.
-    fn few(t: usize, kdim: usize, ldx: usize, x: u64) bool {
+    pub fn few(t: usize, kdim: usize, ldx: usize, x: u64) bool {
         return t <= gemv_rows and kdim % 8 == 0 and ldx % 8 == 0 and x % 16 == 0;
     }
 
-    /// The few-row product: y (bf16, rows `ldy` apart) and / or yf (fp32, rows n apart), `batch` products.
-    pub fn gemv(k: *const Kernels, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, t: usize, y: u64, ldy: usize, yf: u64, batch: usize, sw: usize, sx: usize, sy: usize) void {
-        const A = extern struct { K: i32, N: i32, T: i32, ldx: i32, ldy: i32, has_y: i32, has_yf: i32, pad: i32 = 0, sw: i64, sx: i64, sy: i64 };
+    /// The few-row product's result: bf16 / fp32 rows, or SwiGLU of interleaved (a, c) column pairs.
+    pub const Epi = enum(i32) { plain = 0, swiglu = 2 };
+
+    pub const RowsArgs = extern struct { K: i32, N: i32, T: i32, ldx: i32, ldy: i32, has_y: i32, has_yf: i32, epi: i32, sw: i64, sx: i64, sy: i64 };
+
+    /// The few-row product: y (bf16, rows `ldy` apart) and / or yf (fp32, rows n apart), `batch` products; with
+    /// `.swiglu` the columns are (a, c) pairs and y holds n / 2 columns.
+    pub fn product(k: *const Kernels, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, t: usize, y: u64, ldy: usize, yf: u64, batch: usize, sw: usize, sx: usize, sy: usize, epi: Epi) void {
         const p: gpu.P = if (t <= 1) .om_rows_1 else if (t <= 4) .om_rows_4 else if (t <= 8) .om_rows_8 else if (t <= 12) .om_rows_12 else .om_rows_16;
-        k.g.go(p, .{ blocks(n, 16), 1, batch }, 128, &.{ w, x, y, yf }, A{ .K = i(kdim), .N = i(n), .T = i(t), .ldx = i(ldx), .ldy = i(ldy), .has_y = @intFromBool(y != 0), .has_yf = @intFromBool(yf != 0), .sw = @intCast(sw), .sx = @intCast(sx), .sy = @intCast(sy) });
+        k.g.go(p, .{ blocks(n, 16), 1, batch }, 128, &.{ w, x, y, yf }, RowsArgs{ .K = i(kdim), .N = i(n), .T = i(t), .ldx = i(ldx), .ldy = i(ldy), .has_y = @intFromBool(y != 0), .has_yf = @intFromBool(yf != 0), .epi = @backingInt(epi), .sw = @intCast(sw), .sx = @intCast(sx), .sy = @intCast(sy) });
+    }
+
+    pub fn gemv(k: *const Kernels, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, t: usize, y: u64, ldy: usize, yf: u64, batch: usize, sw: usize, sx: usize, sy: usize) void {
+        k.product(w, x, ldx, kdim, n, t, y, ldy, yf, batch, sw, sx, sy, .plain);
     }
 
     /// Row-major C [m, n] (rows `ldc` apart) = A [m, kd] B [kd, n], A stored [kd, m] when `ta`, B stored [n, kd] when
@@ -86,13 +95,28 @@ pub const Kernels = struct {
     // ---- elementwise and row kernels
 
     pub fn rmsnorm(k: *const Kernels, x: u64, r: u64, w: u64, y: u64, d: usize, ld: usize, ldy: usize, rows: usize, eps: f32, mode: Norm) void {
-        k.rmsnormRows(x, r, w, 0, y, d, ld, ldy, rows, eps, mode);
+        k.rmsnormPost(x, r, 0, w, 0, y, d, ld, ldy, rows, eps, mode);
     }
 
     /// As `rmsnorm` with a weight row a row (`ldw` elements apart).
     pub fn rmsnormRows(k: *const Kernels, x: u64, r: u64, w: u64, ldw: usize, y: u64, d: usize, ld: usize, ldy: usize, rows: usize, eps: f32, mode: Norm) void {
-        const A = extern struct { D: i32, ld: i32, ldy: i32, eps: f32, mode: i32, ldw: i32, has_r: i32 };
-        k.g.go(.om_rmsnorm, .{ rows, 1, 1 }, 256, &.{ x, r, w, y }, A{ .D = i(d), .ld = i(ld), .ldy = i(ldy), .eps = eps, .mode = @backingInt(mode), .ldw = i(ldw), .has_r = @intFromBool(r != 0) });
+        k.rmsnormPost(x, r, 0, w, ldw, y, d, ld, ldy, rows, eps, mode);
+    }
+
+    /// As `rmsnormRows`, r first normed by `pw` (a sandwich layer's post norm) when given.
+    pub fn rmsnormPost(k: *const Kernels, x: u64, r: u64, pw: u64, w: u64, ldw: usize, y: u64, d: usize, ld: usize, ldy: usize, rows: usize, eps: f32, mode: Norm) void {
+        const A = extern struct { D: i32, ld: i32, ldy: i32, eps: f32, mode: i32, ldw: i32, has_r: i32, has_pw: i32 };
+        // a few rows: a wide group each (the row's latency is all there is)
+        const wide = rows <= gemv_rows and d >= 1024;
+        k.g.go(if (wide) .om_rmsnorm_1k else .om_rmsnorm, .{ rows, 1, 1 }, if (wide) 1024 else 256, &.{ x, r, w, y, pw }, A{ .D = i(d), .ld = i(ld), .ldy = i(ldy), .eps = eps, .mode = @backingInt(mode), .ldw = i(ldw), .has_r = @intFromBool(r != 0), .has_pw = @intFromBool(pw != 0) });
+    }
+
+    /// The attention heads of `t` rows of `proj` (q | k | v | gate, rows `ld` apart): q heads normed and rotated in
+    /// place, k heads normed, rotated and written to cache row pos0 + t, v copied to the cache (rows `nk` apart).
+    pub fn qkPrep(k: *const Kernels, proj: u64, qn: u64, kn: u64, inv: u64, kc: u64, vc: u64, t: usize, h: usize, hkv: usize, hd: usize, ld: usize, pos0: usize, mode: u8, nk: usize, eps: f32) void {
+        const A = extern struct { T: i32, H: i32, Hkv: i32, hd: i32, ld: i32, pos0: i32, mode: i32, nk: i32, eps: f32 };
+        std.debug.assert(hd <= 128);
+        k.g.go(.om_qk_prep, .{ t * (h + hkv), 1, 1 }, 32, &.{ proj, qn, kn, inv, kc, vc }, A{ .T = i(t), .H = i(h), .Hkv = i(hkv), .hd = i(hd), .ld = i(ld), .pos0 = i(pos0), .mode = mode, .nk = i(nk), .eps = eps });
     }
 
     pub fn headNorm(k: *const Kernels, x: u64, w: u64, t: usize, h: usize, hd: usize, ld: usize, eps: f32) void {
@@ -136,26 +160,31 @@ pub const Kernels = struct {
         kv_len: usize,
         window: usize,
         causal: bool,
+        /// LFM3's per-head gate logits (rows `ldg` apart), applied to the output; 0: none.
+        gate: u64 = 0,
+        ldg: usize = 0,
     };
 
     pub fn attention(k: *const Kernels, p: Attn) !void {
-        const A = extern struct { ldq: i32, ldkv: i32, ldo: i32, T: i32, H: i32, Hkv: i32, hd: i32, pos0: i32, kv_len: i32, window: i32, causal: i32, scale: f32 };
-        const a: A = .{ .ldq = i(p.ldq), .ldkv = i(p.ldkv), .ldo = i(p.ldo), .T = i(p.t), .H = i(p.heads), .Hkv = i(p.kv_heads), .hd = i(p.hd), .pos0 = i(p.pos0), .kv_len = i(p.kv_len), .window = i(p.window), .causal = @intFromBool(p.causal), .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))) };
-        const bufs = [_]u64{ p.q, p.kc, p.vc, p.o };
-        if (p.t > 1 and p.hd % 32 == 0 and p.hd <= 128) return k.g.go(.om_attention_tiles, .{ blocks(p.t, 16), p.heads, 1 }, 128, &bufs, a);
-        const span = if (p.causal and p.window > 0) @min(p.window, p.kv_len) else p.kv_len;
-        if (span > 4096 or p.hd > 128) return error.AttentionSpanTooLong;
-        k.g.go(.om_attention, .{ p.t * p.heads, 1, 1 }, 128, &bufs, a);
+        if (p.hd % 32 != 0 or p.hd > 128) return error.UnsupportedHeadDim;
+        if (p.t == 1 and p.kv_len > 4096) return error.AttentionSpanTooLong;
+        if (p.t == 1) {
+            const A = extern struct { ldkv: i32, H: i32, Hkv: i32, hd: i32, pos: i32, kv_len: i32, window: i32, causal: i32, has_gate: i32, gate_off: i32, scale: f32 };
+            const span = if (p.causal and p.window > 0) @min(p.window, p.kv_len) else p.kv_len;
+            if (span > 4096) return error.AttentionSpanTooLong;
+            // the gate's logits sit in the query's row (q | k | v | gate)
+            const off: usize = if (p.gate != 0) (p.gate - p.q) / 2 else 0;
+            return k.g.go(.om_attend, .{ p.heads, 1, 1 }, 256, &.{ p.q, p.kc, p.vc, p.o }, A{ .ldkv = i(p.ldkv), .H = i(p.heads), .Hkv = i(p.kv_heads), .hd = i(p.hd), .pos = i(p.pos0), .kv_len = i(p.kv_len), .window = i(p.window), .causal = @intFromBool(p.causal), .has_gate = @intFromBool(p.gate != 0), .gate_off = i(off), .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))) });
+        }
+        const A = extern struct { ldq: i32, ldkv: i32, ldo: i32, T: i32, H: i32, Hkv: i32, hd: i32, pos0: i32, kv_len: i32, window: i32, causal: i32, scale: f32, has_gate: i32, ldg: i32 };
+        const a: A = .{ .ldq = i(p.ldq), .ldkv = i(p.ldkv), .ldo = i(p.ldo), .T = i(p.t), .H = i(p.heads), .Hkv = i(p.kv_heads), .hd = i(p.hd), .pos0 = i(p.pos0), .kv_len = i(p.kv_len), .window = i(p.window), .causal = @intFromBool(p.causal), .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))), .has_gate = @intFromBool(p.gate != 0), .ldg = i(p.ldg) };
+        k.g.go(.om_attention_tiles, .{ blocks(p.t, 16), p.heads, 1 }, 128, &.{ p.q, p.kc, p.vc, p.o, p.gate }, a);
     }
 
-    pub fn gate(k: *const Kernels, o: u64, ldo: usize, g: u64, ldg: usize, t: usize, h: usize, hd: usize) void {
-        const A = extern struct { ldo: i32, ldg: i32, T: i32, H: i32, hd: i32 };
-        k.go(.om_gate, t * h * hd, 256, &.{ o, g }, A{ .ldo = i(ldo), .ldg = i(ldg), .T = i(t), .H = i(h), .hd = i(hd) });
-    }
-
-    pub fn swiglu(k: *const Kernels, ac: u64, y: u64, t: usize, f: usize) void {
-        const A = extern struct { T: i32, F: i32 };
-        k.go(.om_swiglu, t * f, 256, &.{ ac, y }, A{ .T = i(t), .F = i(f) });
+    /// SwiGLU over rows of 2f: halves, or interleaved (a, c) pairs.
+    pub fn swiglu(k: *const Kernels, ac: u64, y: u64, t: usize, f: usize, inter: bool) void {
+        const A = extern struct { T: i32, F: i32, inter: i32 };
+        k.go(.om_swiglu, t * f, 256, &.{ ac, y }, A{ .T = i(t), .F = i(f), .inter = @intFromBool(inter) });
     }
 
     pub fn biasAct(k: *const Kernels, acc: u64, bias: u64, y: u64, rows: usize, cols: usize, per_row: bool, act: Act) void {
@@ -210,9 +239,14 @@ pub const Kernels = struct {
         k.go(.om_polar, t * nb, 256, &.{ x, spec }, A{ .T = i(t), .NB = i(nb) });
     }
 
-    pub fn argmax(k: *const Kernels, x: u64, n: usize, sup: u64, ns: usize, out: u64) void {
-        const A = extern struct { N: i32, ns: i32 };
-        k.g.go(.om_argmax, .{ 1, 1, 1 }, 1024, &.{ x, sup, out }, A{ .N = i(n), .ns = i(ns) });
+    /// The first index of the largest of n bf16 logits (ids in `sup` excluded) into `out`, in two stages through
+    /// `ws` (parts of 1024 logits: 8 bytes a part).
+    pub fn argmax(k: *const Kernels, x: u64, n: usize, sup: u64, ns: usize, out: u64, ws: u64) void {
+        const A = extern struct { N: i32, ns: i32, per: i32 };
+        const per = 1024;
+        const parts = blocks(n, per);
+        k.g.go(.om_argmax_part, .{ parts, 1, 1 }, 256, &.{ x, sup, ws, ws + parts * 4 }, A{ .N = i(n), .ns = i(ns), .per = per });
+        k.g.go(.om_argmax_final, .{ 1, 1, 1 }, 32, &.{ ws, ws + parts * 4, out }, @as(i32, i(parts)));
     }
 
     pub const Pick = struct {
@@ -261,8 +295,7 @@ pub const Kernels = struct {
 };
 
 test "argument structs match the kernels' layouts" {
-    const R = extern struct { K: i32, N: i32, T: i32, ldx: i32, ldy: i32, has_y: i32, has_yf: i32, pad: i32 = 0, sw: i64, sx: i64, sy: i64 };
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(R));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(Kernels.RowsArgs));
     const P = extern struct { p0: i32, hn: i32, penalty: f32, temp: f32, seed: u64, frame: i32, NQ: i32, size: i32, pad: i32 = 0 };
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(P));
 }

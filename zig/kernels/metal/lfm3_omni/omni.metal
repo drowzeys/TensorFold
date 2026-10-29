@@ -1,95 +1,59 @@
 // LFM3-Omni on Metal: the four Liquid stacks' ops (speech encoder, backbone, depth decoder, Liquid codec decoder), the
 // speech encoder's strided convolutions, the depth decoder's inputs and picks, the codec's spectra and the log-mel
 // front end. Ported from zig/kernels/cuda/lfm3_omni.cu: every op that rounds to bf16 in the reference rounds here.
-#include <metal_stdlib>
-using namespace metal;
-
-typedef ushort bf;
-
-inline float f(bf x) { return as_type<float>(uint(x) << 16); }
-
-inline bf b(float x) {
-  const uint u = as_type<uint>(x);
-  if ((u & 0x7FFFFFFFu) > 0x7F800000u) return bf((u >> 16) | 0x40u);
-  return bf((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
-}
-
-inline float rb(float x) { return f(b(x)); }
-
-inline float sigm(float x) { return 1.0f / (1.0f + precise::exp(-x)); }
-
-// erf for the exact GELU (Metal has none): Numerical Recipes' erfc fit (fractional error < 1.2e-7), with the Taylor
-// series near zero where 1 - erfc would cancel; far below the bf16 rounding that follows.
-inline float erf_f(float xf) {
-  const float x = fabs(xf);
-  float r;
-  if (x < 0.25f) {
-    const float t = x * x;
-    r = 1.1283791670955126f * x * (1.0f - t * (1.0f / 3.0f - t * (0.1f - t * (1.0f / 42.0f - t * (1.0f / 216.0f)))));
-  } else {
-    const float t = 1.0f / (1.0f + 0.5f * x);
-    const float e = t * precise::exp(-x * x - 1.26551223f + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
-    r = 1.0f - e;
-  }
-  return xf < 0.0f ? -r : r;
-}
-
-template <uint NT>
-inline float group_sum(float v, threadgroup float* red, uint tid) {
-  v = simd_sum(v);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if ((tid & 31) == 0) red[tid >> 5] = v;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float t = 0.0f;
-  for (uint i = 0; i < NT / 32; ++i) t += red[i];
-  return t;
-}
-
-template <uint NT>
-inline float group_max(float v, threadgroup float* red, uint tid) {
-  v = simd_max(v);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if ((tid & 31) == 0) red[tid >> 5] = v;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float t = -INFINITY;
-  for (uint i = 0; i < NT / 32; ++i) t = max(t, red[i]);
-  return t;
-}
+#include "om_common.h"
 
 // ---- norms
 
 struct NormArgs {
   int D, ld, ldy;
   float eps;
-  int mode, ldw, has_r;
+  int mode, ldw, has_r, has_pw;
 };
 
-// RMSNorm over rows of D (a group of 256 a row). With R: X = bf16(X + R) first (written back to X).
-// mode 0: bf16(w * bf16(x * rsqrt)); mode 1: bf16(x * rsqrt * w). W rows `ldw` apart (0: one weight for all rows).
-[[max_total_threads_per_threadgroup(256)]] kernel void om_rmsnorm(device bf* X [[buffer(0)]], device const bf* R [[buffer(1)]],
-                                                               device const bf* Wb [[buffer(2)]], device bf* Y [[buffer(3)]],
-                                                               constant NormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
-                                                               uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float red[8];
+// RMSNorm over rows of D (a group of NT a row: 1024 for the few-row path, where a row is all there is). With R: X = bf16(X + R) first (written back to X), R itself first
+// normed by PW when given (a sandwich layer's post norm, mode 0). mode 0: bf16(w * bf16(x * rsqrt)); mode 1:
+// bf16(x * rsqrt * w). W rows `ldw` apart (0: one weight for all rows).
+template <uint NT>
+inline void rmsnorm_body(device bf* X, device const bf* R, device const bf* Wb, device bf* Y, device const bf* PW, constant NormArgs& a,
+                         uint row, uint tid, threadgroup float* red) {
   device const bf* W = Wb + (long)row * a.ldw;
   device bf* x = X + (long)row * a.ld;
   device bf* y = Y + (long)row * a.ldy;
   device const bf* r = R + (long)row * a.ld;
+  float inv_r = 0.0f;
+  if (a.has_r && a.has_pw) {
+    float sr = 0.0f;
+    for (int i = tid; i < a.D; i += NT) sr += f(r[i]) * f(r[i]);
+    inv_r = precise::rsqrt(group_sum<NT>(sr, red, tid) / float(a.D) + a.eps);
+  }
   float ss = 0.0f;
-  for (int i = tid; i < a.D; i += 256) {
+  for (int i = tid; i < a.D; i += NT) {
     float v = f(x[i]);
     if (a.has_r) {
-      v = rb(v + f(r[i]));
+      const float add = a.has_pw ? rb(f(PW[i]) * rb(f(r[i]) * inv_r)) : f(r[i]);
+      v = rb(v + add);
       x[i] = b(v);
     }
     ss += v * v;
   }
-  const float inv = precise::rsqrt(group_sum<256>(ss, red, tid) / float(a.D) + a.eps);
-  for (int i = tid; i < a.D; i += 256) {
+  const float inv = precise::rsqrt(group_sum<NT>(ss, red, tid) / float(a.D) + a.eps);
+  for (int i = tid; i < a.D; i += NT) {
     const float v = f(x[i]) * inv;
     y[i] = a.mode == 0 ? b(f(W[i]) * rb(v)) : b(v * f(W[i]));
   }
 }
+
+#define OM_RMSNORM(NAME, NT)                                                                                                       \
+  [[max_total_threads_per_threadgroup(NT)]] kernel void NAME(                                                                       \
+      device bf* X [[buffer(0)]], device const bf* R [[buffer(1)]], device const bf* Wb [[buffer(2)]], device bf* Y [[buffer(3)]],   \
+      device const bf* PW [[buffer(4)]], constant NormArgs& a [[buffer(5)]], uint row [[threadgroup_position_in_grid]],             \
+      uint tid [[thread_index_in_threadgroup]]) {                                                                                  \
+    threadgroup float red[NT / 32];                                                                                                \
+    rmsnorm_body<NT>(X, R, Wb, Y, PW, a, row, tid, red);                                                                           \
+  }
+OM_RMSNORM(om_rmsnorm, 256)
+OM_RMSNORM(om_rmsnorm_1k, 1024)
 
 struct HeadNormArgs {
   int T, H, hd, ld;
@@ -262,60 +226,19 @@ kernel void om_conv_state(device const bf* BCx [[buffer(0)]], device bf* STATE [
 struct AttnArgs {
   int ldq, ldkv, ldo, T, H, Hkv, hd, pos0, kv_len, window, causal;
   float scale;
+  int has_gate, ldg;
 };
 
-#define OM_SPAN 4096
-
-// T query rows at positions pos0 + t over the cache: causal rows see keys up to their own position, `window` > 0 the
-// last `window` keys, causal 0 every key. A group of 128 a (row, head); scores in threadgroup memory.
-[[max_total_threads_per_threadgroup(128)]] kernel void om_attention(device const bf* Q [[buffer(0)]], device const bf* Kc [[buffer(1)]],
-                                                                 device const bf* Vc [[buffer(2)]], device bf* O [[buffer(3)]],
-                                                                 constant AttnArgs& a [[buffer(4)]], uint blk [[threadgroup_position_in_grid]],
-                                                                 uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float q[128];
-  threadgroup float sc[OM_SPAN];
-  threadgroup float red[4];
-  const int t = blk / a.H, h = blk % a.H, kh = h / (a.H / a.Hkv);
-  const int pos = a.pos0 + t;
-  int hi = a.causal ? pos + 1 : a.kv_len;
-  const int lo = (a.causal && a.window > 0) ? max(0, pos + 1 - a.window) : 0;
-  if (hi > a.kv_len) hi = a.kv_len;
-  device const bf* qr = Q + (long)t * a.ldq + h * a.hd;
-  for (int i = tid; i < a.hd; i += 128) q[i] = f(qr[i]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float m = -INFINITY;
-  for (int k = lo + tid; k < hi; k += 128) {
-    device const bf* kr = Kc + (long)k * a.ldkv + kh * a.hd;
-    float s = 0.0f;
-    for (int i = 0; i < a.hd; i += 2) s += q[i] * f(kr[i]) + q[i + 1] * f(kr[i + 1]);
-    s *= a.scale;
-    sc[k - lo] = s;
-    m = max(m, s);
-  }
-  m = group_max<128>(m, red, tid);
-  float l = 0.0f;
-  for (int k = lo + tid; k < hi; k += 128) {
-    const float e = precise::exp(sc[k - lo] - m);
-    sc[k - lo] = e;
-    l += e;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  l = group_sum<128>(l, red, tid);
-  const float inv = 1.0f / l;
-  for (int i = tid; i < a.hd; i += 128) {
-    float acc = 0.0f;
-    for (int k = lo; k < hi; ++k) acc += sc[k - lo] * f(Vc[(long)k * a.ldkv + kh * a.hd + i]);
-    O[(long)t * a.ldo + h * a.hd + i] = b(acc * inv);
-  }
-}
-
 // Many query rows: a group takes 16 rows of one head and walks the cache in tiles of 32 keys held in threadgroup
-// memory, with an online softmax per row (4 simdgroups, 4 rows each). Masks as om_attention. hd <= 128, hd % 32 == 0.
+// memory, with an online softmax per row (4 simdgroups, 4 rows each). Causal rows see keys up to their own position,
+// `window` > 0 the last `window` keys, causal 0 every key; LFM3's per-head sigmoid output gate (G, rows ldg apart)
+// applied when given. hd <= 128, hd % 32 == 0.
 #define AT_Q 16
 #define AT_K 32
 [[max_total_threads_per_threadgroup(128)]] kernel void om_attention_tiles(device const bf* Q [[buffer(0)]], device const bf* Kc [[buffer(1)]],
                                                                        device const bf* Vc [[buffer(2)]], device bf* O [[buffer(3)]],
-                                                                       constant AttnArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                                                       device const bf* G [[buffer(4)]], constant AttnArgs& a [[buffer(5)]],
+                                                                       uint2 tg [[threadgroup_position_in_grid]],
                                                                        uint tid [[thread_index_in_threadgroup]]) {
   threadgroup float qs[AT_Q * 128];
   threadgroup float ss[AT_Q * AT_K];
@@ -390,40 +313,32 @@ struct AttnArgs {
     const int r = r0 + warp * 4 + x;
     if (r >= a.T) continue;
     const float inv = 1.0f / l[x];
+    const float g = a.has_gate ? rb(sigm(f(G[(long)r * a.ldg + h]))) : 1.0f;
     for (int c = 0; c < 4; ++c)
-      if (c < dpl) O[(long)r * a.ldo + h * hd + lane + 32 * c] = b(acc[x][c] * inv);
+      if (c < dpl) {
+        const bf o = b(acc[x][c] * inv);
+        O[(long)r * a.ldo + h * hd + lane + 32 * c] = a.has_gate ? b(f(o) * g) : o;
+      }
   }
-}
-
-struct GateArgs {
-  int ldo, ldg, T, H, hd;
-};
-
-// O *= bf16(sigmoid(G)) per head (LFM3's output gate).
-kernel void om_gate(device bf* O [[buffer(0)]], device const bf* G [[buffer(1)]], constant GateArgs& a [[buffer(2)]],
-                    uint gid [[thread_position_in_grid]]) {
-  const long i = gid;
-  if (i >= (long)a.T * a.H * a.hd) return;
-  const int t = int(i / ((long)a.H * a.hd)), h = int((i / a.hd) % a.H), c = int(i % a.hd);
-  const float g = rb(sigm(f(G[(long)t * a.ldg + h])));
-  device bf* o = O + (long)t * a.ldo + h * a.hd + c;
-  *o = b(f(*o) * g);
 }
 
 // ---- elementwise
 
 struct SwigluArgs {
-  int T, F;
+  int T, F, inter;
 };
 
+// y = bf16(bf16(silu(a)) * c) from rows of 2F: a | c halves, or (inter) pairs a_j, c_j side by side.
 kernel void om_swiglu(device const bf* AC [[buffer(0)]], device bf* Y [[buffer(1)]], constant SwigluArgs& a [[buffer(2)]],
                       uint gid [[thread_position_in_grid]]) {
   const long i = gid;
   if (i >= (long)a.T * a.F) return;
   const long t = i / a.F;
   const int c = int(i % a.F);
-  const float x = f(AC[t * 2 * a.F + c]);
-  Y[i] = b(rb(x / (1.0f + precise::exp(-x))) * f(AC[t * 2 * a.F + a.F + c]));
+  const long ia = a.inter ? t * 2 * a.F + 2 * c : t * 2 * a.F + c;
+  const long ic = a.inter ? ia + 1 : ia + a.F;
+  const float x = f(AC[ia]);
+  Y[i] = b(rb(x / (1.0f + precise::exp(-x))) * f(AC[ic]));
 }
 
 struct BiasActArgs {
@@ -564,118 +479,12 @@ kernel void om_polar(device const bf* X [[buffer(0)]], device float* S [[buffer(
   S[t * 2 * a.NB + a.NB + k] = m * precise::sin(ph);
 }
 
-struct ArgmaxArgs {
-  int N, ns;
-};
-
 inline void better(thread float& best, thread int& at, float v, int i) {
   if (v > best || (v == best && i < at)) {
     best = v;
     at = i;
   }
 }
-
-// Greedy text: the first index of the largest of N bf16 logits, ids in SUP excluded; one group of 1024.
-[[max_total_threads_per_threadgroup(1024)]] kernel void om_argmax(device const bf* X [[buffer(0)]], device const int* SUP [[buffer(1)]],
-                                                               device int* OUT [[buffer(2)]], constant ArgmaxArgs& a [[buffer(3)]],
-                                                               uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float bv[32];
-  threadgroup int bi[32];
-  float best = -INFINITY;
-  int at = 0x7fffffff;
-  for (int i = tid; i < a.N; i += 1024) {
-    bool skip = false;
-    for (int j = 0; j < a.ns; ++j) skip |= SUP[j] == i;
-    if (skip) continue;
-    better(best, at, f(X[i]), i);
-  }
-  for (ushort o = 16; o > 0; o >>= 1) better(best, at, simd_shuffle_xor(best, o), simd_shuffle_xor(at, o));
-  if ((tid & 31) == 0) {
-    bv[tid >> 5] = best;
-    bi[tid >> 5] = at;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid < 32) {
-    best = bv[tid];
-    at = bi[tid];
-    for (ushort o = 16; o > 0; o >>= 1) better(best, at, simd_shuffle_xor(best, o), simd_shuffle_xor(at, o));
-    if (tid == 0) OUT[0] = at;
-  }
-}
-
-// ---- few-row products: a simdgroup takes 4 weight rows, its lanes stride the K chunks of 8; R input rows at most
-
-struct RowsArgs {
-  int K, N, T, ldx, ldy;
-  int has_y, has_yf;
-  int pad;
-  long sw, sx, sy;
-};
-
-inline float4 bf4(uint2 w) {
-  return float4(as_type<float>(w.x << 16), as_type<float>(w.x & 0xFFFF0000u), as_type<float>(w.y << 16), as_type<float>(w.y & 0xFFFF0000u));
-}
-
-template <int R>
-inline void rows_body(device const bf* W, device const bf* X, device bf* Y, device float* YF, constant RowsArgs& a, uint3 tg, uint sg,
-                      uint lane) {
-  W += (long)tg.z * a.sw;
-  X += (long)tg.z * a.sx;
-  Y += (long)tg.z * a.sy;
-  const int n0 = (tg.x * 4 + sg) * 4;
-  if (n0 >= a.N) return;
-  const int nr = min(R, a.T);
-  device const uint4* w[4];
-  for (int j = 0; j < 4; ++j) w[j] = (device const uint4*)(W + (long)min(n0 + j, a.N - 1) * a.K);
-  float acc[R][4];
-  for (int r = 0; r < R; ++r)
-    for (int j = 0; j < 4; ++j) acc[r][j] = 0.0f;
-  for (int c = lane; c < a.K / 8; c += 32) {
-    uint4 wv[4];
-    for (int j = 0; j < 4; ++j) wv[j] = w[j][c];
-    for (int r = 0; r < R; ++r) {
-      if (r >= nr) break;
-      const uint4 xv = ((device const uint4*)(X + (long)r * a.ldx))[c];
-      const float4 x0 = bf4(xv.xy), x1 = bf4(xv.zw);
-      for (int j = 0; j < 4; ++j) {
-        const float4 w0 = bf4(wv[j].xy), w1 = bf4(wv[j].zw);
-        float s = acc[r][j];
-        s = fma(w0.x, x0.x, s);
-        s = fma(w0.y, x0.y, s);
-        s = fma(w0.z, x0.z, s);
-        s = fma(w0.w, x0.w, s);
-        s = fma(w1.x, x1.x, s);
-        s = fma(w1.y, x1.y, s);
-        s = fma(w1.z, x1.z, s);
-        s = fma(w1.w, x1.w, s);
-        acc[r][j] = s;
-      }
-    }
-  }
-  for (int r = 0; r < R; ++r) {
-    if (r >= nr) break;
-    for (int j = 0; j < 4; ++j) {
-      const float v = simd_sum(acc[r][j]);
-      if (lane == 0 && n0 + j < a.N) {
-        if (a.has_y) Y[(long)r * a.ldy + n0 + j] = b(v);
-        if (a.has_yf) YF[(long)r * a.N + n0 + j] = v;
-      }
-    }
-  }
-}
-
-#define OM_ROWS(R)                                                                                                                  \
-  [[max_total_threads_per_threadgroup(128)]] kernel void om_rows_##R(                                                              \
-      device const bf* W [[buffer(0)]], device const bf* X [[buffer(1)]], device bf* Y [[buffer(2)]], device float* YF [[buffer(3)]], \
-      constant RowsArgs& a [[buffer(4)]], uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
-      uint lane [[thread_index_in_simdgroup]]) {                                                                                   \
-    rows_body<R>(W, X, Y, YF, a, tg, sg, lane);                                                                                    \
-  }
-OM_ROWS(1)
-OM_ROWS(4)
-OM_ROWS(8)
-OM_ROWS(12)
-OM_ROWS(16)
 
 // ---- products of many rows: C [M, N] = A [M, K] B [K, N] (either stored transposed), fp32 accumulate on the
 // simdgroup matrix units, the operands staged as fp32 tiles; a batch on the grid's z.

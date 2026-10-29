@@ -139,6 +139,7 @@ pub const Engine = struct {
     logits: u64,
     pick: u64,
     sup: u64,
+    amax_ws: u64, // the greedy pick's parts
     din_f32: u64,
     din: u64,
     dx: u64,
@@ -198,6 +199,7 @@ pub const Engine = struct {
         e.mel.init();
         try e.loadModel(model_dir);
         try e.allocScratch();
+        if (std.c.getenv("LFM3_OMNI_KBENCH") != null) try e.kbench();
         return e;
     }
 
@@ -335,6 +337,7 @@ pub const Engine = struct {
         e.bb_out = try a.alloc(R * cfg.hidden * 2);
         e.logits = try a.alloc(cfg.vocab * 2);
         e.pick = try a.alloc(4);
+        e.amax_ws = try a.alloc(8 * (cfg.vocab / 1024 + 1));
         const sup = [_]i32{ cfg.audio_token_id, cfg.audio_out_token_id, cfg.image_token_id, cfg.video_token_id };
         e.sup = try a.upload(std.mem.sliceAsBytes(&sup));
         const NQ = cfg.codebooks;
@@ -360,6 +363,41 @@ pub const Engine = struct {
         e.c_frames = try a.alloc(6 * CC * cfg.n_fft * 4);
         e.host_frames = try e.gpa.alloc(f32, 6 * CC * cfg.n_fft);
         e.host_logits = try e.gpa.alloc(f32, NQ * cfg.codebook_size);
+    }
+
+    /// LFM3_OMNI_KBENCH=1: the decode path's dispatches alone, each repeated in one command buffer (GPU ms each).
+    fn kbench(e: *Engine) !void {
+        const k = &e.k;
+        const l = &e.bb.layers[0];
+        const la = &e.bb.layers[2];
+        const D = cfg.hidden;
+        const bb = &e.bb;
+        const cols = bb.nq() + 2 * bb.nk() + 16;
+        const Case = enum { lm_head, argmax, w13, w2, in_proj, conv, qkvg, qk_prep, attend300, rmsnorm, o_proj, depth_w13_12, depth_w13_nax, depth_logits };
+        inline for (@typeInfo(Case).@"enum".field_names) |name| {
+            const c = @field(Case, name);
+            const n = 50;
+            try e.g.flush();
+            const t0 = e.g.gpu_s;
+            for (0..n) |_| switch (c) {
+                .lm_head => k.linear(e.embed, e.bb_out, D, D, cfg.vocab, e.logits, cfg.vocab, 1),
+                .argmax => k.argmax(e.logits, cfg.vocab, e.sup, 4, e.pick, e.amax_ws),
+                .w13 => k.product(l.w13, e.bb_x, D, D, 2 * 7680, 1, bb.y, 7680, 0, 1, 0, 0, 0, .swiglu),
+                .w2 => k.linear(l.w2, bb.y, 7680, 7680, D, bb.tmp, D, 1),
+                .in_proj => k.product(l.in_proj, e.bb_x, D, D, 3 * D, 1, bb.proj, 3 * D, 0, 1, 0, 0, 0, .plain),
+                .conv => k.shortConv(bb.proj, 3 * D, l.conv_w, l.state, bb.y, D, 1, D, 7),
+                .qkvg => k.product(la.qkvg, e.bb_x, D, D, cols, 1, bb.proj, cols, 0, 1, 0, 0, 0, .plain),
+                .qk_prep => k.qkPrep(bb.proj, la.q_norm, la.k_norm, bb.inv_full, la.kc, la.vc, 1, 16, 4, 128, cols, 299, 1, 512, 1e-5),
+                .attend300 => try k.attention(.{ .q = bb.proj, .ldq = cols, .kc = la.kc, .vc = la.vc, .ldkv = 512, .o = bb.y, .ldo = 2048, .t = 1, .heads = 16, .kv_heads = 4, .hd = 128, .pos0 = 299, .kv_len = 300, .window = 0, .causal = true, .gate = bb.proj + (2048 + 1024) * 2, .ldg = cols }),
+                .rmsnorm => k.rmsnormPost(e.bb_x, bb.tmp, l.post_ffn_norm, bb.final_norm, 0, e.bb_out, D, D, D, 1, 1e-5, .lfm),
+                .o_proj => k.linear(la.o_proj, bb.y, D, D, D, bb.tmp, D, 1),
+                .depth_w13_12 => k.product(e.depth.layers[0].w13, e.dx, 1024, 1024, 2 * 2816, 12, e.depth.y, 2816, 0, 1, 0, 0, 0, .swiglu),
+                .depth_w13_nax => k.gemm(false, true, 12, 2 * 2816, 1024, e.dx, 1024, e.depth.layers[0].w13, 1024, e.depth.proj, 2 * 2816, .bf16, .bf16, 1, 0, 0, 0),
+                .depth_logits => k.linearBatched(e.depth_tables, cfg.codebook_size * cfg.depth_d, e.dz, cfg.depth_d, cfg.depth_d, cfg.codebook_size, e.dlog, cfg.codebook_size, 1, cfg.codebooks),
+            };
+            try e.g.flush();
+            std.log.info("kbench {s}: {d:.1} us", .{ name, (e.g.gpu_s - t0) * 1e6 / n });
+        }
     }
 
     // ---- host copies (unified memory: the GPU's work so far finishes first)
@@ -481,7 +519,7 @@ pub const Engine = struct {
         const t0 = e.g.gpu_s;
         defer e.phase(.text, t0) catch {};
         e.k.linear(e.embed, e.last, cfg.hidden, cfg.hidden, cfg.vocab, e.logits, cfg.vocab, 1);
-        e.k.argmax(e.logits, cfg.vocab, e.sup, 4, e.pick);
+        e.k.argmax(e.logits, cfg.vocab, e.sup, 4, e.pick, e.amax_ws);
         var v: i32 = 0;
         try e.d2h(std.mem.asBytes(&v), e.pick);
         return @intCast(v);
@@ -780,7 +818,7 @@ pub const Engine = struct {
         if (stream.audio) try e.flushCodec(&ola, &pending, &decoded, sink, st_, t_req, true);
         st_.total_ms = msSince(io, t_req);
         if (e.prof) {
-            for (0..4) |i| std.log.info("lfm3-omni profile: {s} {d} x {d:.3} ms GPU", .{ @tagName(@as(Phase, @enumFromInt(i))), e.prof_n[i], if (e.prof_n[i] > 0) e.prof_s[i] * 1e3 / @as(f64, @floatFromInt(e.prof_n[i])) else 0 });
+            for (0..4) |i| std.log.info("lfm3-omni profile: {s} {d} x {d:.3} ms GPU", .{ @tagName(@as(Phase, @fromBackingInt(@intCast(i)))), e.prof_n[i], if (e.prof_n[i] > 0) e.prof_s[i] * 1e3 / @as(f64, @floatFromInt(e.prof_n[i])) else 0 });
             std.log.info("lfm3-omni profile: {d} dispatches", .{e.g.dispatches});
             e.prof_s = @splat(0);
             e.prof_n = @splat(0);
