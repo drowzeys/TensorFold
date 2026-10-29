@@ -184,6 +184,8 @@ const Glue = struct {
     qkv: cuda.Function,
     attn256: cuda.Function,
     attn512: cuda.Function,
+    attn256_tiled: cuda.Function,
+    attn512_tiled: cuda.Function,
     add_norm: cuda.Function,
     gelu_mul: cuda.Function,
     ple_gate: cuda.Function,
@@ -199,6 +201,8 @@ const Glue = struct {
             .qkv = try mod.function("tf_eg2_qkv"),
             .attn256 = try mod.function("tf_eg2_attn256"),
             .attn512 = try mod.function("tf_eg2_attn512"),
+            .attn256_tiled = try mod.function("tf_eg2_attn256_tiled"),
+            .attn512_tiled = try mod.function("tf_eg2_attn512_tiled"),
             .add_norm = try mod.function("tf_eg2_add_norm"),
             .gelu_mul = try mod.function("tf_eg2_gelu_mul"),
             .ple_gate = try mod.function("tf_eg2_ple_gate"),
@@ -225,6 +229,7 @@ const Engine = struct {
     scratch: cuda.DeviceBuffer,
     b: Buffers,
     host: []i32, // ids | pos | lo | hi for max_rows, then ends
+    tiled: bool = true, // keys and values shared in shared memory across a block's rows (TF_EG2_ATTN=row: a warp a row)
     mutex: std.Io.Mutex = .init, // one batch at a time: HTTP threads call submit directly
 
     fn of(ctx: *anyopaque) *Engine {
@@ -339,7 +344,13 @@ const Engine = struct {
                 a.add(@as(c_int, heads));
                 a.add(@as(c_int, @intCast(kv)));
                 a.add(@as(c_int, if (full(i)) 0 else window));
-                try e.launch(if (hd == 512) e.glue.attn512 else e.glue.attn256, .{ .x = grid(n * heads * 32, 128) }, 128, &a);
+                if (!e.tiled) {
+                    try e.launch(if (hd == 512) e.glue.attn512 else e.glue.attn256, .{ .x = grid(n * heads * 32, 128) }, 128, &a);
+                } else if (hd == 512) {
+                    try e.launch(e.glue.attn512_tiled, .{ .x = grid(n, 8), .y = heads }, 128, &a);
+                } else {
+                    try e.launch(e.glue.attn256_tiled, .{ .x = grid(n, 16), .y = heads }, 128, &a);
+                }
             }
             try e.gemm.run(e.stream, b.att, l.o, b.o, n, hidden, heads * hd, .bf16);
             try e.addNorm(b.o, l.post_attn, l.pre_ff, n, 1);
@@ -457,6 +468,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     e.b = .{ .ids = ptrs[0], .pos = ptrs[1], .lo = ptrs[2], .hi = ptrs[3], .ends = ptrs[4], .h = ptrs[5], .xn = ptrs[6], .pli = ptrs[7], .qkv = ptrs[8], .att = ptrs[9], .o = ptrs[10], .gu = ptrs[11], .m = ptrs[12], .g = ptrs[13], .p = ptrs[14], .out = ptrs[15] };
     e.host = try gpa.alloc(i32, 4 * max_rows + max_inputs);
+    if (std.c.getenv("TF_EG2_ATTN")) |v| e.tiled = !std.mem.eql(u8, std.mem.span(v), "row");
     std.log.info("EmbeddingGemma-2 on CUDA: {d}-dimensional vectors (MRL {d}, {d}, {d}), up to {d} inputs and {d} tokens a batch", .{ dim, mrl[0], mrl[1], mrl[2], max_inputs, max_rows });
     return .{ .engine = .{ .ctx = e, .vtable = &Engine.vtable }, .close = Engine.close, .ctx = e };
 }

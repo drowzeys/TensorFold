@@ -168,6 +168,114 @@ __device__ __forceinline__ void attend(const __nv_bfloat16* __restrict__ qkv, __
     for (int i = 0; i < per; ++i) o[lane + 32 * i] = __float2bfloat16_rn(acc[i] / l);
 }
 
+// The same attention with key and value rows shared: a block of 4 warps takes R query rows a warp (4R consecutive
+// rows) for one q head, and reads the keys and values its rows need once, KT rows at a time, into shared memory. A
+// row skips keys outside its own input and window. One row's arithmetic is the same as `attend`'s, in the same order.
+template <int D, int R, int KT>
+__device__ __forceinline__ void attend_tiled(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out,
+                                             const int* __restrict__ lo, const int* __restrict__ hi, int rows, int hq, int hkv,
+                                             int window) {
+    constexpr int per = D / 32;
+    constexpr int RB = 4 * R;  // rows a block
+    __shared__ __align__(16) __nv_bfloat16 ks[KT * D];
+    __shared__ __align__(16) __nv_bfloat16 vs[KT * D];
+    const int head = blockIdx.y;
+    const int kvh = head / (hq / hkv);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int heads = hq + 2 * hkv;
+    const int64_t stride = static_cast<int64_t>(heads) * D;
+    const int first = blockIdx.x * RB;
+    const int last = min(rows, first + RB) - 1;
+    float qv[R][per], acc[R][per], m[R], l[R];
+    int a[R], b[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = first + warp * R + r;
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+        a[r] = 0;
+        b[r] = 0;  // a row past the end attends to nothing
+        if (row < rows) {
+            a[r] = lo[row];
+            b[r] = hi[row];
+            if (window > 0) {
+                a[r] = max(a[r], row - window);
+                b[r] = min(b[r], row + window + 1);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < per; ++i) {
+            qv[r][i] = row < rows ? bf(qkv[row * stride + head * D + lane + 32 * i]) : 0.0f;
+            acc[r][i] = 0.0f;
+        }
+    }
+    // the keys any row of the block reads: rows are in input order, so lo and hi only grow
+    int A = lo[first], B = hi[last];
+    if (window > 0) {
+        A = max(A, first - window);
+        B = min(B, last + window + 1);
+    }
+    for (int t = A; t < B; t += KT) {
+        const int nk = min(KT, B - t);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < KT * D / 8; idx += blockDim.x) {
+            const int kk = idx / (D / 8), c = (idx % (D / 8)) * 8;
+            uint4 kz = make_uint4(0, 0, 0, 0), vz = kz;
+            if (kk < nk) {
+                const int64_t at = (t + kk) * stride;
+                kz = *reinterpret_cast<const uint4*>(qkv + at + (hq + kvh) * D + c);
+                vz = *reinterpret_cast<const uint4*>(qkv + at + (hq + hkv + kvh) * D + c);
+            }
+            *reinterpret_cast<uint4*>(ks + kk * D + c) = kz;
+            *reinterpret_cast<uint4*>(vs + kk * D + c) = vz;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < nk; ++kk) {
+            const int j = t + kk;
+            float kv[per];
+#pragma unroll
+            for (int i = 0; i < per; ++i) kv[i] = bf(ks[kk * D + lane + 32 * i]);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (j < a[r] || j >= b[r]) continue;  // the same for every lane of the warp
+                float s = 0.0f;
+#pragma unroll
+                for (int i = 0; i < per; ++i) s = fmaf(qv[r][i], kv[i], s);
+                s = warp_sum(s);
+                const float mn = fmaxf(m[r], s);
+                const float c = __expf(m[r] - mn);
+                const float e = __expf(s - mn);
+                l[r] = l[r] * c + e;
+#pragma unroll
+                for (int i = 0; i < per; ++i) acc[r][i] = fmaf(e, bf(vs[kk * D + lane + 32 * i]), acc[r][i] * c);
+                m[r] = mn;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = first + warp * R + r;
+        if (row >= rows) continue;
+        __nv_bfloat16* o = out + (static_cast<int64_t>(row) * hq + head) * D;
+#pragma unroll
+        for (int i = 0; i < per; ++i) o[lane + 32 * i] = __float2bfloat16_rn(acc[r][i] / l[r]);
+    }
+}
+
+// grid (rows / 16, q heads): 4 rows a warp, 32 keys a tile (32 KB of shared memory)
+extern "C" __global__ void __launch_bounds__(128) tf_eg2_attn256_tiled(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out,
+                                                                       const int* __restrict__ lo, const int* __restrict__ hi, int rows,
+                                                                       int hq, int hkv, int window) {
+    attend_tiled<256, 4, 32>(qkv, out, lo, hi, rows, hq, hkv, window);
+}
+
+// grid (rows / 8, q heads): 2 rows a warp, 16 keys a tile (32 KB of shared memory)
+extern "C" __global__ void __launch_bounds__(128) tf_eg2_attn512_tiled(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out,
+                                                                       const int* __restrict__ lo, const int* __restrict__ hi, int rows,
+                                                                       int hq, int hkv, int window) {
+    attend_tiled<512, 2, 16>(qkv, out, lo, hi, rows, hq, hkv, window);
+}
+
 extern "C" __global__ void __launch_bounds__(128) tf_eg2_attn256(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out,
                                                                  const int* __restrict__ lo, const int* __restrict__ hi, int rows, int hq,
                                                                  int hkv, int window) {
