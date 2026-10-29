@@ -211,6 +211,8 @@ pub fn run(gpu: check.Gpu) !void {
     var prefill_tile22 = prefill_tile22_k.Registrations.init(gpu, s, &affine4);
     defer prefill_tile22.deinit();
     try prefill_tile22.append(cap, a, &kernels);
+    const mid_set = try @import("contract_qmm_mid.zig").Set.create(a, gpu, s, &affine4, mods[5], &kernels);
+    defer mid_set.destroy();
     var mx = [_]mx_k.Product{
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane, .clusters = true },
         .{ .rig = .{ .gpu = gpu, .s = s }, .lane = &lane_reduce, .clusters = false },

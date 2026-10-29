@@ -317,6 +317,8 @@ fn u(x: usize) u32 {
 }
 
 pub const Affine4Kernels = @import("affine4_kernels.zig").Affine4Kernels;
+pub const affine4_mid = @import("affine4_mid.zig");
+pub const MidRows = affine4_mid.Mid;
 
 /// affine8.cu's shared bytes a width: Tile<64, 64, 6, bits>::SMEM for gemv, Tile<64, 64, 4, bits>::SMEM for split.
 pub fn gemvSmem(bits: u8) u32 {
@@ -496,6 +498,7 @@ test "split_k follows the Python shapes" {
 
 test {
     _ = @import("qlinear_test.zig");
+    _ = @import("affine4_mid.zig");
 }
 
 pub const block = exl3.block;

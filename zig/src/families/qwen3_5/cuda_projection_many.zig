@@ -8,7 +8,8 @@ const Proj = engine.Proj;
 pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const u64, rows: usize, prompt: bool, params: u64, sums: bool, allow_fused_prompt: bool) !void {
     if (ls.len == 0 or ls.len != outs.len) return error.UnexpectedTensor;
     const A = cuda.qlinear.Affine4Kernels;
-    const fused_prompt = allow_fused_prompt and prompt and rows > A.max_rows and qwen38PromptShape(ls, rows) and !e.int8.on and e.affine.pdl and blk: {
+    // with qmm_midrow's tiles attached each projection takes its own sized tile (TF_Q27_FUSED_FIRST=1: this grid first)
+    const fused_prompt = allow_fused_prompt and prompt and rows > A.max_rows and qwen38PromptShape(ls, rows) and !e.int8.on and e.affine.pdl and (e.affine.mid == null or fusedFirst()) and blk: {
         const k = ls[0].inputs();
         for (ls) |l| if (l != .a4 or l.inputs() != k) break :blk false;
         for (outs, 0..) |out, i| for (outs[i + 1 ..]) |other| if (out == other) break :blk false;
@@ -34,6 +35,11 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out + at * l.outputs() * 2 };
         try e.affine.decodeMany(e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], @min(A.max_rows, rows - at));
     }
+}
+
+fn fusedFirst() bool {
+    const v = std.c.getenv("TF_Q27_FUSED_FIRST") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
 /// Fuses only Qwen3.8 short QKV and Delta shapes that passed same-stack A-B-A screening on GB10.

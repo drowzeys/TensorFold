@@ -43,6 +43,7 @@ pub const Affine4Kernels = struct {
     prefill22_fn: Function, // the prompt tile on 2x2 warps and two stages (`half_prompt` picks it)
     prefill_many_fn: Function, // GB10: one prompt grid over projections sharing the bf16 input
     half_prompt: bool = false, // prompts on prefill22_fn: its four warps a block and two stages are quicker on an RTX 5090
+    mid: ?linear.MidRows = null, // GB10: prompts on qmm_midrow's tiles (prefill_fn's bits), when the engine attaches them
     words_fn: Function, // affine4_pack.cu: MLX words into the tiles
     scales_fn: Function, // affine4_pack.cu: (n, kg) scales or biases into (kg, npad)
     gemv_blocks: usize, // resident lane_gemv CTAs: per SM times SMs
@@ -61,6 +62,7 @@ pub const Affine4Kernels = struct {
         a.prefill22_fn = try prefill_mod.function(symbols.prefill22);
         a.prefill_many_fn = try prefill_mod.function(symbols.prefill_many);
         a.half_prompt = false;
+        a.mid = null;
         a.gemv_fn = try gemv_mod.function(symbols.gemv);
         a.split_fn = try gemv_mod.function(symbols.gemv_split);
         a.seg_fn = try gemv_mod.function(symbols.gemv_seg);
@@ -248,8 +250,9 @@ pub const Affine4Kernels = struct {
         try launch_.launch(a.group_fn, cfg, s, &g);
     }
 
-    /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
+    /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out (`mid`: same bits).
     pub fn prompt(a: *const Affine4Kernels, s: Stream, x: u64, q: Affine4, out: u64, rows: usize) !void {
+        if (a.mid) |*m| if (!a.half_prompt and try m.prompt(s, x, q, out, rows)) return;
         return a.promptTile(s, x, q, out, rows, a.half_prompt);
     }
 
