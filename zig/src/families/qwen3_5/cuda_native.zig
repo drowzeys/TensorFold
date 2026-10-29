@@ -41,6 +41,9 @@ pub const snap_drop = reuse.drop;
 pub const snap_host = true;
 pub const snap_lookahead: u32 = 0;
 pub const snap_grid: u32 = E.max_rows;
+/// The server also cuts at a chat prompt's turn starts and its system prompt's end, and states are kept there
+/// (cuda_snaps.passRules): a cold pass cuts there too (cuda_prefill.nextCut), so a resumed turn keeps its bits.
+pub const snap_turns = true;
 /// --learn-conversations: the kept states' disk image, the probe their identity hashes, the facts they depend on.
 pub const kept_disk = @import("cuda_disk.zig");
 

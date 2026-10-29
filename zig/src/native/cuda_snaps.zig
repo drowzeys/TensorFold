@@ -15,12 +15,12 @@ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
     return rules;
 }
 
-/// Native CUDA families own their grid, independently of the server's template chunk starts.
+/// Native CUDA families own their grid; one with `snap_turns` also keeps at the server's template chunk starts.
 pub fn passRules(comptime F: type, prompt_rows: u32) api.prompt_cache.Rules {
     var rules = cacheRules(F);
     rules.chunk = prompt_rows;
     if (@hasDecl(F, "snap_repeat_min")) rules.repeat_min = if (std.c.getenv("TF_FLASHNEXT_REPEAT_CACHE")) |v| (if (std.mem.eql(u8, std.mem.span(v), "0")) 0 else F.snap_repeat_min) else F.snap_repeat_min;
-    rules.chunk_starts = false;
+    rules.chunk_starts = @hasDecl(F, "snap_turns"); // a family cutting at the request's chunk starts keeps there
     return rules;
 }
 
@@ -86,6 +86,42 @@ test "a family with snap_grid keeps on its chunk starts, any other at any row as
     defer store.deinit();
     const marks = try store.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{});
     try std.testing.expectEqualSlices(u32, &[_]u32{2048}, marks);
+}
+
+test "a family with snap_turns keeps a short chat's state at the turn start its pass cuts; one without keeps none" {
+    const Turns = struct {
+        pub const snap_grid: u32 = 4096;
+        pub const snap_turns = true;
+    };
+    const Grid = struct {
+        pub const snap_grid: u32 = 4096;
+    };
+    try std.testing.expect(passRules(Turns, 4096).chunk_starts and !passRules(Grid, 4096).chunk_starts);
+    const Stub = struct {
+        fn bytes(_: *anyopaque, _: u32) u64 {
+            return 0;
+        }
+        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!api.prompt_cache.Saved {
+            return error.Unused;
+        }
+        fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {}
+        fn drop(_: *anyopaque, _: api.prompt_cache.Saved) void {}
+    };
+    var unused: u8 = 0;
+    const vtable: api.prompt_cache.Snapshots.VTable = .{ .bytes = Stub.bytes, .save = Stub.save, .restore = Stub.restore, .drop = Stub.drop };
+    const copies: api.prompt_cache.Snapshots = .{ .ptr = &unused, .vtable = &vtable };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prompt = try a.alloc(u32, 900); // a system prompt, two turns, then the last user message from 860
+    for (prompt, 0..) |*t, i| t.* = @intCast(i + 1);
+    const starts = [_]u32{ 599, 860 }; // the server's chunk starts: the system prompt's end and the last turn's start
+    var turns = api.prompt_cache.Store.init(std.testing.allocator, copies, passRules(Turns, 4096), 1 << 30);
+    defer turns.deinit();
+    try std.testing.expectEqualSlices(u32, &[_]u32{860}, try turns.marks(a, prompt, 0, 860, &.{}, &starts, &.{}));
+    var grid = api.prompt_cache.Store.init(std.testing.allocator, copies, passRules(Grid, 4096), 1 << 30);
+    defer grid.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try grid.marks(a, prompt, 0, 860, &.{}, &.{}, &.{})).len);
 }
 
 test {

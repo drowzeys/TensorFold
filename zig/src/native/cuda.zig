@@ -456,13 +456,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         std.log.info("recording each stream's rows under {s}/{s}", .{ dir, r.recorder.name });
     }
     errdefer if (h.recording) |r| r.free(gpa);
-    // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+    // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0; a family with
+    // `snap_turns` also takes the server's chunk starts (turns, the system prompt's end), so states keep there
     const admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
     try h.serve(io, served.facts, loaded.rows, .{
         .lanes = streams,
         .context_window = @intCast(window),
         .startup = h.startup,
         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
+        .prefill_step = if (comptime @hasDecl(F, "snap_turns")) @import("cuda_startup.zig").rows(F, loaded) else 0,
         .prompt_cache = h.store != null,
         .prompt_cache_capacity = cache_capacity,
         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
