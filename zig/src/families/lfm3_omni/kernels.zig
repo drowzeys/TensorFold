@@ -1,0 +1,375 @@
+//! LFM3-Omni's launches: lfm3_omni.cu by symbol and cuBLAS (classic API, fp32 compute) for every matrix product.
+const std = @import("std");
+const cuda = @import("cuda");
+const blas = @import("blas");
+
+pub const Op = blas.Op;
+
+/// One field a kernel of lfm3_omni.cu, loaded by its field name.
+const Fns = struct {
+    om_rmsnorm: cuda.Function,
+    om_head_norm: cuda.Function,
+    om_rope: cuda.Function,
+    om_copy_rows: cuda.Function,
+    om_short_conv: cuda.Function,
+    om_attention: cuda.Function,
+    om_gate: cuda.Function,
+    om_swiglu: cuda.Function,
+    om_add: cuda.Function,
+    om_bias_act: cuda.Function,
+    om_layernorm: cuda.Function,
+    om_embed: cuda.Function,
+    om_embed_codes: cuda.Function,
+    om_depth_in: cuda.Function,
+    om_conv2d_s2: cuda.Function,
+    om_f32_bf16: cuda.Function,
+    om_bf16_f32: cuda.Function,
+    om_fsq_decode: cuda.Function,
+    om_repeat_rows: cuda.Function,
+    om_polar: cuda.Function,
+    om_argmax: cuda.Function,
+};
+
+pub const Act = enum(i32) { none = 0, silu = 1, gelu = 2 };
+pub const Norm = enum(i32) { lfm = 0, head = 1 };
+
+pub const Kernels = struct {
+    mod: cuda.Module,
+    fns: Fns,
+    blas: blas.Blas,
+    ws: cuda.DeviceBuffer,
+
+    pub fn load(d: *const cuda.Driver) !Kernels {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var k: Kernels = undefined;
+        k.mod = try cuda.Module.load(d, cuda.kernels.lfm3_omni);
+        errdefer k.mod.unload();
+        const info = @typeInfo(Fns).@"struct";
+        inline for (info.field_names) |name| @field(k.fns, name) = try k.mod.function(name);
+        try k.fns.om_attention.allowDynamicShared(64 << 10);
+        const ws_bytes: usize = 32 << 20;
+        k.ws = try cuda.DeviceBuffer.alloc(d, ws_bytes);
+        errdefer k.ws.free();
+        k.blas = try blas.Blas.open(k.ws.ptr, ws_bytes);
+        return k;
+    }
+
+    pub fn unload(k: *Kernels) void {
+        k.blas.close();
+        k.ws.free();
+        k.mod.unload();
+    }
+
+    fn go(f: cuda.Function, s: cuda.Stream, grid: usize, block: usize, shared: usize, a: *cuda.Args) !void {
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = @intCast(block) }, .shared = @intCast(shared) }, s, a);
+    }
+
+    fn i(x: usize) i32 {
+        return @intCast(x);
+    }
+
+    fn blocks(n: usize, per: usize) usize {
+        return (n + per - 1) / per;
+    }
+
+    // ---- matrix products (row-major views over cuBLAS's column-major API)
+
+    /// y [t, n] = x [t, k] w^T with w [n, k]; x rows `ldx` apart, y rows `ldy` apart; bf16 out, fp32 accumulate.
+    pub fn linear(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, y: u64, ldy: usize, t: usize) !void {
+        try k.blas.gemm(s, .t, .n, n, t, kdim, 1.0, w, kdim, 0, x, ldx, 0, 0.0, y, ldy, 0, 1, .bf16, .bf16);
+    }
+
+    /// As `linear`, the result in fp32 (for a bias added before the one rounding).
+    pub fn linearF32(k: *const Kernels, s: cuda.Stream, w: u64, x: u64, ldx: usize, kdim: usize, n: usize, y: u64, t: usize) !void {
+        try k.blas.gemm(s, .t, .n, n, t, kdim, 1.0, w, kdim, 0, x, ldx, 0, 0.0, y, n, 0, 1, .bf16, .f32);
+    }
+
+    /// Row-major C [m, n] = A [m, kd] B [kd, n] with any of them transposed in memory (`ta`: A stored [kd, m]),
+    /// in `in_t` with the result in `out_t`.
+    pub fn matmul(k: *const Kernels, s: cuda.Stream, ta: bool, tb: bool, m: usize, n: usize, kd: usize, a: u64, b: u64, c: u64, in_t: blas.DataType, out_t: blas.DataType) !void {
+        // column-major C^T [n, m] = B^T A^T
+        const opb: Op = if (tb) .t else .n;
+        const opa: Op = if (ta) .t else .n;
+        const ldb = if (tb) kd else n;
+        const lda = if (ta) m else kd;
+        try k.blas.gemm(s, opb, opa, n, m, kd, 1.0, b, ldb, 0, a, lda, 0, 0.0, c, n, 0, 1, in_t, out_t);
+    }
+
+    /// `batch` products y_j [t, n] = x_j [t, kd] w_j^T, the operands `sw`, `sx`, `sy` elements apart; bf16 out.
+    pub fn linearBatched(k: *const Kernels, s: cuda.Stream, w: u64, sw: usize, x: u64, sx: usize, kd: usize, n: usize, y: u64, sy: usize, t: usize, batch: usize) !void {
+        try k.blas.gemm(s, .t, .n, n, t, kd, 1.0, w, kd, sw, x, kd, sx, 0.0, y, n, sy, batch, .bf16, .bf16);
+    }
+
+    // ---- elementwise and row kernels
+
+    pub fn rmsnorm(k: *const Kernels, s: cuda.Stream, x: u64, r: u64, w: u64, y: u64, d: usize, ld: usize, ldy: usize, rows: usize, eps: f32, mode: Norm) !void {
+        return k.rmsnormRows(s, x, r, w, 0, y, d, ld, ldy, rows, eps, mode);
+    }
+
+    /// As `rmsnorm` with a weight row a row (`ldw` elements apart).
+    pub fn rmsnormRows(k: *const Kernels, s: cuda.Stream, x: u64, r: u64, w: u64, ldw: usize, y: u64, d: usize, ld: usize, ldy: usize, rows: usize, eps: f32, mode: Norm) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(r);
+        a.add(w);
+        a.add(y);
+        a.add(i(d));
+        a.add(i(ld));
+        a.add(i(ldy));
+        a.add(eps);
+        a.add(@intFromEnum(mode));
+        a.add(i(ldw));
+        try go(k.fns.om_rmsnorm, s, rows, 256, 0, &a);
+    }
+
+    pub fn headNorm(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, t: usize, h: usize, hd: usize, ld: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(w);
+        a.add(i(t));
+        a.add(i(h));
+        a.add(i(hd));
+        a.add(i(ld));
+        a.add(eps);
+        try go(k.fns.om_head_norm, s, blocks(t * h * 32, 256), 256, 0, &a);
+    }
+
+    pub fn rope(k: *const Kernels, s: cuda.Stream, x: u64, inv: u64, t: usize, h: usize, hd: usize, ld: usize, pos0: usize, mode: u8) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(inv);
+        a.add(i(t));
+        a.add(i(h));
+        a.add(i(hd));
+        a.add(i(ld));
+        a.add(i(pos0));
+        a.add(@as(i32, mode));
+        try go(k.fns.om_rope, s, blocks(t * h * hd / 2, 256), 256, 0, &a);
+    }
+
+    pub fn copyRows(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, t: usize, n: usize, lds: usize, ldd: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(dst);
+        a.add(i(t));
+        a.add(i(n));
+        a.add(i(lds));
+        a.add(i(ldd));
+        try go(k.fns.om_copy_rows, s, blocks(t * n, 256), 256, 0, &a);
+    }
+
+    pub fn shortConv(k: *const Kernels, s: cuda.Stream, bcx: u64, ld: usize, w: u64, state: u64, y: u64, ldy: usize, t: usize, d: usize, kw: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(bcx);
+        a.add(i(ld));
+        a.add(w);
+        a.add(state);
+        a.add(y);
+        a.add(i(ldy));
+        a.add(i(t));
+        a.add(i(d));
+        a.add(i(kw));
+        try go(k.fns.om_short_conv, s, blocks(d, 128), 128, 0, &a);
+    }
+
+    pub const Attn = struct {
+        q: u64,
+        ldq: usize,
+        kc: u64,
+        vc: u64,
+        ldkv: usize,
+        o: u64,
+        ldo: usize,
+        t: usize,
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        pos0: usize,
+        kv_len: usize,
+        window: usize,
+        causal: bool,
+    };
+
+    pub fn attention(k: *const Kernels, s: cuda.Stream, p: Attn) !void {
+        const span = if (p.causal and p.window > 0) @min(p.window, p.kv_len) else p.kv_len;
+        const shared = (128 + span) * 4;
+        if (shared > 64 << 10) return error.AttentionSpanTooLong;
+        var a: cuda.Args = .{};
+        a.add(p.q);
+        a.add(i(p.ldq));
+        a.add(p.kc);
+        a.add(p.vc);
+        a.add(i(p.ldkv));
+        a.add(p.o);
+        a.add(i(p.ldo));
+        a.add(i(p.heads));
+        a.add(i(p.kv_heads));
+        a.add(i(p.hd));
+        a.add(i(p.pos0));
+        a.add(i(p.kv_len));
+        a.add(i(p.window));
+        a.add(@as(i32, @intFromBool(p.causal)));
+        a.add(1.0 / @sqrt(@as(f32, @floatFromInt(p.hd))));
+        try go(k.fns.om_attention, s, p.t * p.heads, 128, shared, &a);
+    }
+
+    pub fn gate(k: *const Kernels, s: cuda.Stream, o: u64, ldo: usize, g: u64, ldg: usize, t: usize, h: usize, hd: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(o);
+        a.add(i(ldo));
+        a.add(g);
+        a.add(i(ldg));
+        a.add(i(t));
+        a.add(i(h));
+        a.add(i(hd));
+        try go(k.fns.om_gate, s, blocks(t * h * hd, 256), 256, 0, &a);
+    }
+
+    pub fn swiglu(k: *const Kernels, s: cuda.Stream, ac: u64, y: u64, t: usize, f: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(ac);
+        a.add(y);
+        a.add(i(t));
+        a.add(i(f));
+        try go(k.fns.om_swiglu, s, blocks(t * f, 256), 256, 0, &a);
+    }
+
+    pub fn add(k: *const Kernels, s: cuda.Stream, y: u64, x: u64, r: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(y);
+        a.add(x);
+        a.add(r);
+        a.add(@as(i64, @intCast(n)));
+        try go(k.fns.om_add, s, blocks(n, 256), 256, 0, &a);
+    }
+
+    pub fn biasAct(k: *const Kernels, s: cuda.Stream, acc: u64, bias: u64, y: u64, rows: usize, cols: usize, per_row: bool, act: Act) !void {
+        var a: cuda.Args = .{};
+        a.add(acc);
+        a.add(bias);
+        a.add(y);
+        a.add(i(rows));
+        a.add(i(cols));
+        a.add(@as(i32, @intFromBool(per_row)));
+        a.add(@intFromEnum(act));
+        try go(k.fns.om_bias_act, s, blocks(rows * cols, 256), 256, 0, &a);
+    }
+
+    pub fn layernorm(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, bias: u64, y: u64, d: usize, rows: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(w);
+        a.add(bias);
+        a.add(y);
+        a.add(i(d));
+        a.add(eps);
+        try go(k.fns.om_layernorm, s, rows, 256, 0, &a);
+    }
+
+    pub fn embed(k: *const Kernels, s: cuda.Stream, table: u64, ids: u64, y: u64, t: usize, d: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(table);
+        a.add(ids);
+        a.add(y);
+        a.add(i(t));
+        a.add(i(d));
+        try go(k.fns.om_embed, s, blocks(t * d, 256), 256, 0, &a);
+    }
+
+    pub fn embedCodes(k: *const Kernels, s: cuda.Stream, table: u64, codes: u64, y: u64, t: usize, d: usize, nq: usize, size: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(table);
+        a.add(codes);
+        a.add(y);
+        a.add(i(t));
+        a.add(i(d));
+        a.add(i(nq));
+        a.add(i(size));
+        try go(k.fns.om_embed_codes, s, blocks(t * d, 256), 256, 0, &a);
+    }
+
+    pub fn depthIn(k: *const Kernels, s: cuda.Stream, din: u64, mask: u64, tables: u64, codes: u64, masked: u64, x: u64, nq: usize, d: usize, size: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(din);
+        a.add(mask);
+        a.add(tables);
+        a.add(codes);
+        a.add(masked);
+        a.add(x);
+        a.add(i(nq));
+        a.add(i(d));
+        a.add(i(size));
+        try go(k.fns.om_depth_in, s, blocks(nq * d, 256), 256, 0, &a);
+    }
+
+    pub fn conv2dS2(k: *const Kernels, s: cuda.Stream, x: u64, cin: usize, h: usize, w: usize, wt: u64, bias: u64, y: u64, c: usize, h2: usize, w2: usize, silu: bool) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(i(cin));
+        a.add(i(h));
+        a.add(i(w));
+        a.add(wt);
+        a.add(bias);
+        a.add(y);
+        a.add(i(c));
+        a.add(i(h2));
+        a.add(i(w2));
+        a.add(@as(i32, @intFromBool(silu)));
+        try go(k.fns.om_conv2d_s2, s, blocks(c * h2 * w2, 256), 256, 0, &a);
+    }
+
+    pub fn f32ToBf16(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try go(k.fns.om_f32_bf16, s, blocks(n, 256), 256, 0, &a);
+    }
+
+    pub fn bf16ToF32(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try go(k.fns.om_bf16_f32, s, blocks(n, 256), 256, 0, &a);
+    }
+
+    pub fn fsqDecode(k: *const Kernels, s: cuda.Stream, codes: u64, stride: usize, l: u64, n: usize, nq: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(codes);
+        a.add(i(stride));
+        a.add(l);
+        a.add(i(n));
+        a.add(i(nq));
+        try go(k.fns.om_fsq_decode, s, blocks(n * nq, 128), 128, 0, &a);
+    }
+
+    pub fn repeatRows(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize, d: usize, rep: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(i(n));
+        a.add(i(d));
+        a.add(i(rep));
+        try go(k.fns.om_repeat_rows, s, blocks(n * rep * d, 256), 256, 0, &a);
+    }
+
+    pub fn polar(k: *const Kernels, s: cuda.Stream, x: u64, spec: u64, t: usize, nb: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(spec);
+        a.add(i(t));
+        a.add(i(nb));
+        try go(k.fns.om_polar, s, blocks(t * nb, 256), 256, 0, &a);
+    }
+
+    pub fn argmax(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, sup: u64, ns: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(i(n));
+        a.add(sup);
+        a.add(i(ns));
+        a.add(out);
+        try go(k.fns.om_argmax, s, 1, 1024, 0, &a);
+    }
+};
