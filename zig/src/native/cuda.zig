@@ -13,6 +13,7 @@ const family_options = @import("cuda_options.zig");
 pub const follow = @import("cuda_follow.zig").follow;
 const lfm2 = @import("lfm2.zig");
 const lfm3_vl = @import("lfm3_vl.zig");
+const lfm3_vl_chat = @import("lfm3_vl_chat.zig");
 const glm = @import("glm_cuda");
 const qwen35 = @import("qwen35");
 const kolibri1 = @import("kolibri1");
@@ -192,7 +193,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
-    if (std.mem.eql(u8, o.model_type, lfm3_vl.family.model_type)) return lfm3_vl.open(a, gpa, io, o, problem);
+    if (std.mem.eql(u8, o.model_type, lfm3_vl.family.model_type)) {
+        // d1's checkpoints decide (lfm3_vl.zig); any other LFM3-VL chats on LFM3's lanes with its tower
+        if (lfm3_vl.decides(a, io, o.dir)) return lfm3_vl.open(a, gpa, io, o, problem);
+        return openWith(lfm3_vl_chat, a, gpa, io, o, problem);
+    }
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {
             problem.* = why;
@@ -496,6 +501,7 @@ test {
     _ = lane_backend;
     _ = snaps;
     _ = cuda_device; // the device and variable tests
+    _ = lfm3_vl_chat;
     _ = windows;
 }
 

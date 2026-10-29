@@ -357,6 +357,16 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     return .{ .engine = .{ .ctx = e, .vtable = &Engine.vtable }, .close = Engine.close, .ctx = e };
 }
 
+/// A d1 checkpoint (its config.json names a `d1_` setting) decides; any other LFM3-VL chats (lfm3_vl_chat.zig).
+pub fn decides(a: Allocator, io: std.Io, dir: []const u8) bool {
+    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return true;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 22)) catch return true;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return true;
+    if (v != .object) return true;
+    for (v.object.keys()) |k| if (std.mem.startsWith(u8, k, "d1_")) return true;
+    return false;
+}
+
 /// `calibration.json`'s default temperature, 1 without the file; a non-positive or non-finite one is refused.
 fn calibration(a: Allocator, io: std.Io, dir: []const u8) !f64 {
     const path = try std.fs.path.join(a, &.{ dir, "calibration.json" });

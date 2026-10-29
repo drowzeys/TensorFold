@@ -42,7 +42,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PastContext => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.NoFreeSlot => "every stream's caches are in use: retry once another request ends",
         error.NoDraftHead => "LFM3 on CUDA has no draft head: it drafts from the prompt's own text",
-        error.Lfm3TextOnly => "LFM3-1.7B is a text model, and LFM3-VL's image tower is not built on CUDA yet: this request has images",
+        error.Lfm3TextOnly => "LFM3-1.7B is a text model and this request has images: LFM3-VL reads them, served with --vision",
         error.StructuresUnsupported => "structured output is not built for LFM3 on CUDA yet",
         error.NonFiniteLogits => "the model's logits went non-finite at this row: the request is stopped rather than answered from them",
         error.CapturedKernels => "LFM3 runs on the engine's own kernels: unset TENSORFOLD_CUDA_KERNELS",

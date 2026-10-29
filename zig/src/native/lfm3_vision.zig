@@ -95,11 +95,16 @@ fn bf16(x: f32) u16 {
 
 /// The d1 cap (Pillow's bicubic), smart_resize (torch's uint8 bicubic), patches and RoPE tables.
 pub fn prepare(a: Allocator, rgb: Rgb) !Picture {
+    return prepareUnder(a, rgb, cap_pixels);
+}
+
+/// `prepare` under a cap of `cap` pixels (d1's), or none (LFM3-VL's processor: smart_resize alone).
+pub fn prepareUnder(a: Allocator, rgb: Rgb, cap: ?usize) !Picture {
     var src = rgb;
     var capped: ?[]u8 = null;
     defer if (capped) |c| a.free(c);
-    if (rgb.width * rgb.height > cap_pixels) {
-        const s = @sqrt(@as(f64, cap_pixels) / @as(f64, @floatFromInt(rgb.width * rgb.height)));
+    if (cap != null and rgb.width * rgb.height > cap.?) {
+        const s = @sqrt(@as(f64, @floatFromInt(cap.?)) / @as(f64, @floatFromInt(rgb.width * rgb.height)));
         const w = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(rgb.width)) * s)));
         const h = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(rgb.height)) * s)));
         capped = try resample.resize(a, .pillow, .of(rgb.pixels, rgb.width, rgb.height), w, h);
@@ -118,6 +123,28 @@ pub fn prepare(a: Allocator, rgb: Rgb) !Picture {
     // (x / 255 - 0.5) / 0.5 in f32, as the processor's fused rescale and normalize, then the patchifier's bf16
     var table: [256]u16 = undefined;
     for (&table, 0..) |*v, i| v.* = bf16((@as(f32, @floatFromInt(i)) * @as(f32, 0.00392156862745098) - 0.5) / 0.5);
+    for (0..n) |i| {
+        const py, const pxl = spot(i, gw);
+        // the row's (C, T, 16, 16) values: each channel's patch twice
+        const row = px[i * patch_width ..][0..patch_width];
+        for (0..3) |ch| for (0..temporal) |t| for (0..patch) |r| for (0..patch) |col| {
+            const v = pixels[((py * patch + r) * sw + pxl * patch + col) * 3 + ch];
+            row[((ch * temporal + t) * patch + r) * patch + col] = table[v];
+        };
+    }
+    return withRope(a, px, gh, gw);
+}
+
+/// Merge-order row `i`'s patch (row, column) on a grid `gw` patches wide.
+fn spot(i: usize, gw: usize) [2]usize {
+    const block = i / 4;
+    const inner = i % 4;
+    return .{ (block / (gw / 2)) * 2 + inner / 2, (block % (gw / 2)) * 2 + inner % 2 };
+}
+
+/// A picture of patch rows `px` (kept on success) on a gh x gw grid, with its axial RoPE tables: (h, w freqs) twice.
+fn withRope(a: Allocator, px: []u16, gh: usize, gw: usize) !Picture {
+    const n = gh * gw;
     const cs = try a.alloc(f32, n * dim);
     errdefer a.free(cs);
     const sn = try a.alloc(f32, n * dim);
@@ -128,17 +155,7 @@ pub fn prepare(a: Allocator, rgb: Rgb) !Picture {
         v.* = 1.0 / std.math.pow(f32, @floatCast(theta), e);
     }
     for (0..n) |i| {
-        const block = i / 4;
-        const inner = i % 4;
-        const py = (block / (gw / 2)) * 2 + inner / 2;
-        const pxl = (block % (gw / 2)) * 2 + inner % 2;
-        // the row's (C, T, 16, 16) values: each channel's patch twice
-        const row = px[i * patch_width ..][0..patch_width];
-        for (0..3) |ch| for (0..temporal) |t| for (0..patch) |r| for (0..patch) |col| {
-            const v = pixels[((py * patch + r) * sw + pxl * patch + col) * 3 + ch];
-            row[((ch * temporal + t) * patch + r) * patch + col] = table[v];
-        };
-        // axial RoPE: (h freqs, w freqs) twice over the head
+        const py, const pxl = spot(i, gw);
         const c = cs[i * dim ..][0..dim];
         const s = sn[i * dim ..][0..dim];
         for (0..dim / 4) |j| {
@@ -153,6 +170,41 @@ pub fn prepare(a: Allocator, rgb: Rgb) !Picture {
         }
     }
     return .{ .gh = gh, .gw = gw, .px = px, .cos = cs, .sin = sn };
+}
+
+/// A prepared picture's patch rows as f32 (exact: they are bf16), the form a server's image request carries.
+pub fn widen(a: Allocator, p: *const Picture) ![]f32 {
+    const out = try a.alloc(f32, p.px.len);
+    for (out, p.px) |*o, b| o.* = @bitCast(@as(u32, b) << 16);
+    return out;
+}
+
+/// The picture a server's image request carries (`widen`'s rows on a gh x gw grid), its RoPE tables made again.
+pub fn fromRows(a: Allocator, rows: []const f32, gh: usize, gw: usize) !Picture {
+    if (gh % merge != 0 or gw % merge != 0 or gh * gw > patches_most or rows.len != gh * gw * patch_width) return error.BadPictureRows;
+    const px = try a.alloc(u16, rows.len);
+    errdefer a.free(px);
+    for (px, rows) |*b, v| b.* = bf16(v);
+    return withRope(a, px, gh, gw);
+}
+
+test "a server's rows give back the prepared picture, and RoPE tables the same" {
+    const a = std.testing.allocator;
+    const w = 64;
+    const h = 96;
+    const pixels = try a.alloc(u8, w * h * 3);
+    defer a.free(pixels);
+    for (pixels, 0..) |*v, i| v.* = @intCast((i * 37) % 251);
+    var p = try prepareUnder(a, .{ .width = w, .height = h, .pixels = pixels }, null);
+    defer free(a, &p);
+    const rows = try widen(a, &p);
+    defer a.free(rows);
+    var q = try fromRows(a, rows, p.gh, p.gw);
+    defer free(a, &q);
+    try std.testing.expectEqualSlices(u16, p.px, q.px);
+    try std.testing.expectEqualSlices(f32, p.cos, q.cos);
+    try std.testing.expectEqualSlices(f32, p.sin, q.sin);
+    try std.testing.expectError(error.BadPictureRows, fromRows(a, rows, p.gh + 1, p.gw));
 }
 
 pub fn free(a: Allocator, p: *Picture) void {
