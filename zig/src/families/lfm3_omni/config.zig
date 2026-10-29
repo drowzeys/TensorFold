@@ -1,6 +1,6 @@
 //! LFM3-Omni-2B's shapes and token ids (the released config), checked against the checkpoint's config.json at load.
 const std = @import("std");
-const stack = @import("stack.zig");
+const stack = @import("spec.zig");
 
 pub const hidden = 2048;
 pub const vocab = 128000;

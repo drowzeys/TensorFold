@@ -1,15 +1,14 @@
 //! A small HTTP/1.1 server for one LFM3-Omni engine: POST /v1/audio/chat takes a spoken turn (base64 WAV in JSON)
 //! and answers with interleaved text and 24 kHz speech, streamed as server-sent events or whole; GET /health.
-//! One request at a time; requests queue on the listen backlog.
+//! One request at a time; requests queue on the listen backlog. The engine is either backend's (`e: anytype`).
 const std = @import("std");
 const core = @import("core");
-const engine = @import("engine.zig");
+const engine = @import("common.zig");
 const cfg = @import("config.zig");
 const mel = @import("mel.zig");
 const prompt = @import("prompt.zig");
 const wav = @import("wav");
 
-const Engine = engine.Engine;
 
 extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
 extern "c" fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const anyopaque, len: u32) c_int;
@@ -59,7 +58,7 @@ const Conn = struct {
     }
 };
 
-pub fn run(gpa: std.mem.Allocator, io: std.Io, e: *Engine, tok: *const core.tokenizer.Tokenizer, o: Options) !void {
+pub fn run(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.tokenizer.Tokenizer, o: Options) !void {
     const fd = socket(2, 1, 0);
     if (fd < 0) return error.Socket;
     defer _ = close(fd);
@@ -190,7 +189,7 @@ fn num(v: ?std.json.Value) ?f64 {
     };
 }
 
-fn handle(gpa: std.mem.Allocator, io: std.Io, e: *Engine, tok: *const core.tokenizer.Tokenizer, o: Options, c: *Conn) !void {
+fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.tokenizer.Tokenizer, o: Options, c: *Conn) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
