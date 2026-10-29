@@ -78,7 +78,7 @@ pub fn reply(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     const branches = try cx.a.alloc([]const u32, questions.len);
     for (questions, codes, branches) |q, *c, *b| {
         c.* = if (q.kind == .choice) try f.codes(q.keys) else &.{};
-        b.* = try f.encode(try suffix(cx.a, q, c.*));
+        b.* = try f.encode(try suffix(cx.a, q, c.*, srv.engine.info().decision_lead));
     }
     const groups = try cx.a.alloc([]const []const u32, questions.len);
     for (questions, codes, groups) |q, c, *g| g.* = try f.readout(q, c);
@@ -92,7 +92,8 @@ pub fn reply(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     }
     const scores = try scoreAll(srv, cx, .{ .trunk = trunk, .at = head.len, .pictures = seen.urls }, branches, groups, &read);
     const answers = try json.newObject(cx.a);
-    for (questions, scores) |q, s| try answers.put(cx.a, q.id, try answer(cx.a, q, s));
+    const t = srv.engine.info().decision_temperature;
+    for (questions, scores) |q, s| try answers.put(cx.a, q.id, try answer(cx.a, q, s, t));
     const usage = try json.newObject(cx.a);
     try usage.put(cx.a, "input_tokens", try json.intValue(cx.a, read));
     try usage.put(cx.a, "output_tokens", .{ .int = "0" });
@@ -334,10 +335,11 @@ fn indented(w: *std.Io.Writer, v: Value, level: usize) std.Io.Writer.Error!void 
     }
 }
 
-fn suffix(a: Allocator, q: Question, codes: []const Code) Allocator.Error![]const u8 {
+fn suffix(a: Allocator, q: Question, codes: []const Code, lead: []const u8) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     questionText(a, &out.writer, q, codes) catch return error.OutOfMemory;
     out.writer.writeAll(im_end ++ "\n" ++ im_start ++ "assistant\n") catch return error.OutOfMemory;
+    out.writer.writeAll(lead) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
@@ -422,13 +424,13 @@ fn scoreAll(srv: *Server, cx: *Cx, trunk: api.Decision, branches: []const []cons
     return out;
 }
 
-fn answer(a: Allocator, q: Question, scores: []const f64) Allocator.Error!Value {
+fn answer(a: Allocator, q: Question, scores: []const f64, temperature: f64) Allocator.Error!Value {
     var peak = scores[0];
     for (scores[1..]) |s| peak = @max(peak, s);
     const p = try a.alloc(f64, scores.len);
     var z: f64 = 0;
     for (scores, p) |s, *x| {
-        x.* = @exp(s - peak);
+        x.* = @exp((s - peak) / temperature);
         z += x.*;
     }
     for (p) |*x| x.* /= z;

@@ -22,8 +22,9 @@ pub const schedule: [layers]LayerType = .{
 };
 
 pub const Width = struct { bits: u8, group: u16 };
-/// The projections' storage: MLX affine at `quant`'s widths, or ModelOpt NVFP4 (FP4 FFN only); decoders refuse others.
-pub const Scheme = enum { mlx_affine, modelopt_nvfp4 };
+/// The projections' storage: MLX affine at `quant`'s widths, ModelOpt NVFP4 (FP4 FFN only), or the bf16 release as
+/// published (no quantization entry at all); decoders refuse others.
+pub const Scheme = enum { mlx_affine, modelopt_nvfp4, bf16 };
 /// The width `quant` reports for a ModelOpt NVFP4 export (its FFN): 4 bits in groups of 16.
 pub const nvfp4_width: Width = .{ .bits = 4, .group = 16 };
 pub const Quant = struct {
@@ -327,6 +328,7 @@ pub const Backend = enum { metal, cuda };
 /// Whether `backend` serves this checkpoint's scheme: ModelOpt NVFP4 is CUDA's only, so Metal refuses it by name.
 pub fn servedOn(config: *const Config, backend: Backend) !void {
     if (config.scheme == .modelopt_nvfp4 and backend == .metal) return error.Lfm3ModeloptNvfp4NotOnMetal;
+    if (config.scheme == .bf16 and backend == .metal) return error.Lfm3Bf16NotOnMetal;
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
@@ -342,6 +344,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     if (kind == .vision_language) try vision(root);
     if (root.get("quantization") == null) if (root.get("quantization_config")) |qc| if (try modelopt(qc, kind))
         return .{ .arena = arena, .kind = kind, .context = context, .scheme = .modelopt_nvfp4, .quant = .{ .global = nvfp4_width } };
+    // the bf16 release as published: no quantization entry; every projection is read as stored
+    if (root.get("quantization") == null and root.get("quantization_config") == null)
+        return .{ .arena = arena, .kind = kind, .context = context, .scheme = .bf16, .quant = .{ .global = .{ .bits = 16, .group = 0 } } };
     const q = try quantization(a, root.get("quantization") orelse root.get("quantization_config") orelse
         return error.UnsupportedLfm3Quantization);
     if (root.get("quantization_config")) |other| {

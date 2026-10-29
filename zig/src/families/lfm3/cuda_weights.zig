@@ -1,4 +1,5 @@
-//! LFM3's weights on CUDA from ModelOpt NVFP4 (weight-only): FP4 FFN, bf16 mixers, embedding, tied head and norms.
+//! LFM3's weights on CUDA: ModelOpt NVFP4 (weight-only: FP4 FFN, bf16 mixers, embedding, tied head and norms), or the
+//! bf16 release as published (every projection bf16), text alone or the text decoder of LFM3-VL.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -66,8 +67,8 @@ pub const Weights = struct {
     }
 };
 
-/// The largest staged projection: conv in (3 x 2048 rows) in bf16, or the FFN's w1 and w3 codes and scales.
-pub const stage_bytes = @max(3 * c.hidden * c.hidden * 2, 2 * c.intermediate * (c.hidden / 2 + c.hidden / 16)) + 4 * 256;
+/// The largest staged projection: the FFN's w1 and w3 stacked in bf16 (the NVFP4 codes and scales take less).
+pub const stage_bytes = @max(3 * c.hidden * c.hidden * 2, 2 * c.intermediate * c.hidden * 2) + 4 * 256;
 
 const Ctx = struct {
     w: *Weights,
@@ -139,13 +140,20 @@ fn scalar(ck: *core.checkpoint.Checkpoint, name: []const u8) !f32 {
 }
 
 /// The text decoder's tensors against the shared admission (weights.zig): names, dtypes, shapes, bytes, nothing extra.
-fn admitted(gpa: std.mem.Allocator, config: *const c.Config, ck: *const core.checkpoint.Checkpoint) !void {
+fn admitted(gpa: std.mem.Allocator, config: *const c.Config, ck: *const core.checkpoint.Checkpoint) !admit.Namespace {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var all: core.safetensors.Header = .empty;
     for (ck.files.items) |*f| for (f.names.keys(), f.names.values()) |name, e| try all.put(arena.allocator(), name, e);
     const m = try admit.validate(gpa, config, &all);
-    if (m.namespace != .bare) return error.UnsupportedLfm3Quantization;
+    // NVFP4: the export's bare names; bf16: bare (text) or the VL layout's text decoder
+    const ok = switch (config.scheme) {
+        .modelopt_nvfp4 => m.namespace == .bare,
+        .bf16 => m.namespace == .bare or m.namespace == .vl,
+        .mlx_affine => false,
+    };
+    if (!ok) return error.UnsupportedLfm3Quantization;
+    return m.namespace;
 }
 
 fn named(b: []u8, prefix: []const u8, suffix: []const u8) ![]const u8 {
@@ -155,7 +163,7 @@ fn named(b: []u8, prefix: []const u8, suffix: []const u8) ![]const u8 {
 /// Every tensor checked against the admitted geometry and packed for the lane; `layers` caps them (tests).
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, k: *const kern.Kernels, dir: []const u8, layers: ?usize) !Weights {
     var config = try c.Config.read(gpa, io, dir);
-    if (config.scheme != .modelopt_nvfp4 or config.kind != .text) {
+    if (config.scheme == .mlx_affine or (config.scheme == .modelopt_nvfp4 and config.kind != .text)) {
         config.deinit();
         return error.UnsupportedLfm3Quantization; // MLX affine and FP8 exports: other loaders of the same layers
     }
@@ -163,15 +171,20 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.S
     errdefer w.deinit();
     var ck = try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    try admitted(gpa, &w.config, &ck);
-    if (!@import("builtin").is_test) std.log.info("LFM3 NVFP4 on CUDA serves weight-only: FP4 weights, bf16 activations; the export's static FP4 input scales are read and not applied", .{});
+    const ns = try admitted(gpa, &w.config, &ck);
+    const fp4 = w.config.scheme == .modelopt_nvfp4;
+    if (!@import("builtin").is_test) {
+        if (fp4) std.log.info("LFM3 NVFP4 on CUDA serves weight-only: FP4 weights, bf16 activations; the export's static FP4 input scales are read and not applied", .{}) else std.log.info("LFM3 on CUDA from the bf16 release: every projection bf16", .{});
+    }
+    const root = ns.prefix();
     const h = c.hidden;
     var stage = try DeviceBuffer.alloc(d, stage_bytes);
     defer stage.free();
     var x: Ctx = .{ .w = &w, .d = d, .s = s, .k = k, .ck = &ck, .stage = stage };
-    w.embed = try x.tensor("model.embed_tokens.weight", .bf16, &.{ c.vocab, h });
+    var nb1: [96]u8 = undefined;
+    w.embed = try x.tensor(try named(&nb1, root, "embed_tokens.weight"), .bf16, &.{ c.vocab, h });
     w.head = try x.pack(w.embed, c.vocab, h); // tied: the lane's copy of the embedding
-    w.final_norm = try x.tensor("model.embedding_norm.weight", .bf16, &.{h});
+    w.final_norm = try x.tensor(try named(&nb1, root, "embedding_norm.weight"), .bf16, &.{h});
     const n = @min(layers orelse c.layers, c.layers);
     w.layers = try gpa.alloc(Layer, n);
     var b1: [128]u8 = undefined;
@@ -180,7 +193,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.S
     var b4: [128]u8 = undefined;
     for (w.layers, w.config.layer_types[0..n], 0..) |*l, kind, i| {
         var pb: [64]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pb, "model.layers.{d}.", .{i});
+        const p = try std.fmt.bufPrint(&pb, "{s}layers.{d}.", .{ root, i });
         l.operator_norm = try x.tensor(try named(&b1, p, "operator_norm.weight"), .bf16, &.{h});
         l.post_operator_norm = try x.tensor(try named(&b1, p, "post_operator_norm.weight"), .bf16, &.{h});
         l.ffn_norm = try x.tensor(try named(&b1, p, "ffn_norm.weight"), .bf16, &.{h});
@@ -208,8 +221,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.S
                 .sliding = kind == .sliding_attention,
             } };
         }
-        l.gate_up = try x.nvfp4(&.{ try named(&b1, p, "feed_forward.w1"), try named(&b2, p, "feed_forward.w3") }, &.{ c.intermediate, c.intermediate }, h);
-        l.down = try x.nvfp4(&.{try named(&b1, p, "feed_forward.w2")}, &.{h}, c.intermediate);
+        const ffn = [_][]const u8{ try named(&b1, p, "feed_forward.w1"), try named(&b2, p, "feed_forward.w3") };
+        const down = [_][]const u8{try named(&b3, p, "feed_forward.w2")};
+        l.gate_up = if (fp4) try x.nvfp4(&ffn, &.{ c.intermediate, c.intermediate }, h) else try x.bf16(&ffn, &.{ c.intermediate, c.intermediate }, h);
+        l.down = if (fp4) try x.nvfp4(&down, &.{h}, c.intermediate) else try x.bf16(&down, &.{h}, c.intermediate);
     }
     return w;
 }
@@ -217,6 +232,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.S
 test "the stage holds conv in's bf16 rows and the FFN's stacked codes and scales" {
     try std.testing.expect(stage_bytes >= 3 * c.hidden * c.hidden * 2);
     try std.testing.expect(stage_bytes >= 2 * c.intermediate * c.hidden / 2 + 2 * c.intermediate * c.hidden / 16);
+    try std.testing.expect(stage_bytes >= 2 * c.intermediate * c.hidden * 2);
     try std.testing.expect(stage_bytes >= qkvg_rows * c.hidden * 2);
     try std.testing.expectEqual(@as(usize, 3088), qkvg_rows);
 }

@@ -7,9 +7,15 @@ const Allocator = std.mem.Allocator;
 pub const Namespace = enum {
     bare,
     wrapped,
+    /// transformers 5's VL layout: the text decoder under `model.language_model.`, beside the vision tower
+    vl,
 
     pub fn prefix(n: Namespace) []const u8 {
-        return if (n == .bare) "model." else "language_model.model.";
+        return switch (n) {
+            .bare => "model.",
+            .wrapped => "language_model.model.",
+            .vl => "model.language_model.",
+        };
     }
 };
 
@@ -35,6 +41,7 @@ fn named(a: Allocator, out: *std.ArrayList(Expected), prefix: []const u8, suffix
 
 fn affine(a: Allocator, out: *std.ArrayList(Expected), cfg: *const c.Config, prefix: []const u8, suffix: []const u8, n: usize, k: usize) !void {
     if (cfg.scheme == .modelopt_nvfp4) return modelopt(a, out, prefix, suffix, n, k);
+    if (cfg.scheme == .bf16) return named(a, out, prefix, try std.fmt.allocPrint(a, "{s}.weight", .{suffix}), &.{ n, k });
     var buf: [256]u8 = undefined;
     const module = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
     const q = try cfg.width(module);
@@ -74,7 +81,7 @@ pub fn schema(a: Allocator, cfg: *const c.Config, namespace: Namespace) ![]Expec
             try affine(a, &out, cfg, p, "conv.in_proj", 3 * c.hidden, c.hidden);
             try affine(a, &out, cfg, p, "conv.out_proj", c.hidden, c.hidden);
             // MLX keeps the depthwise kernel as [channels, taps, 1], torch as [channels, 1, taps]: same values
-            const taps: []const usize = if (cfg.scheme == .modelopt_nvfp4) &.{ c.hidden, 1, c.conv_taps } else &.{ c.hidden, c.conv_taps, 1 };
+            const taps: []const usize = if (cfg.scheme != .mlx_affine) &.{ c.hidden, 1, c.conv_taps } else &.{ c.hidden, c.conv_taps, 1 };
             try named(a, &out, p, "conv.conv.weight", taps);
         } else {
             try affine(a, &out, cfg, p, "self_attn.q_proj", c.query_heads * c.head_dim, c.hidden);
@@ -93,9 +100,10 @@ pub fn schema(a: Allocator, cfg: *const c.Config, namespace: Namespace) ![]Expec
 pub fn validate(a: Allocator, cfg: *const c.Config, header: *const st.Header) !Manifest {
     const bare = header.contains("model.embed_tokens.weight");
     const wrapped = header.contains("language_model.model.embed_tokens.weight");
-    if (bare and wrapped) return error.MixedNamespaces;
-    if (!bare and !wrapped) return error.MissingTensor;
-    const namespace: Namespace = if (bare) .bare else .wrapped;
+    const vl = header.contains("model.language_model.embed_tokens.weight");
+    if (@as(u8, @intFromBool(bare)) + @intFromBool(wrapped) + @intFromBool(vl) > 1) return error.MixedNamespaces;
+    if (!bare and !wrapped and !vl) return error.MissingTensor;
+    const namespace: Namespace = if (bare) .bare else if (wrapped) .wrapped else .vl;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const expected = try schema(arena.allocator(), cfg, namespace);
@@ -112,6 +120,9 @@ pub fn validate(a: Allocator, cfg: *const c.Config, header: *const st.Header) !M
         try names.put(arena.allocator(), e.name, {});
     }
     for (header.keys()) |name| {
+        // the VL layout's vision tower and projector are the vision admission's, not the text decoder's
+        if (cfg.kind == .vision_language and (std.mem.startsWith(u8, name, "model.vision_tower.") or
+            std.mem.startsWith(u8, name, "model.multi_modal_projector."))) continue;
         if (std.mem.startsWith(u8, name, "model.") or std.mem.startsWith(u8, name, "language_model.")) {
             if (!names.contains(name)) return error.UnexpectedTensor;
         }
