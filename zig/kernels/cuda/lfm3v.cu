@@ -1,7 +1,4 @@
-// LFM3-VL's vision tower glue (lfm3_vision.zig), at torch's rounding points:
-//   RMSNorm: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), the mean in fp32;
-//   q and k: that norm per head, then RoPE in fp32 on the bf16 rows (cos, sin fp32 [P, D]), rounded once;
-//   the gated depthwise 3x3 conv: bf16(C * bf16(conv(bf16(B * x)))) over each frame's raster grid, rows in merge order.
+// LFM3-VL's vision tower glue (lfm3_vision.zig) at torch's bf16 rounding points, and d1's set attention.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -51,7 +48,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_lfm3v_rms(const __nv_bfloat
     }
 }
 
-// qkv [P, 3 H 64] in place: q (part 0) and k (part 1) heads RMSNormed then rotated; v untouched. A warp a (row, head, part).
+// qkv [P, 3 H 64] in place: q and k heads RMSNormed, then RoPE in fp32; v untouched. A warp a (row, head, part).
 extern "C" __global__ void __launch_bounds__(32) tf_lfm3v_qk(__nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ qw,
                                                              const __nv_bfloat16* __restrict__ kw, const float* __restrict__ cs,
                                                              const float* __restrict__ sn, int P, int H, float eps) {
@@ -82,8 +79,7 @@ __device__ __forceinline__ void raster(int i, int gw, int& y, int& x) {
 
 __device__ __forceinline__ int merged(int y, int x, int gw) { return ((y / 2) * (gw / 2) + x / 2) * 4 + (y % 2) * 2 + x % 2; }
 
-// out [P, C] = bf16(C * bf16(dwconv3x3(bf16(B * x)))) of bcx [P, 3C] (B | C | x), w [C, 9]; one frame of gh x gw rows.
-// A thread a (row, channel); zero padding outside the frame.
+// out [P, C] = bf16(C * bf16(dwconv3x3(bf16(B * x)))) of bcx [P, 3C], w [C, 9]; a thread a (row, channel).
 extern "C" __global__ void __launch_bounds__(256) tf_lfm3v_conv(const __nv_bfloat16* __restrict__ bcx, const __nv_bfloat16* __restrict__ w,
                                                                 __nv_bfloat16* __restrict__ out, int gh, int gw, int C) {
     const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -115,7 +111,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_lfm3v_add(const __nv_bfloat
     if (i < count) y[i] = __float2bfloat16_rn(__fadd_rn(bf(a[i]), bf(b[i])));
 }
 
-// y [rows, n] = bf16(silu(bf16 g) ) * u as torch: F.silu on the bf16 w1 rows, then the bf16 product; gu [rows, 2n] (w1 | w3).
+// y [rows, n] = bf16(silu(g)) * u as torch rounds them; gu [rows, 2n] holds w1's rows then w3's.
 extern "C" __global__ void __launch_bounds__(256) tf_lfm3v_silu_mul(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ y,
                                                                     int n, long long count) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -126,9 +122,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_lfm3v_silu_mul(const __nv_b
     y[i] = __float2bfloat16_rn(__fmul_rn(s, bf(gu[row * 2 * n + n + c])));
 }
 
-// d1's `set` attention on a full-attention layer of one packed row (attention.py `Sees`): a query sees key j when the
-// query or the key is in the state (row < state) or both are in the same question. q [R, H 128], kv [R, 2 Hk 128]
-// (keys then values, normed and rotated), out [R, H 128]; GQA H / Hk. A warp a (row, head), fp32 online softmax.
+// d1's set attention: a row sees a key in the state or in its own question; a warp a (row, head), fp32 softmax.
 extern "C" __global__ void __launch_bounds__(32) tf_lfm3v_set_attn(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kv,
                                                                    const int* __restrict__ group, __nv_bfloat16* __restrict__ out, int R,
                                                                    int H, int Hk, int state, float scale) {
@@ -160,9 +154,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_lfm3v_set_attn(const __nv_bf
     for (int i = 0; i < 4; ++i) out[static_cast<int64_t>(row) * H * D + head * D + lane + 32 * i] = __float2bfloat16_rn(o[i] / l);
 }
 
-// tf_lfm3v_set_attn's arithmetic, tiled: a block of 16 warps takes 4 query rows x the 4 query heads of one kv head and
-// stages 32 keys' K and V rows in shared memory for all of them; a tile no row of the block may see is skipped.
-// Same order of sums a (row, head) as the untiled kernel (keys in order, fp32 online softmax, flash's bf16 P for P.V).
+// tf_lfm3v_set_attn's sums in the same order, tiled: 4 rows x a kv head's 4 query heads share 32 staged keys.
 extern "C" __global__ void __launch_bounds__(512) tf_lfm3v_set_attn_tiled(const __nv_bfloat16* __restrict__ q,
                                                                           const __nv_bfloat16* __restrict__ kv,
                                                                           const int* __restrict__ group, __nv_bfloat16* __restrict__ out,

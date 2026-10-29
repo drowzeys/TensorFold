@@ -272,7 +272,7 @@ const Full = struct {
     }
 };
 
-/// A tower's attention by head dim: SigLIP2's 72, RADIO's 80 and LFM3-VL's 64 (full_kernel's bits in one barrier a tile).
+/// A tower's attention by head dim: SigLIP2's 72, RADIO's 80 and LFM3-VL's 64 (full_kernel's bits).
 const fulls = [_]Full{
     .{ .dim = 72, .warps = 8, .slots = 8 },
     .{ .dim = 80, .warps = 8 },

@@ -1,7 +1,4 @@
-//! LFM3-VL's pictures on CUDA (d1-2B): Lfm3VlImageProcessor on the CPU (the d1 pixel cap, smart_resize to 32,
-//! torch's uint8 bicubic, 16-pixel patches in 2 x 2 merge-block order, two identical frames a patch), then
-//! Lfm3VlVisionModel (a linear patchifier, 14 layers of gated depthwise 3 x 3 convs and bidirectional GQA attention
-//! with axial RoPE) and Lfm3VlMultiModalProjector, at torch's bf16 rounding points (lfm3v.cu).
+//! LFM3-VL's pictures on CUDA: the image processor on the CPU, then the vision tower and projector (lfm3v.cu).
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");

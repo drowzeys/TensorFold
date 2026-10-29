@@ -1,5 +1,4 @@
-//! LFM3's weights on CUDA: ModelOpt NVFP4 (weight-only: FP4 FFN, bf16 mixers, embedding, tied head and norms), or the
-//! bf16 release as published (every projection bf16), text alone or the text decoder of LFM3-VL.
+//! LFM3's weights on CUDA: ModelOpt NVFP4 (weight-only) or the bf16 release, text alone or LFM3-VL's text decoder.
 const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
@@ -37,8 +36,7 @@ pub const Weights = struct {
     final_norm: u64 = 0,
     layers: []Layer = &.{},
     buffers: std.ArrayList(DeviceBuffer) = .empty,
-    /// bf16 projections kept as stored, row-major [n, k], for prompt rows through a GEMM (`loadPlain`): a decision
-    /// engine reads prompts only, so the lane's decode layout is not made.
+    /// bf16 projections kept as stored [n, k] for a prompt-only GEMM (`loadPlain`); no lane decode layout.
     plain: bool = false,
 
     pub fn deinit(w: *Weights) void {

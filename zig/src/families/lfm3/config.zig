@@ -22,8 +22,7 @@ pub const schedule: [layers]LayerType = .{
 };
 
 pub const Width = struct { bits: u8, group: u16 };
-/// The projections' storage: MLX affine at `quant`'s widths, ModelOpt NVFP4 (FP4 FFN only), or the bf16 release as
-/// published (no quantization entry at all); decoders refuse others.
+/// The projections' storage: MLX affine, ModelOpt NVFP4 (FP4 FFN only) or the bf16 release; decoders refuse others.
 pub const Scheme = enum { mlx_affine, modelopt_nvfp4, bf16 };
 /// The width `quant` reports for a ModelOpt NVFP4 export (its FFN): 4 bits in groups of 16.
 pub const nvfp4_width: Width = .{ .bits = 4, .group = 16 };

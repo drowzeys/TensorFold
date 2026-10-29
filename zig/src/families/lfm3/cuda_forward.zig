@@ -152,13 +152,10 @@ const Pass = struct {
     }
 };
 
-/// Rows of a forward's embedding replaced by other rows (a picture's projected features): `count` rows from `src`
-/// at row `at` of the forward, bf16 [count, hidden].
+/// `count` bf16 rows from `src` over the forward's embedding at row `at` (a picture's projected features).
 pub const Insert = struct { at: usize, src: u64, count: usize };
 
-/// d1's `set` attention on the full-attention layers of one whole prompt row from position 0: the state's rows
-/// [0, state) and every row's group (int32 [rows] on the device: -1 in the state, else its question), read by `kernel`
-/// (lfm3v.cu tf_lfm3v_set_attn). Sliding and conv layers stay causal, as d1 keeps them.
+/// d1's set attention on full-attention layers: rows [0, state) and each row's group (int32, -1 in the state).
 pub const Set = struct { kernel: cuda.Function, group: u64, state: usize };
 
 /// What a decision forward adds: rows over the embedding, `set` attention, the logits of rows `heads_at` (in order).

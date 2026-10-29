@@ -231,8 +231,7 @@ pub const Info = struct {
     prompt_cache_plan: ?PromptCachePlan = null,
     /// The engine scores decisions (`score`) and writes no text: the server refuses text requests.
     decides: bool = false,
-    /// Text a decision engine's answer slot follows after the assistant header (its chat template's opening of an
-    /// unthinking turn, such as LFM3's empty think block); empty: the header alone.
+    /// Text after the assistant header that opens a decision's answer slot (LFM3's empty think block); empty: none.
     decision_lead: []const u8 = "",
     /// The checkpoint's calibrated temperature for option answers (d1's `calibration.json` default): scores / it.
     decision_temperature: f64 = 1,

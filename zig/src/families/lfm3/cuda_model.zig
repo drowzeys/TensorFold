@@ -8,8 +8,8 @@ const kern = @import("cuda_kernels.zig");
 
 const DeviceBuffer = cuda.DeviceBuffer;
 
-/// Rows a prompt chunk takes: 2048, so a d1 decision (pictures, state and its questions) reads in one pass.
-pub const prompt_rows = 2048;
+/// Rows a prompt chunk takes.
+pub const prompt_rows = 1024;
 /// Rows a round of windows takes over every stream.
 pub const round_rows = 128;
 /// Layers of each mixer kind in the admitted schedule.

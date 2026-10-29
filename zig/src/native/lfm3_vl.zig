@@ -1,6 +1,4 @@
-//! d1-2B (LFM3-VL) on CUDA: an engine that scores decisions through the score hook and writes no text. The bf16
-//! release's text decoder runs on LFM3's CUDA forward, pictures on LFM3-VL's tower (lfm3_vision.zig); each question
-//! is read after its trunk as one causal prompt.
+//! d1-2B (LFM3-VL) on CUDA: decisions scored on LFM3's CUDA forward and LFM3-VL's tower; it writes no text.
 const std = @import("std");
 const cuda = @import("cuda");
 const api = @import("engine_api");
@@ -63,8 +61,7 @@ const Engine = struct {
         return .{ .active = u.device, .peak = u.peak };
     }
 
-    /// `ids` from position 0 on slot 0 in prompt chunks, the picture rows of `runs` over their tokens; the last
-    /// row's logits in `e.row`.
+    /// `ids` from position 0 on slot 0 in prompt chunks with `runs`' picture rows; the last row's logits in `e.row`.
     fn pass(e: *Engine, ids: []const u32, runs: []const Run) !void {
         if (ids.len == 0 or ids.len > e.window) return error.BadWindow;
         try e.m.clearSlot(e.stream, 0);
@@ -94,8 +91,7 @@ const Engine = struct {
         return @as(f32, @bitCast(@as(u32, e.row[id]) << 16));
     }
 
-    /// One packed row under `set` attention: `ids` from position 0, `groups` a row, picture `runs`; the logits of
-    /// rows `ends` (each question's last) in `e.rows`, in order.
+    /// One packed row under set attention; the logits of rows `ends` (each question's last) in `e.rows`, in order.
     fn packPass(e: *Engine, ids: []const u32, groups: []const i32, state: usize, ends: []const usize, runs: []const Run) !void {
         if (ids.len > mdl.prompt_rows) return error.PackTooLong;
         try e.m.clearSlot(e.stream, 0);
@@ -137,8 +133,7 @@ const Engine = struct {
         return if (mass) e.lse() else 0;
     }
 
-    /// Pictures decoded and prepared before the GPU is taken; then their features, and each branch read after the
-    /// trunk as one causal prompt: trunk ++ branch, the labels at its last row.
+    /// Pictures prepared before the GPU is taken, then each branch read after the trunk as one causal prompt.
     fn decide(ctx: *anyopaque, d: *api.Decision) error{ Failed, Refused }!void {
         const e = of(ctx);
         const a = d.arena orelse return error.Failed;
@@ -209,9 +204,7 @@ const Engine = struct {
         }
     }
 
-    /// d1's `set` reading: up to `set_size` questions a pass after their state, the first as its lone prompt, each
-    /// further one opened by the state's question header; every row of the state sees all, a question its state and
-    /// itself (attention.py `pack_set`, `Sees`).
+    /// d1's set reading: up to `set_size` questions a pass after their state, each seeing its state and itself.
     fn decideSet(e: *Engine, d: *api.Decision, a: Allocator, trunk: []const u32, runs: []const Run) error{ Failed, Refused }!void {
         const hdr = if (std.mem.endsWith(u32, trunk, e.header)) e.header else &[_]u32{};
         var label_at: usize = 0;
