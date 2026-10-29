@@ -8,6 +8,7 @@ const be = lanes.backend;
 const Stream = lanes.Stream;
 const Pick = cuda.tree_round.Pick;
 const Pages = @import("cuda_snap.zig").Pages;
+const pictures = @import("cuda_pictures.zig");
 
 /// Positions a page of keys and values holds, in every Liquid family.
 pub const page = 512;
@@ -69,6 +70,8 @@ pub fn Backend(comptime F: type) type {
         comptime {
             std.debug.assert(max_taps <= tap_cap);
         }
+        /// The forward lays rows over a chunk's embedding (`forwardWith`): images, once `Liquid.tower` is set.
+        const inserts = @hasDecl(fwd, "forwardWith");
 
         /// Prompt rows a step takes: the forward's chunk grid, from position 0.
         pub const prompt_rows = mdl.prompt_rows;
@@ -90,6 +93,7 @@ pub fn Backend(comptime F: type) type {
             sampled: bool = false,
             fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
             lease: kv.Lease = .{}, // a paged slot's pages
+            pics: pictures.Rows = .{}, // its images' rows while its prompt pass runs
         };
 
         /// Pages a request holds: its prompt, its reply and one last verify window.
@@ -112,6 +116,9 @@ pub fn Backend(comptime F: type) type {
             pool: ?kv.Pool = null, // the pages every slot leases (attach)
             snaps: ?Pages = null, // the prompt cache's pages, allocated once inside its budget (snap_ready)
             tapped: ?struct { stream: *const Stream, cut: Cut } = null, // the chunk's tapped marks while its hooks run
+            tower: ?pictures.Tower = null, // the image tower (LFM3-VL); null: text only
+            gemm: ?*cuda.vit.Gemms = null, // prompt rows through cuBLASLt on the weights' plain twins; null: the lane
+            host_row: []u16 = &.{}, // one logits row on the host, for logprobs (made at first use)
 
             /// The device bytes `init` allocates: the token and pick rings, metas, each slot's last row and rule.
             pub fn openBytes(slots: usize) usize {
@@ -153,6 +160,7 @@ pub fn Backend(comptime F: type) type {
                 while (it.next()) |l| {
                     if (x.pool) |*p| p.finish(&l.lease);
                     l.rows.deinit(x.gpa);
+                    l.pics.free(x.gpa);
                 }
                 if (x.pool) |*p| p.deinit();
                 if (x.snaps) |*p| p.deinit();
@@ -161,6 +169,7 @@ pub fn Backend(comptime F: type) type {
                 x.gpa.free(x.slot_bufs);
                 x.gpa.free(x.free);
                 x.gpa.free(x.greedy);
+                x.gpa.free(x.host_row);
                 x.tok.free();
                 x.picks.free();
                 x.meta.free();
@@ -170,7 +179,7 @@ pub fn Backend(comptime F: type) type {
                 return .{ .ptr = x, .vtable = &vtable };
             }
 
-            const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
+            const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .first_row = firstRow, .reports_fill = true };
 
             /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, one forward.
             pub fn facts(x: *const Liquid) lanes.Model {
@@ -275,7 +284,7 @@ pub fn Backend(comptime F: type) type {
             fn opening(x: *Liquid, s: *Stream) !*Lane {
                 const p = s.prompt();
                 if (p.len == 0) return error.EmptyPrompt;
-                if (s.images.len > 0) return F.text_only;
+                if (s.images.len > 0 and !(inserts and x.tower != null)) return F.text_only;
                 if (!x.fitsContext(p.len, s.max_new)) return error.PastContext;
                 const got = try x.lanes.getOrPut(x.gpa, s);
                 if (!got.found_existing) {
@@ -298,6 +307,7 @@ pub fn Backend(comptime F: type) type {
                 try x.m.clearSlot(x.s, l.slot);
                 l.fill = x.resumeAt(s, l, p.len);
                 s.fill_at.store(@intCast(l.fill.?), .monotonic);
+                if (inserts and s.images.len > 0) try l.pics.make(x.gpa, x.d, x.s, x.tower.?, s.images, l.fill.?, p.len, cfg.hidden);
                 return l;
             }
 
@@ -332,7 +342,8 @@ pub fn Backend(comptime F: type) type {
                 var rows: [tap_cap]usize = undefined;
                 for (c.taps(), 0..) |t, j| rows[j] = t - at - 1;
                 const ch: fwd.Chain = if (comptime max_taps > 0) .{ .slot = l.slot, .p0 = at, .tokens = p[at..end], .taps = rows[0..c.n] } else .{ .slot = l.slot, .p0 = at, .tokens = p[at..end] };
-                try fwd.forward(x.m, x.k, x.s, &.{ch}, true, end - at - 1, @intFromBool(done));
+                try x.promptChunk(l, ch, at, end, done);
+                if (done) l.pics.free(x.gpa);
                 if (done) try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(l.last, x.m.s.logits, cfg.vocab * 2, x.s.handle), "cuMemcpyDtoDAsync");
                 s.fill_at.store(@intCast(end), .monotonic);
                 l.fill = if (done) null else end;
@@ -344,6 +355,34 @@ pub fn Backend(comptime F: type) type {
                     if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null) hk.at(hk.ptr, s, @intCast(end));
                 }
                 return done;
+            }
+
+            /// A prompt chunk [at, end), its images' rows over the embedding, its projections on cuBLASLt when set.
+            fn promptChunk(x: *Liquid, l: *const Lane, ch: fwd.Chain, at: usize, end: usize, done: bool) !void {
+                if (comptime inserts) {
+                    var parts: [pictures.max_pictures]pictures.Part = undefined;
+                    var ins: [pictures.max_pictures]fwd.Insert = undefined;
+                    const got = l.pics.within(at, end, cfg.hidden, &parts);
+                    for (got, ins[0..got.len]) |g, *i| i.* = .{ .at = g.at, .src = g.src, .count = g.count };
+                    return fwd.forwardWith(x.m, x.k, x.s, &.{ch}, true, end - at - 1, @intFromBool(done), .{ .inserts = ins[0..got.len], .gemm = x.gemm });
+                }
+                try fwd.forward(x.m, x.k, x.s, &.{ch}, true, end - at - 1, @intFromBool(done));
+            }
+
+            /// Logits row `r` of `logits` on the host, after the stream's work.
+            fn hostRow(x: *Liquid, logits: u64, r: usize) ![]const u16 {
+                if (x.host_row.len == 0) x.host_row = try x.gpa.alloc(u16, cfg.vocab);
+                try x.d.check(x.d.api.cuMemcpyDtoHAsync_v2(x.host_row.ptr, logits + r * cfg.vocab * 2, cfg.vocab * 2, x.s.handle), "cuMemcpyDtoHAsync");
+                try x.s.synchronize();
+                return x.host_row;
+            }
+
+            /// The first token's row from the prompt's last logits; the round loop names the token drawn.
+            fn firstRow(ptr: *anyopaque, s: *Stream) anyerror!lanes.LogprobRow {
+                const x = self(ptr);
+                const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
+                const logits = try x.hostRow(l.last, 0);
+                return pictures.row(logits, pictures.argmax(logits), s.logprobs orelse 0);
             }
 
             fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
@@ -439,6 +478,9 @@ pub fn Backend(comptime F: type) type {
                     const n = l.rows.items.len;
                     @memcpy(o.sampled[0..n], got[at..][0..n]);
                     @memcpy(o.drafts[0 .. n - 1], l.rows.items[1..]);
+                    if (o.rows.len > 0) for (o.rows[0..n], 0..) |*r, i| {
+                        r.* = pictures.row(try x.hostRow(x.m.s.logits, at + i), got[at + i], w.stream.logprobs orelse 0);
+                    };
                     l.len = l.base + n; // a chain keeps every row unless rolled back
                     at += n;
                 }
@@ -474,6 +516,7 @@ pub fn Backend(comptime F: type) type {
                     }
                     x.free[l.slot] = true;
                     l.rows.deinit(x.gpa);
+                    l.pics.free(x.gpa);
                     if (x.lanes.count() == 0) x.report();
                 }
             }
