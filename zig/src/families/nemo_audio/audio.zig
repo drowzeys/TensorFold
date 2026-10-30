@@ -61,7 +61,7 @@ pub const Encoder = struct {
         errdefer gpa.destroy(e);
         var w = try W.Weights.load(gpa, io, d, dir, c);
         errdefer w.deinit(gpa);
-        var r = try enc.Runner.init(gpa, d, c);
+        var r = try enc.Runner.init(gpa, d, c, w.fp8);
         errdefer r.deinit();
         e.* = .{ .gpa = gpa, .d = d, .c = c, .w = w, .r = r, .kernel = try sinusoid(gpa, c.asr.d) };
         return e;

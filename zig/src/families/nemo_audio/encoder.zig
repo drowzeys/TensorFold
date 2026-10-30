@@ -21,12 +21,14 @@ pub const Runner = struct {
     scratch: cuda.DeviceBuffer,
     b: Buffers,
     tables: [2]Rope, // the ASR encoder's, then the Sortformer's
+    lane: ?cuda.qmmf.Lane = null, // the lane matmul, for a release whose ASR projections are FP8
+    part: ?cuda.DeviceBuffer = null, // its slice partials where it reduces them (no clusters, below sm_90)
 
     /// Scratch rows, bf16 [rows, widest] unless noted.
     pub const Buffers = struct { in: u64, x: u64, h: u64, a: u64, qkv: u64, wide: u64, acc: u64 };
     const Rope = struct { cos: u64, sin: u64, rot: usize };
 
-    pub fn init(gpa: Allocator, d: *const cuda.Driver, c: Config) !Runner {
+    pub fn init(gpa: Allocator, d: *const cuda.Driver, c: Config, fp8: bool) !Runner {
         if (c.asr.d > widest or c.sf.d > widest) return error.UnsupportedAudioConfig;
         var k = try Kernels.load(d);
         errdefer k.unload();
@@ -62,10 +64,37 @@ pub const Runner = struct {
             try scratch.upload(off + bytes, std.mem.sliceAsBytes(sn));
             off += 2 * bytes;
         }
-        return .{ .k = k, .vk = vk, .g = g, .scratch = scratch, .b = .{ .in = ptrs[0], .x = ptrs[1], .h = ptrs[2], .a = ptrs[3], .qkv = ptrs[4], .wide = ptrs[5], .acc = ptrs[6] }, .tables = ropes };
+        var lane: ?cuda.qmmf.Lane = if (fp8) try cuda.qmmf.Lane.load(d, (try d.capability(0)) / 10) else null;
+        errdefer if (lane) |*l| l.unload();
+        var part: ?cuda.DeviceBuffer = null;
+        if (lane) |l| if (!l.clusters) {
+            // the widest call's partials: the FFN's up (4 d outputs) and down over the most rows
+            var most: usize = 0;
+            for ([_][2]usize{ .{ 3 * c.asr.d, c.asr.d }, .{ c.asr.d, c.asr.d }, .{ 4 * c.asr.d, c.asr.d }, .{ c.asr.d, 4 * c.asr.d } }) |nk| {
+                const w = cuda.modelopt.fp8Weight(0, 1, nk[0], nk[1]);
+                for (1..r + 1) |m| most = @max(most, l.partBytes(m, w));
+            }
+            if (most > 0) part = try cuda.DeviceBuffer.alloc(d, most);
+        };
+        return .{ .k = k, .vk = vk, .g = g, .scratch = scratch, .b = .{ .in = ptrs[0], .x = ptrs[1], .h = ptrs[2], .a = ptrs[3], .qkv = ptrs[4], .wide = ptrs[5], .acc = ptrs[6] }, .tables = ropes, .lane = lane, .part = part };
+    }
+
+    /// y [rows, n] bf16 = x [rows, k] times an FP8 projection (the lane matmul, its scale applied in fp32).
+    fn fp8Project(r: *Runner, s: cuda.Stream, x: u64, w: cuda.qmmf.Weight, y: u64, rows: usize) !void {
+        const l = r.lane orelse return error.Fp8WithoutLane;
+        try l.matmul(s, x, w.k, rows, w, y, if (r.part) |p| p.ptr else 0);
+    }
+
+    /// linearAct with an FP8 projection: fp32 sums at `acc`, then bias, residual and activation as vit's fallback does.
+    fn fp8Linear(r: *Runner, s: cuda.Stream, acc: u64, x: u64, w: cuda.qmmf.Weight, b: u64, rows: usize, res: ?u64, out: u64, act: vit.Act) !void {
+        const l = r.lane orelse return error.Fp8WithoutLane;
+        try l.matmulF32(s, x, w.k, rows, w, acc, if (r.part) |p| p.ptr else 0);
+        try r.vk.biasAct(s, acc, b, res, out, rows, w.n, act);
     }
 
     pub fn deinit(r: *Runner) void {
+        if (r.part) |*p| p.free();
+        if (r.lane) |*l| l.unload();
         r.scratch.free();
         r.g.deinit();
         r.vk.unload();
@@ -90,14 +119,21 @@ pub const Runner = struct {
         if (dump) |dm| try dm.device(s, tag, ".embed_norm", b.x, rows, d);
         for (st.layers, 0..) |l, i| {
             try vk.layerNorm(s, b.x, l.norm1, l.norm1_bias, b.h, rows, d, e.eps);
-            try g.run(s, b.h, l.qkv, b.qkv, rows, 3 * d, d, .bf16);
+            if (l.fp8) |q| try r.fp8Project(s, b.h, q.qkv, b.qkv, rows) else try g.run(s, b.h, l.qkv, b.qkv, rows, 3 * d, d, .bf16);
             const norm: ?[4]u64 = if (e.qk_norm) .{ l.q_norm, l.q_norm_bias, l.k_norm, l.k_norm_bias } else null;
             try r.k.qkRope(s, b.qkv, norm, rope.cos, rope.sin, rows, e.heads, e.dim(), rope.rot, e.eps);
             try r.k.attend(s, b.qkv, b.a, rows, e.heads, e.dim(), len, scale);
-            try vit.linearAct(g, vk, s, b.acc, b.a, l.out, l.out_bias, b.h, rows, d, d, b.x, b.x, .none);
-            try vk.layerNorm(s, b.x, l.norm2, l.norm2_bias, b.h, rows, d, e.eps);
-            try vit.linearAct(g, vk, s, b.acc, b.h, l.fc1, l.fc1_bias, b.wide, rows, 4 * d, d, null, b.wide, .gelu);
-            try vit.linearAct(g, vk, s, b.acc, b.wide, l.fc2, l.fc2_bias, b.h, rows, d, 4 * d, b.x, b.x, .none);
+            if (l.fp8) |q| {
+                try r.fp8Linear(s, b.acc, b.a, q.out, l.out_bias, rows, b.x, b.x, .none);
+                try vk.layerNorm(s, b.x, l.norm2, l.norm2_bias, b.h, rows, d, e.eps);
+                try r.fp8Linear(s, b.acc, b.h, q.fc1, l.fc1_bias, rows, null, b.wide, .gelu);
+                try r.fp8Linear(s, b.acc, b.wide, q.fc2, l.fc2_bias, rows, b.x, b.x, .none);
+            } else {
+                try vit.linearAct(g, vk, s, b.acc, b.a, l.out, l.out_bias, b.h, rows, d, d, b.x, b.x, .none);
+                try vk.layerNorm(s, b.x, l.norm2, l.norm2_bias, b.h, rows, d, e.eps);
+                try vit.linearAct(g, vk, s, b.acc, b.h, l.fc1, l.fc1_bias, b.wide, rows, 4 * d, d, null, b.wide, .gelu);
+                try vit.linearAct(g, vk, s, b.acc, b.wide, l.fc2, l.fc2_bias, b.h, rows, d, 4 * d, b.x, b.x, .none);
+            }
             if (dump) |dm| if (i == 0) try dm.device(s, tag, ".layer0", b.x, rows, d);
         }
         try vk.layerNorm(s, b.x, st.final, st.final_bias, out, rows, d, e.eps);

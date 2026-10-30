@@ -26,7 +26,11 @@ pub const Layer = struct {
     fc1_bias: u64,
     fc2: u64, // [d, 4 d]
     fc2_bias: u64,
+    fp8: ?Fp8 = null, // a quantized release's FP8 projections (qkv, out, fc1, fc2 then read 0 above)
 };
+
+/// A ModelOpt FP8 release's four projections of a layer: e4m3 codes in the lane matmul's order, one scale each.
+pub const Fp8 = struct { qkv: cuda.qmmf.Weight, out: cuda.qmmf.Weight, fc1: cuda.qmmf.Weight, fc2: cuda.qmmf.Weight };
 
 /// One TransformerEncoder: the stacking projection, the embed norm, its layers and the final norm.
 pub const Stack = struct {
@@ -56,6 +60,7 @@ pub const Weights = struct {
     proj_bias: u64,
     host: Host,
     bytes: u64,
+    fp8: bool, // the ASR encoder's projections are FP8 (the NVFP4 and FP8 releases)
 
     pub fn load(gpa: Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config) !Weights {
         const paths = try core.checkpoint.shardFiles(gpa, io, dir);
@@ -93,6 +98,7 @@ pub const Weights = struct {
         w.host = try Host.read(gpa, &p, c);
         errdefer w.host.deinit(gpa);
         try p.stack(&w.asr, asr, c.asr, true);
+        w.fp8 = w.asr.layers.len > 0 and w.asr.layers[0].fp8 != null;
         try p.stack(&w.sf, sf ++ "encoder.", c.sf, false);
         const t = Config.tf_d;
         w.encoder_proj = try p.take(heads_ ++ "encoder_proj.weight", &.{ t, c.sf.d });
@@ -115,7 +121,12 @@ pub const Weights = struct {
         shift(&w, memory.ptr);
         inline for (.{ &w.asr, &w.sf }) |s| {
             shift(s, memory.ptr);
-            for (s.layers) |*l| shift(l, memory.ptr);
+            for (s.layers) |*l| {
+                shift(l, memory.ptr);
+                if (l.fp8) |*q| inline for (.{ &q.qkv, &q.out, &q.fc1, &q.fc2 }) |x| {
+                    x.codes += memory.ptr;
+                };
+            }
         }
         return w;
     }
@@ -179,6 +190,32 @@ const Planner = struct {
     pieces: std.ArrayList(Piece) = .empty,
     bytes: u64 = 256, // nothing at offset 0: an offset of 0 is a tensor the stack does not have
 
+    fn find(p: *Planner, name: []const u8) ?st.Tensor {
+        for (p.files) |*f| if (f.get(name)) |t| return t;
+        return null;
+    }
+
+    /// `{pre}.weight` [n, k] when the release stores it as FP8 (e4m3 codes, an fp32 weight_scale), packed for the lane
+    /// matmul (fp8.packCodes on the host, as modelopt_pack.cu's fp8 lane packs it); null when it is bf16.
+    fn fp8(p: *Planner, pre: []const u8, n: usize, k: usize) !?cuda.qmmf.Weight {
+        var buf: [192]u8 = undefined;
+        const t = p.find(try join(&buf, pre, ".weight")) orelse return null;
+        if (t.dtype != .f8_e4m3) return null;
+        if (!t.is(.f8_e4m3, &.{ n, k }) or k % cuda.qmmf.group != 0) {
+            std.log.err("{s}.weight: {t} {any}, expected F8_E4M3 [{d}, {d}]", .{ pre, t.dtype, t.shape[0..t.rank], n, k });
+            return error.UnexpectedTensor;
+        }
+        const sc = p.find(try join(&buf, pre, ".weight_scale")) orelse return error.MissingTensor;
+        if (sc.dtype != .f32 or sc.bytes.len != 4) return error.UnexpectedTensor;
+        const scale: f32 = @bitCast(std.mem.readInt(u32, sc.bytes[0..4], .little));
+        const npad = cuda.modelopt.padded(n);
+        const bytes = try p.gpa.alloc(u8, npad * k);
+        errdefer p.gpa.free(bytes);
+        cuda.fp8.packCodes(bytes, t.bytes, n, k);
+        const at = try p.place(bytes, true);
+        return cuda.modelopt.fp8Weight(at, scale, n, k);
+    }
+
     fn get(p: *Planner, name: []const u8, shape: []const usize) !st.Tensor {
         for (p.files) |*f| if (f.get(name)) |t| {
             if (t.is(.bf16, shape)) return t;
@@ -228,19 +265,26 @@ const Planner = struct {
                     return std.fmt.bufPrint(b, "{s}layers.{d}.{s}", .{ prefix, li, part });
                 }
             }.of;
+            var q: [4]?cuda.qmmf.Weight = undefined;
+            for ([_][]const u8{ "attn.w_qkv", "attn.out_proj", "ffn.net.0", "ffn.net.3" }, [_][2]usize{ .{ 3 * d, d }, .{ d, d }, .{ 4 * d, d }, .{ d, 4 * d } }, &q) |part, nk, *x| {
+                x.* = try p.fp8(try n(&buf, pre, i, part), nk[0], nk[1]);
+            }
+            const quantized = q[0] != null;
+            for (q) |x| if ((x != null) != quantized) return error.MixedQuantization;
             l.* = .{
                 .norm1 = try p.take(try n(&buf, pre, i, "norm1.weight"), &.{d}),
                 .norm1_bias = try p.take(try n(&buf, pre, i, "norm1.bias"), &.{d}),
-                .qkv = try p.take(try n(&buf, pre, i, "attn.w_qkv.weight"), &.{ 3 * d, d }),
-                .out = try p.take(try n(&buf, pre, i, "attn.out_proj.weight"), &.{ d, d }),
+                .qkv = if (quantized) 0 else try p.take(try n(&buf, pre, i, "attn.w_qkv.weight"), &.{ 3 * d, d }),
+                .out = if (quantized) 0 else try p.take(try n(&buf, pre, i, "attn.out_proj.weight"), &.{ d, d }),
                 .out_bias = try p.take(try n(&buf, pre, i, "attn.out_proj.bias"), &.{d}),
                 .norm2 = try p.take(try n(&buf, pre, i, "norm2.weight"), &.{d}),
                 .norm2_bias = try p.take(try n(&buf, pre, i, "norm2.bias"), &.{d}),
-                .fc1 = try p.take(try n(&buf, pre, i, "ffn.net.0.weight"), &.{ 4 * d, d }),
+                .fc1 = if (quantized) 0 else try p.take(try n(&buf, pre, i, "ffn.net.0.weight"), &.{ 4 * d, d }),
                 .fc1_bias = try p.take(try n(&buf, pre, i, "ffn.net.0.bias"), &.{4 * d}),
-                .fc2 = try p.take(try n(&buf, pre, i, "ffn.net.3.weight"), &.{ d, 4 * d }),
+                .fc2 = if (quantized) 0 else try p.take(try n(&buf, pre, i, "ffn.net.3.weight"), &.{ d, 4 * d }),
                 .fc2_bias = try p.take(try n(&buf, pre, i, "ffn.net.3.bias"), &.{d}),
             };
+            if (quantized) l.fp8 = .{ .qkv = q[0].?, .out = q[1].?, .fc1 = q[2].?, .fc2 = q[3].? };
             if (qk_norm) {
                 l.q_norm = try p.take(try n(&buf, pre, i, "attn.q_norm.weight"), &.{dh});
                 l.q_norm_bias = try p.take(try n(&buf, pre, i, "attn.q_norm.bias"), &.{dh});
