@@ -2,7 +2,7 @@
 
 `lfm3_omni` runs LiquidAI's [`LiquidAI/LFM3-Omni-2B`](https://huggingface.co/LiquidAI/LFM3-Omni-2B) (revision
 `5797d07c125503bd4f4c0e7f915ae2d3d703e8de`) on Apple silicon: a spoken turn in, interleaved text and 24 kHz speech out,
-streamed. The weights are the bf16 release as stored, the bundled Liquid codec (`audio_tokenizer/`) included. The
+streamed. The weights are the bf16 release as stored, the bundled Liquid codec (`audio_tokenizer/`) included. The CUDA backend is [lfm3-omni-cuda.md](lfm3-omni-cuda.md). The
 engine is `zig/src/families/lfm3_omni/metal/` over one metallib (`zig/kernels/metal/lfm3_omni/`). Checked on an M5
 Ultra; chips without tensor units (M1 to M4) are untested. The vision tower is not loaded.
 
