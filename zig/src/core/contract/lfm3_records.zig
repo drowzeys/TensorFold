@@ -60,6 +60,7 @@ pub const metal = [_]M{
     .{ .name = "lfm3-vision l3v_conv", .threads = 256, .tg_memory = 0, .reserved = 256 },
     .{ .name = "lfm3-vision l3v_qk", .threads = 32, .tg_memory = 0, .reserved = 32 },
     .{ .name = "lfm3-vision l3v_attention", .threads = 32, .tg_memory = 0, .reserved = 32 },
+    .{ .name = "lfm3-vision l3v_attention_tiled", .threads = 512, .tg_memory = 8192, .reserved = 512 },
     .{ .name = "lfm3-vision l3v_swiglu", .threads = 256, .tg_memory = 0, .reserved = 256 },
     .{ .name = "lfm3-vision l3v_layer_norm", .threads = 256, .tg_memory = 32, .reserved = 256 },
     .{ .name = "lfm3-vision l3v_project", .threads = 32, .tg_memory = 0, .reserved = 32 },
@@ -67,6 +68,9 @@ pub const metal = [_]M{
     .{ .name = "lfm3-image lfm3_image_rows", .threads = 256, .tg_memory = 0, .reserved = 256 },
 
     .{ .name = "lfm3 lfm3_embed_b4", .threads = 256, .tg_memory = 0, .reserved = 256 },
+    .{ .name = "lfm3 lfm3_embed_bf16", .threads = 256, .tg_memory = 0, .reserved = 256 },
+    .{ .name = "lfm3 lfm3_row_copy", .threads = 256, .tg_memory = 0, .reserved = 256 },
+    .{ .name = "lfm3 lfm3_set_attention", .threads = 512, .tg_memory = 16512, .reserved = 512 },
     .{ .name = "lfm3 lfm3_embed_b6", .threads = 256, .tg_memory = 0, .reserved = 256 },
     .{ .name = "lfm3 lfm3_embed_b8", .threads = 256, .tg_memory = 0, .reserved = 256 },
     .{ .name = "lfm3 lfm3_norm", .threads = 256, .tg_memory = 144, .reserved = 256 },

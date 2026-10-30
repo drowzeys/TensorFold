@@ -22,6 +22,8 @@ pub const schedule: [layers]LayerType = .{
 };
 
 pub const Width = struct { bits: u8, group: u16 };
+/// The projections' storage: MLX affine, or the bf16 release as published (no quantization entry, read as stored).
+pub const Scheme = enum { mlx_affine, bf16 };
 pub const Quant = struct {
     global: Width,
     modules: std.StringHashMapUnmanaged(Width) = .empty,
@@ -82,6 +84,7 @@ pub const Config = struct {
     full_rotary: Rotary = .{ .theta = 1e6, .partial = 0.5 },
     sliding_rotary: Rotary = .{ .theta = 1e4, .partial = 1 },
     quant: Quant,
+    scheme: Scheme = .mlx_affine,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -268,8 +271,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const language = if (kind == .text) root else try object(try field(root, "text_config"));
     const context = try text(language, kind);
     if (kind == .vision_language) try vision(root);
-    const q = try quantization(a, root.get("quantization") orelse root.get("quantization_config") orelse
-        return error.UnsupportedLfm3Quantization);
+    if (root.get("quantization") == null and root.get("quantization_config") == null)
+        return .{ .arena = arena, .kind = kind, .context = context, .scheme = .bf16, .quant = .{ .global = .{ .bits = 16, .group = 0 } } };
+    const q = try quantization(a, (root.get("quantization") orelse root.get("quantization_config")).?);
     if (root.get("quantization_config")) |other| {
         if (!equalQuant(q, try quantization(a, other))) return error.UnsupportedLfm3Quantization;
     }

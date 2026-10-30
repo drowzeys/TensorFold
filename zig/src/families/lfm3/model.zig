@@ -48,6 +48,8 @@ pub const Model = struct {
         for (files) |path| try m.checkpoint.addFile(m.device, path, "");
         m.weights = try weights.load(&m.checkpoint, &m.config);
         m.kernels = try kernels.load(m.device);
+        errdefer m.kernels.deinit();
+        if (m.config.scheme == .bf16) m.kernels.dense = try kernels.Dense.load(m.device);
         m.resident = null;
         if (hold_weights) {
             if (m.device.residencySet(m.checkpoint.shards.items.len)) |set| {
@@ -64,6 +66,7 @@ pub const Model = struct {
     /// Explicit developer qualification path; ordinary model loading retains the established row arithmetic.
     pub fn enableProjectionCandidate(m: *Model) !void {
         if (m.projection_candidate != null or m.binned_candidate != null) return error.ProjectionCandidateAlreadyEnabled;
+        if (m.config.scheme == .bf16) return error.ProjectionCandidateNeedsAffine;
         var list: std.ArrayList(weights.Linear) = .empty;
         defer list.deinit(m.gpa);
         try list.append(m.gpa, m.weights.embedding);
@@ -79,6 +82,7 @@ pub const Model = struct {
 
     pub fn enableBinnedProjectionCandidate(m: *Model) !void {
         if (m.projection_candidate != null or m.binned_candidate != null) return error.ProjectionCandidateAlreadyEnabled;
+        if (m.config.scheme == .bf16) return error.ProjectionCandidateNeedsAffine;
         m.binned_candidate = try binned.Pipelines.load(m.device);
     }
 

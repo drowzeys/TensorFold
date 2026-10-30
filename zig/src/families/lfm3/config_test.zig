@@ -103,6 +103,19 @@ test "VL projector and vision geometry are not silently accepted as the known mo
     try std.testing.expectError(error.UnsupportedLfm3Geometry, c.parse(std.testing.allocator, bytes));
 }
 
+test "the bf16 release, with no quantization entry, parses as its own scheme" {
+    const cut = std.mem.indexOf(u8, vl, ",\n  \"quantization\": {").?;
+    const bytes = try std.mem.concat(std.testing.allocator, u8, &.{ vl[0..cut], "\n}" });
+    defer std.testing.allocator.free(bytes);
+    var config = try c.parse(std.testing.allocator, bytes);
+    defer config.deinit();
+    try std.testing.expectEqual(c.Scheme.bf16, config.scheme);
+    try std.testing.expectEqual(c.Kind.vision_language, config.kind);
+    var mlx = try c.parse(std.testing.allocator, vl);
+    defer mlx.deinit();
+    try std.testing.expectEqual(c.Scheme.mlx_affine, mlx.scheme);
+}
+
 test "malformed JSON fails without retaining allocations" {
     try std.testing.expectError(error.UnexpectedEndOfInput, c.parse(std.testing.allocator, "{"));
 }

@@ -225,6 +225,12 @@ pub const Info = struct {
     prompt_cache_plan: ?PromptCachePlan = null,
     /// The engine scores decisions (`score`) and writes no text: the server refuses text requests.
     decides: bool = false,
+    /// Text after the assistant header that opens a decision's answer slot (LFM3's empty think block); empty: none.
+    decision_lead: []const u8 = "",
+    /// The checkpoint's calibrated temperature for option answers (d1's `calibration.json` default): scores / it.
+    decision_temperature: f64 = 1,
+    /// Pictures a decision request may carry: TensorFold 0.6's ImageLimits.max_images unless the engine reads more.
+    max_pictures: u32 = 4,
     /// Decisions may carry pictures (`Decision.pictures`).
     pictures: bool = false,
     /// Image input (--vision); null: text only.
@@ -352,6 +358,7 @@ pub const Decision = struct {
     at: usize = 0,
     pictures: []const []const u8 = &.{}, // data URLs, in prompt order
     branches: []const []const u32 = &.{},
+    header: []const u32 = &.{}, // the state's closing "QUESTION:" line: a set pack opens each further question with it
     counts: []const usize = &.{},
     labels: []const u32 = &.{},
     logits: []f64 = &.{},

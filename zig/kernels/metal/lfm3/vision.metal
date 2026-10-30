@@ -188,6 +188,53 @@ inline float3 l3v_attention_row(const device bfloat* q, const device bfloat* k, 
   y[qi + 32] = bfloat(sums.y / sums.z);
 }
 
+// l3v_attention's row loop, bit for bit: 8 rows x a KV head's 2 query heads share each 32 keys staged once.
+[[kernel, max_total_threads_per_threadgroup(512)]] void l3v_attention_tiled(
+    const device bfloat* q [[buffer(0)]], const device bfloat* k [[buffer(1)]], const device bfloat* v [[buffer(2)]],
+    device bfloat* y [[buffer(3)]], constant uint& patches [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup bfloat ks[32 * 64];
+  threadgroup bfloat vs[32 * 64];
+  const uint kh = tg.y, row = tg.x * 8 + sg / 2, head = kh * 2 + sg % 2;
+  const bool live = row < patches;
+  const size_t qi = (size_t(row) * 16 + head) * 64 + lane;
+  const float qa = live ? float(q[qi]) : 0.0f, qb = live ? float(q[qi + 32]) : 0.0f;
+  float maximum = -INFINITY;
+  L3_ATTN_ACC total = 0.0f, ya = 0.0f, yb = 0.0f;
+  for (uint t0 = 0; t0 < patches; t0 += 32) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const uint r = tid / 16, c = (tid % 16) * 4, key = t0 + r;
+      uint2 kk = uint2(0), vv = uint2(0);
+      if (key < patches) {
+        const size_t at = (size_t(key) * 8 + kh) * 64 + c;
+        kk = *(const device uint2*)(k + at);
+        vv = *(const device uint2*)(v + at);
+      }
+      *(threadgroup uint2*)(ks + r * 64 + c) = kk;
+      *(threadgroup uint2*)(vs + r * 64 + c) = vv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!live) continue;
+    for (uint r = 0; r < min(32u, patches - t0); ++r) {
+      L3_ATTN_ACC dot = qa * float(ks[r * 64 + lane]);
+      dot += qb * float(ks[r * 64 + lane + 32]);
+      const float score = simd_sum(float(dot)) * 0.125f;
+      const float next = max(maximum, score);
+      const float alpha = maximum == -INFINITY ? 0.0f : metal::precise::exp(maximum - next);
+      const float probability = score == -INFINITY ? 0.0f : metal::precise::exp(score - next);
+      total = total * alpha + probability;
+      ya = ya * alpha + probability * float(vs[r * 64 + lane]);
+      yb = yb * alpha + probability * float(vs[r * 64 + lane + 32]);
+      maximum = next;
+    }
+  }
+  if (!live) return;
+  y[qi] = bfloat(float(ya) / float(total));
+  y[qi + 32] = bfloat(float(yb) / float(total));
+}
+
 // Contract taps observe the same row loop before its BF16 division and output round.
 [[kernel, max_total_threads_per_threadgroup(32)]] void l3v_attention_sums(
     const device bfloat* q [[buffer(0)]], const device bfloat* k [[buffer(1)]], const device bfloat* v [[buffer(2)]],

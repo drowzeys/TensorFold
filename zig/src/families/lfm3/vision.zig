@@ -80,26 +80,40 @@ pub const Vision = struct {
 
     /// Called without another image pass in flight; the output holds one 2048-wide row per merge block.
     pub fn image(self: *Vision, queue: mtl.Queue, pixels: []const f32, gh: u32, gw: u32, out: Ref) !void {
-        return self.execute(queue, pixels, gh, gw, out, null);
+        return self.execute(queue, &.{.{ .pixels = pixels, .gh = gh, .gw = gw }}, out, null);
+    }
+
+    /// Several pictures in one pass, their rows back to back in `out`: products take every picture's rows at once.
+    pub fn images(self: *Vision, queue: mtl.Queue, pictures: []const Picture, out: Ref) !void {
+        return self.execute(queue, pictures, out, null);
     }
 
     /// Developer tracing waits at stage boundaries; all operators and their BF16 roundpoints stay unchanged.
     pub fn imageTrace(self: *Vision, queue: mtl.Queue, pixels: []const f32, gh: u32, gw: u32, out: Ref, trace: Trace) !void {
-        return self.execute(queue, pixels, gh, gw, out, trace);
+        return self.execute(queue, &.{.{ .pixels = pixels, .gh = gh, .gw = gw }}, out, trace);
     }
 
-    fn execute(self: *Vision, queue: mtl.Queue, pixels: []const f32, gh: u32, gw: u32, out: Ref, trace: ?Trace) !void {
-        if (gh == 0 or gw == 0 or gh % 2 != 0 or gw % 2 != 0) return error.Lfm3ImageShape;
-        const patches = std.math.mul(usize, gh, gw) catch return error.Lfm3ImageShape;
-        if (patches > @as(usize, self.max_tokens) * 4 or pixels.len != patches * 1536) return error.Lfm3ImageShape;
+    pub const Picture = struct { pixels: []const f32, gh: u32, gw: u32 };
+
+    fn execute(self: *Vision, queue: mtl.Queue, pictures: []const Picture, out: Ref, trace: ?Trace) !void {
+        var patches: usize = 0;
+        for (pictures) |pic| {
+            if (pic.gh == 0 or pic.gw == 0 or pic.gh % 2 != 0 or pic.gw % 2 != 0) return error.Lfm3ImageShape;
+            const n = std.math.mul(usize, pic.gh, pic.gw) catch return error.Lfm3ImageShape;
+            if (pic.pixels.len != n * 1536) return error.Lfm3ImageShape;
+            patches += n;
+        }
+        if (pictures.len == 0 or patches > @as(usize, self.max_tokens) * 4) return error.Lfm3ImageShape;
         const tokens = patches / 4;
         const end = std.math.add(usize, out.off, tokens * 2048 * 2) catch return error.Lfm3ImageShape;
         if (end > out.buf.length() or out.off % 4 != 0) return error.Lfm3ImageShape;
-        const px = self.patches.slice(u16, pixels.len);
-        for (pixels, px) |value, *dst| {
+        const px = self.patches.slice(u16, patches * 1536);
+        var at: usize = 0;
+        for (pictures) |pic| for (pic.pixels) |value| {
             if (!std.math.isFinite(value)) return error.NonfiniteLfm3Image;
-            dst.* = bf16(value);
-        }
+            px[at] = bf16(value);
+            at += 1;
+        };
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         var cb = queue.commandBuffer();
@@ -114,8 +128,8 @@ pub const Vision = struct {
             self.norm(e, self.h, block.operator_norm, self.x, patches);
             if (index == 0) try stage(queue, trace, "first_operator_norm", ref(self.x), patches, 1024, &cb, &e, &active);
             switch (block.mixer) {
-                .conv => |conv| self.convolution(e, conv, gh, gw, patches),
-                .attention => |a| self.attention(e, a, gw, patches),
+                .conv => |conv| self.convolution(e, conv, pictures, patches),
+                .attention => |a| self.attention(e, a, pictures, patches),
             }
             if (index == 2) {
                 try stage(queue, trace, "first_attention_norm", ref(self.x), patches, 1024, &cb, &e, &active);
@@ -193,35 +207,47 @@ pub const Vision = struct {
         e.dispatchThreads(mtl.Size.of(rows * 1024, 1, 1), mtl.Size.of(256, 1, 1));
     }
 
-    fn convolution(self: *Vision, e: mtl.ComputeEncoder, weights: wts.Conv, gh: u32, gw: u32, patches: usize) void {
+    /// The 3 x 3 spatial convolution over each picture's own grid; the products over every row.
+    fn convolution(self: *Vision, e: mtl.ComputeEncoder, weights: wts.Conv, pictures: []const Picture, patches: usize) void {
         self.kernels.linear(e, ref(self.x), weights.in, ref(self.bcx), patches, 3072, 1024);
         e.setPipeline(self.kernels.get("l3v_conv"));
-        e.setBuffer(self.bcx, 0, 0);
         bind(e, weights.spatial, 1);
-        e.setBuffer(self.y, 0, 2);
-        e.setValue(extern struct { gh: u32, gw: u32 }{ .gh = gh, .gw = gw }, 3);
-        e.dispatchThreads(mtl.Size.of(1024, patches, 1), mtl.Size.of(256, 1, 1));
+        var at: usize = 0;
+        for (pictures) |pic| {
+            const n = @as(usize, pic.gh) * pic.gw;
+            e.setBuffer(self.bcx, at * 3072 * 2, 0);
+            e.setBuffer(self.y, at * 1024 * 2, 2);
+            e.setValue(extern struct { gh: u32, gw: u32 }{ .gh = pic.gh, .gw = pic.gw }, 3);
+            e.dispatchThreads(mtl.Size.of(1024, n, 1), mtl.Size.of(256, 1, 1));
+            at += n;
+        }
         self.kernels.linear(e, ref(self.y), weights.out, ref(self.r), patches, 1024, 1024);
     }
 
-    fn attention(self: *Vision, e: mtl.ComputeEncoder, weights: wts.Attention, gw: u32, patches: usize) void {
+    /// Each picture's rotary positions and attention over its own patches; the products over every row.
+    fn attention(self: *Vision, e: mtl.ComputeEncoder, weights: wts.Attention, pictures: []const Picture, patches: usize) void {
         self.kernels.linear(e, ref(self.x), weights.q, ref(self.q), patches, 1024, 1024);
         self.kernels.linear(e, ref(self.x), weights.k, ref(self.k), patches, 512, 1024);
         self.kernels.linear(e, ref(self.x), weights.v, ref(self.v), patches, 512, 1024);
-        e.setPipeline(self.kernels.get("l3v_qk"));
-        e.setBuffer(self.q, 0, 0);
-        e.setBuffer(self.k, 0, 1);
-        bind(e, weights.q_norm, 2);
-        bind(e, weights.k_norm, 3);
-        e.setValue(gw, 4);
-        e.dispatchGroups(mtl.Size.of(24, patches, 1), mtl.Size.of(32, 1, 1));
-        e.setPipeline(self.kernels.get("l3v_attention"));
-        e.setBuffer(self.q, 0, 0);
-        e.setBuffer(self.k, 0, 1);
-        e.setBuffer(self.v, 0, 2);
-        e.setBuffer(self.y, 0, 3);
-        e.setValue(@as(u32, @intCast(patches)), 4);
-        e.dispatchGroups(mtl.Size.of(16, patches, 1), mtl.Size.of(32, 1, 1));
+        var at: usize = 0;
+        for (pictures) |pic| {
+            const n = @as(usize, pic.gh) * pic.gw;
+            e.setPipeline(self.kernels.get("l3v_qk"));
+            e.setBuffer(self.q, at * 1024 * 2, 0);
+            e.setBuffer(self.k, at * 512 * 2, 1);
+            bind(e, weights.q_norm, 2);
+            bind(e, weights.k_norm, 3);
+            e.setValue(pic.gw, 4);
+            e.dispatchGroups(mtl.Size.of(24, n, 1), mtl.Size.of(32, 1, 1));
+            e.setPipeline(self.kernels.get("l3v_attention_tiled"));
+            e.setBuffer(self.q, at * 1024 * 2, 0);
+            e.setBuffer(self.k, at * 512 * 2, 1);
+            e.setBuffer(self.v, at * 512 * 2, 2);
+            e.setBuffer(self.y, at * 1024 * 2, 3);
+            e.setValue(@as(u32, @intCast(n)), 4);
+            e.dispatchGroups(mtl.Size.of((n + 7) / 8, 8, 1), mtl.Size.of(512, 1, 1));
+            at += n;
+        }
         self.kernels.linear(e, ref(self.y), weights.out, ref(self.r), patches, 1024, 1024);
     }
 

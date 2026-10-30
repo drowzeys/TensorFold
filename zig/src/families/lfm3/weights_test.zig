@@ -101,3 +101,17 @@ test "bad dtype, byte range, namespace and unexpected text tensors are rejected"
         try std.testing.expectError(err, w.validate(std.testing.allocator, &cfg, &h));
     }
 }
+
+test "the bf16 release: one bf16 matrix a projection, torch's conv layout, under transformers 5's VL namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: c.Config = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .kind = .vision_language, .context = 128000, .scheme = .bf16, .quant = .{ .global = .{ .bits = 16, .group = 0 } } };
+    defer cfg.deinit();
+    var h = try header(arena.allocator(), &cfg, .vl);
+    try h.put(arena.allocator(), "model.vision_tower.patchifier.weight", .{ .dtype = .bf16, .rank = 2, .shape = .{ 1024, 1536, 1, 1, 1 }, .begin = 0, .end = 1024 * 1536 * 2 });
+    const m = try w.validate(std.testing.allocator, &cfg, &h);
+    try std.testing.expectEqual(w.Namespace.vl, m.namespace);
+    try std.testing.expectEqual(@as(usize, 286), m.tensors);
+    const conv = h.get("model.language_model.layers.0.conv.conv.weight").?;
+    try std.testing.expectEqualSlices(usize, &.{ 2048, 1, 7 }, conv.shape[0..conv.rank]);
+}

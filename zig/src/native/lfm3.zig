@@ -8,6 +8,11 @@ const lanes = tf.lanes;
 const cache_fit = @import("cache_fit.zig");
 const metal_admit = @import("metal_admit.zig");
 const images = @import("lfm3_images.zig");
+const d1 = @import("lfm3_d1.zig");
+
+test {
+    _ = d1;
+}
 
 const Host = struct {
     resident: ?mtl.resident.Resident = null,
@@ -38,12 +43,16 @@ const Host = struct {
 
 const cannot = "the native LFM3 engine cannot load this checkpoint ({s})";
 const prompt_chunk = 128;
+/// A bf16 release's prompt chunk: its tensor-unit GEMM fills the GPU at 512 rows, not at 128.
+const bf16_prompt_chunk = 512;
 
-fn cacheRules() api.prompt_cache.Rules {
-    return .{ .chunk = prompt_chunk, .repeat_min = 2 * prompt_chunk };
+fn cacheRules(chunk: u32) api.prompt_cache.Rules {
+    return .{ .chunk = chunk, .repeat_min = 2 * chunk };
 }
 
 pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    // d1's checkpoints decide (lfm3_d1.zig); any other LFM3-VL chats on the lanes with its tower
+    if (std.mem.eql(u8, o.model_type, "lfm3_vl") and d1.decides(a, io, o.dir)) return d1.open(a, gpa, io, o, problem);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     var config = q.config.Config.read(gpa, io, o.dir) catch |err| {
@@ -76,7 +85,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.model = model;
     h.resident = null;
     h.vision = null;
-    const chunk = prompt_chunk;
+    const chunk: usize = if (model.config.scheme == .bf16) bf16_prompt_chunk else prompt_chunk;
     h.metal = try q.backend.Metal.init(gpa, model, .{ .capacity = window, .chunk = chunk, .streams = @max(o.lanes, 2) });
     errdefer h.metal.deinit();
     if (model.config.kind == .vision_language) {
@@ -108,7 +117,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         .part_type = "image",
         .explain = q.image.explain,
     } else null;
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "lfm3", .lanes = served, .context_window = @intCast(window), .prefill_step = chunk, .structures = true, .vision = offer });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "lfm3", .lanes = served, .context_window = @intCast(window), .prefill_step = @intCast(chunk), .structures = true, .logprobs = true, .vision = offer });
     h.cache = null;
     var why: []const u8 = "";
     const dev = model.device;
@@ -129,7 +138,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         h.cache = api.prompt_cache.Store.init(gpa, .{
             .ptr = h.metal,
             .vtable = &.{ .bytes = S.bytes, .save = S.save, .restore = S.restore, .drop = S.drop },
-        }, cacheRules(), plan.budget_bytes);
+        }, cacheRules(@intCast(chunk)), plan.budget_bytes);
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
     }
@@ -159,7 +168,7 @@ fn prepareImage(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_to
 
 test "LFM3 repeats keep a resumable raw prefix without caching an unrelated prompt" {
     const a = std.testing.allocator;
-    var store = api.prompt_cache.Store.init(a, undefined, cacheRules(), 102 << 20);
+    var store = api.prompt_cache.Store.init(a, undefined, cacheRules(prompt_chunk), 102 << 20);
     defer store.deinit();
     var tokens: [910]u32 = undefined;
     for (&tokens, 0..) |*token, i| token.* = @intCast(i + 1);

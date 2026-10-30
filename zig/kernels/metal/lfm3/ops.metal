@@ -27,6 +27,19 @@ template [[host_name("lfm3_embed_b4")]] [[kernel]] decltype(lfm3_embed<4>) lfm3_
 template [[host_name("lfm3_embed_b6")]] [[kernel]] decltype(lfm3_embed<6>) lfm3_embed<6>;
 template [[host_name("lfm3_embed_b8")]] [[kernel]] decltype(lfm3_embed<8>) lfm3_embed<8>;
 
+// The bf16 release's embedding row as stored (the same buffer slots as the affine rows; scales and biases unread).
+[[kernel, max_total_threads_per_threadgroup(256)]] void lfm3_embed_bf16(const device uint* ids [[buffer(0)]],
+    const device bfloat* table [[buffer(1)]], device bfloat* out [[buffer(4)]], uint2 at [[thread_position_in_grid]]) {
+  if (at.x >= L3D) return;
+  out[size_t(at.y) * L3D + at.x] = table[size_t(ids[at.y]) * L3D + at.x];
+}
+
+// One hidden row moved bit for bit (a decision's asked rows side by side before the head).
+[[kernel, max_total_threads_per_threadgroup(256)]] void lfm3_row_copy(const device ushort* src [[buffer(0)]],
+    device ushort* dst [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+  if (i < L3D) dst[i] = src[i];
+}
+
 #ifndef L3_SQUARE_ACC
 #define L3_SQUARE_ACC float
 #endif

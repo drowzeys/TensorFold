@@ -75,10 +75,37 @@ pub fn prepareRgb(a: std.mem.Allocator, rgb: picture.Rgb, identity: u64, max_tok
     const gw = size.w / patch;
     const tokens = gh * gw / 4;
     if (tokens > max_tokens) return error.ImageTooLarge;
-    const resized = try picture.resample.resize(a, .torch, .of(rgb.pixels, rgb.width, rgb.height), size.w, size.h);
-    defer a.free(resized);
+    // torch's bicubic at the same size is the identity: a picture already on the grid skips it
+    const same = size.w == rgb.width and size.h == rgb.height;
+    const resized = if (same) rgb.pixels else try picture.resample.resize(a, .torch, .of(rgb.pixels, rgb.width, rgb.height), size.w, size.h);
+    defer if (!same) a.free(resized);
     const pixels = try patchify(a, .{ .pixels = resized, .width = size.w, .height = size.h });
     return .{ .pixels = pixels, .gh = gh, .gw = gw, .tokens = tokens, .hash = picture.identity.withGrid(identity, .{ gh, gw }) };
+}
+
+/// d1's picture: Pillow's bicubic under `cap` pixels, then smart_resize (torch's bicubic); refused past `max_tokens`.
+pub fn prepareCapped(a: std.mem.Allocator, rgb: picture.Rgb, cap: usize, max_tokens: u32) !Prepared {
+    if (rgb.width == 0 or rgb.height == 0) return error.ImageTooSmall;
+    var src = rgb;
+    var capped: ?[]u8 = null;
+    defer if (capped) |px| a.free(px);
+    if (rgb.width * rgb.height > cap) {
+        const s = @sqrt(@as(f64, @floatFromInt(cap)) / @as(f64, @floatFromInt(rgb.width * rgb.height)));
+        const w = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(rgb.width)) * s)));
+        const h = @max(1, @as(usize, @intFromFloat(@as(f64, @floatFromInt(rgb.height)) * s)));
+        capped = try picture.resample.resize(a, .pillow, .of(rgb.pixels, rgb.width, rgb.height), w, h);
+        src = .{ .pixels = capped.?, .width = w, .height = h };
+    }
+    const size = try geometry.smartResize(@intCast(src.height), @intCast(src.width), 32, min_pixels, max_pixels);
+    const gh = size.h / patch;
+    const gw = size.w / patch;
+    const tokens = gh * gw / 4;
+    if (tokens > max_tokens) return error.ImageTooLarge;
+    const same = size.w == src.width and size.h == src.height;
+    const resized = if (same) src.pixels else try picture.resample.resize(a, .torch, .of(src.pixels, src.width, src.height), size.w, size.h);
+    defer if (!same) a.free(resized);
+    const pixels = try patchify(a, .{ .pixels = resized, .width = size.w, .height = size.h });
+    return .{ .pixels = pixels, .gh = gh, .gw = gw, .tokens = tokens, .hash = 0 };
 }
 
 pub fn patchify(a: std.mem.Allocator, rgb: picture.Rgb) ![]f32 {
@@ -159,4 +186,13 @@ test "LFM3 image patches match the processor float32 pixel fixture" {
     std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(prepared.pixels), &digest, .{});
     const actual = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings("53153c22eb4e065031bbdf4de0f038db37ef736a880e3438ac8e0d73f82dcea8", &actual);
+}
+
+test "torch's bicubic at the same size returns the picture unchanged (the grid-sized skip)" {
+    const a = std.testing.allocator;
+    var px: [64 * 32 * 3]u8 = undefined;
+    for (&px, 0..) |*v, i| v.* = @intCast((i * 37 + i / 7) % 256);
+    const out = try picture.resample.resize(a, .torch, .of(&px, 64, 32), 64, 32);
+    defer a.free(out);
+    try std.testing.expectEqualSlices(u8, &px, out);
 }

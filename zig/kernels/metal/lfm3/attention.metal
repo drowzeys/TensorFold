@@ -303,3 +303,63 @@ struct lfm3_attn_segment { ulong keys, values; uint base, rows; lfm3_attn_args a
 #endif
   for (uint j = 0; j < 4; ++j) y[(size_t(tg.y) * 16 + tg.x) * 128 + lane + 32 * j] = bfloat(result[j] / total);
 }
+
+struct lfm3_set_args { uint rows, cap, state; float scale; };
+
+// d1's set reading on full layers (key j seen when it or the row is in the state, or both share a question).
+[[kernel, max_total_threads_per_threadgroup(512)]] void lfm3_set_attention(
+    const device bfloat* queries [[buffer(0)]], const device bfloat* keys [[buffer(1)]],
+    const device bfloat* values [[buffer(2)]], const device int* group [[buffer(3)]],
+    constant lfm3_set_args& p [[buffer(4)]], device bfloat* out [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  // 4 rows x a KV head's 4 query heads share 32 staged keys; FP32 scores, softmax and sums
+  threadgroup bfloat ks[32 * 128];
+  threadgroup bfloat vs[32 * 128];
+  threadgroup int gs[32];
+  const uint kh = tg.y, row = tg.x * 4 + sg / 4, head = kh * 4 + sg % 4;
+  const bool live = row < p.rows;
+  float q[4] = {0, 0, 0, 0};
+  int g = 0;
+  if (live) {
+    for (uint j = 0; j < 4; ++j) q[j] = float(queries[(size_t(row) * 16 + head) * 128 + lane + 32 * j]);
+    g = group[row];
+  }
+  // the block's rows: whether any is in the state, and their questions' span (questions are contiguous runs)
+  const uint r0 = tg.x * 4, r1 = min(p.rows, r0 + 4);
+  const bool block_state = r0 < p.state;
+  const int g_lo = group[r0], g_hi = group[r1 - 1];
+  float m = -INFINITY, l = 0, o[4] = {0, 0, 0, 0};
+  for (uint t0 = 0; t0 < p.rows; t0 += 32) {
+    const uint t1 = min(p.rows, t0 + 32);
+    if (!block_state && t0 >= p.state && (group[t1 - 1] < g_lo || group[t0] > g_hi)) continue;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const uint r = tid / 16, c = (tid % 16) * 8, key = t0 + r;
+      uint4 kk = uint4(0), vv = uint4(0);
+      if (key < p.rows) {
+        const size_t at = (size_t(kh) * p.cap + key) * 128 + c;
+        kk = *(const device uint4*)(keys + at);
+        vv = *(const device uint4*)(values + at);
+      }
+      *(threadgroup uint4*)(ks + r * 128 + c) = kk;
+      *(threadgroup uint4*)(vs + r * 128 + c) = vv;
+      if (tid < 32) gs[tid] = t0 + tid < p.rows ? group[t0 + tid] : -2;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!live) continue;
+    for (uint r = 0; r < t1 - t0; ++r) {
+      const uint j = t0 + r;
+      if (!(row < p.state || j < p.state || gs[r] == g)) continue;
+      float dot = 0;
+      for (uint d = 0; d < 4; ++d) dot += q[d] * float(ks[r * 128 + lane + 32 * d]);
+      const float score = simd_sum(dot) * p.scale, next = max(m, score);
+      const float a = m == -INFINITY ? 0 : metal::precise::exp(m - next), e = metal::precise::exp(score - next);
+      l = l * a + e;
+      for (uint d = 0; d < 4; ++d) o[d] = o[d] * a + e * float(vs[r * 128 + lane + 32 * d]);
+      m = next;
+    }
+  }
+  if (!live) return;
+  for (uint d = 0; d < 4; ++d) out[(size_t(row) * 16 + head) * 128 + lane + 32 * d] = bfloat(o[d] / l);
+}

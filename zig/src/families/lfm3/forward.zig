@@ -21,6 +21,14 @@ pub const Trace = struct {
 };
 
 const QkArgs = extern struct { len: u32, cap: u32, eps: f32, log2_theta: f32, rotary_pairs: u32 };
+const kern = @import("kernels.zig");
+/// The dense row projection's constants (Spark2.5's sp_mv_args).
+const MvArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32 };
+
+/// d1's set attention on full layers: each row's question (int32 [rows], -1 in the state) and the state's rows.
+pub const Set = struct { group: Buffer, state: usize };
+/// What a decision pass adds to a prompt pass: `set` attention, and the logits of rows `heads_at` in order.
+pub const Decision = struct { set: ?Set = null, heads_at: []const usize = &.{} };
 const AttnArgs = @import("kernels.zig").AttentionArgs;
 
 const Prepared = struct { address: u64, off: usize, k: usize, rows: usize, group: usize };
@@ -59,6 +67,10 @@ const Encoder = struct {
 
     fn projection(self: *Encoder, w: row.Weights, x: Buffer, x_off: usize, y: Buffer, y_off: usize, rows: usize) !void {
         try self.begin(.dense);
+        if (wts.isDense(w)) {
+            try self.dense(w, x, x_off, y, y_off, rows);
+            return self.end();
+        }
         if (self.m.binned_candidate) |*candidate| {
             if (binned.supports(w)) {
                 const sums = binned.Ref{ .buf = self.scratch.binned_sums orelse return error.MissingBinnedScratch };
@@ -76,6 +88,26 @@ const Encoder = struct {
             try candidate.encode(self.e, &self.m.kernels.rows, w, x, x_off, self.scratch.sums orelse return error.MissingProjectionCandidateScratch, y, y_off, rows);
         } else try pairs.encode(self.e, &self.m.kernels.rows, w, x, x_off, y, y_off, rows);
         try self.end();
+    }
+
+    /// y [rows, n] = x W^T over a bf16 [n, k] matrix with fp32 sums: register rows to 32, the tensor-unit GEMM past.
+    fn dense(self: *Encoder, w: row.Weights, x: Buffer, x_off: usize, y: Buffer, y_off: usize, rows: usize) !void {
+        const d = self.m.kernels.dense orelse return error.MissingLfmDenseKernels;
+        self.binned_prepared = null;
+        const e = self.e;
+        if (rows <= st.batch_rows) {
+            const v = for (kern.Dense.most_rows, 0..) |most, i| {
+                if (rows <= most) break i;
+            } else unreachable;
+            e.setPipeline(d.matvec[v]);
+            e.setBuffer(x, x_off, 0);
+            e.setBuffer(w.w, w.w_off, 1);
+            e.setValue(MvArgs{ .rows = @intCast(rows), .n = @intCast(w.n), .k = @intCast(w.k), .ldy = @intCast(w.n) }, 2);
+            e.setBuffer(y, y_off, 3);
+            e.dispatchGroups(mtl.Size.of((w.n + 7) / 8, 1, 1), mtl.Size.of(256, 1, 1));
+            return;
+        }
+        kern.gemm(e, &d.gemm, x, x_off, w.w, w.w_off, y, y_off, rows, w.n, w.k);
     }
 
     fn pairedProjection(self: *Encoder, a: row.Weights, b: row.Weights, input: Buffer, first: Buffer, second: Buffer, rows: usize) !bool {
@@ -146,18 +178,26 @@ pub fn project(m: *Model, s: *st.Scratch, w: row.Weights, input: Buffer, output:
 }
 
 pub fn runWithImages(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const u32, record: bool, head: Head, images: ?@import("image_rows.zig").Images) !void {
-    return execute(m, s, segments, tokens, record, head, images, null);
+    return execute(m, s, segments, tokens, record, head, images, null, .{});
+}
+
+/// A decision's prompt pass from position 0 of `cache`: images over the embedding, `set` attention and asked heads.
+pub fn runDecision(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, images: ?@import("image_rows.zig").Images, d: Decision) !void {
+    if (cache.len != 0 or d.heads_at.len > st.batch_rows) return error.InvalidLfmDecision;
+    for (d.heads_at) |r| if (r >= tokens.len) return error.InvalidLfmDecision;
+    if (d.set) |set| if (set.state == 0 or set.state > tokens.len or set.group.length() < tokens.len * 4) return error.InvalidLfmDecision;
+    return execute(m, s, &.{.{ .cache = cache, .rows = tokens.len }}, tokens, false, .last, images, null, d);
 }
 
 pub fn runTrace(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const u32, head: Head, trace: Trace) !void {
-    return execute(m, s, segments, tokens, false, head, null, trace);
+    return execute(m, s, segments, tokens, false, head, null, trace, .{});
 }
 
 pub fn runTraceWithImages(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const u32, head: Head, images: ?@import("image_rows.zig").Images, trace: Trace) !void {
-    return execute(m, s, segments, tokens, false, head, images, trace);
+    return execute(m, s, segments, tokens, false, head, images, trace, .{});
 }
 
-fn execute(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const u32, record: bool, head: Head, images: ?@import("image_rows.zig").Images, trace: ?Trace) !void {
+fn execute(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const u32, record: bool, head: Head, images: ?@import("image_rows.zig").Images, trace: ?Trace, decision: Decision) !void {
     if (trace != null and m.profile != null) return error.ConflictingLfmDiagnostics;
     if (images != null and (record or segments.len != 1)) return error.InvalidLfmImageSegments;
     if (tokens.len == 0 or tokens.len > s.rows or (record and tokens.len > st.batch_rows)) return error.LfmRowsExceeded;
@@ -212,7 +252,7 @@ fn execute(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const
                 try layerStage(&enc, trace, &name, i, "conv_gated", s.y, total, c.hidden, &cb, &ended);
             },
             .attention => |a| {
-                try attention(&enc, s, a, segments, i, total);
+                try attention(&enc, s, a, segments, i, total, decision.set);
                 try layerStage(&enc, trace, &name, i, "attn_q", s.q, total, c.hidden, &cb, &ended);
                 try layerStage(&enc, trace, &name, i, "attn_k", s.k, total, c.kv_heads * c.head_dim, &cb, &ended);
                 try layerStage(&enc, trace, &name, i, "attn_v", s.v, total, c.kv_heads * c.head_dim, &cb, &ended);
@@ -249,7 +289,16 @@ fn execute(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const
     }
 
     try stage(&enc, trace, "final_norm", s.x, total, c.hidden, &cb, &ended);
-    if (head == .all) try enc.projection(embedding, s.x, 0, s.logits, 0, total) else {
+    if (decision.heads_at.len > 0) {
+        // the asked rows side by side in r (free after the last block), then their logits in order
+        for (decision.heads_at, 0..) |r, i| {
+            enc.pipe("lfm3_row_copy");
+            enc.e.setBuffer(s.x, r * c.hidden * 2, 0);
+            enc.e.setBuffer(s.r, i * c.hidden * 2, 1);
+            enc.threads(.{ c.hidden, 1, 1 }, .{ 256, 1, 1 });
+        }
+        try enc.projection(embedding, s.r, 0, s.logits, 0, decision.heads_at.len);
+    } else if (head == .all) try enc.projection(embedding, s.x, 0, s.logits, 0, total) else {
         try enc.projection(embedding, s.x, (total - 1) * c.hidden * 2, s.logits, 0, 1);
     }
     if (m.profile) |profile| try profile.finishEncoding(&enc.e) else enc.e.end();
@@ -395,7 +444,7 @@ fn sharedAttention(enc: *Encoder, s: *st.Scratch, segments: []const Segment, lay
     try enc.end();
 }
 
-fn attention(enc: *Encoder, s: *st.Scratch, a: wts.Attention, segments: []const Segment, layer: usize, total: usize) !void {
+fn attention(enc: *Encoder, s: *st.Scratch, a: wts.Attention, segments: []const Segment, layer: usize, total: usize, set: ?Set) !void {
     try enc.projection(a.q, s.x, 0, s.q, 0, total);
     if (!try enc.pairedProjection(a.k, a.v, s.x, s.k, s.v, total)) {
         try enc.projection(a.k, s.x, 0, s.k, 0, total);
@@ -430,6 +479,21 @@ fn attention(enc: *Encoder, s: *st.Scratch, a: wts.Attention, segments: []const 
         enc.groups(.{ c.query_heads + c.kv_heads, seg.rows, 1 }, .{ 32, 1, 1 });
         try enc.end();
         if (shared) {
+            base += seg.rows;
+            continue;
+        }
+        if (set != null and !sliding) {
+            const args = kern.SetArgs{ .rows = @intCast(seg.rows), .cap = cap, .state = @intCast(set.?.state), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)) };
+            try enc.begin(.attention);
+            enc.pipe("lfm3_set_attention");
+            enc.e.setBuffer(s.queries, 0, 0);
+            enc.e.setBuffer(cache.keys, 0, 1);
+            enc.e.setBuffer(cache.values, 0, 2);
+            enc.e.setBuffer(set.?.group, 0, 3);
+            enc.e.setBytes(std.mem.asBytes(&args), 4);
+            enc.e.setBuffer(s.y, 0, 5);
+            enc.groups(.{ (seg.rows + 3) / 4, c.kv_heads, 1 }, .{ 512, 1, 1 });
+            try enc.end();
             base += seg.rows;
             continue;
         }

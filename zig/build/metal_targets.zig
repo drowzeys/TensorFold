@@ -463,6 +463,9 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = helpers })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = engine })).step);
+    // the LFM3 family's engine tests alone, its Metal device checks included (a serving Mac's short run)
+    const lfm3_filters = &.{ "LFM3", "d1's set attention", "the bf16 release" };
+    b.step("test-lfm3-metal", "LFM3's engine tests and Metal device checks alone").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = engine, .filters = lfm3_filters })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes })).step);
     // the fake fabric maps its windows with mmap: the Macs' RDMA, not Windows
     if (target.result.os.tag != .windows) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fabric })).step);

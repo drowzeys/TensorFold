@@ -32,11 +32,12 @@ pub const Weights = struct {
 const Loader = struct {
     a: std.mem.Allocator,
     checkpoint: *const ck.Checkpoint,
+    root: []const u8,
     seen: std.StringHashMapUnmanaged(void) = .empty,
 
     fn get(self: *Loader, prefix: []const u8, suffix: []const u8, shape: []const usize) !Ref {
         var buf: [192]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
+        const name = try std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ self.root, prefix, suffix });
         const t = try self.checkpoint.get(name);
         if (t.dtype != .bf16 or t.rank != shape.len or !std.mem.eql(usize, t.shape[0..t.rank], shape))
             return error.UnexpectedLfm3VisionTensor;
@@ -52,7 +53,9 @@ const Loader = struct {
 pub fn load(checkpoint: *const ck.Checkpoint) !Weights {
     var arena = std.heap.ArenaAllocator.init(checkpoint.allocator);
     defer arena.deinit();
-    var l: Loader = .{ .a = arena.allocator(), .checkpoint = checkpoint };
+    // transformers 5's bf16 release nests the tower and projector under `model.`, MLX's do not
+    const torch = checkpoint.has("model.vision_tower.patchifier.weight");
+    var l: Loader = .{ .a = arena.allocator(), .checkpoint = checkpoint, .root = if (torch) "model." else "" };
     var out: Weights = .{
         .patch = try l.get("vision_tower.", "patchifier.weight", &.{ width, 1536 }),
         .norm = try l.get("vision_tower.", "embedding_norm.weight", &.{width}),
@@ -79,15 +82,19 @@ pub fn load(checkpoint: *const ck.Checkpoint) !Weights {
             .out = try l.get(p, "self_attn.out_proj.weight", &.{ width, width }),
             .q_norm = try l.get(p, "self_attn.q_layernorm.weight", &.{64}),
             .k_norm = try l.get(p, "self_attn.k_layernorm.weight", &.{64}),
-        } } else .{ .conv = .{
-            .in = try l.get(p, "conv.in_proj.weight", &.{ 3 * width, width }),
-            .out = try l.get(p, "conv.out_proj.weight", &.{ width, width }),
-            .spatial = try l.get(p, "conv.spatial_conv.weight", &.{ width, 3, 3, 1 }),
-        } };
+        } } else .{
+            .conv = .{
+                .in = try l.get(p, "conv.in_proj.weight", &.{ 3 * width, width }),
+                .out = try l.get(p, "conv.out_proj.weight", &.{ width, width }),
+                // torch's [channels, 1, 3, 3] holds the same values as MLX's [channels, 3, 3, 1]
+                .spatial = try l.get(p, "conv.spatial_conv.weight", if (torch) &.{ width, 1, 3, 3 } else &.{ width, 3, 3, 1 }),
+            },
+        };
     }
     var it = checkpoint.tensors.keyIterator();
     while (it.next()) |name| {
-        if (std.mem.startsWith(u8, name.*, "vision_tower.") or std.mem.startsWith(u8, name.*, "multi_modal_projector."))
+        const bare = if (std.mem.startsWith(u8, name.*, l.root)) name.*[l.root.len..] else name.*;
+        if (std.mem.startsWith(u8, bare, "vision_tower.") or std.mem.startsWith(u8, bare, "multi_modal_projector."))
             if (!l.seen.contains(name.*)) return error.UnexpectedLfm3VisionTensor;
     }
     if (l.seen.count() != 138) return error.UnexpectedLfm3VisionTensor;

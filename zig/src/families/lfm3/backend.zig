@@ -95,7 +95,7 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .reports_fill = true } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .first_row = firstRowFn, .reports_fill = true } };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -164,6 +164,16 @@ pub const Metal = struct {
         return try draw(self.gpa, cache.logits.slice(u16, c.vocab), stream.sampling, position, &.{});
     }
 
+    /// The prompt's last row as a logprob row for its argmax (the lane core re-keys it to the committed token).
+    fn firstRowFn(ptr: *anyopaque, stream: *lanes.Stream) !lanes.LogprobRow {
+        const l = (try cast(ptr).cacheOf(stream)).logits.slice(u16, c.vocab);
+        var best: usize = 0;
+        for (l, 0..) |w, i| if (value(w) > value(l[best])) {
+            best = i;
+        };
+        return logprobRow(l, @intCast(best), stream.logprobs orelse 0);
+    }
+
     fn firstMaskedFn(ptr: *anyopaque, stream: *lanes.Stream, position: u64, mask: []const u32) !u64 {
         const self = cast(ptr);
         const cache = try self.cacheOf(stream);
@@ -216,6 +226,7 @@ pub const Metal = struct {
             for (o.sampled, w.positions, 0..) |*t, p, r| {
                 const mask = if (w.masks.len > 0) w.masks[r * mask_words ..][0..mask_words] else &.{};
                 t.* = try draw(self.gpa, logits[(base + r) * c.vocab ..][0..c.vocab], w.stream.sampling, p, mask);
+                if (o.rows.len == w.rows()) o.rows[r] = logprobRow(logits[(base + r) * c.vocab ..][0..c.vocab], t.*, w.stream.logprobs orelse 0);
             }
             @memcpy(o.drafts, w.tokens);
             base += w.rows();
@@ -264,6 +275,8 @@ pub const Snaps = struct {
 
 /// A row's allowed-token bits (structured output): one bit a logit.
 const mask_words = (c.vocab + 31) / 32;
+
+const logprobRow = @import("../step5/backend.zig").row;
 
 pub fn value(word: u16) f64 {
     return @as(f32, @bitCast(@as(u32, word) << 16));

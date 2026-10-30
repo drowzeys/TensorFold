@@ -6,6 +6,12 @@ const c = @import("config.zig");
 
 pub const Tensor = ck.Tensor;
 pub const Linear = row.Weights;
+/// A bf16 release's matrix rides in `Linear` as one bf16 [n, k] tensor at `w`, with these bits and no groups.
+pub const dense_bits = 16;
+
+pub fn isDense(w: Linear) bool {
+    return w.bits == dense_bits;
+}
 pub const Conv = struct { in: Linear, out: Linear, weight: Tensor };
 pub const Attention = struct { q: Linear, k: Linear, v: Linear, out: Linear, gate: Linear, q_norm: Tensor, k_norm: Tensor };
 pub const Dense = struct { gate: Linear, up: Linear, down: Linear };
@@ -43,6 +49,11 @@ const Loader = struct {
     fn affine(self: *Loader, prefix: []const u8, suffix: []const u8, n: usize, k: usize) !Linear {
         var buf: [256]u8 = undefined;
         const name = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
+        if (self.config.scheme == .bf16) {
+            const d = try self.tensor(name, ".weight", .bf16, &.{ n, k });
+            if (n % 8 != 0 or k % 8 != 0) return error.UnsupportedRowShape;
+            return .{ .w = d.buffer, .w_off = d.offset, .scales = d.buffer, .s_off = d.offset, .biases = d.buffer, .b_off = d.offset, .n = n, .k = k, .group = 0, .bits = dense_bits };
+        }
         const q = try self.config.width(name);
         if (k % q.group != 0 or k * q.bits % 32 != 0) return error.UnsupportedQuantization;
         const w = try self.tensor(name, ".weight", .u32, &.{ n, k * q.bits / 32 });
@@ -68,9 +79,10 @@ const Loader = struct {
 pub fn load(ckpt: *const ck.Checkpoint, cfg: *const c.Config) !Weights {
     const bare = ckpt.has("model.embed_tokens.weight");
     const wrapped = ckpt.has("language_model.model.embed_tokens.weight");
-    if (bare and wrapped) return error.MixedNamespaces;
-    if (!bare and !wrapped) return error.MissingTensor;
-    const prefix: []const u8 = if (bare) "model." else "language_model.model.";
+    const vl = ckpt.has("model.language_model.embed_tokens.weight");
+    if (@as(u8, @intFromBool(bare)) + @intFromBool(wrapped) + @intFromBool(vl) > 1) return error.MixedNamespaces;
+    if (!bare and !wrapped and !vl) return error.MissingTensor;
+    const prefix: []const u8 = if (bare) "model." else if (wrapped) "language_model.model." else "model.language_model.";
     var arena = std.heap.ArenaAllocator.init(ckpt.allocator);
     defer arena.deinit();
     var loader: Loader = .{ .checkpoint = ckpt, .config = cfg, .allocator = arena.allocator() };
@@ -91,11 +103,14 @@ pub fn load(ckpt: *const ck.Checkpoint, cfg: *const c.Config) !Weights {
             .up = try loader.affine(p, "feed_forward.w3", c.intermediate, c.hidden),
             .down = try loader.affine(p, "feed_forward.w2", c.hidden, c.intermediate),
         };
-        block.mixer = if (kind == .conv) .{ .conv = .{
-            .in = try loader.affine(p, "conv.in_proj", 3 * c.hidden, c.hidden),
-            .out = try loader.affine(p, "conv.out_proj", c.hidden, c.hidden),
-            .weight = try loader.tensor(p, "conv.conv.weight", .bf16, &.{ c.hidden, c.conv_taps, 1 }),
-        } } else .{ .attention = .{
+        block.mixer = if (kind == .conv) .{
+            .conv = .{
+                .in = try loader.affine(p, "conv.in_proj", 3 * c.hidden, c.hidden),
+                .out = try loader.affine(p, "conv.out_proj", c.hidden, c.hidden),
+                // torch's [channels, 1, taps] holds the same values as MLX's [channels, taps, 1]
+                .weight = try loader.tensor(p, "conv.conv.weight", .bf16, if (cfg.scheme == .bf16) &.{ c.hidden, 1, c.conv_taps } else &.{ c.hidden, c.conv_taps, 1 }),
+            },
+        } else .{ .attention = .{
             .q = try loader.affine(p, "self_attn.q_proj", c.query_heads * c.head_dim, c.hidden),
             .k = try loader.affine(p, "self_attn.k_proj", c.kv_heads * c.head_dim, c.hidden),
             .v = try loader.affine(p, "self_attn.v_proj", c.kv_heads * c.head_dim, c.hidden),
@@ -107,6 +122,7 @@ pub fn load(ckpt: *const ck.Checkpoint, cfg: *const c.Config) !Weights {
     }
     var iterator = ckpt.tensors.keyIterator();
     while (iterator.next()) |name| {
+        if (vl and (std.mem.startsWith(u8, name.*, "model.vision_tower.") or std.mem.startsWith(u8, name.*, "model.multi_modal_projector."))) continue;
         if (std.mem.startsWith(u8, name.*, "model.") or std.mem.startsWith(u8, name.*, "language_model.")) {
             if (!loader.seen.contains(name.*)) return error.UnexpectedTensor;
         }
