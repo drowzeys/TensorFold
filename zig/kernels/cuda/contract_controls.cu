@@ -425,3 +425,6 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_ctl_pattn_128(const __nv
 #include "prefill_attention_rows.cuh"
 }
 }  // namespace tf_prefill_attention
+
+// LFM3-VL vision glue and d1 set attention (lfm3v.cu): one twin a kernel, each with one realistic defect.
+#include "lfm3v_controls.cuh"

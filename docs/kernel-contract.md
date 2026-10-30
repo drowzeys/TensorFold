@@ -197,6 +197,13 @@ prompt rows (`pattn_kernel<64, 8, 4, 8>`), head by head within `attention_ref`'s
 decode reading its values from the neighbouring lane's dims, the prompt from the neighbouring 8 dims).
 CUDA also checks the affine-3 experts' split decode pair, bit-equal to the pair kernel it replaces (two controls,
 one dropping a last round of K groups short of the warps, one chaining the groups in reverse).
+CUDA also checks LFM3-VL's tower glue and d1's set attention (`lfm3v.cu`) at the tower's and d1's served shapes: the RMS
+norm rows, the q/k head norms with their axial RoPE (in place), the residual add and the gated 3x3 conv over merge-order
+rows, each bit-equal to the host's replay of its fp32 and bf16 steps in the kernel's order (the norms' sums also through
+gate 4), the SwiGLU against float64 at its bf16 points within expf's ulps, the set attention (a row sees the state and
+its own question) against `attention_ref`'s bound, and its tiled form bit-equal to it. Seven controls, one a kernel: a
+dropped bf16 point in the norm, the q/k rows and the SwiGLU, the conv's neighbours in raster order, an add that loses a
+partial last block, query heads mapped to KV head h % 4, and a tile skipped by its first key's group alone.
 CUDA also checks Flash Next's NVFP4 experts on prompt tiles with the decode form's sums (SwiGLU gate-up and fp32
 down, each bit-equal to the decode instance it replaces; the scaled-code prompt tile is the planted control).
 
