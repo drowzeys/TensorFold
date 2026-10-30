@@ -102,6 +102,7 @@ pub const Config = struct {
     latent: usize = 0, // moe_latent_size: routed experts read and write this width between two bf16 projections
     omni: bool = false, // nemotron_h_omni: the text model's tensors sit under "language_model."
     salm: bool = false, // nemo_speechlm (Nemotron 3.5 Transcribe): bf16 throughout, NeMo's names under "llm."
+    salm_hf: bool = false, // a quantized Transcribe release (ModelOpt): HF's names as Lightning's, its MTP head under "llm."
     shares: usize = 1, // latent MoE: expert widths cut in this many shares, summed in share order on every TP world
     held: ?usize = null, // a split checkpoint (tensorfold_tp): the one share its expert tensors hold
     rank: usize = 0, // this process's tensor-parallel rank of `world`: set at load, never by config.json
@@ -150,20 +151,25 @@ pub const Config = struct {
 
     /// The stem of layer i's names after prefix(): HF's "backbone.layers.", NeMo's "model.layers." (salm).
     pub fn layerStem(self: Config) []const u8 {
-        return if (self.salm) "model.layers." else "backbone.layers.";
+        return if (self.nemoNames()) "model.layers." else "backbone.layers.";
     }
 
     /// The token table, the final norm and a Mamba layer's fp32 parameters by their names after prefix().
     pub fn embedName(self: Config) []const u8 {
-        return if (self.salm) "model.embed_tokens.weight" else "backbone.embeddings.weight";
+        return if (self.nemoNames()) "model.embed_tokens.weight" else "backbone.embeddings.weight";
     }
 
     pub fn normName(self: Config) []const u8 {
-        return if (self.salm) "model.norm.weight" else "backbone.norm_f.weight";
+        return if (self.nemoNames()) "model.norm.weight" else "backbone.norm_f.weight";
     }
 
     pub fn ssmParams(self: Config) []const u8 {
-        return if (self.salm) "_fp32_params." else "";
+        return if (self.nemoNames()) "_fp32_params." else "";
+    }
+
+    /// The bf16 Transcribe release's NeMo names; its quantized releases keep HF's.
+    pub fn nemoNames(self: Config) bool {
+        return self.salm and !self.salm_hf;
     }
 
     /// The expert width shares this rank holds and sums before the ranks meet.
@@ -464,8 +470,10 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8, why: *Why) !Config 
         try split(&c, root, why);
     };
     c.salm = salm;
-    // the published bf16 weights, read per tensor as the ModelOpt loader reads a bf16 projection
-    if (salm) c.format = .modelopt else try quantization(&c, root, why);
+    // the published bf16 weights, read per tensor as the ModelOpt loader reads a bf16 projection; a quantized
+    // release (NVFP4) names its ModelOpt quantization_config at the top
+    c.salm_hf = salm and quantBlock(root) != null;
+    if (salm and !c.salm_hf) c.format = .modelopt else try quantization(&c, root, why);
     return c;
 }
 
