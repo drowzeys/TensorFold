@@ -35,7 +35,7 @@ pub const prompt_rows: u32 = state.pass_rows;
 pub const window_rows: u32 = state.max_rows; // a request's last verify window: its pages hold that many rows past it
 pub const max_drafts: u32 = @import("cuda_mtp.zig").max_chain; // Super's; open refuses more than a checkpoint's window holds
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, mtp_drafts: ?u32 = null, mtp_confidence: ?f64 = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, mtp_drafts: ?u32 = null, mtp_confidence: ?f64 = null, drafter_bits: u8 = 4 };
 pub const vision = @import("cuda_vision.zig");
 
 /// Thinking budgets the lone driver takes (cuda_lone.zig): above it, the stream goes to the lane core before its cut.
@@ -110,7 +110,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     };
     const carve = try openCarveout(gpa, ctx);
     errdefer if (carve) |c| closeCarveout(gpa, c);
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = true, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision });
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = true, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision, .mtp_bits = o.drafter_bits });
     errdefer e.deinit();
     if (o.mtp_drafts) |n| if (n >= state.windowRows(e.c)) return error.DraftsPastWindow;
     // Bolt has no MTP weights; copy drafts use the lane core and the target's ordinary verify windows.

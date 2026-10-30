@@ -39,6 +39,7 @@ pub const Options = struct {
     slide: bool = false, // Sliding Weights asked for: refused for a checkpoint the learner cannot read
     vision: ?@import("cuda_vision.zig").Limits = null, // --vision: the checkpoint's image tower (an omni checkpoint's)
     precision: ?@import("config.zig").Precision = null, // --precision; null: the checkpoint's math where it is built
+    mtp_bits: u8 = 4, // --drafter-bits: a quantized Transcribe release's MTP head at 4 bits, or bf16 (0)
 };
 
 const prompt_hooks = @import("cuda_prompt_hooks.zig");
@@ -132,6 +133,7 @@ pub const Engine = struct {
         e.trace = platform.c.getenv("TF_SLIDE_TRACE") != null;
         e.c = try Config.read(gpa, io, model_dir);
         try latent.place(&e.c);
+        e.c.mtp_bits = opts.mtp_bits;
         if (e.c.rank > 0) return error.RankServesExperts; // ranks past 0 run cuda_worker.serve, not an engine
         e.c.ck = try @import("cuda_latent_ck.zig").wanted(ctx, e.c, opts.precision);
         if (e.c.world > 1 and opts.segments > 1) return error.SegmentsNeedOneRank; // one stream keeps the jobs in order

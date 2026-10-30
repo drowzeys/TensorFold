@@ -14,7 +14,8 @@ encoder is `zig/src/families/nemo_audio/`, with its kernels in `zig/kernels/cuda
 routers' fp32 biases and the CTC timestamp head. The engine reads these tensors as stored; nothing is converted
 ahead of time. The routed experts stay in bf16 on a grouped kernel of their own (`zig/kernels/cuda/experts_bf16.cu`).
 
-Not read: NVIDIA's FP8 and NVFP4 variants, the DFlash2 draft model, and the CTC timestamp head.
+Not read: NVIDIA's FP8 variant, the DFlash2 draft model, and the CTC timestamp head. The NVFP4 release has its own
+section below.
 
 ## Run on one GB10
 
@@ -98,10 +99,48 @@ The first token waits for the encoder and the whole prompt pass. The drafts kept
 (9,748 of 13,142 on the hour). The 130-second clip answered its first token in 2.32 s. The encoder's attention is a
 plain per-window kernel, not yet a tiled one. The harness's quality suite was not run on this build.
 
+## The NVFP4 release
+
+`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4` (revision `66c6adc4`, 21.6 GB) is NVIDIA's ModelOpt mixed export:
+the language model under HF's names in Nemotron 3.5 Lightning NVFP4's layout (NVFP4 routed and shared experts and
+attention projections, FP8 Mamba projections, bf16 router, norms, token table and `lm_head`), the ASR encoder's 128
+projections in FP8 with one scale each (`perception.safetensors`; the Sortformer, the stacking projection and the
+connector stay bf16) and an FP8 MTP head under `llm.mtp.` (`model-mtp-fp8.safetensors`).
+
+```bash
+tensorfold serve /models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4 --name transcribe
+```
+
+- **Language model:** the existing ModelOpt path (NVFP4 grouped experts, FP8 and NVFP4 lane weights), as Lightning
+  NVFP4 loads, with the Transcribe config's names.
+- **Encoder:** the FP8 projections run as stored on the lane matmul (bf16 rows in, the scale applied in fp32, as the
+  language model's FP8 projections run); everything else as in the bf16 release.
+- **MTP head:** there is no FP8 grouped-expert kernel for its per-tensor experts. By default it is made 4-bit from the
+  FP8 values, as Lightning's ModelOpt head is (MLX affine-4, a 4-bit draft head over the draft ids); `--drafter-bits 0`
+  widens it to bf16 instead (1.9 GiB more). Drafts are checked by the plain path either way: replies equal
+  `"draft": false`.
+- **Size on one GB10:** 20.6 GiB of weights and encoder (22.6 GiB with `--drafter-bits 0`, 19.8 GiB with
+  `--no-drafts`), against 64.1 GiB for the bf16 release.
+
+Measured on one GB10, greedy, thinking off, the card's readable-text prompt, 16 synthetic utterances of 2 to 7 seconds
+and a 55-second two-speaker clip (macOS voices), no prompt cache:
+
+| | bf16 release | NVFP4 release |
+| --- | --- | --- |
+| Replies identical to the bf16 release | | 16 of 17 |
+| Teacher-forced on the bf16 replies, same argmax | | 413 of 415 tokens |
+| WER (16 utterances; 55-second clip) | 2.96%; 0% | 2.96%; 0% |
+| Utterance, median end to end | 592 ms | 222 ms |
+| First token, median | 287 ms | 114 ms |
+
+The one different reply is a near tie on a garbled word ("At his low, pushing" against "At his low position"). With a
+bare "Transcribe the following audio." both releases sometimes answer a spoken request instead of writing it down
+("Give me a one sentence logline for a heist movie..."); the card's transcription prompts do not.
+
 ## Not served yet
 
 - Word timestamps and diarization segments (the card's `ctc_timestamps`, from its CTC head): the head stays
   unloaded.
 - Audio URLs other than data URLs, and formats other than WAV.
-- The DFlash2 draft model, and the FP8 and NVFP4 variants.
+- The DFlash2 draft model, and the FP8 variant.
 - More than one GPU: the model fits one GB10, and the two-rank expert split is Super VL's alone.

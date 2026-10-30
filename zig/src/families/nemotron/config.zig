@@ -103,6 +103,7 @@ pub const Config = struct {
     omni: bool = false, // nemotron_h_omni: the text model's tensors sit under "language_model."
     salm: bool = false, // nemo_speechlm (Nemotron 3.5 Transcribe): bf16 throughout, NeMo's names under "llm."
     salm_hf: bool = false, // a quantized Transcribe release (ModelOpt): HF's names as Lightning's, its MTP head under "llm."
+    mtp_bits: u8 = 4, // --drafter-bits: a quantized Transcribe release's FP8 MTP head made 4-bit (4) or widened to bf16 (0)
     shares: usize = 1, // latent MoE: expert widths cut in this many shares, summed in share order on every TP world
     held: ?usize = null, // a split checkpoint (tensorfold_tp): the one share its expert tensors hold
     rank: usize = 0, // this process's tensor-parallel rank of `world`: set at load, never by config.json

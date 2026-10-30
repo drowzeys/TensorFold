@@ -9,6 +9,7 @@ const Source = @import("cuda_source.zig").Source;
 const latent = @import("cuda_latent.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const salm = @import("cuda_salm.zig");
+const salm_q = @import("cuda_salm_q.zig");
 const join = weights.join;
 const Block = weights.Block;
 pub const Pending = struct {
@@ -115,7 +116,7 @@ fn fill(p: *Pending, io: std.Io, dir: []const u8, c: Config, with_mtp: bool) !vo
     w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}{s}", .{ pre, c.normName() }), .bf16, &.{c.hidden}));
     w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
     // a ModelOpt checkpoint keeps its MTP head in its own shards
-    if (c.salm_hf) try salm.quantizedMtp(L, &ck, c, with_mtp) else if (c.format == .modelopt) if (!with_mtp) try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre})) else if (c.salm) try salm.mtp(L, &ck, c) else if (c.latent > 0) try latent.mtp(L, &ck, c) else try modelopt.mtp(L, &ck, c);
+    if (c.salm_hf) try salm_q.load(L, &ck, c, with_mtp) else if (c.format == .modelopt) if (!with_mtp) try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre})) else if (c.salm) try salm.mtp(L, &ck, c) else if (c.latent > 0) try latent.mtp(L, &ck, c) else try modelopt.mtp(L, &ck, c);
     // the picture tower and its projector load with the image path (an omni checkpoint's other parts)
     if (c.omni) for ([_][]const u8{ "vision_model.", "mlp1.", "vision_projector." }) |part| try ck.skip(part);
     if (ck.unused() != 0) return error.UnusedCheckpointTensors;
