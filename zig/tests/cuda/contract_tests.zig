@@ -569,6 +569,8 @@ pub fn run(gpu: check.Gpu) !void {
     for (&contiguous) |*x| try kernels.append(a, x.kernel());
     const weight_only = try @import("contract_weight_only_suite.zig").Suite.create(a, gpu, s, &kernels);
     defer weight_only.destroy(a);
+    const omni = try @import("contract_lfm3_omni.zig").Set.create(gpu, s, mods[5], &kernels);
+    defer omni.destroy();
     var t: g.Tally = .{};
     try @import("contract_dump.zig").run(a, kernels.items);
     const t0 = check.now(gpu.io);
