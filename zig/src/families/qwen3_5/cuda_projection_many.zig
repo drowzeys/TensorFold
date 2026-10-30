@@ -20,7 +20,7 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
         return e.affine.promptMany(e.stream, x, many[0..ls.len], rows);
     }
-    const segmented = e.affine.split != null and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
+    const segmented = e.affine.split != null and !(prompt and rows > 16) and !(e.affine.pdl and rows > A.max_rows) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {

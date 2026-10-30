@@ -47,7 +47,7 @@ pub const Affine4Kernels = struct {
     words_fn: Function, // affine4_pack.cu: MLX words into the tiles
     scales_fn: Function, // affine4_pack.cu: (n, kg) scales or biases into (kg, npad)
     gemv_blocks: usize, // resident lane_gemv CTAs: per SM times SMs
-    split: ?Split, // every GPU but GB10: lane_gemv's slices on CTAs of their own (one stream's decode() at a time)
+    split: ?Split, // lane_gemv's slices on CTAs of their own (one stream's decode() at a time); GB10: decodeMany only
     pdl: bool, // GB10: the decode kernels launch with programmatic dependent launch
     wide_verify: bool, // off GB10: verify windows of 17 to 32 rows share one weight pass (sm_120, when its engine says)
 
@@ -81,8 +81,15 @@ pub const Affine4Kernels = struct {
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
         a.wide_verify = false;
-        a.split = if (gb10) null else try Split.initFor(d, segs_max);
+        // GB10 too, for decodeMany only: gated-delta a and b (one tile) and attention k and v (16) starve alone
+        a.split = if (gb10 and segOff()) null else try Split.initFor(d, segs_max);
         return a;
+    }
+
+    /// TF_GB10_SEG=0: GB10 decodes each projection alone, as before the segmented launch was taken there.
+    fn segOff() bool {
+        const v = std.c.getenv("TF_GB10_SEG") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "0");
     }
 
     pub fn deinit(a: *Affine4Kernels) void {
@@ -113,7 +120,8 @@ pub const Affine4Kernels = struct {
     pub fn decode(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize) !void {
         if (rows > max_rows) return error.WindowTooWide;
         const sk = splitK(q.n, q.k);
-        if (sk > 1) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
+        // a lone projection on GB10 stays on lane_gemv: the split form is no quicker on the 27B's out, o and down
+        if (sk > 1 and !a.pdl) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
@@ -154,7 +162,7 @@ pub const Affine4Kernels = struct {
         for ([_]usize{ rows, outs[0].q.k, outs[0].q.k }) |v| g.add(int(v));
         g.add(sp.work.ptr);
         g.add(sp.tickets.ptr);
-        try launch_.launch(a.seg_fn, .{ .grid = .{ .x = u(blocks) }, .block = .{ .x = 128 }, .shared = split_smem }, s, &g);
+        try launch_.launch(a.seg_fn, .{ .grid = .{ .x = u(blocks) }, .block = .{ .x = 128 }, .shared = split_smem, .pdl = a.pdl }, s, &g);
     }
 
     /// 16 rows elsewhere; GB10 verify shares a weight panel across up to eight m16 row tiles, sm_120 across two.
@@ -212,7 +220,7 @@ pub const Affine4Kernels = struct {
         for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
         g.add(sp.work.ptr);
         g.add(sp.tickets.ptr);
-        try launch_.launch(a.split_fn, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = split_smem }, s, &g);
+        try launch_.launch(a.split_fn, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = split_smem, .pdl = a.pdl }, s, &g);
     }
 
     /// lane_gemv: every K slice of a column tile in one CTA, summed in slice order, CTAs looping over the tiles.

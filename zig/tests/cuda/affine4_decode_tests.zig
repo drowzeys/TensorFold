@@ -66,6 +66,10 @@ pub fn run(gpu: Gpu) !void {
     const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
     var a4 = try qlinear.Affine4Kernels.resolve(gpu.d, mods[0], mods[1], mods[2], mods[3], sms, false);
     defer a4.deinit();
+    // on GB10 also its own resolve: decode() on lane_gemv and decodeMany's segmented launch, both with dependent launch
+    const gb10 = try gpu.ctx.attribute(.compute_capability_major) == 12 and try gpu.ctx.attribute(.compute_capability_minor) == 1;
+    var g4: ?qlinear.Affine4Kernels = if (gb10) try qlinear.Affine4Kernels.resolve(gpu.d, mods[0], mods[1], mods[2], mods[3], sms, true) else null;
+    defer if (g4) |*g| g.deinit();
     var name: [160]u8 = undefined;
     const most = row_counts[row_counts.len - 1];
     const Out = qlinear.Affine4Kernels.Out;
@@ -116,7 +120,18 @@ pub fn run(gpu: Gpu) !void {
             try a4.decodeMany(r.s, dx, dxs, outs, rows);
             for (outs, want, set.ns) |o, w, n|
                 try check.sameBytes(try std.fmt.bufPrint(&name, "{s}: [{d}, {d}] of {d} segments at {d} rows equals decode()", .{ set.name, n, k, set.ns.len, rows }), try r.back(o.out, rows * n * 2), w[0 .. rows * n * 2]);
+            if (g4) |*g| {
+                for (set.ns, qs, want) |n, q, w| {
+                    const o = try r.zeros(rows * n * 2);
+                    try g.decode(r.s, dx, dxs, q, o, rows);
+                    try check.sameBytes(try std.fmt.bufPrint(&name, "affine-4 [{d}, {d}]: GB10 decode() at {d} rows equals decode()", .{ n, k, rows }), try r.back(o, rows * n * 2), w[0 .. rows * n * 2]);
+                }
+                for (outs) |o| try (cuda.DeviceBuffer{ .d = gpu.d, .ptr = o.out, .len = most * o.q.n * 2 }).fill8(0xff, r.s.handle);
+                try g.decodeMany(r.s, dx, dxs, outs, rows);
+                for (outs, want, set.ns) |o, w, n|
+                    try check.sameBytes(try std.fmt.bufPrint(&name, "{s}: [{d}, {d}] of {d} GB10 segments at {d} rows equals decode()", .{ set.name, n, k, set.ns.len, rows }), try r.back(o.out, rows * n * 2), w[0 .. rows * n * 2]);
+            }
         }
     }
-    check.pass("affine4-decode: {d} sets by {d} row counts: every row count, one segment and every set's segmented launch byte-equal to decode() at 16 rows", .{ sets.len, row_counts.len });
+    check.pass("affine4-decode: {d} sets by {d} row counts: every row count, one segment and every set's segmented launch byte-equal to decode() at 16 rows{s}", .{ sets.len, row_counts.len, if (gb10) " (GB10's resolve too)" else "" });
 }
