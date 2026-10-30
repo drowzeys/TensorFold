@@ -7,6 +7,7 @@ const rig_ = @import("contract_rig.zig");
 const pointwise = @import("contract_lfm3v_pointwise.zig");
 const conv_k = @import("contract_lfm3v_conv.zig");
 const set_k = @import("contract_lfm3v_set.zig");
+const vit_k = @import("contract_lfm3v_vit.zig");
 
 const contract = core.contract;
 const c = contract.spec;
@@ -398,13 +399,17 @@ pub const Qk = struct {
 
 /// Every lfm3v kernel and its control, registered onto `kernels`; the controls from the contract_controls image `ctl`.
 pub const Set = struct {
+    const parts = .{ "rms", "qk", "residual", "silu", "conv", "set", "vit" };
+
     mod: ?cuda.Module = null,
+    pa: ?cuda.Module = null, // prefill_attention: vision_kernel<64, 8>
     rms: [2]Rms = undefined,
     qk: [2]Qk = undefined,
     residual: [2]pointwise.Add = undefined,
     silu: [2]pointwise.Silu = undefined,
     conv: [2]conv_k.Conv = undefined,
     set: [4]set_k.Attn = undefined,
+    vit: [2]vit_k.Vit = undefined,
 
     pub fn add(self: *Set, gpu: check.Gpu, s: cuda.Stream, ctl: cuda.Module, kernels: *std.ArrayList(g.Kernel)) !void {
         self.mod = try cuda.Module.load(gpu.d, cuda.kernels.lfm3v);
@@ -423,12 +428,19 @@ pub const Set = struct {
         for (&self.conv, both) |*x, ctrl| x.* = .{ .rig = rig, .f = try pick(m, ctl, ctrl, "lfm3v_conv"), .control = ctrl, .arena = .init(gpu.gpa) };
         const plain = try m.function("tf_lfm3v_set_attn");
         for (&self.set, set_k.forms) |*x, form| x.* = .{ .rig = rig, .form = form, .f = try (if (form.control) ctl else m).function(form.sym), .plain = plain, .arena = .init(gpu.gpa) };
-        inline for (.{ "rms", "qk", "residual", "silu", "conv", "set" }) |name| for (&@field(self, name)) |*x| try kernels.append(gpu.gpa, x.kernel());
+        self.pa = try cuda.Module.load(gpu.d, cuda.kernels.prefill_attention);
+        for (&self.vit, vit_k.forms) |*x, form| {
+            const f = try (if (form.control) ctl else self.pa.?).function(form.sym);
+            try f.allowDynamicShared(vit_k.smem);
+            x.* = .{ .rig = rig, .form = form, .f = f, .arena = .init(gpu.gpa) };
+        }
+        inline for (parts) |name| for (&@field(self, name)) |*x| try kernels.append(gpu.gpa, x.kernel());
     }
 
     pub fn deinit(self: *Set) void {
         var m = self.mod orelse return;
-        inline for (.{ "rms", "qk", "residual", "silu", "conv", "set" }) |name| for (&@field(self, name)) |*x| x.deinit();
+        inline for (parts) |name| for (&@field(self, name)) |*x| x.deinit();
+        if (self.pa) |*p| p.unload();
         m.unload();
     }
 };

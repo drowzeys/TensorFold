@@ -204,6 +204,8 @@ gate 4), the SwiGLU against float64 at its bf16 points within expf's ulps, the s
 its own question) against `attention_ref`'s bound, and its tiled form bit-equal to it. Seven controls, one a kernel: a
 dropped bf16 point in the norm, the q/k rows and the SwiGLU, the conv's neighbours in raster order, an add that loses a
 partial last block, query heads mapped to KV head h % 4, and a tile skipped by its first key's group alone.
+LFM3-VL's tower attention, `vision_kernel<64, 8>`, runs under the same `attention_ref` bound (every patch over every
+patch) at a 16 x 16, 14 x 20, 32 x 32 and 80 x 80 picture; its control reads its values from the neighbouring 8 dims.
 CUDA also checks Flash Next's NVFP4 experts on prompt tiles with the decode form's sums (SwiGLU gate-up and fp32
 down, each bit-equal to the decode instance it replaces; the scaled-code prompt tile is the planted control).
 
