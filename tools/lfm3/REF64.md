@@ -46,3 +46,17 @@ bf16-points misses where float64 agrees with the engine (margin = bf16 logit of 
 | items | prompt | 4 | 440 " The" | 229 " " | 0.0000 (pre-round -0.0985) | 0.0881 |
 | items | prompt | 631 | 32 "8" | 25 "1" | 0.0000 (pre-round -0.0467) | 0.0636 |
 | items | reply | 772 | 41501 " Item" | 1672 " So" | 0.0000 (pre-round -0.0814) | 0.1797 |
+
+## LFM3-VL vision tower and projector
+
+`vision_ref64.py MODEL_DIR IMAGE OUT.pt [--hf]` runs the tower and projector in float64 on the CPU, from the HF processor's `pixel_values`, on the stored bf16 weights. MLX keeps the depthwise conv as [C, 3, 3, 1] and torch as [C, 1, 3, 3]; the script reads both. `--hf` also runs transformers' `Lfm3VlVisionModel` and projector on the same weights and prints the gap, in float32 by default and in bf16 with `LFM3VL_HF_DTYPE=bf16`. That gives the "reference's own bf16" yardstick. `vision_check.py REF.pt compare OUT.bin` compares an engine's bf16 feature dump against the float64 features, and `dump` writes the pixels as bf16 for an engine.
+
+LFM3-VL-2B-MLX-4bit @ `c823fade`, the synthetic 217×300 picture from #1584's `patches_test.zig` (grid 1×14×20, 70 tokens), on a GB10:
+
+| features [70, 2048] against float64 | rel L2 | cos | worst row cos |
+|---|---|---|---|
+| transformers 5.19, fp32 | 1.46e-5 | 1.000000 | 1.000000 |
+| transformers 5.19, bf16 | 4.74e-2 | 0.998877 | 0.971098 |
+| a bf16 CUDA tower (jschmied/TensorFold:lfm3-vl-cuda-tower) | 3.38e-2 | 0.999430 | 0.980361 |
+
+A planted control (the grid passed as 20×14) gives rel 0.82 and cos 0.67.
