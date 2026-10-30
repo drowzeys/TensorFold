@@ -1,5 +1,6 @@
 //! A small HTTP/1.1 server for one LFM3-Omni engine: POST /v1/audio/chat takes a spoken turn (base64 WAV in JSON)
-//! and answers with interleaved text and 24 kHz speech, streamed as server-sent events or whole; GET /health.
+//! and answers with interleaved text and 24 kHz speech, streamed as server-sent events or whole; GET /health. Earlier
+//! turns of the conversation can come with it as text ("history"). A client that goes away stops its reply.
 //! One request at a time; requests queue on the listen backlog. The engine is either backend's (`e: anytype`).
 const std = @import("std");
 const core = @import("core");
@@ -58,6 +59,10 @@ const Conn = struct {
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.tokenizer.Tokenizer, o: Options) !void {
+    // a client that hangs up mid-reply (a voice agent's barge-in) must fail the send, not kill the server: macOS has
+    // no MSG_NOSIGNAL, and SIGPIPE's default action ends the process
+    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.PIPE, &ignore, null);
     const fd = socket(2, 1, 0);
     if (fd < 0) return error.Socket;
     defer _ = close(fd);
@@ -188,6 +193,22 @@ fn num(v: ?std.json.Value) ?f64 {
     };
 }
 
+/// Earlier turns as text, oldest first: `[{"role": "user" | "assistant", "content": "..."}]`; none when absent.
+fn readHistory(a: std.mem.Allocator, v: ?std.json.Value) ![]const prompt.Message {
+    const list = v orelse return &.{};
+    if (list == .null) return &.{};
+    if (list != .array) return error.BadHistory;
+    const out = try a.alloc(prompt.Message, list.array.items.len);
+    for (list.array.items, out) |item, *m| {
+        if (item != .object) return error.BadHistory;
+        const role = item.object.get("role") orelse return error.BadHistory;
+        const content = item.object.get("content") orelse return error.BadHistory;
+        if (role != .string or content != .string) return error.BadHistory;
+        m.* = .{ .role = role.string, .content = content.string };
+    }
+    return out;
+}
+
 fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.tokenizer.Tokenizer, o: Options, c: *Conn) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -208,6 +229,7 @@ fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.token
     if (pcm.len > e.o.max_input_s * mel.sample_rate) return badRequest(c, a, "the audio is longer than the server takes");
     const system = if (obj.get("system")) |v| (if (v == .string) v.string else o.system) else o.system;
     const stream_out = if (obj.get("stream")) |v| (v == .bool and v.bool) else true;
+    const history = readHistory(a, obj.get("history")) catch return badRequest(c, a, "history: a list of {\"role\": \"user\" or \"assistant\", \"content\": text}");
     var smp = o.smp;
     if (num(obj.get("audio_temperature"))) |x| smp.audio_temperature = @floatCast(x);
     if (num(obj.get("audio_repetition_penalty"))) |x| smp.audio_repetition_penalty = @floatCast(x);
@@ -219,7 +241,11 @@ fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.token
     var turn: Turn = .{ .a = a, .c = c, .tok = tok, .stream = stream_out, .t0 = t0, .io = io };
     const nf = try e.featuresDevice(pcm);
     const n_audio = try e.encode(null, nf);
-    const p = try prompt.build(a, tok, system, n_audio);
+    const p = prompt.buildWith(a, tok, system, history, n_audio) catch |err| switch (err) {
+        error.SpecialTokenInHistory => return badRequest(c, a, "history: special tokens are written by the prompt builder"),
+        error.HistoryRole => return badRequest(c, a, "history: role is user or assistant"),
+        else => return err,
+    };
     if (p.ids.len + smp.max_new + 1 > e.o.max_ctx) return badRequest(c, a, "the prompt and reply do not fit the window");
     try e.prefill(p.ids, p.audio_at, null);
     if (stream_out) try c.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");

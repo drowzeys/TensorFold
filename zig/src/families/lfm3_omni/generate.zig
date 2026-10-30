@@ -14,8 +14,9 @@ const usage =
     \\                          [--identity-order 1] [--seed 0] [--max-new 512] [--first-chunk 1] [--chunk 8]
     \\                          [--dump DIR] [--force DIR] [--repeat 1]
     \\
-    \\--serve: POST /v1/audio/chat {"audio": base64 WAV, "system"?, "stream"? (true), "audio_temperature"?, "seed"?,
-    \\  "max_new"?} answers with server-sent events (text deltas, base64 pcm16 24 kHz audio, then done) or one JSON.
+    \\--serve: POST /v1/audio/chat {"audio": base64 WAV, "system"?, "history"? ([{"role": "user" | "assistant",
+    \\  "content": text}], earlier turns oldest first), "stream"? (true), "audio_temperature"?, "seed"?, "max_new"?}
+    \\  answers with server-sent events (text deltas, base64 pcm16 24 kHz audio, then done) or one JSON.
     \\The input is any PCM or float WAV, resampled to 16 kHz; the reply is 16-bit PCM mono at 24 kHz.
     \\--dump DIR (an existing directory) writes the stages as raw little-endian arrays: mel.f32 [128, frames],
     \\  enc.f32 and audio_emb.f32 [tokens, ...], input_ids.i32, prefill_hidden.f32 [rows, 2048], first_logits.f32,
