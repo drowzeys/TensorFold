@@ -6,37 +6,28 @@ const core = @import("core");
 const Allocator = std.mem.Allocator;
 const vit = cuda.vit;
 
-pub const family: api.Family = .{ .model_type = "embedding_gemma2", .formats = &.{"bf16"} };
-
-// config.json's text_config (checked at load)
-const hidden = 512;
-const inter = 2048;
-const layers = 24;
-const per_layer = 512; // hidden_size_per_layer_input
-const heads = 4;
-const vocab = 262144;
-const dim = 768; // embedding_dim
-const window = 512; // sliding_window: |q - k| <= 512 on the sliding layers
-const eps: f32 = 1e-6;
-const context = 8192;
-/// Tokens a batch at most (every input's rows together).
-const max_rows = 8192;
-const max_inputs = 128;
-const mrl = [_]u32{ 512, 256, 128 };
-
-/// Layers 5, 11, 17 and 23 attend over the whole input with 512-wide heads and one kv head; the rest slide.
-fn full(i: usize) bool {
-    return i % 6 == 5;
-}
-fn headDim(i: usize) usize {
-    return if (full(i)) 512 else 256;
-}
-fn kvHeads(i: usize) usize {
-    return if (full(i)) 1 else 2;
-}
-fn qkvWidth(i: usize) usize {
-    return (heads + 2 * kvHeads(i)) * headDim(i);
-}
+const geo = @import("embgemma2_geometry.zig");
+pub const family = geo.family;
+const hidden = geo.hidden;
+const inter = geo.inter;
+const layers = geo.layers;
+const per_layer = geo.per_layer;
+const heads = geo.heads;
+const vocab = geo.vocab;
+const dim = geo.dim;
+const window = geo.window;
+const eps = geo.eps;
+const context = geo.context;
+const max_rows = geo.max_rows;
+const max_inputs = geo.max_inputs;
+const mrl = geo.mrl;
+const full = geo.full;
+const headDim = geo.headDim;
+const kvHeads = geo.kvHeads;
+const qkvWidth = geo.qkvWidth;
+const key = geo.key;
+const bf16f = geo.bf16f;
+const admit = geo.admit;
 
 const Layer = struct {
     qkv: u64,
@@ -109,15 +100,6 @@ const Loader = struct {
     }
 };
 
-fn key(b: []u8, i: usize, s: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(b, "language_model.layers.{d}.{s}", .{ i, s });
-}
-
-fn bf16f(bytes: []const u8) f32 {
-    const bits: u32 = @as(u32, std.mem.readInt(u16, bytes[0..2], .little)) << 16;
-    return @bitCast(bits);
-}
-
 fn load(gpa: Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8) !Weights {
     var ck = try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
@@ -159,22 +141,6 @@ fn load(gpa: Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8) !Wei
         l.scalar = bf16f(try x.tensor(try key(&b1, i, "layer_scalar"), &.{1}));
     }
     return w;
-}
-
-/// config.json must be this geometry: the kernels and buffers are sized for it.
-fn admit(a: Allocator, io: std.Io, dir: []const u8) !void {
-    const path = try std.fs.path.join(a, &.{ dir, "config.json" });
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 22));
-    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
-    const t = (v.object.get("text_config") orelse return error.NoTextConfig).object;
-    const want = .{ .{ "hidden_size", hidden }, .{ "intermediate_size", inter }, .{ "num_hidden_layers", layers }, .{ "num_attention_heads", heads }, .{ "num_key_value_heads", 2 }, .{ "head_dim", 256 }, .{ "vocab_size", vocab }, .{ "embedding_dim", dim }, .{ "sliding_window", window }, .{ "hidden_size_per_layer_input", per_layer } };
-    inline for (want) |p| {
-        const got = t.get(p[0]) orelse return error.EmbeddingGemma2Geometry;
-        if (got != .integer or got.integer != p[1]) return error.EmbeddingGemma2Geometry;
-    }
-    const types = (t.get("layer_types") orelse return error.EmbeddingGemma2Geometry).array.items;
-    if (types.len != layers) return error.EmbeddingGemma2Geometry;
-    for (types, 0..) |ty, i| if (!std.mem.eql(u8, ty.string, if (full(i)) "full_attention" else "sliding_attention")) return error.EmbeddingGemma2Geometry;
 }
 
 const Glue = struct {
@@ -316,7 +282,7 @@ const Engine = struct {
             var a: cuda.Args = .{};
             for ([_]u64{ b.ids, e.w.embed, b.h }) |p| a.add(p);
             a.add(@as(c_int, hidden));
-            a.add(@as(f32, 22.625)); // sqrt(512) in bf16
+            a.add(geo.embed_scale); // sqrt(512) in bf16
             try e.launch(e.glue.embed, .{ .x = @intCast(n) }, 128, &a);
         }
         // the per-layer inputs: one projection of the embeddings, scaled by 512^-0.5 and normed per layer slice
@@ -333,7 +299,7 @@ const Engine = struct {
                 a.add(@as(c_int, heads));
                 a.add(@as(c_int, @intCast(kv)));
                 a.add(@as(c_int, @intCast(hd)));
-                a.add(@as(f32, if (full(i)) 1e6 else 1e4));
+                a.add(geo.theta(i));
                 a.add(eps);
                 try e.launch(e.glue.qkv, .{ .x = @intCast(n), .y = @intCast(heads + 2 * kv) }, 128, &a);
             }

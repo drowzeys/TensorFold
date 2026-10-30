@@ -71,8 +71,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_eg2_rms(const __nv_bfloat16
     }
 }
 
-// qkv [rows, (hq + 2 * hkv) * hd] in place: q and k RMSNorm with their weights then RoPE at the row's position in
-// its input, v RMSNorm without a scale. A block of 128 per (row, head), hd <= 512.
+// q, k: RMSNorm with weights then RoPE at the row's position in its input; v: RMSNorm. 128 threads a (row, head).
 extern "C" __global__ void __launch_bounds__(128) tf_eg2_qkv(__nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ qn,
                                                              const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, int hq, int hkv,
                                                              int hd, float theta, float eps) {
@@ -121,8 +120,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_eg2_qkv(__nv_bfloat16* __re
     }
 }
 
-// out [rows, hq * hd] = softmax(q k^T) v over the row's own input (lo[row] <= key < hi[row]), and within `window`
-// positions either side when window > 0; scale 1 (the q/k norms carry it). A warp per (row, q head); hd 256 or 512.
+// softmax(q k^T) v over lo[row] <= key < hi[row], within `window` either side when set, scale 1: a warp a (row, head).
 template <int D>
 __device__ __forceinline__ void attend(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out, const int* __restrict__ lo,
                                        const int* __restrict__ hi, int rows, int hq, int hkv, int window) {
@@ -168,9 +166,7 @@ __device__ __forceinline__ void attend(const __nv_bfloat16* __restrict__ qkv, __
     for (int i = 0; i < per; ++i) o[lane + 32 * i] = __float2bfloat16_rn(acc[i] / l);
 }
 
-// The same attention with key and value rows shared: a block of 4 warps takes R query rows a warp (4R consecutive
-// rows) for one q head, and reads the keys and values its rows need once, KT rows at a time, into shared memory. A
-// row skips keys outside its own input and window. One row's arithmetic is the same as `attend`'s, in the same order.
+// `attend` with keys and values shared: 4 warps of R rows read their keys KT at a time into shared memory, same order.
 template <int D, int R, int KT>
 __device__ __forceinline__ void attend_tiled(const __nv_bfloat16* __restrict__ qkv, __nv_bfloat16* __restrict__ out,
                                              const int* __restrict__ lo, const int* __restrict__ hi, int rows, int hq, int hkv,
@@ -288,8 +284,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_eg2_attn512(const __nv_bflo
     attend<512>(qkv, out, lo, hi, rows, hq, hkv, window);
 }
 
-// h = rbf(h + rbf(RMSNorm(x) * wp)), then h = rbf(h * scalar) when scalar != 1, then y = RMSNorm(h) * wn when wn is set:
-// a sub-block's post norm, its residual add, the layer scalar and the next norm in one pass. A block of 128 a row, n <= 512.
+// post norm, residual, layer scalar and the next norm in one pass: h += rbf(norm(x) * wp); y = norm(h) * wn when set.
 extern "C" __global__ void __launch_bounds__(128) tf_eg2_add_norm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ wp,
                                                                   __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ wn,
                                                                   __nv_bfloat16* __restrict__ y, int n, float eps, float scalar) {
@@ -350,8 +345,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_eg2_ple_gate(const __nv_bfl
     y[i] = __float2bfloat16_rn(__fmul_rn(a, bf(pli[(r * layers + layer) * n + c])));
 }
 
-// out [inputs, dim] f32 = L2-normalised (mean of x's rows for each input) projected by w [dim, n]: mean pooling,
-// the embedding projection (linear, so taken once after the mean) and the normalisation. A block of 256 an input.
+// Mean pooling, the projection (linear, so taken on the mean) and L2 normalisation: a block of 256 an input.
 extern "C" __global__ void __launch_bounds__(256) tf_eg2_pool(const __nv_bfloat16* __restrict__ x, const int* __restrict__ ends,
                                                               const __nv_bfloat16* __restrict__ w, float* __restrict__ out, int n, int dim) {
     __shared__ float mean[512];
