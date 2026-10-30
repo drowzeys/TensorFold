@@ -77,8 +77,18 @@ on MPS); the GPU was shared with other work throughout:
   Read causally (`TF_D1_ATTENTION=causal`, against fp32's causal reading): routes 52 of 52, 0.0099 (bf16 0.0155).
 - d1 latency, a request end to end, median of 10: one question 19.1 ms, the router 21.1 ms, three questions over 4
   and 8 frames (448 x 252) 69.4 and 123.1 ms (transformers bf16 on MPS: 20.0, 29.3, 77.6 and 123.3 ms).
+- LFM3-VL-2B, 44 synthetic stills with a camera question each, greedy, 48 tokens: replies identical to fp32 on 42
+  of 44 (transformers bf16: 41) and to transformers bf16 on 43; teacher-forced along the engine's tokens, its top-20
+  probabilities sit 0.000264 from fp32 on average (bf16 0.000318), 0.0053 a row (bf16 0.0063, its cached decode rows
+  0.0062), and it picks fp32's top token on 538 of 540 rows (bf16 537; the two misses 0.18 and 0.043 nats apart).
+  The largest single difference is 0.135 (bf16 0.092), the prompt's last row at most 0.0080 (bf16 0.0062).
+- Eight text-only prompts: short, 0.000615 from fp32 a probability (bf16 0.000603), 237 of 238 top tokens (bf16 234);
+  after a 420-token passage, 0.000606 (bf16 0.000604) and 261 of 270 (bf16 265), a row 0.0121 (bf16 0.0121, its
+  cached decode rows 0.0126). The passage repeats one sentence, so near ties are many.
 - LFM3-VL-2B, camera answers (36 questions, one 640 x 480 picture each, no prompt cache): first word 0.082 s, the
   whole answer 0.163 s (transformers bf16 on MPS: 0.074 s and 0.164 s); a decode row about 6.4 ms.
+- The GEMM against the register kernels on the same rows: 14 to 20 of 65,536 bf16 outputs differ by one rounding,
+  with the same mean error from float64 (K 1024 to 4096); its sums are fp32.
 
 The bf16 weights are under the LFM Open License v1.0, as the MLX exports.
 
