@@ -8,6 +8,7 @@ const weights = @import("cuda_draft_weights.zig");
 pub const tree = @import("cuda_draft_tree.zig");
 const profile = @import("cuda_startup_profile.zig");
 pub const precision = @import("cuda_draft_precision.zig");
+const resume_ = @import("cuda_draft_resume.zig");
 
 const E = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
@@ -43,6 +44,8 @@ pub const Ctx = struct {
     // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
     scanned: usize = 0,
     wide: bool = false,
+    // a released context's stream tokens: a later stream with the same prefix keeps its rows (cuda_draft_resume.zig)
+    toks: std.ArrayList(u32) = .empty,
 };
 
 pub const Draft = struct {
@@ -219,6 +222,7 @@ pub const Draft = struct {
     }
 
     fn drop(d: *Draft, ctx: *Ctx) void {
+        ctx.toks.deinit(d.gpa);
         ctx.ring.free();
         d.gpa.destroy(ctx);
     }
@@ -410,9 +414,9 @@ pub const Draft = struct {
             ctx.* = .{ .ring = .{ .d = d.e.d, .ptr = ptr, .len = d.c.ringBytes(), .borrowed = true } };
             return d.streams.put(d.gpa, s, ctx);
         };
-        const ctx = d.pool.pop() orelse try d.create();
+        const ctx = resume_.take(d, s) orelse d.pool.pop() orelse try d.create();
         errdefer d.pool.append(d.gpa, ctx) catch d.drop(ctx);
-        ctx.* = .{ .ring = ctx.ring };
+        resume_.open(ctx, s);
         try d.streams.put(d.gpa, s, ctx);
     }
 
@@ -483,6 +487,7 @@ pub const Draft = struct {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
+            resume_.keep(d.gpa, kv.value, s);
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }
     }
@@ -502,6 +507,7 @@ pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
 
 test {
     _ = tree;
+    _ = resume_;
 }
 
 test "a drafter config with a zero divisor is refused, and any admitted rank's selector rows fit the staging area" {
