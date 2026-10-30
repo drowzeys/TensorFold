@@ -424,4 +424,14 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_ctl_pattn_128(const __nv
     auto first_row = [] { return blockIdx.x * 16 * (WARPS / HPC); };
 #include "prefill_attention_rows.cuh"
 }
+// The same fault in vision_kernel<64, 8> (LFM3-VL's tower, 16 heads of 64): values from the neighbouring 8 dims.
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_vision_64(const __nv_bfloat16* __restrict__ qkv,
+                                                                   __nv_bfloat16* __restrict__ out, int W, int HO,
+                                                                   float scale) {
+    constexpr int D = 64, WARPS = 8;
+#include "prefill_attention_vision.cuh"
+}
 }  // namespace tf_prefill_attention
+
+// LFM3-VL vision glue and d1 set attention (lfm3v.cu): one twin a kernel, each with one realistic defect.
+#include "lfm3v_controls.cuh"
