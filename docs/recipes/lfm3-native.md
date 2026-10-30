@@ -42,6 +42,46 @@ flowchart LR
   D --> L[Existing lane engine]
 ```
 
+## The bf16 releases: d1-2B and LFM3-VL-2B
+
+The bf16 releases as published (no quantization entry in `config.json`, transformers 5's `model.language_model.`
+layout) load on Metal beside the MLX exports: [`LiquidAI/LFM3-VL-2B`](https://huggingface.co/LiquidAI/LFM3-VL-2B)
+at `ba44bd51db20a2753f28c273a1571ccaa210d954` chats with images, and [`LiquidAI/d1-2B`](https://huggingface.co/LiquidAI/d1-2B)
+at `cfe5760ff5d5998f91d9ac56bd4b2dbd96996d41` (an `lfm3_vl` checkpoint with `d1_*` settings) decides.
+
+```sh
+./zig-out/native/bin/tensorfold-native serve MODELS/LFM3-VL-2B --vision --vision-image-tokens 1600 --no-thinking --context 8192
+./zig-out/native/bin/tensorfold-native serve MODELS/d1-2B
+```
+
+- Projections read the stored bf16 matrices: up to 32 rows on register kernels (Spark2.5's `sp_matvec`), more on the
+  tensor-unit GEMM (`gemm_nax`, fp32 sums); a prompt chunk is 512 rows. The tied head is the embedding.
+- `--vision-image-tokens 1600` gives each picture the processor's own reach (smart_resize, 1280 x 1280 at most);
+  the default 256 resizes larger pictures down. `logprobs` and `top_logprobs` are served for every LFM3 checkpoint.
+- The image tower's products take the same GEMM (an image's rows fill it), its attention stages 32 keys a threadgroup
+  (`l3v_attention_tiled`, bit for bit the row loop), and a decision's pictures run through the tower together.
+- d1 serves `/v1/systemone` and `/v1/decisions` (`zig/src/native/lfm3_d1.zig`): the answer slot opens with
+  `<think></think>`, option scores take `calibration.json`'s temperature, up to 16 pictures a decision (each under
+  `d1_vision_max_pixels`, Pillow's bicubic then smart_resize). `d1_attention: "set"` packs up to `d1_set_size`
+  questions after their state in one pass: on full-attention layers the state reads everything and a question its
+  state and itself (`lfm3_set_attention`); convolution and sliding layers stay causal. `TF_D1_ATTENTION=causal` reads
+  one question a pass. A label's logit is the final row against the bf16 head in float64, not a bf16 logits row.
+
+Receipt, M5 Ultra, against transformers 5.21 running each checkpoint's own code on the same Mac (fp32 on the CPU, bf16
+on MPS); the GPU was shared with other work throughout:
+
+- d1 (`set`, the checkpoint's reading), against fp32: the 52 router turns pick fp32's route 52 of 52, probabilities at
+  most 0.0072 apart (transformers bf16: 52 of 52, 0.0152); six yes/no pairs 0.0036 (0.0039); 20 synthetic clips x 3
+  questions agree 59 of 60 at 4 frames, at most 0.038 and 0.0040 on average apart (bf16: 58 of 60, 0.047, 0.0055),
+  and 59 of 60 at 8 frames, 0.022 and 0.0034 (bf16: 60 of 60, 0.015, 0.0026); clip accuracy 0.80 as the reference.
+  Read causally (`TF_D1_ATTENTION=causal`, against fp32's causal reading): routes 52 of 52, 0.0099 (bf16 0.0155).
+- d1 latency, a request end to end, median of 10: one question 19.1 ms, the router 21.1 ms, three questions over 4
+  and 8 frames (448 x 252) 69.4 and 123.1 ms (transformers bf16 on MPS: 20.0, 29.3, 77.6 and 123.3 ms).
+- LFM3-VL-2B, camera answers (36 questions, one 640 x 480 picture each, no prompt cache): first word 0.082 s, the
+  whole answer 0.163 s (transformers bf16 on MPS: 0.074 s and 0.164 s); a decode row about 6.4 ms.
+
+The bf16 weights are under the LFM Open License v1.0, as the MLX exports.
+
 ## Inspect a checkpoint
 
 Use Python 3.11 or newer. The inspector uses the standard library. It resolves a full Hugging Face commit,
@@ -121,6 +161,6 @@ python3 tools/lfm3/serve_check.py --binary ./zig-out/native/bin/tensorfold-nativ
 ```
 
 Long-context model fidelity, maximum image budgets, 6/8-bit performance and other Apple GPU generations remain separate qualification work.
-Structured output requires the native grammar library; logprobs and video are not advertised.
+Structured output requires the native grammar library; video is not advertised.
 A complete earlier global M5 contract run found one Qwen4 failure that also reproduces on the unchanged pinned base.
 It is not a final-source global pass. Agree model-fidelity and performance gates on #1491 before claiming release readiness.
