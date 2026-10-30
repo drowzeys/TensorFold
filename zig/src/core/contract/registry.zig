@@ -384,7 +384,7 @@ pub fn checkCuda(a: std.mem.Allocator, list: []const CudaRecord, quiet: bool) !u
     return n;
 }
 /// Metal pipelines as the engine launches them; tg_memory is the most any chip reflects, m1 and m2 the compiled limits.
-pub const metal = @import("fsr_records.zig").metal ++ [_]M{
+pub const metal = @import("fsr_records.zig").metal ++ @import("embgemma2_records.zig").metal ++ [_]M{
     .{ .name = "softmax tf_softmax_bf16", .threads = 1024, .tg_memory = 256, .m1 = 1024, .m2 = 1024 },
     .{ .name = "rms tf_rms_norm_bf16", .threads = 1024, .tg_memory = 144, .m1 = 1024, .m2 = 1024 },
     .{ .name = "top-k tf_bf16_topk", .threads = 256, .tg_memory = 4096, .m1 = 768, .m2 = 768 },
@@ -544,7 +544,7 @@ pub const metal = @import("fsr_records.zig").metal ++ [_]M{
 pub const metal_controls = [_]M{
     .{ .name = "control: row projection q4 g64 at 1024 threads tf_row_projection_q4_f32", .threads = 1024, .tg_memory = 0, .m1 = 512, .m2 = 512 },
     .{ .name = "control: 36 KiB tf_ctl_big_tg", .threads = 256, .tg_memory = 36 * 1024 },
-};
+} ++ @import("embgemma2_records.zig").controls;
 /// Every Metal launch's problems on every family we serve, printed; returns how many.
 pub fn checkMetal(a: std.mem.Allocator, list: []const M, quiet: bool) !usize {
     var out: std.ArrayList(u8) = .empty;

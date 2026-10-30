@@ -17,6 +17,8 @@ pub const gemma4_fused = @embedFile("gemma4/fused.metal");
 pub const gemma4_prompt_attention = @embedFile("gemma4/prompt_attention.metal");
 /// Gemma 4's image tower: gemm_nax and its glue (families/gemma4/vision.zig).
 pub const gemma4_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("gemma4/vision.metal");
+/// EmbeddingGemma-2: gemm_nax, its projections and glue, then its attention (native/embgemma2_model.zig).
+pub const embgemma2 = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("embgemma2/eg2.metal") ++ @embedFile("embgemma2/eg2_attention.metal");
 
 /// LFM2-MoE: embedding, norms, the short conv, attention, the route and the experts' glue.
 pub const lfm2 = @embedFile("lfm2/lfm2.metal") ++ @embedFile("lfm2/lfm2_segments.metal");

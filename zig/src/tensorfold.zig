@@ -23,6 +23,8 @@ pub const lanes = @import("lanes");
 pub const segments = @import("core/segments.zig");
 pub const row_projection = @import("core/row_projection.zig");
 pub const frags = @import("core/frags.zig");
+/// EmbeddingGemma-2's Metal kernel source (native/embgemma2_model.zig compiles it with frags.source).
+pub const embgemma2_kernels = @import("kernel_sources").embgemma2;
 pub const affine_mm = @import("core/affine_mm.zig");
 /// The checkpoint formats (MLX affine and its fp64 reader for the device checks, exact widen).
 pub const quant = @import("core/quant/quant.zig");
