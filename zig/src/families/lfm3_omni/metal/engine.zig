@@ -1,6 +1,7 @@
 //! LFM3-Omni-2B on Metal (Apple silicon): the log-mel front end, the speech encoder and its projector, the LFM3
 //! backbone, the depth decoder that writes each speech frame's 12 codes, and the Liquid codec's decoder streaming
-//! 24 kHz audio. bf16 weights as released, in unified memory; one request at a time. The CUDA engine's operations and
+//! 24 kHz audio; pictures through the LFM3-VL vision tower and projector (vision.zig). bf16 weights as released, in
+//! unified memory; one request at a time. The CUDA engine's operations and
 //! public calls, so generate.zig and serve.zig drive either.
 const std = @import("std");
 const st = @import("core").safetensors;
@@ -8,6 +9,8 @@ const metallib = @import("lfm3_omni_metallib");
 const gpu = @import("gpu.zig");
 const kern = @import("kernels.zig");
 const stack = @import("stack.zig");
+const vision = @import("vision.zig");
+const image = @import("../image.zig");
 const melmod = @import("../mel.zig");
 const cfg = @import("../config.zig");
 const common = @import("../common.zig");
@@ -25,6 +28,8 @@ pub const Options = struct {
     /// Longest reply in speech frames (12.5 a second) and the codec's largest chunk.
     max_frames: usize = 1024,
     codec_chunk: usize = 64,
+    /// Language tokens of pictures a request takes (4 patches each); the processor's own bound, 2,048, by default.
+    max_image_tokens: usize = image.max_tokens,
     /// Accepted for the CUDA engine's flags; Metal encodes each row's dispatches into one command buffer.
     graphs: bool = true,
 };
@@ -77,6 +82,7 @@ pub const Engine = struct {
     window: [cfg.n_fft]f32,
 
     enc: Stack,
+    vis: vision.Vision,
     bb: Stack,
     depth: Stack,
     codec: Stack,
@@ -131,6 +137,9 @@ pub const Engine = struct {
     h1: u64,
     audio_emb: u64,
     audio_tokens: usize = 0,
+    /// The pictures' projected rows (bf16 [image_tokens, 2048], pictures in order) and how many.
+    image_emb: u64,
+    image_tokens: usize = 0,
     /// The newest backbone row's hidden state (bf16 on the device).
     last: u64 = 0,
     ids: u64,
@@ -184,6 +193,7 @@ pub const Engine = struct {
         e.io = io;
         e.o = o;
         e.audio_tokens = 0;
+        e.image_tokens = 0;
         e.last = 0;
         e.prof = if (std.c.getenv("LFM3_OMNI_PROFILE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
         e.prof_s = @splat(0);
@@ -207,6 +217,7 @@ pub const Engine = struct {
         e.g.flush() catch {};
         e.gpa.free(e.host_frames);
         e.gpa.free(e.host_logits);
+        e.vis.deinit(e.gpa);
         for ([_]*Stack{ &e.enc, &e.bb, &e.depth, &e.codec }) |s| e.gpa.free(s.layers);
         e.g.close();
         e.gpa.destroy(e.mel);
@@ -221,11 +232,12 @@ pub const Engine = struct {
         const gpa = e.gpa;
         const mpath = try std.fs.path.join(gpa, &.{ dir, "model.safetensors" });
         defer gpa.free(mpath);
-        var f = try st.File.openPrefixes(gpa, e.io, mpath, &.{ "model.audio_encoder.", "model.audio_projector.", "model.language_model.", "model.codebook_embedding.", "model.depth_decoder." });
+        var f = try st.File.openPrefixes(gpa, e.io, mpath, &.{ "model.audio_encoder.", "model.audio_projector.", "model.language_model.", "model.codebook_embedding.", "model.depth_decoder.", "model.vision_tower.", "model.multi_modal_projector." });
         defer f.close(e.io);
         const a = &e.a;
         const max_tokens = melmod.tokens(melmod.frames(e.o.max_input_s * melmod.sample_rate));
         e.enc = try stack.load(gpa, a, &f, cfg.encoderSpec(max_tokens));
+        e.vis = try vision.Vision.load(gpa, a, &f, e.o.max_image_tokens);
         e.bb = try stack.load(gpa, a, &f, cfg.backboneSpec(e.o.prefill_rows, e.o.max_ctx));
         e.depth = try stack.load(gpa, a, &f, cfg.depthSpec());
         const p = "model.audio_encoder.downsample.";
@@ -331,6 +343,7 @@ pub const Engine = struct {
         e.ln_out = try a.alloc(T * cfg.enc_d * 2);
         e.h1 = try a.alloc(T * cfg.hidden * 2);
         e.audio_emb = try a.alloc(T * cfg.hidden * 2);
+        e.image_emb = try a.alloc(e.o.max_image_tokens * cfg.hidden * 2);
         const R = e.o.prefill_rows;
         e.ids = try a.alloc(R * 4);
         e.bb_x = try a.alloc(R * cfg.hidden * 2);
@@ -468,11 +481,59 @@ pub const Engine = struct {
         return w3;
     }
 
+    // ---- pictures in
+
+    /// Pictures (the processor's patches) through the vision tower and projector: `image_emb` holds their rows, one a
+    /// language token, pictures in order. Returns the tokens.
+    pub fn encodeImages(e: *Engine, pictures: []const image.Prepared) !usize {
+        var list: [16]vision.Picture = undefined;
+        if (pictures.len > list.len) return error.TooManyImages;
+        var tokens: usize = 0;
+        for (pictures, 0..) |p, i| {
+            list[i] = .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw };
+            tokens += p.tokens();
+        }
+        if (tokens > e.o.max_image_tokens) return error.ImageTooLarge;
+        e.image_tokens = try e.vis.run(&e.k, list[0..pictures.len], e.image_emb);
+        return e.image_tokens;
+    }
+
+    /// The tower's last hidden state (bf16 [patches, 1024]) of the last `encodeImages`, for checks.
+    pub fn towerOut(e: *const Engine) u64 {
+        return e.vis.towerOut();
+    }
+
     // ---- the backbone
+
+    /// Rows of the prompt taken from an encoder instead of the embedding table: `rows` rows from `at`, from `src`.
+    pub const Span = struct { at: usize, rows: usize, src: u64 };
 
     /// Prompt rows through the backbone from an empty window: token ids, with the `audio_tokens` placeholder rows
     /// (contiguous, from `audio_at`) taken from the encoder. `hidden_out`, if given, receives every row's state (fp32).
     pub fn prefill(e: *Engine, ids: []const u32, audio_at: usize, hidden_out: ?[]f32) !void {
+        return e.prefillSpans(ids, &.{.{ .at = audio_at, .rows = e.audio_tokens, .src = e.audio_emb }}, hidden_out);
+    }
+
+    /// `prefill` with pictures: the speech span at `audio_at`, and each picture's `<|image|>` rows (from `images`, in
+    /// order) taken from `image_emb` in turn.
+    pub fn prefillMedia(e: *Engine, ids: []const u32, audio_at: usize, images: []const usize, hidden_out: ?[]f32) !void {
+        var spans: [17]Span = undefined;
+        if (images.len + 1 > spans.len) return error.TooManyImages;
+        spans[0] = .{ .at = audio_at, .rows = e.audio_tokens, .src = e.audio_emb };
+        var row: usize = 0;
+        for (images, 1..) |at, i| {
+            var n: usize = 0;
+            while (at + n < ids.len and ids[at + n] == cfg.image_token_id) n += 1;
+            if (n == 0 or row + n > e.image_tokens) return error.ImageRows;
+            spans[i] = .{ .at = at, .rows = n, .src = e.image_emb + row * cfg.hidden * 2 };
+            row += n;
+        }
+        if (row != e.image_tokens) return error.ImageRows;
+        return e.prefillSpans(ids, spans[0 .. images.len + 1], hidden_out);
+    }
+
+    /// Prompt rows through the backbone from an empty window, the `spans`' rows from their encoders.
+    pub fn prefillSpans(e: *Engine, ids: []const u32, spans: []const Span, hidden_out: ?[]f32) !void {
         const k = &e.k;
         const R = e.o.prefill_rows;
         e.bb.reset();
@@ -485,16 +546,19 @@ pub const Engine = struct {
             const t = @min(R, ids.len - at);
             for (0..t) |j| {
                 const g = at + j;
-                const audio = g >= audio_at and g < audio_at + e.audio_tokens;
-                ibuf[j] = if (audio) -1 else @intCast(ids[g]);
+                var taken = false;
+                for (spans) |sp| taken = taken or (g >= sp.at and g < sp.at + sp.rows);
+                ibuf[j] = if (taken) -1 else @intCast(ids[g]);
             }
             // a chunk's ids in order with the previous chunk's work
             var w: usize = 0;
             while (w < t) : (w += 1024) e.g.set(e.ids + w * 4, std.mem.sliceAsBytes(ibuf[w..@min(t, w + 1024)]));
             k.embed(e.embed, e.ids, e.bb_x, t, cfg.hidden);
-            const lo = @max(at, audio_at);
-            const hi = @min(at + t, audio_at + e.audio_tokens);
-            if (hi > lo) e.d2d(e.bb_x + (lo - at) * cfg.hidden * 2, e.audio_emb + (lo - audio_at) * cfg.hidden * 2, (hi - lo) * cfg.hidden * 2);
+            for (spans) |sp| {
+                const lo = @max(at, sp.at);
+                const hi = @min(at + t, sp.at + sp.rows);
+                if (hi > lo) e.d2d(e.bb_x + (lo - at) * cfg.hidden * 2, sp.src + (lo - sp.at) * cfg.hidden * 2, (hi - lo) * cfg.hidden * 2);
+            }
             try e.bb.forward(k, e.bb_x, t, e.bb_out);
             if (hidden_out) |ho| {
                 try e.d2h(std.mem.sliceAsBytes(hb[0 .. t * cfg.hidden]), e.bb_out);

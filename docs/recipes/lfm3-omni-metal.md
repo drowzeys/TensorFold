@@ -1,10 +1,11 @@
-# LFM3-Omni-2B speech to speech, native Metal
+# LFM3-Omni-2B speech (and pictures) to speech, native Metal
 
 `lfm3_omni` also runs LiquidAI's [`LiquidAI/LFM3-Omni-2B`](https://huggingface.co/LiquidAI/LFM3-Omni-2B) (revision
-`5797d07c125503bd4f4c0e7f915ae2d3d703e8de`) on Apple silicon: a spoken turn in, interleaved text and 24 kHz speech out,
-streamed. Same weights (the bf16 release as stored, the bundled Liquid codec included), same tool and server as the
-CUDA port ([lfm3-omni-cuda.md](lfm3-omni-cuda.md)); the engine is `zig/src/families/lfm3_omni/metal/` over one
-metallib (`zig/kernels/metal/lfm3_omni/`). Checked on an M5 Ultra (macOS 27). The vision tower is not loaded.
+`5797d07c125503bd4f4c0e7f915ae2d3d703e8de`) on Apple silicon: a spoken turn in, with pictures if any, interleaved text
+and 24 kHz speech out, streamed. Same weights (the bf16 release as stored, the bundled Liquid codec included), same tool
+and server as the CUDA port ([lfm3-omni-cuda.md](lfm3-omni-cuda.md)); the engine is `zig/src/families/lfm3_omni/metal/`
+over one metallib (`zig/kernels/metal/lfm3_omni/`). Checked on an M5 Ultra (macOS 27). Pictures are Metal only for
+now (the CUDA engine refuses them); video is not taken.
 
 ```bash
 hf download LiquidAI/LFM3-Omni-2B --revision 5797d07c125503bd4f4c0e7f915ae2d3d703e8de --local-dir "$HOME/models/lfm3-omni-2b"
@@ -12,11 +13,31 @@ hf download LiquidAI/LFM3-Omni-2B --revision 5797d07c125503bd4f4c0e7f915ae2d3d70
 zig build lfm3-omni-generate -Doptimize=ReleaseFast
 zig-out/bin/lfm3-omni-generate --model "$HOME/models/lfm3-omni-2b" --wav question.wav --out reply.wav \
   --system "Respond with interleaved text and audio. You are a helpful voice assistant."
+zig-out/bin/lfm3-omni-generate --model "$HOME/models/lfm3-omni-2b" --wav question.wav --image frame.png --out reply.wav
 zig-out/bin/lfm3-omni-generate --model "$HOME/models/lfm3-omni-2b" --serve 127.0.0.1:8441 --system-file system.txt
 ```
 
 `POST /v1/audio/chat` and `GET /health` are the CUDA recipe's (server-sent text deltas, base64 16-bit 24 kHz audio
-chunks, a `done` event with the timings). About 4.4 GB of unified memory.
+chunks, a `done` event with the timings), and the request may carry `"images"`: a list of base64 PNG or JPEG pictures
+(or `data:` URLs of them; `"image"` for one), at most 8 a turn. They go in the spoken turn before its speech, as the chat
+template places an image part before an audio part. JPEG needs the pinned libjpeg-turbo the shared picture decoder
+loads; a client that has a JPEG can send it as PNG. About 5.2 GB of unified memory (the vision tower and projector
+0.38 GB, and their scratch for the processor's largest picture, 2,048 tokens).
+
+## Pictures
+
+The checkpoint's `Lfm3VlImageProcessor` on the host, as `processor_config.json` sets it for Omni (65,536 to 2,097,152
+pixels): smart_resize to multiples of 32, torch's antialiased uint8 bicubic (`core/picture/resample.zig`, skipped
+when the picture is already on the grid), `(x - 127.5) / 127.5` in fp32 (the fused rescale and normalize), patches of
+16 x 16 in merge order, each channel's patch twice. A 640 x 480 camera frame is 40 x 30 patches, 300 tokens. Then the
+LFM3-VL tower (Omni's `vision_config` is LFM3-VL-2B's: 14 layers, gated 3 x 3 depthwise convolutions and, on the even
+layers from 2 on, bidirectional attention with 16 query and 8 key heads and axial RoPE, SwiGLU 2560; checked at load)
+and the projector (a per-patch LayerNorm, four merge-order patches a row, 4096 -> 4096 with GELU, -> 2048). The
+tower's own operators come from the LFM3-VL Metal port (`zig/kernels/metal/lfm3/vision.metal`: the convolution, the
+head norms with the axial rotation, the tiled attention, RMSNorm, SwiGLU, the LayerNorm), in
+`zig/kernels/metal/lfm3_omni/omni_vision.metal`; its products and the projector's take the family's GEMM (the tensor
+unit on an M5) and its bias-and-activation kernel (`metal/vision.zig`). The projected rows replace the `<|image|>`
+rows of the prompt, as the speech encoder's rows replace `<|audio|>` (`prefillMedia`).
 
 ## What runs
 
@@ -76,6 +97,51 @@ WER is the reference model's own ASR on each reply's audio against the reply's s
 (`LFM3_OMNI_PROFILE=1`): a backbone row 3.5 ms (2.97 GB of bf16 weights; the products alone run in 2.9 ms), a speech
 frame (three depth passes) 1.9 ms, a codec chunk 2.5 ms. Timings were taken with other GPU work on the same machine
 at times; the medians above are from runs where the two passes agreed.
+
+## Receipt: pictures
+
+M5 Ultra, 12 synthetic camera frames (generated webcam scenes: clothing, a held object, a sign, things to count, a
+place, an object in one hand; JPEG at quality 90, then a 640 x 480 PNG, 300 image tokens each) with their question
+spoken by a macOS voice, the picture before the speech in the user turn, against the reference (`transformers` with the
+checkpoint's own code, MPS bf16 and MPS fp32). The rule: no further from fp32 than the reference's own bf16 run.
+
+| stage | check | Metal vs fp32 | reference bf16 vs fp32 |
+| --- | --- | --- | --- |
+| tower (last hidden state) | cosine, median (min) of 12 | 0.99960 (0.99867) | 0.99962 (0.99815) |
+| tower | patch rows under 0.99 cosine, of 14,400 | 122 | 115 |
+| projector | cosine, median (min) | 0.99947 (0.99743) | 0.99950 (0.99725) |
+| prompt hidden states | row cosine median; the picture's rows; the last row | 0.99979; 0.99962; 0.99992 | 0.99980; 0.99963; 0.99992 |
+| text | teacher-forced greedy top-1, on the fp32 reply | 209/212 (98.6%) | |
+| codes | teacher-forced, on the fp32 reply | 88.7% | |
+
+Against the bf16 reference: the prompt's token ids and patch grids identical (12/12), tower cosine 0.99980 median
+(0.99874 min), projector 0.99968 (0.99779), prompt row cosine 0.99972, teacher-forced text 213/217 (98.2%), codes
+89.3%. A few patch rows of a picture can sit far apart in both bf16 runs alike (the bf16 reference too has rows under
+0.99 against fp32): bf16 rounding in the tower, not a port difference.
+
+Time, warm, on a machine with other GPU work: the picture on the host (PNG decode, patches) 7 ms, the tower and
+projector 27 ms for 300 tokens, the first audio of a reply about 117 ms after the request (62 ms without a picture,
+on a quiet GPU).
+
+Camera questions, the 44 of the synthetic set (the 12 above among them; questions spoken, frames as above), one
+request each with no conversation, greedy text with the card's audio settings, scored by keywords (a count by its
+number, a sign by its word, which hand by the first left or right said, against the person's own hand). The frame is
+the camera's view; in the last column a question about left or right gets the person's own (mirrored) view, as the
+page shows it. A small vision model behind the same client (Cosmos3-Edge, LFM3-VL-2B, both on TensorFold Metal) is
+asked the side as the picture's side, mirrored, and the client names it:
+
+| | Omni, camera's view | Omni, mirrored view | Omni, mirrored for left or right | Cosmos3-Edge | LFM3-VL-2B |
+| --- | --- | --- | --- | --- | --- |
+| right answers | 39/44 | 39/44 | **43/44** | 41/44 | 38/44 |
+| clothing, held, sign, count, scene | 36/36 | 30/36 (mirrored signs) | 36/36 | 36/36 | 36/36 |
+| which hand | 3/8 | 7/8 | 7/8 | 5/8 | 2/8 |
+| says "you" | 35/36 | 35/36 | 35/36 | 31/36 | 36/36 |
+| first text, median | 0.10 s | 0.10 s | 0.10 s | 0.11 s | 0.11 s |
+| first audio, median | 0.13 s | 0.13 s | 0.13 s | (text only) | (text only) |
+
+Omni's first audio there includes the picture. Earlier turns sent along as text (`history`) pull its left or right
+after its earlier answers: with the 44 asked as one conversation, which hand fell to 5/8; a left-or-right question
+sent without the conversation kept 7/8 (42/44 in all).
 
 ## Licence
 

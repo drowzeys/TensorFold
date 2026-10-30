@@ -12,12 +12,15 @@ const usage =
     \\       lfm3-omni-generate --model DIR --wav IN.wav [--out REPLY.wav] [--system TEXT | --system-file FILE]
     \\                          [--audio-temperature 0.4] [--audio-repetition-penalty 1.2] [--audio-top-k 0]
     \\                          [--identity-order 1] [--seed 0] [--max-new 512] [--first-chunk 1] [--chunk 8]
-    \\                          [--dump DIR] [--force DIR] [--repeat 1]
+    \\                          [--dump DIR] [--force DIR] [--repeat 1] [--image PICTURE.png ...]
     \\
     \\--serve: POST /v1/audio/chat {"audio": base64 WAV, "system"?, "history"? ([{"role": "user" | "assistant",
-    \\  "content": text}], earlier turns oldest first), "stream"? (true), "audio_temperature"?, "seed"?, "max_new"?}
+    \\  "content": text}], earlier turns oldest first), "images"? ([base64 PNG or JPEG], seen before the speech),
+    \\  "stream"? (true), "audio_temperature"?, "seed"?, "max_new"?}
     \\  answers with server-sent events (text deltas, base64 pcm16 24 kHz audio, then done) or one JSON.
     \\The input is any PCM or float WAV, resampled to 16 kHz; the reply is 16-bit PCM mono at 24 kHz.
+    \\--image (repeatable): a PNG or JPEG the spoken turn is about, placed before the speech as the chat template
+    \\  places an image part; with --dump also tower.f32 [patches, 1024] and image_emb.f32 [tokens, 2048].
     \\--dump DIR (an existing directory) writes the stages as raw little-endian arrays: mel.f32 [128, frames],
     \\  enc.f32 and audio_emb.f32 [tokens, ...], input_ids.i32, prefill_hidden.f32 [rows, 2048], first_logits.f32,
     \\  depth_logits0.f32 [12, 2017], gen_seq.i32, gen_codes.i32 [frames, 12], step_hidden.f32, codec_lin.f32
@@ -48,6 +51,7 @@ const Args = struct {
     host_mel: bool = false,
     serve: ?[]const u8 = null,
     graphs: bool = true,
+    images: std.ArrayList([]const u8) = .empty,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -66,7 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
         const v = argv[i + 1];
         if (eq(k, "--model")) a.model = v else if (eq(k, "--wav")) a.wav = v else if (eq(k, "--out")) a.out = v else if (eq(k, "--system")) a.system = v else if (eq(k, "--system-file")) {
             a.system = std.mem.trim(u8, try std.Io.Dir.cwd().readFileAlloc(io, v, arena, .limited(1 << 20)), " \n\r\t");
-        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--serve")) a.serve = v else if (eq(k, "--graphs")) a.graphs = !eq(v, "0") else if (eq(k, "--host-mel")) a.host_mel = !eq(v, "0") else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else {
+        } else if (eq(k, "--audio-temperature")) a.smp.audio_temperature = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-repetition-penalty")) a.smp.audio_repetition_penalty = try std.fmt.parseFloat(f32, v) else if (eq(k, "--audio-top-k")) a.smp.audio_top_k = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--identity-order")) a.smp.identity_order = !eq(v, "0") else if (eq(k, "--seed")) a.smp.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(k, "--max-new")) a.smp.max_new = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--first-chunk")) a.stream.first = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--chunk")) a.stream.chunk = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--dump")) a.dump = v else if (eq(k, "--force")) a.force = v else if (eq(k, "--codec-ref")) a.codec_ref = v else if (eq(k, "--depth-check")) a.depth_check = v else if (eq(k, "--serve")) a.serve = v else if (eq(k, "--graphs")) a.graphs = !eq(v, "0") else if (eq(k, "--host-mel")) a.host_mel = !eq(v, "0") else if (eq(k, "--repeat")) a.repeat = try std.fmt.parseInt(usize, v, 10) else if (eq(k, "--image")) try a.images.append(arena, v) else {
             std.debug.print("unknown flag {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -121,8 +125,17 @@ fn warm(gpa: std.mem.Allocator, io: std.Io, e: *Engine, tok: *const core.tokeniz
     for (pcm) |*x| x.* = (prng.random().float(f32) - 0.5) * 0.002;
     const nf = try e.featuresDevice(pcm);
     const n = try e.encode(null, nf);
-    const p = try om.prompt.build(ar, tok, a.system, n);
+    var p = try om.prompt.build(ar, tok, a.system, n);
     try e.prefill(p.ids, p.audio_at, null);
+    if (@hasDecl(Engine, "encodeImages")) {
+        // a small grey gradient through the vision tower too, so a first picture finds it ready
+        const px = try ar.alloc(u8, 256 * 256 * 3);
+        for (px, 0..) |*x, i| x.* = @intCast((i / 3) % 256);
+        const pic = try om.image.prepareRgb(ar, .{ .pixels = px, .width = 256, .height = 256 });
+        _ = try e.encodeImages(&.{pic});
+        p = try om.prompt.buildMedia(ar, tok, a.system, &.{}, &.{pic.tokens()}, n);
+        try e.prefillMedia(p.ids, p.audio_at, p.images, null);
+    }
     var st: om.engine.Stats = .{};
     var smp = a.smp;
     smp.max_new = 24;
@@ -199,6 +212,33 @@ fn run(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *Engine, tok: *const core
     const t_enc = om.engine.nowNs(io);
     const n_audio = try e.encode(if (a.host_mel) feats else null, nf);
     const dump = if (last) a.dump else null;
+    // the pictures: the processor's patches on the host, then the tower and projector
+    const t_img = om.engine.nowNs(io);
+    const pictures = try ar.alloc(om.image.Prepared, a.images.items.len);
+    const image_tokens = try ar.alloc(usize, pictures.len);
+    for (a.images.items, pictures, image_tokens) |path, *pic, *n| {
+        pic.* = try om.image.prepare(io, ar, try std.Io.Dir.cwd().readFileAlloc(io, path, ar, .limited(64 << 20)));
+        n.* = pic.tokens();
+    }
+    var n_image: usize = 0;
+    var picture_ms: f64 = 0;
+    var tower_ms: f64 = 0;
+    if (pictures.len > 0) if (comptime !@hasDecl(Engine, "encodeImages")) return error.NoVisionTower else {
+        const t_tower = om.engine.nowNs(io);
+        picture_ms = @as(f64, @floatFromInt(t_tower - t_img)) / 1e6;
+        n_image = try e.encodeImages(pictures);
+        try e.stream.synchronize();
+        tower_ms = @as(f64, @floatFromInt(om.engine.nowNs(io) - t_tower)) / 1e6;
+        if (dump) |d| {
+            var patches: usize = 0;
+            for (pictures) |pic| patches += pic.patches();
+            try writeRaw(io, d, "tower.f32", std.mem.sliceAsBytes(try deviceRows(ar, e, e.towerOut(), patches * 1024)));
+            try writeRaw(io, d, "image_emb.f32", std.mem.sliceAsBytes(try deviceRows(ar, e, e.image_emb, n_image * cfg.hidden)));
+            var grid: std.ArrayList(i32) = .empty;
+            for (pictures) |pic| try grid.appendSlice(ar, &.{ @intCast(pic.gh), @intCast(pic.gw) });
+            try writeRaw(io, d, "image_grid.i32", std.mem.sliceAsBytes(grid.items));
+        }
+    };
     if (dump) |d| {
         try e.stream.synchronize();
         if (!a.host_mel) try e.d2h(std.mem.sliceAsBytes(feats), e.mel_f32);
@@ -208,12 +248,12 @@ fn run(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *Engine, tok: *const core
     }
     st.encode_ms = @as(f64, @floatFromInt(om.engine.nowNs(io) - t_enc)) / 1e6;
     st.audio_tokens = n_audio;
-    const p = try om.prompt.build(ar, tok, a.system, n_audio);
+    const p = try om.prompt.buildMedia(ar, tok, a.system, &.{}, image_tokens, n_audio);
     st.prompt_rows = p.ids.len;
     const t_pre = om.engine.nowNs(io);
     var all_hidden: ?[]f32 = null;
     if (dump != null) all_hidden = try ar.alloc(f32, p.ids.len * cfg.hidden);
-    try e.prefill(p.ids, p.audio_at, all_hidden);
+    try prefillPrompt(e, p.ids, p, all_hidden);
     st.prefill_ms = @as(f64, @floatFromInt(om.engine.nowNs(io) - t_pre)) / 1e6;
     var hidden: std.ArrayList(f32) = .empty;
     var out: Out = .{ .gpa = gpa, .e = e };
@@ -249,11 +289,12 @@ fn run(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *Engine, tok: *const core
         try writeRaw(io, d, "reply_stream.f32", std.mem.sliceAsBytes(out.pcm.items));
         var frames: []const [cfg.codebooks]i32 = out.frames.items;
         if (a.codec_ref) |cr| frames = try readFrames(ar, io, cr);
-        try dumpDepthAndCodec(ar, io, e, d, p.ids, p.audio_at, frames, a.stream);
+        try dumpDepthAndCodec(ar, io, e, d, p, frames, a.stream);
         hidden.deinit(gpa);
     }
     if (forced) |f| std.debug.print("FORCED text {d}/{d} codes {d}/{d} frames {d}/{d}\n", .{ f.text_hits, f.text_total, f.code_hits, f.code_total, f.frame_hits, f.frame_total });
     std.debug.print("TEXT {s}\n", .{text});
+    std.debug.print("IMAGE image_tokens={d} picture_ms={d:.1} tower_ms={d:.1}\n", .{ n_image, picture_ms, tower_ms });
     std.debug.print("RESULT lfm3-omni OK input_s={d:.2} audio_tokens={d} prompt_rows={d} mel_ms={d:.1} encode_ms={d:.1} prefill_ms={d:.1} first_text_ms={d:.1} first_frame_ms={d:.1} first_pcm_ms={d:.1} text_tokens={d} frames={d} speech_s={d:.2} step_ms={d:.1} depth_ms={d:.1} codec_ms={d:.1} total_ms={d:.1}\n", .{ @as(f64, @floatFromInt(pcm.len)) / 16000.0, st.audio_tokens, st.prompt_rows, st.mel_ms, st.encode_ms, st.prefill_ms, st.first_text_ms, st.first_frame_ms, st.first_pcm_ms, st.text_tokens, st.frames, @as(f64, @floatFromInt(st.samples)) / 24000.0, st.step_ms, st.depth_ms, st.codec_ms, st.total_ms });
 }
 
@@ -305,9 +346,15 @@ fn deviceRows(ar: std.mem.Allocator, e: *Engine, src: u64, n: usize) ![]f32 {
 }
 
 /// The first frame's depth logits from the prompt (every codebook masked) and the whole reply through the codec.
-fn dumpDepthAndCodec(ar: std.mem.Allocator, io: std.Io, e: *Engine, d: []const u8, ids: []const u32, audio_at: usize, frames: []const [cfg.codebooks]i32, sm: om.engine.Streaming) !void {
+/// `p`'s rows `ids` (the whole prompt or a prefix of it) through the backbone, its pictures' rows from the tower.
+fn prefillPrompt(e: *Engine, ids: []const u32, p: om.prompt.Prompt, hidden_out: ?[]f32) !void {
+    if (p.images.len == 0) return e.prefill(ids, p.audio_at, hidden_out);
+    if (comptime !@hasDecl(Engine, "prefillMedia")) return error.NoVisionTower else return e.prefillMedia(ids, p.audio_at, p.images, hidden_out);
+}
+
+fn dumpDepthAndCodec(ar: std.mem.Allocator, io: std.Io, e: *Engine, d: []const u8, p: om.prompt.Prompt, frames: []const [cfg.codebooks]i32, sm: om.engine.Streaming) !void {
     // the reference scores the prompt without the interleaved marker
-    try e.prefill(ids[0 .. ids.len - 1], audio_at, null);
+    try prefillPrompt(e, p.ids[0 .. p.ids.len - 1], p, null);
     try e.depthStart();
     const codes: [cfg.codebooks]i32 = @splat(0);
     const masked: [cfg.codebooks]bool = @splat(true);

@@ -8,7 +8,7 @@ const dir = "zig/kernels/metal/lfm3_omni";
 fn metallib(b: *std.Build, metal_std: []const u8) std.Build.LazyPath {
     const link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib", "-o" });
     const out = link.addOutputFileArg("lfm3_omni.metallib");
-    for ([_][]const u8{ "omni", "omni_rows", "omni_nax" }) |name| {
+    for ([_][]const u8{ "omni", "omni_rows", "omni_nax", "omni_vision" }) |name| {
         const cc = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", b.fmt("-std={s}", .{metal_std}), "-fmetal-math-mode=safe", "-fmetal-math-fp32-functions=precise", "-c" });
         cc.addFileArg(b.path(b.fmt("{s}/{s}.metal", .{ dir, name })));
         cc.addFileInput(b.path(dir ++ "/om_common.h"));

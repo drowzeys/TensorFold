@@ -1,6 +1,7 @@
 //! A small HTTP/1.1 server for one LFM3-Omni engine: POST /v1/audio/chat takes a spoken turn (base64 WAV in JSON)
 //! and answers with interleaved text and 24 kHz speech, streamed as server-sent events or whole; GET /health. Earlier
-//! turns of the conversation can come with it as text ("history"). A client that goes away stops its reply.
+//! turns of the conversation can come with it as text ("history"), and pictures (base64 PNG or JPEG, "images") that the
+//! spoken turn is about, on an engine with the vision tower. A client that goes away stops its reply.
 //! One request at a time; requests queue on the listen backlog. The engine is either backend's (`e: anytype`).
 const std = @import("std");
 const core = @import("core");
@@ -8,6 +9,7 @@ const engine = @import("common.zig");
 const cfg = @import("config.zig");
 const mel = @import("mel.zig");
 const prompt = @import("prompt.zig");
+const image = @import("image.zig");
 const wav = @import("wav");
 
 extern "c" fn socket(domain: c_int, ty: c_int, proto: c_int) c_int;
@@ -209,6 +211,39 @@ fn readHistory(a: std.mem.Allocator, v: ?std.json.Value) ![]const prompt.Message
     return out;
 }
 
+/// Pictures of the turn: `images` (a list) or `image` (one), each base64 PNG or JPEG bytes or a data: URL of one.
+fn readImages(a: std.mem.Allocator, obj: std.json.ObjectMap) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    if (obj.get("image")) |v| switch (v) {
+        .null => {},
+        .string => |x| try list.append(a, x),
+        else => return error.BadImages,
+    };
+    if (obj.get("images")) |v| switch (v) {
+        .null => {},
+        .array => |arr| for (arr.items) |item| {
+            if (item != .string) return error.BadImages;
+            try list.append(a, item.string);
+        },
+        else => return error.BadImages,
+    };
+    const out = try a.alloc([]const u8, list.items.len);
+    for (list.items, out) |text, *bytes| {
+        var b64 = text;
+        if (std.mem.startsWith(u8, b64, "data:")) {
+            const comma = std.mem.indexOfScalar(u8, b64, ',') orelse return error.BadImages;
+            b64 = b64[comma + 1 ..];
+        }
+        const raw = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(b64) catch return error.BadImages);
+        std.base64.standard.Decoder.decode(raw, b64) catch return error.BadImages;
+        bytes.* = raw;
+    }
+    return out;
+}
+
+/// The most pictures one turn takes.
+pub const max_images = 8;
+
 fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.tokenizer.Tokenizer, o: Options, c: *Conn) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -237,21 +272,41 @@ fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.token
     if (num(obj.get("max_new"))) |x| smp.max_new = @min(@as(usize, @intFromFloat(x)), e.o.max_frames);
     smp.audio_top_k = 0;
 
+    const sees = @hasDecl(@TypeOf(e.*), "encodeImages");
+    const files = readImages(a, obj) catch return badRequest(c, a, "images: a list of base64 PNG or JPEG pictures");
+    if (files.len > 0 and !sees) return badRequest(c, a, "this engine does not take pictures");
+    if (files.len > max_images) return badRequest(c, a, "too many pictures for one turn");
+    const pictures = try a.alloc(image.Prepared, files.len);
+    const image_tokens = try a.alloc(usize, files.len);
+    for (files, pictures, image_tokens) |bytes, *pic, *n| {
+        pic.* = image.prepare(io, a, bytes) catch |err| return badRequest(c, a, try std.fmt.allocPrint(a, "a picture: {s}", .{image.explain(err)}));
+        n.* = pic.tokens();
+    }
+
     var st: engine.Stats = .{};
     var turn: Turn = .{ .a = a, .c = c, .tok = tok, .stream = stream_out, .t0 = t0, .io = io };
+    var n_image: usize = 0;
+    if (comptime sees) {
+        if (files.len > 0) n_image = e.encodeImages(pictures) catch |err| switch (err) {
+            error.ImageTooLarge => return badRequest(c, a, "the pictures are more image tokens than the server takes"),
+            else => return err,
+        };
+    }
     const nf = try e.featuresDevice(pcm);
     const n_audio = try e.encode(null, nf);
-    const p = prompt.buildWith(a, tok, system, history, n_audio) catch |err| switch (err) {
+    const p = prompt.buildMedia(a, tok, system, history, image_tokens, n_audio) catch |err| switch (err) {
         error.SpecialTokenInHistory => return badRequest(c, a, "history: special tokens are written by the prompt builder"),
         error.HistoryRole => return badRequest(c, a, "history: role is user or assistant"),
         else => return err,
     };
     if (p.ids.len + smp.max_new + 1 > e.o.max_ctx) return badRequest(c, a, "the prompt and reply do not fit the window");
-    try e.prefill(p.ids, p.audio_at, null);
+    if (comptime sees) {
+        if (files.len > 0) try e.prefillMedia(p.ids, p.audio_at, p.images, null) else try e.prefill(p.ids, p.audio_at, null);
+    } else try e.prefill(p.ids, p.audio_at, null);
     if (stream_out) try c.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
     try e.reply(smp, o.stream, .{ .ctx = &turn, .text = Turn.onText, .pcm = Turn.onPcm }, null, &st, t0);
     const text = try tok.decode(a, turn.text_ids.items, true);
-    const stats = try std.fmt.allocPrint(a, "\"text\":{s},\"frames\":{d},\"speech_s\":{d:.3},\"audio_tokens\":{d},\"prompt_rows\":{d},\"first_text_ms\":{d:.1},\"first_audio_ms\":{d:.1},\"total_ms\":{d:.1}", .{ try jstr(a, text), st.frames, @as(f64, @floatFromInt(st.samples)) / cfg.sample_rate, n_audio, p.ids.len, st.first_text_ms, turn.first_audio_ms, st.total_ms });
+    const stats = try std.fmt.allocPrint(a, "\"text\":{s},\"frames\":{d},\"speech_s\":{d:.3},\"audio_tokens\":{d},\"image_tokens\":{d},\"prompt_rows\":{d},\"first_text_ms\":{d:.1},\"first_audio_ms\":{d:.1},\"total_ms\":{d:.1}", .{ try jstr(a, text), st.frames, @as(f64, @floatFromInt(st.samples)) / cfg.sample_rate, n_audio, n_image, p.ids.len, st.first_text_ms, turn.first_audio_ms, st.total_ms });
     if (!stream_out) {
         const wb = try wav.encode16(a, turn.pcm.items, cfg.sample_rate);
         const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(wb.len));
@@ -261,5 +316,5 @@ fn handle(gpa: std.mem.Allocator, io: std.Io, e: anytype, tok: *const core.token
     try turn.event(try std.fmt.allocPrint(a, "{{\"type\":\"done\",{s}}}", .{stats}));
     try turn.event("[DONE]");
     try c.chunk("");
-    std.log.info("lfm3-omni: {d} audio tokens, {d} frames, first audio {d:.1} ms, total {d:.1} ms", .{ n_audio, st.frames, turn.first_audio_ms, st.total_ms });
+    std.log.info("lfm3-omni: {d} audio tokens, {d} image tokens, {d} frames, first audio {d:.1} ms, total {d:.1} ms", .{ n_audio, n_image, st.frames, turn.first_audio_ms, st.total_ms });
 }

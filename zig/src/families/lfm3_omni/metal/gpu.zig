@@ -46,6 +46,14 @@ pub const P = enum {
     om_mel_frames,
     om_power,
     om_logmel,
+    // the vision tower's own operators (omni_vision.metal)
+    l3v_rms,
+    l3v_add,
+    l3v_conv,
+    l3v_qk,
+    l3v_attention_tiled,
+    l3v_swiglu,
+    l3v_layer_norm,
 };
 
 const n_pipes = @typeInfo(P).@"enum".field_names.len;

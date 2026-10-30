@@ -48,6 +48,8 @@ pub const encoder_kinds = [_]stack.Kind{ C, C, F, C, C, F, C, C, F, C, C, F, C, 
 pub const backbone_kinds = [_]stack.Kind{ C, C, F, C, S, C, F, C, S, C, F, C, S, C, F, C, S, C, F, C, S, C, F, C };
 pub const depth_kinds = [_]stack.Kind{ F, F, F };
 pub const codec_kinds = [_]stack.Kind{ C, C, S, C, S, C, S, C };
+/// The vision tower (LFM3-VL's): attention on the even layers from 2 on.
+pub const vision_kinds = [_]stack.Kind{ C, C, F, C, F, C, F, C, F, C, F, C, F, C };
 
 /// The speech encoder: LFM2 layers (3-tap conv, no output gate), causal attention over the last 32 tokens.
 pub fn encoderSpec(max_tokens: usize) stack.Spec {
@@ -141,6 +143,20 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     try int(dc, "hidden_size", depth_d);
     try int(dc, "num_hidden_layers", depth_kinds.len);
     try int(dc, "head_dim", 32);
+    try int(root, "image_token_id", image_token_id);
+    try int(root, "projector_hidden_size", 4096);
+    try int(root, "downsample_factor", 2);
+    const vc = try object(try get(root, "vision_config"));
+    try int(vc, "hidden_size", 1024);
+    try int(vc, "intermediate_size", 2560);
+    try int(vc, "num_hidden_layers", vision_kinds.len);
+    try int(vc, "num_attention_heads", 16);
+    try int(vc, "num_key_value_heads", 8);
+    try int(vc, "patch_size", 16);
+    try int(vc, "spatial_merge_size", 2);
+    try int(vc, "temporal_patch_size", 2);
+    try int(vc, "conv_kernel_size", 3);
+    try kinds(vc, &vision_kinds);
     const ms = try get(root, "maskgit_schedule");
     if (ms != .array or ms.array.items.len != maskgit_schedule.len) return error.UnsupportedConfig;
     for (ms.array.items, maskgit_schedule) |x, w| if (x != .integer or x.integer != w) return error.UnsupportedConfig;
