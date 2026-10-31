@@ -13,6 +13,26 @@ pub const Plan = struct {
     openers: []const u32 = &.{}, // the special tokens that open any message
     assistant: []const u32 = &.{}, // the tokens that open an assistant message
     min_chunk: u32 = 256,
+    /// Turn starts (Info.turn_starts): every message start but an assistant reply's is a start, however near, and
+    /// replies are not: a voice chat's next turn resumes at the state its warm request or the turn before kept there.
+    turns: bool = false,
+
+    /// How near a request's own cut (the system prompt's end) another start may stay.
+    pub fn cutGap(p: Plan) u32 {
+        return if (p.turns) TURN_CUT_GAP else p.min_chunk;
+    }
+
+    /// Turn starts: each message's opener past the first, unless it opens an assistant reply.
+    fn turnPoints(p: Plan, a: Allocator, ids: []const u32) ![]u32 {
+        var out: std.ArrayList(u32) = .empty;
+        const k = p.assistant.len;
+        for (ids, 0..) |t, i| {
+            if (i == 0 or std.mem.indexOfScalar(u32, p.openers, t) == null) continue;
+            if (k > 0 and i + k <= ids.len and std.mem.eql(u32, ids[i..][0..k], p.assistant)) continue;
+            try out.append(a, @intCast(i));
+        }
+        return out.items;
+    }
 
     /// Resume points: every assistant message's start, and the second message's.
     fn points(p: Plan, a: Allocator, ids: []const u32) ![]u32 {
@@ -39,12 +59,14 @@ pub const Plan = struct {
     /// The starts after 0 of `ids`' chunks; empty with no step.
     pub fn starts(p: Plan, a: Allocator, ids: []const u32) ![]const u32 {
         if (p.step == 0) return &.{};
-        const found = if ((p.openers.len > 0 or p.assistant.len > 0) and ids.len > 1) try p.points(a, ids) else &[_]u32{};
+        const turns = p.turns and p.openers.len > 0;
+        const found = if (turns) try p.turnPoints(a, ids) else if ((p.openers.len > 0 or p.assistant.len > 0) and ids.len > 1) try p.points(a, ids) else &[_]u32{};
+        const gap: usize = if (turns) 1 else p.min_chunk; // turn starts are never merged
         var out: std.ArrayList(u32) = .empty;
         var last: usize = 0;
         var i: usize = 0;
         while (true) {
-            while (i < found.len and found[i] < last + p.min_chunk) i += 1; // too close to the last start: merged into its chunk
+            while (i < found.len and found[i] < last + gap) i += 1; // too close to the last start: merged into its chunk
             var next = last + p.step;
             if (i < found.len and found[i] < next) next = found[i];
             if (next >= ids.len) return out.items;
@@ -53,6 +75,9 @@ pub const Plan = struct {
         }
     }
 };
+
+/// With turn starts, a start this near the system prompt's cut goes (the first user message's opener, a header before it).
+pub const TURN_CUT_GAP: u32 = 8;
 
 /// `starts` with `cut` too: a state kept just before a conversation's own text reads only shared tokens.
 pub fn withCut(a: Allocator, starts: []const u32, cut: u32, len: usize, min_chunk: u32) ![]const u32 {
@@ -152,6 +177,26 @@ test "a harness cut joins the starts, nearer ones go" {
     try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 0, 4680, 256));
     try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 4680, 4680, 256));
     try std.testing.expectEqualSlices(u32, &.{ 600, 4096 }, try withCut(a, &.{4096}, 600, 4680, 256));
+}
+
+test "turn starts: every message start but a reply's, however near, on the step grid; the cut keeps its own gap" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 10 opens a message, 10 7 a reply: system 0, user 3, reply 6, user 9, reply 12, user 15 ("…"), generation 18
+    const talk = [_]u32{ 10, 1, 2, 10, 3, 4, 10, 7, 5, 10, 3, 4, 10, 7, 5, 10, 3, 4, 10, 7 };
+    const plan: Plan = .{ .step = 8, .openers = &.{10}, .assistant = &.{ 10, 7 }, .min_chunk = 256, .turns = true };
+    try std.testing.expectEqualSlices(u32, &.{ 3, 9, 15 }, try plan.starts(a, &talk));
+    const wide: Plan = .{ .step = 4, .openers = &.{10}, .assistant = &.{ 10, 7 }, .turns = true };
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 9, 13, 15, 19 }, try wide.starts(a, &talk));
+    var off = plan;
+    off.turns = false;
+    try std.testing.expectEqualSlices(u32, &.{ 8, 16 }, try off.starts(a, &talk)); // replies 256+ apart only: the grid
+    try std.testing.expectEqual(@as(u32, TURN_CUT_GAP), plan.cutGap());
+    try std.testing.expectEqual(@as(u32, 256), off.cutGap());
+    // the system cut inside the first user header drops that user's opener, never a later turn's start
+    try std.testing.expectEqualSlices(u32, &.{ 511, 530, 571 }, try withCut(a, &.{ 509, 530, 571 }, 511, 600, plan.cutGap()));
+    try std.testing.expectEqualSlices(u32, &.{511}, try withCut(a, &.{ 509, 530, 571 }, 511, 600, off.cutGap()));
 }
 
 test "chunk starts match PrefillPlan.chunks" {

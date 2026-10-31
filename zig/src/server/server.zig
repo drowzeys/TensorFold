@@ -211,8 +211,12 @@ pub const Server = struct {
         }
         if (srv.info.prefill_step > 0) {
             srv.chunks = try chunk_plan.markers(srv, a, srv.info.prefill_step);
+            srv.chunks.turns = srv.info.turn_starts and srv.chunks.openers.len > 0;
             var step: [32]u8 = undefined;
-            log.line("prompt chunks of up to {s} tokens, cut at replies {d}+ tokens apart", .{ live.commas(&step, srv.info.prefill_step), srv.chunks.min_chunk });
+            if (srv.chunks.turns)
+                log.line("prompt chunks of up to {s} tokens, cut at every turn's start", .{live.commas(&step, srv.info.prefill_step)})
+            else
+                log.line("prompt chunks of up to {s} tokens, cut at replies {d}+ tokens apart", .{ live.commas(&step, srv.info.prefill_step), srv.chunks.min_chunk });
         }
         return srv;
     }

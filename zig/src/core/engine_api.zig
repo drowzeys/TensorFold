@@ -216,6 +216,9 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// The server's chunk starts are also every message start but an assistant reply's, however near: a chat's turn
+    /// starts, where the engine keeps a state, so each turn resumes at its own start (needs `prefill_step`).
+    turn_starts: bool = false,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
     /// Startup cache budget and the smallest state admitted by the family's existing keep plan.

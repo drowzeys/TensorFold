@@ -465,6 +465,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .startup = h.startup,
         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
         .prefill_step = if (comptime @hasDecl(F, "snap_turns")) @import("cuda_startup.zig").rows(F, loaded) else 0,
+        // cache on or off alike, so a pass cuts where it would with the cache on: the same bits either way
+        .turn_starts = @hasDecl(F, "snap_turns") and turnStarts(getenv("TF_TURN_STARTS")),
         .prompt_cache = h.store != null,
         .prompt_cache_capacity = cache_capacity,
         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
@@ -495,6 +497,15 @@ test {
     _ = snaps;
     _ = cuda_device; // the device and variable tests
     _ = windows;
+}
+
+/// TF_TURN_STARTS=0: a snap_turns family's chunks start only at the system prompt's end and replies 256+ tokens apart.
+fn turnStarts(v: ?[]const u8) bool {
+    return !std.mem.eql(u8, std.mem.trim(u8, v orelse return true, " "), "0");
+}
+
+test "turn starts are on unless TF_TURN_STARTS is 0" {
+    try std.testing.expect(turnStarts(null) and turnStarts("1") and turnStarts("") and !turnStarts("0") and !turnStarts(" 0"));
 }
 
 test "CUDA host preserves prefill_step and first-before-draft capability" {
