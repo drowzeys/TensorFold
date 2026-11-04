@@ -74,6 +74,13 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         break :blk run.captureStdOut(.{});
     }, .{ .name = "h3", .flags = &.{"-O3"} }, sms) else null;
     @import("h3_host.zig").library(b, target, optimize, h3_image);
+    // the int8 H3 engine (the Imagination Studio's, from h3-cuda-lora 1f7ecc75): its own kernel image and library
+    const h3_int8_image = if (nvcc) |tool| fatbin(b, tool, version orelse blk: {
+        const run = b.addSystemCommand(&.{ tool, "--version" });
+        run.has_side_effects = true;
+        break :blk run.captureStdOut(.{});
+    }, .{ .name = "h3_int8", .flags = &.{"-O3"} }, sms) else null;
+    @import("h3_host.zig").libraryInt8(b, target, optimize, h3_int8_image);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });

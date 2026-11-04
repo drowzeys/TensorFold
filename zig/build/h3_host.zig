@@ -73,6 +73,27 @@ pub fn library(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     step.dependOn(&b.addInstallArtifact(lib, .{}).step);
 }
 
+/// `zig build tf-h3-int8 -Dnvcc=...`: tf_h3 (libtf_h3.so, tf_h3.dll), MiniMax H3 / FastH3's transformer blocks on CUDA
+/// in int8 with tf_h3_set_weight for LoRA merges: the engine the Imagination Studio's ComfyUI node loads.
+pub fn libraryInt8(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image_: ?std.Build.LazyPath) void {
+    const step = b.step("tf-h3-int8", "tf_h3: MiniMax H3 / FastH3's transformer blocks on CUDA in int8 (the Studio's engine)");
+    const image = image_ orelse {
+        step.dependOn(&b.addFail("tf-h3-int8 needs -Dnvcc").step);
+        return;
+    };
+    const cuda = @import("cuda.zig").runtime(b, target, optimize, &.{});
+    const lib = b.addLibrary(.{ .name = "tf_h3", .linkage = .dynamic, .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/h3_int8/cuda_lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }},
+    }) });
+    lib.root_module.addAnonymousImport("fatbin_h3", .{ .root_source_file = image });
+    const install = b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = "h3-int8" } } });
+    step.dependOn(&install.step);
+}
+
 /// core's safetensors reader alone, for the CUDA side's checkpoint (h3/checkpoint.zig).
 pub fn safetensors(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors.zig"), .target = target });
