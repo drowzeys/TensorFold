@@ -302,7 +302,7 @@ fn runRequest(gpa: std.mem.Allocator, io: std.Io, a: Args, e: *d3.Engine, tts: ?
     const total_ms = @as(f64, @floatFromInt(d3.engine.nowNs(io) - t_req)) / 1e6;
     const mu = cuda.usage(false);
     if (json) {
-        std.debug.print("{{\"ok\":true,\"frames\":{d},\"eos\":{},\"audio_s\":{d:.3},\"prompt_rows\":{d},\"ref_frames\":{d},\"encode_ms\":{d:.1},\"prefill_ms\":{d:.1},\"first_audio_ms\":{d:.1},\"total_ms\":{d:.1},\"fps\":{d:.2},\"wav\":\"{s}\"}}\n", .{ st.frames, st.eos, st.audio_s, rows.len, ref_frames, encode_ms, st.prefill_ms, st.first_audio_ms + encode_ms, total_ms, st.fps(), q.wav orelse "" });
+        std.debug.print("{{\"ok\":true,\"frames\":{d},\"eos\":{},\"audio_s\":{d:.3},\"prompt_rows\":{d},\"ref_frames\":{d},\"encode_ms\":{d:.1},\"prefill_ms\":{d:.1},\"first_audio_ms\":{d:.1},\"total_ms\":{d:.1},\"fps\":{d:.2},\"wav\":{f}}}\n", .{ st.frames, st.eos, st.audio_s, rows.len, ref_frames, encode_ms, st.prefill_ms, st.first_audio_ms + encode_ms, total_ms, st.fps(), std.json.fmt(q.wav orelse "", .{}) });
     } else {
         std.debug.print("RESULT drama3 OK frames={d} eos={} audio_s={d:.2} prompt_rows={d} ref_frames={d} encode_ms={d:.1} prefill_ms={d:.1} first_audio_ms={d:.1} total_ms={d:.1} fps={d:.2} rtf={d:.2} device_peak_gb={d:.2}\n", .{ st.frames, st.eos, st.audio_s, rows.len, ref_frames, encode_ms, st.prefill_ms, st.first_audio_ms + encode_ms, total_ms, st.fps(), st.fps() / 21.533, @as(f64, @floatFromInt(mu.peak)) / 1e9 });
     }
