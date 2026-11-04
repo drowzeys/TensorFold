@@ -1,5 +1,6 @@
 //! Nemotron 3.5 Bolt's lane backend over libbolt.so: prompts, shared verify windows, rollback, drafts, keyed draws.
 const std = @import("std");
+const sys = @import("sys");
 const lanes = @import("lanes");
 const reuse = @import("cuda_reuse.zig");
 const cuda = @import("cuda");
@@ -58,7 +59,6 @@ fn nowMs() f64 {
     _ = clock_gettime(1, &ts);
     return @as(f64, @floatFromInt(ts.sec)) * 1000.0 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// What the backend keeps for one live stream: its libbolt sequence, the prompt pass in progress, and the drafts held.
 const Slot = struct {
@@ -157,13 +157,15 @@ const Engine = struct {
     }
 
     /// One piece of the prompt pass, cut at the cache's marks, small enough that a cancel lands quickly.
-    fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) !bool {
+    /// One prompt chunk; `max_rows` (1.2.2's lanes, 0: uncapped) caps it below the engine's own piece size.
+    fn prefillStep(ptr: *anyopaque, s: *lanes.Stream, max_rows: u32) anyerror!bool {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const prompt_len = s.prompt().len;
         const slot = e.slots.get(s) orelse try e.begin(s);
         if (s.isCancelled() or s.yields()) return error.Cancelled;
         if (slot.at >= prompt_len) return true;
-        const rows: usize = if (e.decoding > 0) busy_piece_rows else piece_rows;
+        const own: usize = if (e.decoding > 0) busy_piece_rows else piece_rows;
+        const rows: usize = if (max_rows > 0) @min(own, @as(usize, max_rows)) else own;
         var end = @min(prompt_len, slot.at + rows);
         var merged = false; // a mark in the last few rows, kept at the prompt's end by this piece
         for (s.reuse.marks) |m| {
@@ -222,7 +224,7 @@ const Engine = struct {
     }
 
     fn prefill(ptr: *anyopaque, s: *lanes.Stream) !void {
-        while (!try prefillStep(ptr, s)) {}
+        while (!try prefillStep(ptr, s, 0)) {}
     }
 
     fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) !u64 {
@@ -436,7 +438,7 @@ const Engine = struct {
             };
         };
         // the first token leaves before LiLiCorr's first proposal (BOLT_FIRST_EARLY=0: after it)
-        const early = if (std.c.getenv("BOLT_FIRST_EARLY")) |v| v[0] != '0' else true;
+        const early = if (sys.c.getenv("BOLT_FIRST_EARLY")) |v| v[0] != '0' else true;
         return .{ .ptr = e, .vtable = &vt.v, .first_before_draft = early };
     }
 };
@@ -516,28 +518,28 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var stream: ?cuda.Stream = if (tower != null) try cuda.Stream.init(ctx.d, false) else null;
     errdefer if (stream) |*st| st.deinit();
     const handle = lib.openLibrary() orelse {
-        std.log.err("bolt: libbolt.so: {s} (zig build bolt -Dnvcc=NVCC installs it beside the server)", .{if (lib.dlerror()) |m| std.mem.span(m) else "not found"});
+        std.log.err("bolt: {s}: {s} (zig build bolt -Dnvcc=NVCC installs it beside the server)", .{ lib.library_name, if (lib.dlerror()) |m| std.mem.span(m) else "not found" });
         return error.BoltMissing;
     };
     const api = try lib.Api.load(handle);
-    if (std.c.getenv("BOLT_TAIL_MERGE")) |v| tail_merge = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tail_merge;
-    if (std.c.getenv("BOLT_MARK_LATE")) |v| defer_mark = v[0] != '0';
+    if (sys.c.getenv("BOLT_TAIL_MERGE")) |v| tail_merge = std.fmt.parseInt(usize, std.mem.span(v), 10) catch tail_merge;
+    if (sys.c.getenv("BOLT_MARK_LATE")) |v| defer_mark = v[0] != '0';
     if (api.abi() != lib.abi_version) {
         std.log.err("bolt: libbolt.so speaks ABI {d}, this server {d}: build it from the same source", .{ api.abi(), lib.abi_version });
         return error.BoltMissing;
     }
     // one libbolt sequence a stream (--parallel), unless BOLT_SEQS says otherwise
     var seqs_buf: [16]u8 = undefined;
-    _ = setenv("BOLT_SEQS", std.fmt.bufPrintSentinel(&seqs_buf, "{d}", .{o.lanes}, 0) catch "1", 0);
+    _ = sys.env.setenv("BOLT_SEQS", std.fmt.bufPrintSentinel(&seqs_buf, "{d}", .{o.lanes}, 0) catch "1", 0);
     // no drafter checkpoint is read (or its memory held) when the server runs --no-drafts
-    if (!o.drafts) _ = setenv("BOLT_DRAFT_OFF", "1", 1);
+    if (!o.drafts) _ = sys.env.setenv("BOLT_DRAFT_OFF", "1", 1);
     const path = try gpa.allocSentinel(u8, dir.len, 0);
     defer gpa.free(path);
     @memcpy(path[0..dir.len], dir);
     const model = api.open(path, @intCast(o.context)) orelse return error.BoltLoad;
     const e = try gpa.create(Engine);
     const nseq: u32 = @intCast(@max(1, api.seqs(model)));
-    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = std.c.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
+    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = sys.c.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
     for (0..window) |i| costs[i] = .{ .width = @intCast(i + 1), .ms = api.cost(model, @intCast(i + 1)) };
     const propose_ms = api.cost(model, 0);
     const propose_multi_ms = api.draft_multi_cost(model);

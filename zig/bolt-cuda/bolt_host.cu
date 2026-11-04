@@ -18,10 +18,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <chrono>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "bolt_map.h"
 
 #define CK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { fprintf(stderr, "bolt: %s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(_e)); } } while (0)
 
@@ -78,7 +75,7 @@ std::string slurp(const std::string& path) {
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     std::string s(n, 0);
-    if (fread(s.data(), 1, n, f) != (size_t)n) s.clear();
+    if (n > 0 && fread(&s[0], 1, n, f) != (size_t)n) s.clear();
     fclose(f);
     return s;
 }
@@ -149,17 +146,13 @@ bool lookup(Store* s, const std::string& name, Info& info, const uint8_t*& data)
     const std::string& shard = it->second;
     if (!s->headers.count(shard)) {
         std::string path = s->dir + "/" + shard;
-        int fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st;
-        if (fstat(fd, &st) != 0) { close(fd); return false; }
-        void* m = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (m == MAP_FAILED) return false;
-        madvise(m, st.st_size, MADV_WILLNEED);
-        s->maps.push_back({m, (size_t)st.st_size});
-        s->files[shard] = {(const uint8_t*)m, (size_t)st.st_size};
-        parse_header((const uint8_t*)m, st.st_size, s->headers[shard]);
+        size_t size = 0;
+        void* m = bolt_map_file(path.c_str(), &size);
+        if (!m) return false;
+        bolt_will_need(m, size);
+        s->maps.push_back({m, size});
+        s->files[shard] = {(const uint8_t*)m, size};
+        parse_header((const uint8_t*)m, size, s->headers[shard]);
     }
     auto jt = s->headers[shard].find(name);
     if (jt == s->headers[shard].end()) return false;
@@ -407,7 +400,7 @@ struct KvPool {
 };
 
 struct Bolt;
-extern "C" void bolt_prof_report(Bolt* b);
+extern "C" BOLT_API void bolt_prof_report(Bolt* b);
 
 struct Bolt {
     int context = 32768;
@@ -903,7 +896,7 @@ int run_block(Bolt* b, int seq, const int* tokens, int T, int record, int cand_k
 
 static void bolt_calibrate(Bolt* b);
 
-extern "C" Bolt* bolt_open(const char* dir, int context) {
+extern "C" BOLT_API Bolt* bolt_open(const char* dir, int context) {
     {
         // BOLT_SPIN=0 leaves the driver's default wait; spinning on the host while a forward runs skips the wake-up
         // latency of a yielding wait after every sync (llama.cpp measured a large decode gain from this on GB10)
@@ -1100,7 +1093,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     CK(cudaEventCreateWithFlags(&b->ev_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&b->ev_j1, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&b->ev_j2, cudaEventDisableTiming));
-    for (auto& m : store->maps) munmap(m.first, m.second);
+    for (auto& m : store->maps) bolt_unmap_file(m.first, m.second);
     store->maps.clear();
     delete store;
 
@@ -1129,35 +1122,35 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     return b;
 }
 
-extern "C" Bolt* bolt_load(const char* dir) {
+extern "C" BOLT_API Bolt* bolt_load(const char* dir) {
     const char* c = getenv("BOLT_CONTEXT");
     return bolt_open(dir, c ? atoi(c) : 32768);
 }
 
 
 // The C ABI version bolt_native.zig checks at load: bump it with any change to the calls below.
-extern "C" int bolt_abi() { return 3; }
+extern "C" BOLT_API int bolt_abi() { return 3; }
 
-extern "C" int bolt_seqs(Bolt* b) { return b->nseq; }
-extern "C" int bolt_context(Bolt* b) { return b->context; }
+extern "C" BOLT_API int bolt_seqs(Bolt* b) { return b->nseq; }
+extern "C" BOLT_API int bolt_context(Bolt* b) { return b->context; }
 
 // Device bytes one more sequence holds at this context: both SSM slots and the conv ring of every Mamba layer, the
 // KV rows of every attention layer, the drafter's rings.
-extern "C" uint64_t bolt_seq_bytes(Bolt* b) {
+extern "C" BOLT_API uint64_t bolt_seq_bytes(Bolt* b) {
     const uint64_t ssm = b->ssm_lazy ? (uint64_t)SSM_ELEMS + 2ull * VERIFY_MAX * (HIST_ROW + 128) : 2 * (uint64_t)SSM_ELEMS;
     return (uint64_t)b->mamba_layers * (ssm + (uint64_t)CONV_SLOTS * CONV_ELEMS) * 4 + (uint64_t)(b->kv.lazy && !b->kv_pin ? b->kv.tokens_per_gran : b->context) * kv_token_bytes(b) +
            (b->draft ? draft_blob_bytes() : 0);
 }
 
 // Seven draft tokens for the block that starts with `anchor` at the sequence's current position (0 when no drafter).
-extern "C" int bolt_propose_seq(Bolt* b, int seq, int anchor, int* out) {
+extern "C" BOLT_API int bolt_propose_seq(Bolt* b, int seq, int anchor, int* out) {
     if (!b->draft) return 0;
     flush_ingest(b, seq);
     return draft_propose(b->draft, seq, anchor, b->seqs[seq].len, out, b->s0);
 }
 
 // Drafts for several sequences in one pass over the drafter's weights: out is [n][8], got[i] is 7 or 0.
-extern "C" void bolt_propose_multi(Bolt* b, int n, const int* seqs, const int* anchors, int* out, int* got) {
+extern "C" BOLT_API void bolt_propose_multi(Bolt* b, int n, const int* seqs, const int* anchors, int* out, int* got) {
     int pos[SEG_MAX];
     if (!b->draft || n < 1 || n > SEG_MAX) { for (int i = 0; i < n; i++) got[i] = 0; return; }
     flush_all_ingest(b);
@@ -1165,17 +1158,17 @@ extern "C" void bolt_propose_multi(Bolt* b, int n, const int* seqs, const int* a
     draft_propose_multi(b->draft, n, seqs, anchors, pos, out, got, b->s0);
 }
 
-extern "C" int bolt_has_draft(Bolt* b) { return b->draft != nullptr; }
+extern "C" BOLT_API int bolt_has_draft(Bolt* b) { return b->draft != nullptr; }
 // Measured forward time in ms for a verify window of `width` rows, and for one proposal (width 0).
-extern "C" double bolt_cost(Bolt* b, int width) {
+extern "C" BOLT_API double bolt_cost(Bolt* b, int width) {
     if (width == 0) return b->draft_ms;
     if (width < 1 || width > VERIFY_MAX) return 0;
     return b->cost_ms[width];
 }
 // Proposal ms for a call over all the sequences (0 when there is one).
-extern "C" double bolt_draft_multi_cost(Bolt* b) { return b->draft_multi_ms; }
+extern "C" BOLT_API double bolt_draft_multi_cost(Bolt* b) { return b->draft_multi_ms; }
 // Forward ms of shared blocks (several sequences' windows): fills rows[i], ms[i] and returns how many.
-extern "C" int bolt_shared_costs(Bolt* b, int* rows, double* ms, int cap) {
+extern "C" BOLT_API int bolt_shared_costs(Bolt* b, int* rows, double* ms, int cap) {
     int n = 0;
     for (auto& e : b->shared_ms) {
         if (n >= cap) break;
@@ -1186,10 +1179,10 @@ extern "C" int bolt_shared_costs(Bolt* b, int* rows, double* ms, int cap) {
     return n;
 }
 
-extern "C" void bolt_free(Bolt* b) { (void)b; /* the process owns the model until it exits */ }
+extern "C" BOLT_API void bolt_free(Bolt* b) { (void)b; /* the process owns the model until it exits */ }
 
 // Start a sequence over: empty caches and state. Only the slots the first block reads are cleared.
-extern "C" void bolt_reset_seq(Bolt* b, int seq) {
+extern "C" BOLT_API void bolt_reset_seq(Bolt* b, int seq) {
     Bolt::Seq& q = b->seqs[seq];
     const bool used = q.used;
     q = Bolt::Seq();
@@ -1203,7 +1196,7 @@ extern "C" void bolt_reset_seq(Bolt* b, int seq) {
 }
 
 // Sequence slots for callers that serve several streams: the lowest free one, started over (-1 when none).
-extern "C" int bolt_seq_alloc(Bolt* b) {
+extern "C" BOLT_API int bolt_seq_alloc(Bolt* b) {
     for (int i = 0; i < b->nseq; i++) {
         if (b->seqs[i].used) continue;
         bolt_reset_seq(b, i);
@@ -1212,17 +1205,17 @@ extern "C" int bolt_seq_alloc(Bolt* b) {
     }
     return -1;
 }
-extern "C" void bolt_seq_release(Bolt* b, int seq) {
+extern "C" BOLT_API void bolt_seq_release(Bolt* b, int seq) {
     if (seq < 0 || seq >= b->nseq) return;
     b->seqs[seq].used = false;
     kv_trim(b, seq);
 }
 
-extern "C" int bolt_len_seq(Bolt* b, int seq) { return b->seqs[seq].len; }
+extern "C" BOLT_API int bolt_len_seq(Bolt* b, int seq) { return b->seqs[seq].len; }
 
 // One block of rows for each of nseg sequences, all verify windows (record): their state is advanced as if every row
 // is kept; bolt_keep_seq cuts a sequence back. Candidates of every row are read back (rows in segment order).
-extern "C" int bolt_forward_multi(Bolt* b, int nseg, const int* seqs, const int* rows, const int* tokens, int cand_k) {
+extern "C" BOLT_API int bolt_forward_multi(Bolt* b, int nseg, const int* seqs, const int* rows, const int* tokens, int cand_k) {
     SegIn sg[SEG_MAX];
     if (nseg < 1 || nseg > SEG_MAX) return -1;
     int at = 0;
@@ -1235,7 +1228,7 @@ extern "C" int bolt_forward_multi(Bolt* b, int nseg, const int* seqs, const int*
 
 // Structured output: redraw n rows of the last forward among the tokens their masks allow (row rows[i] reads masks + i * words,
 // bit t set = token t allowed) and replace those rows' candidates. A row with fewer than k allowed tokens ends in -3.4e38 values.
-extern "C" int bolt_mask_rows(Bolt* b, int n, const int* rows, const uint32_t* masks, int words, int k) {
+extern "C" BOLT_API int bolt_mask_rows(Bolt* b, int n, const int* rows, const uint32_t* masks, int words, int k) {
     if (n < 1 || n > LOGIT_ROWS || words < 1 || words > VOCAB / 32 || k < 1) return -1;
     if (k > CAND) k = CAND;
     for (int i = 0; i < n; i++) if (rows[i] < 0 || rows[i] >= LOGIT_ROWS) return -2;
@@ -1255,7 +1248,7 @@ extern "C" int bolt_mask_rows(Bolt* b, int n, const int* rows, const uint32_t* m
 }
 
 // Candidates of a row of the last forward, best first.
-extern "C" void bolt_candidates(Bolt* b, int row, int k, float* vals, int* ids) {
+extern "C" BOLT_API void bolt_candidates(Bolt* b, int row, int k, float* vals, int* ids) {
     if (k > CAND) k = CAND;
     memcpy(vals, &b->cvals_h[(size_t)row * CAND], (size_t)k * 4);
     memcpy(ids, &b->cids_h[(size_t)row * CAND], (size_t)k * 4);
@@ -1288,12 +1281,12 @@ static bool keep_rows(Bolt* b, int seq, int n) {
     return launched;
 }
 
-extern "C" void bolt_keep_seq(Bolt* b, int seq, int n) {
+extern "C" BOLT_API void bolt_keep_seq(Bolt* b, int seq, int n) {
     if (keep_rows(b, seq, n)) CK(cudaStreamSynchronize(b->s0));
 }
 
 // The same for several sequences at once: their replays go out together and the host waits once.
-extern "C" void bolt_keep_multi(Bolt* b, int n, const int* seqs, const int* counts) {
+extern "C" BOLT_API void bolt_keep_multi(Bolt* b, int n, const int* seqs, const int* counts) {
     bool launched = false;
     for (int i = 0; i < n; i++) {
         if (seqs[i] < 0 || seqs[i] >= b->nseq) continue;
@@ -1311,12 +1304,12 @@ static void fold_pending(Bolt* b, int seq) {
 }
 
 // Tell the drafter where the sequence's whole prompt ends: rows more than its window before that are never ingested.
-extern "C" void bolt_prompt_end(Bolt* b, int seq, int total) {
+extern "C" BOLT_API void bolt_prompt_end(Bolt* b, int seq, int total) {
     b->seqs[seq].ingest_floor = total > 1100 ? total - 1100 : 0;
 }
 
 // The prompt: chunks of TMAX rows. Afterwards row 0 of bolt_candidates is the last prompt row.
-extern "C" int bolt_prefill_seq(Bolt* b, int seq, const int* tokens, int n, int cand_k) {
+extern "C" BOLT_API int bolt_prefill_seq(Bolt* b, int seq, const int* tokens, int n, int cand_k) {
     int done = 0;
     while (done < n) {
         int t = n - done < TMAX ? n - done : TMAX;
@@ -1334,7 +1327,7 @@ extern "C" int bolt_prefill_seq(Bolt* b, int seq, const int* tokens, int n, int 
 struct BoltRowRun { int pos, count; const void* rows; };
 
 // bolt_prefill_seq with image rows: the tokens in the runs are placeholders (any id); their rows are replaced.
-extern "C" int bolt_prefill_seq_rows(Bolt* b, int seq, const int* tokens, int n, int cand_k, const BoltRowRun* runs, int nruns) {
+extern "C" BOLT_API int bolt_prefill_seq_rows(Bolt* b, int seq, const int* tokens, int n, int cand_k, const BoltRowRun* runs, int nruns) {
     int done = 0;
     std::vector<int> toks(tokens, tokens + n);
     std::vector<EmbedPatch> patches;
@@ -1357,33 +1350,33 @@ extern "C" int bolt_prefill_seq_rows(Bolt* b, int seq, const int* tokens, int n,
 }
 
 // The residual stream after the six drafter layers for one row of the last forward.
-extern "C" void bolt_aux(Bolt* b, int row, float* out) {
+extern "C" BOLT_API void bolt_aux(Bolt* b, int row, float* out) {
     CK(cudaMemcpy(out, b->cap + (size_t)row * 6 * HID, 6 * HID * 4, cudaMemcpyDeviceToHost));
 }
 
 // ---- single-sequence API (sequence 0) for the bench tools ----
 
-extern "C" void bolt_reset(Bolt* b) { bolt_reset_seq(b, 0); }
-extern "C" int bolt_len(Bolt* b) { return b->seqs[0].len; }
-extern "C" int bolt_propose(Bolt* b, int anchor, int* out) { return bolt_propose_seq(b, 0, anchor, out); }
-extern "C" void bolt_keep(Bolt* b, int n) { bolt_keep_seq(b, 0, n); }
-extern "C" int bolt_prefill(Bolt* b, const int* tokens, int n, int cand_k) {
+extern "C" BOLT_API void bolt_reset(Bolt* b) { bolt_reset_seq(b, 0); }
+extern "C" BOLT_API int bolt_len(Bolt* b) { return b->seqs[0].len; }
+extern "C" BOLT_API int bolt_propose(Bolt* b, int anchor, int* out) { return bolt_propose_seq(b, 0, anchor, out); }
+extern "C" BOLT_API void bolt_keep(Bolt* b, int n) { bolt_keep_seq(b, 0, n); }
+extern "C" BOLT_API int bolt_prefill(Bolt* b, const int* tokens, int n, int cand_k) {
     bolt_prompt_end(b, 0, b->seqs[0].len + n);
     return bolt_prefill_seq(b, 0, tokens, n, cand_k);
 }
 // One sequence's block of up to TMAX rows (record: a verify window of up to VERIFY_MAX rows).
-extern "C" int bolt_forward_seq(Bolt* b, int seq, const int* tokens, int T, int record, int cand_k) { return run_block(b, seq, tokens, T, record, cand_k); }
+extern "C" BOLT_API int bolt_forward_seq(Bolt* b, int seq, const int* tokens, int T, int record, int cand_k) { return run_block(b, seq, tokens, T, record, cand_k); }
 // Run T rows. record keeps per-row mamba state so bolt_keep can roll back (T <= 8).
-extern "C" int bolt_forward(Bolt* b, const int* tokens, int T, int record, int cand_k) { return run_block(b, 0, tokens, T, record, cand_k); }
+extern "C" BOLT_API int bolt_forward(Bolt* b, const int* tokens, int T, int record, int cand_k) { return run_block(b, 0, tokens, T, record, cand_k); }
 
-extern "C" void bolt_push(Bolt* b, uint32_t token) {
+extern "C" BOLT_API void bolt_push(Bolt* b, uint32_t token) {
     int t = (int)token;
     run_block(b, 0, &t, 1, 0, 1);
 }
 
-extern "C" int bolt_sample(Bolt* b) { return b->cids_h[0]; }
+extern "C" BOLT_API int bolt_sample(Bolt* b) { return b->cids_h[0]; }
 
-extern "C" float bolt_logprob(Bolt* b, int target) {
+extern "C" BOLT_API float bolt_logprob(Bolt* b, int target) {
     std::vector<float> h(VOCAB);
     CK(cudaMemcpy(h.data(), b->logits, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));  // row 0 of the last block
     float m = -1e30f;
@@ -1394,7 +1387,7 @@ extern "C" float bolt_logprob(Bolt* b, int target) {
 }
 
 // Log-probability of `target` under a row of the last block's logits.
-extern "C" float bolt_logprob_row(Bolt* b, int row, int target) {
+extern "C" BOLT_API float bolt_logprob_row(Bolt* b, int row, int target) {
     std::vector<float> h(VOCAB);
     CK(cudaMemcpy(h.data(), b->logits + (size_t)row * VOCAB, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost));
     float m = -1e30f;
@@ -1406,7 +1399,7 @@ extern "C" float bolt_logprob_row(Bolt* b, int row, int target) {
 
 // Test hook: teacher-forced drafter accuracy over a known sequence. stats[j] counts slot j hits,
 // stats[8 + a] counts blocks whose accepted prefix was a, stats[20] the blocks scored.
-extern "C" void bolt_probe(Bolt* b, const int* toks, int n, int* stats) {
+extern "C" BOLT_API void bolt_probe(Bolt* b, const int* toks, int n, int* stats) {
     for (int i = 0; i < n; i++) {
         if (i > 0 && i + 8 <= n) {
             int out[8];
@@ -1541,7 +1534,7 @@ static void bolt_calibrate(Bolt* b) {
     fprintf(stderr, "\n");
 }
 
-extern "C" void bolt_prof_report(Bolt* b) {
+extern "C" BOLT_API void bolt_prof_report(Bolt* b) {
     draft_prof_report();
     std::vector<std::pair<std::string, std::pair<double, int>>> v(b->prof_acc.begin(), b->prof_acc.end());
     std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second.first > y.second.first; });
@@ -1571,11 +1564,11 @@ struct Snap {
     size_t bytes = 0;
 };
 
-extern "C" uint64_t bolt_snap_bytes(Bolt* b, int at) {
+extern "C" BOLT_API uint64_t bolt_snap_bytes(Bolt* b, int at) {
     return (uint64_t)b->mamba_layers * (SSM_ELEMS + CONV_ELEMS) * 4 + (uint64_t)at * kv_token_bytes(b) + (b->draft ? draft_blob_bytes() : 0);
 }
 
-extern "C" void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
+extern "C" BOLT_API void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
     Bolt::Seq& q = b->seqs[seq];
     if (at != q.len || at <= 0) return nullptr;
     flush_ingest(b, seq);
@@ -1614,7 +1607,7 @@ extern "C" void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
 }
 
 // Make the sequence's live state the snapshot's. Returns 0 on success.
-extern "C" int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
+extern "C" BOLT_API int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
     Snap* sn = (Snap*)handle;
     if (!sn || sn->at > b->context) return -1;
     Bolt::Seq& q = b->seqs[seq];
@@ -1650,10 +1643,10 @@ extern "C" int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
     return 0;
 }
 
-extern "C" void* bolt_snap_save(Bolt* b, int at) { return bolt_snap_save_seq(b, 0, at); }
-extern "C" int bolt_snap_restore(Bolt* b, void* handle) { return bolt_snap_restore_seq(b, 0, handle); }
+extern "C" BOLT_API void* bolt_snap_save(Bolt* b, int at) { return bolt_snap_save_seq(b, 0, at); }
+extern "C" BOLT_API int bolt_snap_restore(Bolt* b, void* handle) { return bolt_snap_restore_seq(b, 0, handle); }
 
-extern "C" void bolt_snap_drop(Bolt*, void* handle) {
+extern "C" BOLT_API void bolt_snap_drop(Bolt*, void* handle) {
     Snap* sn = (Snap*)handle;
     if (!sn) return;
     cudaFree(sn->ssm); cudaFree(sn->conv); cudaFree(sn->kv); cudaFree(sn->draft);

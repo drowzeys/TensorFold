@@ -1,13 +1,46 @@
 //! libbolt's C ABI as the Bolt backend sees it: the symbols, resolved once, and where the library is found.
 const std = @import("std");
+const sys = @import("sys");
 
 /// The C ABI version of libbolt this backend speaks (`bolt_abi`).
 pub const abi_version: c_int = 3;
 
-extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
-extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
-pub extern "c" fn dlerror() ?[*:0]const u8;
-extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
+const windows = @import("builtin").os.tag == .windows;
+
+/// The loader: dlopen elsewhere, LoadLibraryA/GetProcAddress on Windows (bolt.dll).
+const dl = if (windows) struct {
+    extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetModuleFileNameA(module: ?*anyopaque, name: [*]u8, size: u32) callconv(.winapi) u32;
+    fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque {
+        _ = mode;
+        return LoadLibraryA(path);
+    }
+    fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque {
+        return GetProcAddress(handle orelse return null, name);
+    }
+    fn dlerror() ?[*:0]const u8 {
+        return null;
+    }
+    /// This executable's path, as readlink("/proc/self/exe") gives it elsewhere.
+    fn selfExe(buf: []u8) isize {
+        const n = GetModuleFileNameA(null, buf.ptr, @intCast(buf.len));
+        return if (n == 0 or n >= buf.len) -1 else @intCast(n);
+    }
+} else struct {
+    extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
+    extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
+    extern "c" fn dlerror() ?[*:0]const u8;
+    extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
+    fn selfExe(buf: []u8) isize {
+        return readlink("/proc/self/exe", buf.ptr, buf.len);
+    }
+};
+const dlopen = dl.dlopen;
+const dlsym = dl.dlsym;
+pub const dlerror = dl.dlerror;
+/// The library's file name: bolt.dll beside tensorfold-native.exe on Windows, libbolt.so in native/lib elsewhere.
+pub const library_name = if (windows) "bolt.dll" else "libbolt.so";
 
 /// A run of a prompt piece whose embeddings are rows on the device (bolt_prefill_seq_rows).
 pub const RowRun = extern struct { pos: c_int, count: c_int, rows: u64 };
@@ -74,24 +107,25 @@ pub const Api = struct {
 
     fn sym(comptime T: type, handle: ?*anyopaque, name: [*:0]const u8) !T {
         const p = dlsym(handle, name) orelse {
-            std.log.err("bolt: libbolt.so has no {s}", .{name});
+            std.log.err("bolt: {s} has no {s}", .{ library_name, name });
             return error.BoltMissing;
         };
         return @ptrCast(@alignCast(p));
     }
 };
 
-/// libbolt.so: TENSORFOLD_BOLT_LIB, else beside the server (native/lib), else the loader's path.
+/// libbolt.so (bolt.dll on Windows): TENSORFOLD_BOLT_LIB, else beside the server (native/lib), else the loader's path.
 pub fn openLibrary() ?*anyopaque {
-    if (std.c.getenv("TENSORFOLD_BOLT_LIB")) |p| return dlopen(p, 2);
+    if (sys.c.getenv("TENSORFOLD_BOLT_LIB")) |p| return dlopen(p, 2);
     var exe: [std.fs.max_path_bytes]u8 = undefined;
-    const n = readlink("/proc/self/exe", &exe, exe.len - 1);
+    const n = dl.selfExe(exe[0 .. exe.len - 1]);
     if (n > 0) {
         const dir = std.fs.path.dirname(exe[0..@intCast(n)]) orelse "";
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrintSentinel(&buf, "{s}/../lib/libbolt.so", .{dir}, 0)) |path| {
+        const beside = if (windows) "{s}\\bolt.dll" else "{s}/../lib/libbolt.so";
+        if (std.fmt.bufPrintSentinel(&buf, beside, .{dir}, 0)) |path| {
             if (dlopen(path, 2)) |h| return h;
         } else |_| {}
     }
-    return dlopen("libbolt.so", 2);
+    return dlopen(library_name, 2);
 }

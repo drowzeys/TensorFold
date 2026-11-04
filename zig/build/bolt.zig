@@ -17,11 +17,17 @@ pub fn steps(b: *std.Build, nvcc: ?[]const u8) void {
         return;
     };
     const root: std.Build.LazyPath = .{ .cwd_relative = dir };
-    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121a,code=sm_121a", "-I" });
+    // Windows: bolt.dll beside tensorfold-native.exe (the loader's first search place), linked to cuda.lib; nvcc
+    // drives cl there, which has no -fPIC.
+    const windows = b.graph.host.result.os.tag == .windows;
+    const run = b.addSystemCommand(&.{ tool, "-shared" });
+    // /MD: the shared UCRT, so the BOLT_* variables the server sets with _putenv_s are the ones libbolt's getenv reads.
+    run.addArgs(if (windows) &.{ "-Xcompiler", "/MD" } else &.{ "-Xcompiler", "-fPIC" });
+    run.addArgs(&.{ "-O3", "-gencode", "arch=compute_121a,code=sm_121a", "-I" });
     run.addDirectoryArg(root);
     run.addArg("-o");
-    const lib = run.addOutputFileArg("libbolt.so");
+    const lib = run.addOutputFileArg(if (windows) "bolt.dll" else "libbolt.so");
     for (sources) |name| run.addFileArg(root.path(b, name));
     run.addArg("-lcuda");
-    step.dependOn(&b.addInstallFile(lib, "native/lib/libbolt.so").step);
+    step.dependOn(&b.addInstallFile(lib, if (windows) "native/bin/bolt.dll" else "native/lib/libbolt.so").step);
 }

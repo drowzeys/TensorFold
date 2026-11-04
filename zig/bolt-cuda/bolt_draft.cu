@@ -12,10 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "bolt_map.h"
 
 #define CK(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) { fprintf(stderr, "bolt draft: %s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(_e)); } } while (0)
 
@@ -75,14 +72,10 @@ bool parse(const uint8_t* file, size_t n, std::unordered_map<std::string, Info>&
 }
 
 bool open_file(const char* path, File& f) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-    struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return false; }
-    void* p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (p == MAP_FAILED) return false;
-    f.map = p; f.size = st.st_size;
+    size_t size = 0;
+    void* p = bolt_map_file(path, &size);
+    if (!p) return false;
+    f.map = p; f.size = size;
     if (!parse((const uint8_t*)p, f.size, f.tab)) return false;
     uint64_t hs; memcpy(&hs, p, 8);
     f.data_base = (const uint8_t*)p + 8 + hs;
@@ -879,7 +872,7 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
         CK(cudaMalloc(&d->abias, bias.size() * 4));
         CK(cudaMemcpy(d->abias, bias.data(), bias.size() * 4, cudaMemcpyHostToDevice));
     }
-    munmap(f.map, f.size);
+    bolt_unmap_file(f.map, f.size);
 
     const size_t NB = d->nb;
     auto fa = [&](float** p, size_t n) { CK(cudaMalloc(p, n * 4)); CK(cudaMemset(*p, 0, n * 4)); };
